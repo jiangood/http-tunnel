@@ -20,17 +20,17 @@ sleep 10
 kill $(jobs -p)
 
 
-echo rathole
+echo http-tunnel
 
-pid_s=$(ps aux | grep "rathole server" | head -n 1 | awk '{print $2}')
+pid_s=$(ps aux | grep "http-tunnel server" | head -n 1 | awk '{print $2}')
 while true; do
-	ps --pid $pid_s -o rsz= >> ratholec-mem.log
+	ps --pid $pid_s -o rsz= >> http-tunnel-client-mem.log
 sleep 1
 done &
 
-pid_c=$(ps aux | grep "rathole client" | head -n 1 | awk '{print $2}')
+pid_c=$(ps aux | grep "http-tunnel client" | head -n 1 | awk '{print $2}')
 while true; do
-	ps --pid $pid_c -o rsz= >> ratholes-mem.log
+	ps --pid $pid_c -o rsz= >> http-tunnel-server-mem.log
 sleep 1
 done &
 
@@ -42,5 +42,5 @@ kill $(jobs -p)
 
 gawk -i inplace '{print $1 "000"}' frpc-mem.log
 gawk -i inplace '{print $1 "000"}' frps-mem.log
-gawk -i inplace '{print $1 "000"}' ratholec-mem.log
-gawk -i inplace '{print $1 "000"}' ratholes-mem.log
+gawk -i inplace '{print $1 "000"}' http-tunnel-client-mem.log
+gawk -i inplace '{print $1 "000"}' http-tunnel-server-mem.log

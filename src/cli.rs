@@ -66,7 +66,7 @@ pub struct ClientArgs {
 
     /// The token of the client. It must match the one in the server's configuration
     ///
-    /// It can also be passed via the `RATHOLE_TOKEN` environment variable
-    #[clap(long, short, env = "RATHOLE_TOKEN", hide_env_values = true)]
+    /// It can also be passed via the `HTTP_TUNNEL_TOKEN` environment variable
+    #[clap(long, short, env = "HTTP_TUNNEL_TOKEN", hide_env_values = true)]
     pub token: String,
 }

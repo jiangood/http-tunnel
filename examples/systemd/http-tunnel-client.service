@@ -1,5 +1,5 @@
 [Unit]
-Description=Rathole Client Service
+Description=http-tunnel Client Service
 After=network.target
 
 [Service]
@@ -10,13 +10,13 @@ LimitNOFILE=1048576
 
 # The token is read from the environment, so that it doesn't show up in `ps`
 # with root
-EnvironmentFile=-/etc/rathole/client.env
+EnvironmentFile=-/etc/http-tunnel/client.env
 # without root
-# EnvironmentFile=-%h/.local/etc/rathole/client.env
+# EnvironmentFile=-%h/.local/etc/http-tunnel/client.env
 
 # The `--remote` must be the address of your server, and the `--name` must be
 # defined in the configuration of the server
-ExecStart=/usr/bin/rathole client --remote example.com:2333 --name home
+ExecStart=/usr/bin/http-tunnel client --remote example.com:2333 --name home
 
 [Install]
 WantedBy=multi-user.target

@@ -1,5 +1,5 @@
 {
-  description = "A lightweight and high-performance reverse proxy for NAT traversal";
+  description = "A secure, stable and high-performance HTTP reverse proxy for NAT traversal";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
@@ -18,8 +18,8 @@
     in
     {
       overlays.default = final: prev: {
-        rathole = final.rustPlatform.buildRustPackage {
-          pname = "rathole";
+        http-tunnel = final.rustPlatform.buildRustPackage {
+          pname = "http-tunnel";
           version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
           src = final.lib.fileset.toSource {
             root = ./.;
@@ -35,10 +35,10 @@
           buildInputs = [ final.zlib ];
           doCheck = false;
           meta = {
-            description = "A lightweight and high-performance reverse proxy for NAT traversal";
-            homepage = "https://github.com/rathole-org/rathole";
+            description = "A secure, stable and high-performance HTTP reverse proxy for NAT traversal";
+            homepage = "https://github.com/jiangood/http-tunnel";
             license = final.lib.licenses.asl20;
-            mainProgram = "rathole";
+            mainProgram = "http-tunnel";
           };
         };
       };
@@ -49,22 +49,22 @@
           pkgs' = pkgs.extend self.overlays.default;
         in
         {
-          rathole = pkgs'.rathole;
-          default = pkgs'.rathole;
+          http-tunnel = pkgs'.http-tunnel;
+          default = pkgs'.http-tunnel;
         }
       );
 
       apps = forAllSystems (pkgs: rec {
-        rathole = {
+        http-tunnel = {
           type = "app";
-          program = pkgs.lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.rathole;
+          program = pkgs.lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.http-tunnel;
         };
-        default = rathole;
+        default = http-tunnel;
       });
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
-          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.rathole ];
+          inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.http-tunnel ];
           packages = with pkgs; [
             rustfmt
             clippy
@@ -74,7 +74,7 @@
       });
 
       checks = forAllSystems (pkgs: {
-        rathole = self.packages.${pkgs.stdenv.hostPlatform.system}.rathole;
+        http-tunnel = self.packages.${pkgs.stdenv.hostPlatform.system}.http-tunnel;
       });
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);

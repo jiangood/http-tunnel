@@ -7,32 +7,32 @@ use tokio::{
     sync::broadcast,
 };
 
-pub async fn run_rathole_server(
+pub async fn run_http_tunnel_server(
     config_path: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let cli = rathole::Cli {
-        cmd: rathole::Command::Server(rathole::ServerArgs {
+    let cli = http_tunnel::Cli {
+        cmd: http_tunnel::Command::Server(http_tunnel::ServerArgs {
             config_path: PathBuf::from(config_path),
         }),
     };
-    rathole::run(cli, shutdown_rx).await
+    http_tunnel::run(cli, shutdown_rx).await
 }
 
-pub async fn run_rathole_client(
+pub async fn run_http_tunnel_client(
     name: &str,
     remote: &str,
     token: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let cli = rathole::Cli {
-        cmd: rathole::Command::Client(rathole::ClientArgs {
+    let cli = http_tunnel::Cli {
+        cmd: http_tunnel::Command::Client(http_tunnel::ClientArgs {
             name: name.to_string(),
             remote: remote.to_string(),
             token: token.to_string(),
         }),
     };
-    rathole::run(cli, shutdown_rx).await
+    http_tunnel::run(cli, shutdown_rx).await
 }
 
 pub mod tcp {

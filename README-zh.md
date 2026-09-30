@@ -1,24 +1,26 @@
-# rathole
+# http-tunnel
 
-![rathole-logo](./docs/img/rathole-logo.png)
+![http-tunnel-logo](./docs/img/http-tunnel-logo.png)
 
-[![GitHub stars](https://img.shields.io/github/stars/rapiz1/rathole)](https://github.com/rapiz1/rathole/stargazers)
-[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/rapiz1/rathole)](https://github.com/rapiz1/rathole/releases)
-![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/rapiz1/rathole/rust.yml?branch=main)
-[![GitHub all releases](https://img.shields.io/github/downloads/rapiz1/rathole/total)](https://github.com/rapiz1/rathole/releases)
-![Docker Pulls](https://img.shields.io/docker/pulls/rapiz1/rathole)
+[![GitHub stars](https://img.shields.io/github/stars/jiangood/http-tunnel)](https://github.com/jiangood/http-tunnel/stargazers)
+[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/jiangood/http-tunnel)](https://github.com/jiangood/http-tunnel/releases)
+![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/jiangood/http-tunnel/rust.yml?branch=main)
+[![GitHub all releases](https://img.shields.io/github/downloads/jiangood/http-tunnel/total)](https://github.com/jiangood/http-tunnel/releases)
 
 [English](README.md) | [简体中文](README-zh.md)
 
 安全、稳定、高性能的 HTTP 内网穿透工具，用 Rust 语言编写
 
-`rathole` 可以将 NAT 后的设备上的 HTTP 服务通过具有公网 IP 的服务器暴露在公网上。服务端只监听一个 HTTP 端口，并根据请求的 `Host` 头把请求路由到对应的服务。服务端与客户端之间的流量通过一条普通的 TCP 隧道承载。
+`http-tunnel` 可以将 NAT 后的设备上的 HTTP 服务通过具有公网 IP 的服务器暴露在公网上。服务端只监听一个 HTTP 端口，并根据请求的 `Host` 头把请求路由到对应的服务。服务端与客户端之间的流量通过一条普通的 TCP 隧道承载。
 
 所有的配置都放在服务端。客户端由服务端配置：客户端不需要配置文件，服务端会把需要转发的服务下发给它。
 
+> `http-tunnel` 是 [rathole](https://github.com/rathole-org/rathole) 的 fork，被改造为 HTTP 反向代理。
+> 项目基于 Apache-2.0 协议发布，详见 [LICENSE](./LICENSE)。
+
 <!-- TOC -->
 
-- [rathole](#rathole)
+- [http-tunnel](#http-tunnel)
   - [Features](#features)
   - [Quickstart](#quickstart)
   - [Configuration](#configuration)
@@ -40,9 +42,9 @@
 
 ## Quickstart
 
-一个全功能的 `rathole` 可以从 [release](https://github.com/rapiz1/rathole/releases) 页面下载。或者 [从源码编译](docs/build-guide.md) **获取其他平台和最小化的二进制文件**。
+一个全功能的 `http-tunnel` 可以从 [release](https://github.com/jiangood/http-tunnel/releases) 页面下载。或者 [从源码编译](docs/build-guide.md) **获取其他平台和最小化的二进制文件**。也提供 [Docker 镜像](https://github.com/jiangood/http-tunnel/pkgs/container/http-tunnel)。
 
-使用 rathole 需要一个有公网 IP 的服务器，和一个在 NAT 或防火墙后的设备，其中有些 HTTP 服务需要暴露在互联网上。
+使用 http-tunnel 需要一个有公网 IP 的服务器，和一个在 NAT 或防火墙后的设备，其中有些 HTTP 服务需要暴露在互联网上。
 
 假设你在家里的 NAT 后面有一个 NAS，并且想把它的 Web 界面暴露在 `nas.example.com`：
 
@@ -66,7 +68,7 @@ local_addr = "127.0.0.1:80" # NAS 上的 Web 界面地址，从 NAS 的角度看
 然后运行:
 
 ```bash
-./rathole server server.toml
+./http-tunnel server server.toml
 ```
 
 2. 在 NAT 后面的主机（你的 NAS）上
@@ -74,22 +76,22 @@ local_addr = "127.0.0.1:80" # NAS 上的 Web 界面地址，从 NAS 的角度看
 客户端不需要配置文件。只需要告诉它服务端的地址、它在服务端配置中的名字，以及它的 token：
 
 ```bash
-./rathole client --remote myserver.com:2333 --name home_nas --token use_a_secret_that_only_you_know
+./http-tunnel client --remote myserver.com:2333 --name home_nas --token use_a_secret_that_only_you_know
 ```
 
 或者用环境变量传入 token，这样它就不会出现在 `ps` 里：
 
 ```bash
-RATHOLE_TOKEN=use_a_secret_that_only_you_know ./rathole client --remote myserver.com:2333 --name home_nas
+HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know ./http-tunnel client --remote myserver.com:2333 --name home_nas
 ```
 
-3. 现在 `rathole` 客户端会连接运行在 `myserver.com:2333` 的 `rathole` 服务器，服务端会把 `home_nas` 的服务（包括
+3. 现在 `http-tunnel` 客户端会连接运行在 `myserver.com:2333` 的 `http-tunnel` 服务器，服务端会把 `home_nas` 的服务（包括
    `my_nas`）下发给它。任何到服务器 `80` 端口、`Host: nas.example.com` 的 HTTP 请求将被转发到客户端所在主机的 `80`
    端口。
 
 所以你可以在 `nas.example.com` 解析到你的服务器后，访问 `http://nas.example.com`。
 
-[Systemd examples](./examples/systemd) 中提供了一些让 `rathole` 在 Linux 上作为后台服务运行的配置示例。
+[Systemd examples](./examples/systemd) 中提供了一些让 `http-tunnel` 在 Linux 上作为后台服务运行的配置示例。
 
 ## Configuration
 
@@ -106,7 +108,7 @@ http_bind_addr = "0.0.0.0:80" # Necessary. The HTTP entrypoint. Visitors are rou
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
 
 [clients.home] # 一个客户端。名字 `home` 必须和客户端的 `--name` 一致
-token = "use_a_secret_that_only_you_know" # Necessary. 客户端的 token，也可以通过 `RATHOLE_TOKEN` 环境变量传入
+token = "use_a_secret_that_only_you_know" # Necessary. 客户端的 token，也可以通过 `HTTP_TUNNEL_TOKEN` 环境变量传入
 heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `heartbeat_interval`. Default: 40 seconds
 retry_interval = 1 # Optional. 客户端连接服务端的重试间隔。Default: 1 second
 nodelay = true # Optional. 该客户端下所有服务默认是否启用 TCP_NODELAY。Default: true
@@ -143,27 +145,27 @@ local_addr = "127.0.0.1:1083"
 
 ### Logging
 
-`rathole`，像许多其他 Rust 程序一样，使用环境变量来控制日志级别。
+`http-tunnel`，像许多其他 Rust 程序一样，使用环境变量来控制日志级别。
 
 支持的 Logging Level 有 `info`, `warn`, `error`, `debug`, `trace`
 
 比如将日志级别设置为 `error`:
 
 ```shell
-RUST_LOG=error ./rathole server config.toml
+RUST_LOG=error ./http-tunnel server config.toml
 ```
 
 如果 `RUST_LOG` 不存在，默认的日志级别是 `info`。
 
 ### Tuning
 
-rathole 默认启用 TCP_NODELAY。这能够减少延迟并使交互式应用受益。但它会减少一些带宽。
+http-tunnel 默认启用 TCP_NODELAY。这能够减少延迟并使交互式应用受益。但它会减少一些带宽。
 
 如果带宽更重要，TCP_NODELAY 仍然可以通过配置 `nodelay = false` 关闭（按客户端或按服务配置）。
 
 ## Benchmark
 
-rathole 的延迟与 [frp](https://github.com/fatedier/frp) 相近，在高并发情况下表现更好，能提供更大的带宽，内存占用更少。
+http-tunnel 的延迟与 [frp](https://github.com/fatedier/frp) 相近，在高并发情况下表现更好，能提供更大的带宽，内存占用更少。
 
 关于测试进行的更多细节，参见单独页面 [Benchmark](./docs/benchmark.md)。
 

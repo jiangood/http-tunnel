@@ -143,7 +143,7 @@ fn default_heartbeat_interval() -> u64 {
     DEFAULT_HEARTBEAT_INTERVAL_SECS
 }
 
-/// The configuration of a server. It's the only configuration of `rathole`
+/// The configuration of a server. It's the only configuration of `http-tunnel`
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -164,7 +164,7 @@ impl ServerConfig {
                 if s.contains("[server") || s.contains("[client") || s.contains("default_token") {
                     anyhow!(
                         "{}\nNote: `[server]` is no longer needed, and `[client]`, `[server.services]` and \
-                         `default_token` are no longer supported. `rathole` only reads the configuration of \
+                         `default_token` are no longer supported. `http-tunnel` only reads the configuration of \
                          the server: clients and their services are defined in `[clients.<name>]`, and a \
                          client is started with `--remote`, `--name` and `--token`.",
                         e

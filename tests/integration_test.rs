@@ -1,5 +1,5 @@
 use anyhow::{Ok, Result};
-use common::run_rathole_client;
+use common::run_http_tunnel_client;
 use rand::Rng;
 use std::time::Duration;
 use tokio::{
@@ -11,7 +11,7 @@ use tokio::{
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
-use crate::common::run_rathole_server;
+use crate::common::run_http_tunnel_server;
 
 mod common;
 
@@ -50,7 +50,7 @@ async fn http_routing() -> Result<()> {
     // Start the client
     info!("start the client");
     let client = tokio::spawn(async move {
-        run_rathole_client(CLIENT_NAME, SERVER_ADDR, CLIENT_TOKEN, client_shutdown_rx)
+        run_http_tunnel_client(CLIENT_NAME, SERVER_ADDR, CLIENT_TOKEN, client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -61,7 +61,7 @@ async fn http_routing() -> Result<()> {
     // Start the server
     info!("start the server");
     let server = tokio::spawn(async move {
-        run_rathole_server(SERVER_CONFIG, server_shutdown_rx)
+        run_http_tunnel_server(SERVER_CONFIG, server_shutdown_rx)
             .await
             .unwrap();
     });
@@ -83,7 +83,7 @@ async fn http_routing() -> Result<()> {
     info!("restart the client");
     let client_shutdown_rx = client_shutdown_tx.subscribe();
     let client = tokio::spawn(async move {
-        run_rathole_client(CLIENT_NAME, SERVER_ADDR, CLIENT_TOKEN, client_shutdown_rx)
+        run_http_tunnel_client(CLIENT_NAME, SERVER_ADDR, CLIENT_TOKEN, client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -100,7 +100,7 @@ async fn http_routing() -> Result<()> {
     info!("restart the server");
     let server_shutdown_rx = server_shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
-        run_rathole_server(SERVER_CONFIG, server_shutdown_rx)
+        run_http_tunnel_server(SERVER_CONFIG, server_shutdown_rx)
             .await
             .unwrap();
     });

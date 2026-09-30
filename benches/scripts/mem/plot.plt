@@ -14,5 +14,5 @@ set yrange [0:*]
 
 plot "frps-mem.log" using 1 with lines axes x1y1 title "frps RSZ", \
      "frpc-mem.log" using 1 with lines axes x1y1 title "frpc RSZ", \
-     "ratholes-mem.log" using 1 with lines axes x1y1 title "ratholes RSZ", \
-     "ratholec-mem.log" using 1 with lines axes x1y1 title "ratholec RSZ"
+     "http-tunnel-server-mem.log" using 1 with lines axes x1y1 title "http-tunnel-server RSZ", \
+     "http-tunnel-client-mem.log" using 1 with lines axes x1y1 title "http-tunnel-client RSZ"

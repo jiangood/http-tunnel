@@ -1,25 +1,27 @@
-# rathole
+# http-tunnel
 
-![rathole-logo](./docs/img/rathole-logo.png)
+![http-tunnel-logo](./docs/img/http-tunnel-logo.png)
 
-[![GitHub stars](https://img.shields.io/github/stars/rapiz1/rathole)](https://github.com/rapiz1/rathole/stargazers)
-[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/rapiz1/rathole)](https://github.com/rapiz1/rathole/releases)
-![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/rapiz1/rathole/rust.yml?branch=main)
-[![GitHub all releases](https://img.shields.io/github/downloads/rapiz1/rathole/total)](https://github.com/rapiz1/rathole/releases)
-![Docker Pulls](https://img.shields.io/docker/pulls/rapiz1/rathole)
+[![GitHub stars](https://img.shields.io/github/stars/jiangood/http-tunnel)](https://github.com/jiangood/http-tunnel/stargazers)
+[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/jiangood/http-tunnel)](https://github.com/jiangood/http-tunnel/releases)
+![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/jiangood/http-tunnel/rust.yml?branch=main)
+[![GitHub all releases](https://img.shields.io/github/downloads/jiangood/http-tunnel/total)](https://github.com/jiangood/http-tunnel/releases)
 
 [English](README.md) | [简体中文](README-zh.md)
 
 A secure, stable and high-performance HTTP reverse proxy for NAT traversal, written in Rust
 
-`rathole` exposes HTTP services on a device behind the NAT to the Internet, via a server with a public IP. The server listens on a single HTTP port and routes each request to the right service according to the `Host` header. The traffic between the server and the client is carried over a plain TCP tunnel.
+`http-tunnel` exposes HTTP services on a device behind the NAT to the Internet, via a server with a public IP. The server listens on a single HTTP port and routes each request to the right service according to the `Host` header. The traffic between the server and the client is carried over a plain TCP tunnel.
 
 The whole configuration lives on the server. A client is configured by the server: it takes no configuration file, and
 the server pushes it the services that it should forward.
 
+> `http-tunnel` is a fork of [rathole](https://github.com/rathole-org/rathole), reworked into an HTTP reverse proxy.
+> It is distributed under the Apache-2.0 license, see [LICENSE](./LICENSE).
+
 <!-- TOC -->
 
-- [rathole](#rathole)
+- [http-tunnel](#http-tunnel)
   - [Features](#features)
   - [Quickstart](#quickstart)
   - [Configuration](#configuration)
@@ -41,9 +43,9 @@ the server pushes it the services that it should forward.
 
 ## Quickstart
 
-A full-powered `rathole` can be obtained from the [release](https://github.com/rapiz1/rathole/releases) page. Or [build from source](docs/build-guide.md) **for other platforms and minimizing the binary**. A [Docker image](https://hub.docker.com/r/rapiz1/rathole) is also available.
+A full-powered `http-tunnel` can be obtained from the [release](https://github.com/jiangood/http-tunnel/releases) page. Or [build from source](docs/build-guide.md) **for other platforms and minimizing the binary**. A [Docker image](https://github.com/jiangood/http-tunnel/pkgs/container/http-tunnel) is also available.
 
-To use `rathole`, you need a server with a public IP, and a device behind the NAT, where some HTTP services that need to be exposed to the Internet.
+To use `http-tunnel`, you need a server with a public IP, and a device behind the NAT, where some HTTP services that need to be exposed to the Internet.
 
 Assuming you have a NAS at home behind the NAT, and want to expose its web UI at `nas.example.com`:
 
@@ -53,7 +55,7 @@ Create `server.toml` with the following content and accommodate it to your needs
 
 ```toml
 # server.toml
-bind_addr = "0.0.0.0:2333" # `2333` specifies the port that rathole listens for clients
+bind_addr = "0.0.0.0:2333" # `2333` specifies the port that http-tunnel listens for clients
 http_bind_addr = "0.0.0.0:80" # `80` specifies the HTTP entrypoint that visitors connect to
 
 [clients.home_nas] # The name of the client
@@ -67,7 +69,7 @@ local_addr = "127.0.0.1:80" # The address of the NAS web UI, as seen from the NA
 Then run:
 
 ```bash
-./rathole server server.toml
+./http-tunnel server server.toml
 ```
 
 2. On the host which is behind the NAT (your NAS)
@@ -76,13 +78,13 @@ The client needs no configuration file. Just tell it where the server is, which 
 of the server, and its token:
 
 ```bash
-./rathole client --remote myserver.com:2333 --name home_nas --token use_a_secret_that_only_you_know
+./http-tunnel client --remote myserver.com:2333 --name home_nas --token use_a_secret_that_only_you_know
 ```
 
 or pass the token in the environment, so that it doesn't show up in `ps`:
 
 ```bash
-RATHOLE_TOKEN=use_a_secret_that_only_you_know ./rathole client --remote myserver.com:2333 --name home_nas
+HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know ./http-tunnel client --remote myserver.com:2333 --name home_nas
 ```
 
 3. Now the client will try to connect to the server `myserver.com` on port `2333`, and the server pushes it the services
@@ -91,7 +93,7 @@ RATHOLE_TOKEN=use_a_secret_that_only_you_know ./rathole client --remote myserver
 
 So you can visit `http://nas.example.com` (with `nas.example.com` resolving to your server) to reach the NAS web UI.
 
-To run `rathole` as a background service on Linux, checkout the [systemd examples](./examples/systemd).
+To run `http-tunnel` as a background service on Linux, checkout the [systemd examples](./examples/systemd).
 
 ## Configuration
 
@@ -108,7 +110,7 @@ http_bind_addr = "0.0.0.0:80" # Necessary. The HTTP entrypoint. Visitors are rou
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
 
 [clients.home] # A client. The name `home` must be identical to the `--name` of the client
-token = "use_a_secret_that_only_you_know" # Necessary. The token of the client. It can also be given by the `RATHOLE_TOKEN` environment variable
+token = "use_a_secret_that_only_you_know" # Necessary. The token of the client. It can also be given by the `HTTP_TUNNEL_TOKEN` environment variable
 heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `heartbeat_interval`. Default: 40 seconds
 retry_interval = 1 # Optional. The interval between retries of the client to connect to the server. Default: 1 second
 nodelay = true # Optional. The default TCP_NODELAY of the services of this client. Default: true
@@ -146,26 +148,26 @@ Routing is done once per connection, on its first request. A keep-alive connecti
 
 ### Logging
 
-`rathole`, like many other Rust programs, use environment variables to control the logging level. `info`, `warn`, `error`, `debug`, `trace` are available.
+`http-tunnel`, like many other Rust programs, use environment variables to control the logging level. `info`, `warn`, `error`, `debug`, `trace` are available.
 
 ```shell
-RUST_LOG=error ./rathole server config.toml
+RUST_LOG=error ./http-tunnel server config.toml
 ```
 
-will run `rathole` with only error level logging.
+will run `http-tunnel` with only error level logging.
 
 If `RUST_LOG` is not present, the default logging level is `info`.
 
 ### Tuning
 
-`rathole` enables TCP_NODELAY by default, which should benefit the latency and interactive applications. However, it slightly decreases the bandwidth.
+`http-tunnel` enables TCP_NODELAY by default, which should benefit the latency and interactive applications. However, it slightly decreases the bandwidth.
 
 If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false`, either for a whole client or
 per service.
 
 ## Benchmark
 
-`rathole` has similar latency to [frp](https://github.com/fatedier/frp), but can handle a more connections, provide larger bandwidth, with less memory usage.
+`http-tunnel` has similar latency to [frp](https://github.com/fatedier/frp), but can handle a more connections, provide larger bandwidth, with less memory usage.
 
 For more details, see the separate page [Benchmark](./docs/benchmark.md).
 

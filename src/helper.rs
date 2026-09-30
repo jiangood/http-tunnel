@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 #[allow(dead_code)]
 pub fn feature_not_compile(feature: &str) -> ! {
     panic!(
-        "The feature '{}' is not compiled in this binary. Please re-compile rathole",
+        "The feature '{}' is not compiled in this binary. Please re-compile http-tunnel",
         feature
     )
 }
