@@ -10,9 +10,9 @@
 
 [English](README.md) | [简体中文](README-zh.md)
 
-安全、稳定、高性能的内网穿透工具，用 Rust 语言编写
+安全、稳定、高性能的 HTTP 内网穿透工具，用 Rust 语言编写
 
-rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://github.com/inconshreveable/ngrok)，可以让 NAT 后的设备上的服务通过具有公网 IP 的服务器暴露在公网上。
+`rathole` 可以将 NAT 后的设备上的 HTTP 服务通过具有公网 IP 的服务器暴露在公网上。服务端只监听一个 HTTP 端口，并根据请求的 `Host` 头把请求路由到对应的服务。服务端与客户端之间的流量通过一条普通的 TCP 隧道承载。
 
 <!-- TOC -->
 
@@ -20,6 +20,7 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
   - [Features](#features)
   - [Quickstart](#quickstart)
   - [Configuration](#configuration)
+    - [Routing](#routing)
     - [Logging](#logging)
     - [Tuning](#tuning)
   - [Benchmark](#benchmark)
@@ -29,20 +30,18 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 
 ## Features
 
+- **HTTP 反向代理** 一个公网 HTTP 端口即可服务所有服务，按 `Host` 头路由。WebSocket 及其他协议升级可原样透传。
 - **高性能** 具有更高的吞吐量，高并发下更稳定。见[Benchmark](#benchmark)
-- **低资源消耗** 内存占用远低于同类工具。见[Benchmark](#benchmark)。[二进制文件最小](docs/build-guide.md)可以到 **~500KiB**，可以部署在嵌入式设备如路由器上。
-- **安全性** 每个服务单独强制鉴权。Server 和 Client 负责各自的配置。使用 Noise Protocol 可以简单地配置传输加密，而不需要自签证书。同时也支持 TLS。
-- **热重载** 支持配置文件热重载，动态修改端口转发服务。HTTP API 正在开发中。
+- **低资源消耗** 内存占用远低于同类工具。见[Benchmark](#benchmark)
+- **安全性** 每个服务单独强制鉴权。Server 和 Client 负责各自的配置。
 
 ## Quickstart
 
 一个全功能的 `rathole` 可以从 [release](https://github.com/rapiz1/rathole/releases) 页面下载。或者 [从源码编译](docs/build-guide.md) **获取其他平台和最小化的二进制文件**。
 
-`rathole` 的使用和 frp 非常类似，如果你有后者的使用经验，那配置对你来说非常简单，区别只是转发服务的配置分离到了服务端和客户端，并且必须要设置 token。
+使用 rathole 需要一个有公网 IP 的服务器，和一个在 NAT 或防火墙后的设备，其中有些 HTTP 服务需要暴露在互联网上。
 
-使用 rathole 需要一个有公网 IP 的服务器，和一个在 NAT 或防火墙后的设备，其中有些服务需要暴露在互联网上。
-
-假设你在家里的 NAT 后面有一个 NAS，并且想把它的 ssh 服务暴露在公网上：
+假设你在家里的 NAT 后面有一个 NAS，并且想把它的 Web 界面暴露在 `nas.example.com`：
 
 1. 在有一个公网 IP 的服务器上
 
@@ -52,10 +51,11 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 # server.toml
 [server]
 bind_addr = "0.0.0.0:2333" # `2333` 配置了服务端监听客户端连接的端口
+http_bind_addr = "0.0.0.0:80" # `80` 配置了供访问者连接的 HTTP 入口
+default_token = "use_a_secret_that_only_you_know"
 
-[server.services.my_nas_ssh]
-token = "use_a_secret_that_only_you_know" # 用于验证的 token
-bind_addr = "0.0.0.0:5202" # `5202` 配置了将 `my_nas_ssh` 暴露给互联网的端口
+[server.services.my_nas]
+hosts = ["nas.example.com"] # 具有该 `Host` 的请求会被转发到 `my_nas`
 ```
 
 然后运行:
@@ -72,9 +72,10 @@ bind_addr = "0.0.0.0:5202" # `5202` 配置了将 `my_nas_ssh` 暴露给互联网
 # client.toml
 [client]
 remote_addr = "myserver.com:2333" # 服务器的地址。端口必须与 `server.bind_addr` 中的端口相同。
-[client.services.my_nas_ssh]
-token = "use_a_secret_that_only_you_know" # 必须与服务器相同以通过验证
-local_addr = "127.0.0.1:22" # 需要被转发的服务的地址
+default_token = "use_a_secret_that_only_you_know"
+
+[client.services.my_nas]
+local_addr = "127.0.0.1:80" # 需要被转发的本地 HTTP 服务的地址
 ```
 
 然后运行：
@@ -83,9 +84,9 @@ local_addr = "127.0.0.1:22" # 需要被转发的服务的地址
 ./rathole client.toml
 ```
 
-3. 现在 `rathole` 客户端会连接运行在 `myserver.com:2333`的 `rathole` 服务器，任何到 `myserver.com:5202` 的流量将被转发到客户端所在主机的 `22` 端口。
+3. 现在 `rathole` 客户端会连接运行在 `myserver.com:2333`的 `rathole` 服务器，任何到服务器 `80` 端口、`Host: nas.example.com` 的 HTTP 请求将被转发到客户端所在主机的 `80` 端口。
 
-所以你可以 `ssh myserver.com:5202` 来 ssh 到你的 NAS。
+所以你可以在 `nas.example.com` 解析到你的服务器后，访问 `http://nas.example.com`。
 
 [Systemd examples](./examples/systemd) 中提供了一些让 `rathole` 在 Linux 上作为后台服务运行的配置示例。
 
@@ -97,8 +98,6 @@ local_addr = "127.0.0.1:22" # 需要被转发的服务的地址
 
 **推荐首先查看 [examples](./examples) 中的配置示例来快速理解配置格式**，如果有不清楚的地方再查阅完整配置格式。
 
-关于如何配置 Noise Protocol 和 TLS 来进行加密传输，参见 [Transport](./docs/transport.md)。
-
 下面是完整的配置格式。
 
 ```toml
@@ -108,32 +107,10 @@ default_token = "default_token_if_not_specify" # Optional. The default token of 
 heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second
 
-[client.transport] # The whole block is optional. Specify which transport to use
-type = "tcp" # Optional. Possible values: ["tcp", "tls", "noise"]. Default: "tcp"
-
-[client.transport.tcp] # Optional. Also affects `noise` and `tls`
-proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. The proxy used to connect to the server. `http` and `socks5` is supported.
-nodelay = true # Optional. Override the `client.transport.nodelay` per service
-keepalive_secs = 20 # Optional. Specify `tcp_keepalive_time` in `tcp(7)`, if applicable. Default: 20 seconds
-keepalive_interval = 8 # Optional. Specify `tcp_keepalive_intvl` in `tcp(7)`, if applicable. Default: 8 seconds
-
-[client.transport.tls] # Necessary if `type` is "tls"
-trusted_root = "ca.pem" # Necessary. The certificate of CA that signed the server's certificate
-hostname = "example.com" # Optional. The hostname that the client uses to validate the certificate. If not set, fallback to `client.remote_addr`
-
-[client.transport.noise] # Noise protocol. See `docs/transport.md` for further explanation
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
-local_private_key = "key_encoded_in_base64" # Optional
-remote_public_key = "key_encoded_in_base64" # Optional
-
-[client.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # If `true` then it will use settings in `client.transport.tls`
-
 [client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
-type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
 token = "whatever" # Necessary if `client.default_token` not set
-local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
-nodelay = true # Optional. Determine whether to enable TCP_NODELAY for data transmission, if applicable, to improve the latency but decrease the bandwidth. Default: true
+local_addr = "127.0.0.1:1081" # Necessary. The address of the local HTTP service that needs to be forwarded
+nodelay = true # Optional. Determine whether to enable TCP_NODELAY, to improve the latency but decrease the bandwidth. Default: true
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
 
 [client.services.service2] # Multiple services can be defined
@@ -141,38 +118,26 @@ local_addr = "127.0.0.1:1082"
 
 [server]
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
+http_bind_addr = "0.0.0.0:80" # Necessary. The HTTP entrypoint. Visitors are routed by the `Host` header
 default_token = "default_token_if_not_specify" # Optional
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
 
-[server.transport] # Same as `[client.transport]`
-type = "tcp"
-
-[server.transport.tcp] # Same as the client
-nodelay = true
-keepalive_secs = 20
-keepalive_interval = 8
-
-[server.transport.tls] # Necessary if `type` is "tls"
-pkcs12 = "identify.pfx" # Necessary. pkcs12 file of server's certificate and private key
-pkcs12_password = "password" # Necessary. Password of the pkcs12 file
-
-[server.transport.noise] # Same as `[client.transport.noise]`
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "key_encoded_in_base64"
-remote_public_key = "key_encoded_in_base64"
-
-[server.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # If `true` then it will use settings in `server.transport.tls`
-
 [server.services.service1] # The service name must be identical to the client side
-type = "tcp" # Optional. Same as the client `[client.services.X.type]
 token = "whatever" # Necessary if `server.default_token` not set
-bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
+hosts = ["service1.example.com"] # Necessary. Requests with these `Host` values are routed to this service
 nodelay = true # Optional. Same as the client
 
 [server.services.service2]
-bind_addr = "0.0.0.1:8082"
+hosts = ["service2.example.com", "www.service2.example.com"]
 ```
+
+### Routing
+
+服务端在 `http_bind_addr` 上接受 HTTP 连接。对每个连接，它读取 HTTP 请求行与 `Host` 头（不触碰请求体），然后把该连接转发给 `hosts` 中包含该 host 的服务。Host 匹配不区分大小写，并忽略端口。
+
+如果没有服务匹配该 `Host`，服务端返回 `404`。如果匹配到的服务尚未连接，则返回 `503`。
+
+路由对每条连接只进行一次，基于其第一个请求。若后续请求在 keep-alive 连接上携带不同的 `Host`，不会重新路由。
 
 ### Logging
 
@@ -190,9 +155,9 @@ RUST_LOG=error ./rathole config.toml
 
 ### Tuning
 
-从 v0.4.7 开始, rathole 默认启用 TCP_NODELAY。这能够减少延迟并使交互式应用受益，比如 RDP，Minecraft 服务器。但它会减少一些带宽。
+rathole 默认启用 TCP_NODELAY。这能够减少延迟并使交互式应用受益。但它会减少一些带宽。
 
-如果带宽更重要，比如网盘类应用，TCP_NODELAY 仍然可以通过配置 `nodelay = false` 关闭。
+如果带宽更重要，TCP_NODELAY 仍然可以通过配置 `nodelay = false` 关闭（按服务配置）。
 
 ## Benchmark
 
@@ -200,20 +165,15 @@ rathole 的延迟与 [frp](https://github.com/fatedier/frp) 相近，在高并�
 
 关于测试进行的更多细节，参见单独页面 [Benchmark](./docs/benchmark.md)。
 
-**但是，不要从这里得出结论，`rathole` 能让内网转发出来的服务快上数倍。** Benchmark 是在本地回环上进行的，其结果说明了任务受 CPU 限制时的结果。当用户的网络不是瓶颈时，用户能得到很大的提升。但是，对很多用户来说并不是这样。在这种情况下，`rathole` 能带来的主要好处是更少的资源占用，而带宽和延迟不一定有显著的改善。
-
 ![http_throughput](./docs/img/http_throughput.svg)
 ![tcp_bitrate](./docs/img/tcp_bitrate.svg)
-![udp_bitrate](./docs/img/udp_bitrate.svg)
 ![mem](./docs/img/mem-graph.png)
 
 ## Development Status
 
 `rathole` 正在积极开发中
 
-- [x] 支持 TLS
-- [x] 支持 UDP
-- [x] 热重载
+- [x] HTTP 反向代理
 - [ ] 用于配置的 HTTP APIs
 
 [Out of Scope](./docs/out-of-scope.md) 列举了没有计划开发的特性并说明了原因。

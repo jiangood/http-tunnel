@@ -24,11 +24,8 @@ A data channel is a TCP connection between the *server* and the *client* that on
 
 ## The Process
 
-*TODO: Add more details about the protocol*
-
-When `rathole` starts in the client mode, it creates connections to `server.common.bind_addr` for each service. These connection acts as control channels.
+When `rathole` starts in the client mode, it creates connections to `server.bind_addr` for each service. These connection acts as control channels.
 
 When a control channel starts, the server challenge the client by a nonce, the client is required to authenticate as the service it wants to represent. Then the forwarding of that service is set up.
 
-When the server accepts a connection on a service's `bind_port`, it sends a control command to the client via the corresponding control channel. Then the client connects to the server to create a data channel. In this way, a forwarding is set up. The server also creates a few data channels in advance to improve the latency.
-
+The server also listens on `server.http_bind_addr` for HTTP visitors. When a visitor connects, the server reads the HTTP request line and the `Host` header, and looks up the service that claims the host in its `hosts`. Then it sends a control command to the client via the corresponding control channel, and hands the visitor over to the service's connection pool. The client connects to the server to create a data channel, and the prefetched header bytes are replayed along with the rest of the connection. In this way, a forwarding is set up. The server also creates a few data channels in advance to improve the latency.

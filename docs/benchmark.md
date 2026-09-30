@@ -13,7 +13,6 @@
 ## Bandwidth
 
 ![tcp_bitrate](./img/tcp_bitrate.svg)
-![udp_bitrate](./img/udp_bitrate.svg)
 
 rathole with the following configuration:
 ```toml
@@ -21,21 +20,16 @@ rathole with the following configuration:
 remote_addr = "localhost:2333"
 default_token = "123"
 
-[client.services.bench-tcp]
-local_addr = "127.0.0.1:80"
-[client.services.bench-udp]
-type = "udp"
+[client.services.bench]
 local_addr = "127.0.0.1:80"
 
 [server]
 bind_addr = "0.0.0.0:2333"
+http_bind_addr = "0.0.0.0:80"
 default_token = "123"
 
-[server.services.bench-tcp]
-bind_addr = "0.0.0.0:5202"
-[server.services.bench-udp]
-type = "udp"
-bind_addr = "0.0.0.0:5202"
+[server.services.bench]
+hosts = ["bench.test"]
 ```
 
 frp 0.38.0 with the following configuration:
@@ -55,11 +49,6 @@ token = 1233
 
 [bench-tcp]
 type = tcp
-local_ip = 127.0.0.1
-local_port = 80
-remote_port = 5203
-[bench-udp]
-type = udp
 local_ip = 127.0.0.1
 local_port = 80
 remote_port = 5203

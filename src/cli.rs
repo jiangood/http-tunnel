@@ -1,12 +1,6 @@
 use clap::{AppSettings, ArgGroup, Parser};
 use lazy_static::lazy_static;
 
-#[derive(clap::ArgEnum, Clone, Debug, Copy)]
-pub enum KeypairType {
-    X25519,
-    X448,
-}
-
 lazy_static! {
     static ref VERSION: &'static str =
         option_env!("VERGEN_GIT_SEMVER_LIGHTWEIGHT").unwrap_or(env!("VERGEN_BUILD_SEMVER"));
@@ -42,7 +36,7 @@ cargo Features:      {}
 #[clap(group(
             ArgGroup::new("cmds")
                 .required(true)
-                .args(&["CONFIG", "genkey"]),
+                .args(&["CONFIG"]),
         ))]
 pub struct Cli {
     /// The path to the configuration file
@@ -59,10 +53,4 @@ pub struct Cli {
     /// Run as a client
     #[clap(long, short, group = "mode")]
     pub client: bool,
-
-    /// Generate a keypair for the use of the noise protocol
-    ///
-    /// The DH function to use is x25519
-    #[clap(long, arg_enum, value_name = "CURVE")]
-    pub genkey: Option<Option<KeypairType>>,
 }

@@ -87,13 +87,6 @@ jobs:
           profile: minimal
           default: true
       
-      - name: Install OpenSSL
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get install pkg-config libssl-dev
-      - name: Install OpenSSL
-        if: matrix.os == 'macos-latest'
-        run: brew install openssl@3
-      
       # Native build
       - name: Install target
         if: matrix.cross == false
@@ -111,10 +104,10 @@ jobs:
         run: cargo install --version 0.2.5 cross
       - name: Run tests
         if: matrix.cross
-        run: cross test --release --target ${{ matrix.target }} --verbose --features embedded --no-default-features
+        run: cross test --release --target ${{ matrix.target }} --verbose --no-default-features --features server,client
       - name: Build release
         if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }} --features embedded --no-default-features
+        run: cross build --release --target ${{ matrix.target }} --no-default-features --features server,client
 
       - name: Run UPX
         # Upx may not support some platforms. Ignore the errors

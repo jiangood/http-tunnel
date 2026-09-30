@@ -1,6 +1,5 @@
 mod cli;
 mod config;
-mod config_watcher;
 mod constants;
 mod helper;
 mod multi_map;
@@ -8,13 +7,11 @@ mod protocol;
 mod transport;
 
 pub use cli::Cli;
-use cli::KeypairType;
 pub use config::Config;
-pub use constants::UDP_BUFFER_SIZE;
 
 use anyhow::Result;
-use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, info};
+use tokio::sync::broadcast;
+use tracing::debug;
 
 #[cfg(feature = "client")]
 mod client;
@@ -22,103 +19,28 @@ mod client;
 use client::run_client;
 
 #[cfg(feature = "server")]
+mod http;
+#[cfg(feature = "server")]
 mod server;
 #[cfg(feature = "server")]
 use server::run_server;
 
-use crate::config_watcher::{ConfigChange, ConfigWatcherHandle};
-
-const DEFAULT_CURVE: KeypairType = KeypairType::X25519;
-
-fn get_str_from_keypair_type(curve: KeypairType) -> &'static str {
-    match curve {
-        KeypairType::X25519 => "25519",
-        KeypairType::X448 => "448",
-    }
-}
-
-#[cfg(feature = "noise")]
-fn genkey(curve: Option<KeypairType>) -> Result<()> {
-    let curve = curve.unwrap_or(DEFAULT_CURVE);
-    let builder = snowstorm::Builder::new(
-        format!(
-            "Noise_KK_{}_ChaChaPoly_BLAKE2s",
-            get_str_from_keypair_type(curve)
-        )
-        .parse()?,
-    );
-    let keypair = builder.generate_keypair()?;
-
-    println!("Private Key:\n{}\n", base64::encode(keypair.private));
-    println!("Public Key:\n{}", base64::encode(keypair.public));
-    Ok(())
-}
-
-#[cfg(not(feature = "noise"))]
-fn genkey(curve: Option<KeypairType>) -> Result<()> {
-    crate::helper::feature_not_compile("nosie")
-}
-
 pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    if args.genkey.is_some() {
-        return genkey(args.genkey.unwrap());
-    }
-
     // Raise `nofile` limit on linux and mac
     fdlimit::raise_fd_limit();
 
-    // Spawn a config watcher. The watcher will send a initial signal to start the instance with a config
     let config_path = args.config_path.as_ref().unwrap();
-    let mut cfg_watcher = ConfigWatcherHandle::new(config_path, shutdown_rx).await?;
+    let config = Config::from_file(config_path).await?;
 
-    // shutdown_tx owns the instance
-    let (shutdown_tx, _) = broadcast::channel(1);
+    debug!("{:?}", config);
 
-    // (The join handle of the last instance, The service update channel sender)
-    let mut last_instance: Option<(tokio::task::JoinHandle<_>, mpsc::Sender<ConfigChange>)> = None;
-
-    while let Some(e) = cfg_watcher.event_rx.recv().await {
-        match e {
-            ConfigChange::General(config) => {
-                if let Some((i, _)) = last_instance {
-                    info!("General configuration change detected. Restarting...");
-                    shutdown_tx.send(true)?;
-                    i.await??;
-                }
-
-                debug!("{:?}", config);
-
-                let (service_update_tx, service_update_rx) = mpsc::channel(1024);
-
-                last_instance = Some((
-                    tokio::spawn(run_instance(
-                        *config,
-                        args.clone(),
-                        shutdown_tx.subscribe(),
-                        service_update_rx,
-                    )),
-                    service_update_tx,
-                ));
-            }
-            ev => {
-                info!("Service change detected. {:?}", ev);
-                if let Some((_, service_update_tx)) = &last_instance {
-                    let _ = service_update_tx.send(ev).await;
-                }
-            }
-        }
-    }
-
-    let _ = shutdown_tx.send(true);
-
-    Ok(())
+    run_instance(config, args, shutdown_rx).await
 }
 
 async fn run_instance(
     config: Config,
     args: Cli,
     shutdown_rx: broadcast::Receiver<bool>,
-    service_update: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
     match determine_run_mode(&config, &args) {
         RunMode::Undetermine => panic!("Cannot determine running as a server or a client"),
@@ -126,13 +48,13 @@ async fn run_instance(
             #[cfg(not(feature = "client"))]
             crate::helper::feature_not_compile("client");
             #[cfg(feature = "client")]
-            run_client(config, shutdown_rx, service_update).await
+            run_client(config, shutdown_rx).await
         }
         RunMode::Server => {
             #[cfg(not(feature = "server"))]
             crate::helper::feature_not_compile("server");
             #[cfg(feature = "server")]
-            run_server(config, shutdown_rx, service_update).await
+            run_server(config, shutdown_rx).await
         }
     }
 }
@@ -246,7 +168,6 @@ mod tests {
                 config_path: Some(std::path::PathBuf::new()),
                 server: t.arg_s,
                 client: t.arg_c,
-                ..Default::default()
             };
 
             assert_eq!(determine_run_mode(&config, &args), t.run_mode);

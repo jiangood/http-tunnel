@@ -6,10 +6,6 @@ But that doesn't mean it's not useful for other purposes. In the future, more co
 
 > Make each program do one thing well.
 
-- *Domain based forwarding for HTTP*
-
-  Introducing these kind of features into `rathole` itself ultimately reinvent a nginx. Use nginx to do this and set `rathole` as the upstream. This method achieves better performance as well as flexibility.
-
 - *HTTP Request Logging*
 
   `rathole` doesn't interference with the application layer traffic. A right place for this kind of stuff is the web server, and a network capture tool.

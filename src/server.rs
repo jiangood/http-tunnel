@@ -1,14 +1,12 @@
-use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
-use crate::config_watcher::{ConfigChange, ServerServiceChange};
-use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
+use crate::config::{Config, ServerConfig, ServerServiceConfig};
+use crate::constants::listen_backoff;
 use crate::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
-    self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
-    HASH_WIDTH_IN_BYTES,
+    self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, HASH_WIDTH_IN_BYTES,
 };
-use crate::transport::{SocketOpts, TcpTransport, Transport};
+use crate::transport::SocketOpts;
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
@@ -17,33 +15,32 @@ use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::io::{copy_bidirectional, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
-#[cfg(feature = "noise")]
-use crate::transport::NoiseTransport;
-#[cfg(any(feature = "native-tls", feature = "rustls"))]
-use crate::transport::TlsTransport;
-#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-use crate::transport::WebsocketTransport;
-
 type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
 
-const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP servies
-const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP services
+const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP services
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
+// A visitor accepted by the HTTP entrypoint. `prefetched` holds the bytes that were
+// read while sniffing the `Host` header and must be replayed to the service.
+pub(crate) struct HttpVisitor {
+    pub stream: TcpStream,
+    pub prefetched: Vec<u8>,
+}
+
+// A hash map of ControlChannelHandles, indexed by ServiceDigest or Nonce
+// See also MultiMap
+pub(crate) type ControlChannelMap = MultiMap<ServiceDigest, Nonce, ControlChannelHandle>;
+
 // The entrypoint of running a server
-pub async fn run_server(
-    config: Config,
-    shutdown_rx: broadcast::Receiver<bool>,
-    update_rx: mpsc::Receiver<ConfigChange>,
-) -> Result<()> {
+pub async fn run_server(config: Config, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
     let config = match config.server {
             Some(config) => config,
             None => {
@@ -51,58 +48,23 @@ pub async fn run_server(
             }
         };
 
-    match config.transport.transport_type {
-        TransportType::Tcp => {
-            let mut server = Server::<TcpTransport>::from(config).await?;
-            server.run(shutdown_rx, update_rx).await?;
-        }
-        TransportType::Tls => {
-            #[cfg(any(feature = "native-tls", feature = "rustls"))]
-            {
-                let mut server = Server::<TlsTransport>::from(config).await?;
-                server.run(shutdown_rx, update_rx).await?;
-            }
-            #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-            crate::helper::feature_neither_compile("native-tls", "rustls")
-        }
-        TransportType::Noise => {
-            #[cfg(feature = "noise")]
-            {
-                let mut server = Server::<NoiseTransport>::from(config).await?;
-                server.run(shutdown_rx, update_rx).await?;
-            }
-            #[cfg(not(feature = "noise"))]
-            crate::helper::feature_not_compile("noise")
-        }
-        TransportType::Websocket => {
-            #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-            {
-                let mut server = Server::<WebsocketTransport>::from(config).await?;
-                server.run(shutdown_rx, update_rx).await?;
-            }
-            #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
-            crate::helper::feature_neither_compile("websocket-native-tls", "websocket-rustls")
-        }
-    }
+    let mut server = Server::from(config).await?;
+    server.run(shutdown_rx).await?;
 
     Ok(())
 }
 
-// A hash map of ControlChannelHandles, indexed by ServiceDigest or Nonce
-// See also MultiMap
-type ControlChannelMap<T> = MultiMap<ServiceDigest, Nonce, ControlChannelHandle<T>>;
-
 // Server holds all states of running a server
-struct Server<T: Transport> {
+struct Server {
     // `[server]` config
     config: Arc<ServerConfig>,
 
     // `[server.services]` config, indexed by ServiceDigest
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
-    // Collection of contorl channels
-    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
-    // Wrapper around the transport layer
-    transport: Arc<T>,
+    // Collection of control channels
+    control_channels: Arc<RwLock<ControlChannelMap>>,
+    // `Host` -> ServiceDigest
+    routing_table: Arc<RwLock<crate::http::RoutingTable>>,
 }
 
 // Generate a hash map of services which is indexed by ServiceDigest
@@ -116,34 +78,56 @@ fn generate_service_hashmap(
     ret
 }
 
-impl<T: 'static + Transport> Server<T> {
+// Generate a routing table which maps a `Host` to a ServiceDigest
+fn generate_routing_table(server_config: &ServerConfig) -> crate::http::RoutingTable {
+    let mut ret = HashMap::new();
+    for (name, s) in &server_config.services {
+        let digest = protocol::digest(name.as_bytes());
+        for host in &s.hosts {
+            ret.insert(host.clone(), digest);
+        }
+    }
+    ret
+}
+
+impl Server {
     // Create a server from `[server]`
-    pub async fn from(config: ServerConfig) -> Result<Server<T>> {
+    pub async fn from(config: ServerConfig) -> Result<Server> {
         let config = Arc::new(config);
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
+        let routing_table = Arc::new(RwLock::new(generate_routing_table(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
-        let transport = Arc::new(T::new(&config.transport)?);
         Ok(Server {
             config,
             services,
             control_channels,
-            transport,
+            routing_table,
         })
     }
 
     // The entry point of Server
-    pub async fn run(
-        &mut self,
-        mut shutdown_rx: broadcast::Receiver<bool>,
-        mut update_rx: mpsc::Receiver<ConfigChange>,
-    ) -> Result<()> {
-        // Listen at `server.bind_addr`
-        let l = self
-            .transport
-            .bind(&self.config.bind_addr)
-            .await
-            .with_context(|| "Failed to listen at `server.bind_addr`")?;
+    pub async fn run(&mut self, mut shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
+        // Listen at `server.bind_addr` for the control and data channels of clients
+        let l: TcpListener = retry_notify_with_deadline(
+            listen_backoff(),
+            || async { Ok(TcpListener::bind(&self.config.bind_addr).await?) },
+            |e, duration| {
+                error!("{:#}. Retry in {:?}", e, duration);
+            },
+            &mut shutdown_rx,
+        )
+        .await
+        .with_context(|| "Failed to listen at `server.bind_addr`")?;
+
         info!("Listening at {}", self.config.bind_addr);
+
+        // Run the HTTP entrypoint which routes visitors by the `Host` header
+        let http_task = tokio::spawn(crate::http::serve(
+            self.config.http_bind_addr.clone(),
+            self.routing_table.clone(),
+            self.control_channels.clone(),
+            shutdown_rx.resubscribe(),
+        ));
 
         // Retry at least every 100ms
         let mut backoff = ExponentialBackoff {
@@ -156,31 +140,24 @@ impl<T: 'static + Transport> Server<T> {
         loop {
             tokio::select! {
                 // Wait for incoming control and data channels
-                ret = self.transport.accept(&l) => {
+                ret = l.accept() => {
                     match ret {
                         Err(err) => {
-                            // Detects whether it's an IO error
-                            if let Some(err) = err.downcast_ref::<io::Error>() {
-                                // If it is an IO error, then it's possibly an
-                                // EMFILE. So sleep for a while and retry
-                                // TODO: Only sleep for EMFILE, ENFILE, ENOMEM, ENOBUFS
-                                if let Some(d) = backoff.next_backoff() {
-                                    error!("Failed to accept: {:#}. Retry in {:?}...", err, d);
-                                    time::sleep(d).await;
-                                } else {
-                                    // This branch will never be executed according to the current retry policy
-                                    error!("Too many retries. Aborting...");
-                                    break;
-                                }
+                            // It is an IO error, so it's possibly an EMFILE.
+                            // Sleep for a while and retry
+                            if let Some(d) = backoff.next_backoff() {
+                                error!("Failed to accept: {:#}. Retry in {:?}...", err, d);
+                                time::sleep(d).await;
+                            } else {
+                                error!("Too many retries. Aborting...");
+                                break;
                             }
-                            // If it's not an IO error, then it comes from
-                            // the transport layer, so just ignore it
                         }
                         Ok((conn, addr)) => {
                             backoff.reset();
 
                             // Do transport handshake with a timeout
-                            match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), self.transport.handshake(conn)).await {
+                            match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), handshake(conn)).await {
                                 Ok(conn) => {
                                     match conn.with_context(|| "Failed to do transport handshake") {
                                         Ok(conn) => {
@@ -208,49 +185,28 @@ impl<T: 'static + Transport> Server<T> {
                 _ = shutdown_rx.recv() => {
                     info!("Shuting down gracefully...");
                     break;
-                },
-                e = update_rx.recv() => {
-                    if let Some(e) = e {
-                        self.handle_hot_reload(e).await;
-                    }
                 }
             }
         }
+
+        let _ = http_task.await;
 
         info!("Shutdown");
 
         Ok(())
     }
+}
 
-    async fn handle_hot_reload(&mut self, e: ConfigChange) {
-        match e {
-            ConfigChange::ServerChange(server_change) => match server_change {
-                ServerServiceChange::Add(cfg) => {
-                    let hash = protocol::digest(cfg.name.as_bytes());
-                    let mut wg = self.services.write().await;
-                    let _ = wg.insert(hash, cfg);
-
-                    let mut wg = self.control_channels.write().await;
-                    let _ = wg.remove1(&hash);
-                }
-                ServerServiceChange::Delete(s) => {
-                    let hash = protocol::digest(s.as_bytes());
-                    let _ = self.services.write().await.remove(&hash);
-
-                    let mut wg = self.control_channels.write().await;
-                    let _ = wg.remove1(&hash);
-                }
-            },
-            ignored => warn!("Ignored {:?} since running as a server", ignored),
-        }
-    }
+// Plain TCP accepts the connection as is
+async fn handshake(conn: TcpStream) -> Result<TcpStream> {
+    Ok(conn)
 }
 
 // Handle connections to `server.bind_addr`
-async fn handle_connection<T: 'static + Transport>(
-    mut conn: T::Stream,
+async fn handle_connection(
+    mut conn: TcpStream,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
-    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    control_channels: Arc<RwLock<ControlChannelMap>>,
     server_config: Arc<ServerConfig>,
 ) -> Result<()> {
     // Read hello
@@ -273,16 +229,16 @@ async fn handle_connection<T: 'static + Transport>(
     Ok(())
 }
 
-async fn do_control_channel_handshake<T: 'static + Transport>(
-    mut conn: T::Stream,
+async fn do_control_channel_handshake(
+    mut conn: TcpStream,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
-    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    control_channels: Arc<RwLock<ControlChannelMap>>,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
-    T::hint(&conn, SocketOpts::for_control_channel());
+    SocketOpts::for_control_channel().apply(&conn);
 
     // Generate a nonce
     let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];
@@ -358,9 +314,9 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     Ok(())
 }
 
-async fn do_data_channel_handshake<T: 'static + Transport>(
-    conn: T::Stream,
-    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+async fn do_data_channel_handshake(
+    conn: TcpStream,
+    control_channels: Arc<RwLock<ControlChannelMap>>,
     nonce: Nonce,
 ) -> Result<()> {
     debug!("Try to handshake a data channel");
@@ -369,7 +325,7 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
     let control_channels_guard = control_channels.read().await;
     match control_channels_guard.get2(&nonce) {
         Some(handle) => {
-            T::hint(&conn, SocketOpts::from_server_cfg(&handle.service));
+            SocketOpts::from_server_cfg(&handle.service).apply(&conn);
 
             // Send the data channel to the corresponding control channel
             handle
@@ -385,25 +341,23 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
     Ok(())
 }
 
-pub struct ControlChannelHandle<T: Transport> {
+pub(crate) struct ControlChannelHandle {
     // Shutdown the control channel by dropping it
     _shutdown_tx: broadcast::Sender<bool>,
-    data_ch_tx: mpsc::Sender<T::Stream>,
+    data_ch_tx: mpsc::Sender<TcpStream>,
+    pub(crate) visitor_tx: mpsc::Sender<HttpVisitor>,
     service: ServerServiceConfig,
 }
 
-impl<T> ControlChannelHandle<T>
-where
-    T: 'static + Transport,
-{
+impl ControlChannelHandle {
     // Create a control channel handle, where the control channel handling task
     // and the connection pool task are created.
     #[instrument(name = "handle", skip_all, fields(service = %service.name))]
     fn new(
-        conn: T::Stream,
+        conn: TcpStream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
-    ) -> ControlChannelHandle<T> {
+    ) -> ControlChannelHandle {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
 
@@ -413,57 +367,31 @@ where
         // Store data channel creation requests
         let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
 
-        // Cache some data channels for later use
-        let pool_size = match service.service_type {
-            ServiceType::Tcp => TCP_POOL_SIZE,
-            ServiceType::Udp => UDP_POOL_SIZE,
-        };
+        // Visitors handed over by the HTTP entrypoint
+        let (visitor_tx, visitor_rx) = mpsc::channel(CHAN_SIZE);
 
-        for _i in 0..pool_size {
+        // Cache some data channels for later use
+        for _i in 0..TCP_POOL_SIZE {
             if let Err(e) = data_ch_req_tx.send(true) {
                 error!("Failed to request data channel {}", e);
             };
         }
 
-        let shutdown_rx_clone = shutdown_tx.subscribe();
-        let bind_addr = service.bind_addr.clone();
-        match service.service_type {
-            ServiceType::Tcp => tokio::spawn(
-                async move {
-                    if let Err(e) = run_tcp_connection_pool::<T>(
-                        bind_addr,
-                        data_ch_rx,
-                        data_ch_req_tx,
-                        shutdown_rx_clone,
-                    )
-                    .await
-                    .with_context(|| "Failed to run TCP connection pool")
-                    {
-                        error!("{:#}", e);
-                    }
+        tokio::spawn(
+            async move {
+                if let Err(e) =
+                    run_tcp_connection_pool(data_ch_rx, visitor_rx, data_ch_req_tx)
+                        .await
+                        .with_context(|| "Failed to run TCP connection pool")
+                {
+                    error!("{:#}", e);
                 }
-                .instrument(Span::current()),
-            ),
-            ServiceType::Udp => tokio::spawn(
-                async move {
-                    if let Err(e) = run_udp_connection_pool::<T>(
-                        bind_addr,
-                        data_ch_rx,
-                        data_ch_req_tx,
-                        shutdown_rx_clone,
-                    )
-                    .await
-                    .with_context(|| "Failed to run TCP connection pool")
-                    {
-                        error!("{:#}", e);
-                    }
-                }
-                .instrument(Span::current()),
-            ),
-        };
+            }
+            .instrument(Span::current()),
+        );
 
         // Create the control channel
-        let ch = ControlChannel::<T> {
+        let ch = ControlChannel {
             conn,
             shutdown_rx,
             data_ch_req_rx,
@@ -483,20 +411,21 @@ where
         ControlChannelHandle {
             _shutdown_tx: shutdown_tx,
             data_ch_tx,
+            visitor_tx,
             service,
         }
     }
 }
 
-// Control channel, using T as the transport layer. P is TcpStream or UdpTraffic
-struct ControlChannel<T: Transport> {
-    conn: T::Stream,                               // The connection of control channel
+// Control channel
+struct ControlChannel {
+    conn: TcpStream,                               // The connection of control channel
     shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
-    data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
+    data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives data channel creation requests
     heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
 }
 
-impl<T: Transport> ControlChannel<T> {
+impl ControlChannel {
     async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
         write_and_flush(&mut self.conn, data)
             .await
@@ -544,100 +473,28 @@ impl<T: Transport> ControlChannel<T> {
     }
 }
 
-fn tcp_listen_and_send(
-    addr: String,
-    data_ch_req_tx: mpsc::UnboundedSender<bool>,
-    mut shutdown_rx: broadcast::Receiver<bool>,
-) -> mpsc::Receiver<TcpStream> {
-    let (tx, rx) = mpsc::channel(CHAN_SIZE);
-
-    tokio::spawn(async move {
-        let l = retry_notify_with_deadline(listen_backoff(),  || async {
-            Ok(TcpListener::bind(&addr).await?)
-        }, |e, duration| {
-            error!("{:#}. Retry in {:?}", e, duration);
-        }, &mut shutdown_rx).await
-        .with_context(|| "Failed to listen for the service");
-
-        let l: TcpListener = match l {
-            Ok(v) => v,
-            Err(e) => {
-                error!("{:#}", e);
-                return;
-            }
-        };
-
-        info!("Listening at {}", &addr);
-
-        // Retry at least every 1s
-        let mut backoff = ExponentialBackoff {
-            max_interval: Duration::from_secs(1),
-            max_elapsed_time: None,
-            ..Default::default()
-        };
-
-        // Wait for visitors and the shutdown signal
-        loop {
-            tokio::select! {
-                val = l.accept() => {
-                    match val {
-                        Err(e) => {
-                            // `l` is a TCP listener so this must be a IO error
-                            // Possibly a EMFILE. So sleep for a while
-                            error!("{}. Sleep for a while", e);
-                            if let Some(d) = backoff.next_backoff() {
-                                time::sleep(d).await;
-                            } else {
-                                // This branch will never be reached for current backoff policy
-                                error!("Too many retries. Aborting...");
-                                break;
-                            }
-                        }
-                        Ok((incoming, addr)) => {
-                            // For every visitor, request to create a data channel
-                            if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
-                                // An error indicates the control channel is broken
-                                // So break the loop
-                                break;
-                            }
-
-                            backoff.reset();
-
-                            debug!("New visitor from {}", addr);
-
-                            // Send the visitor to the connection pool
-                            let _ = tx.send(incoming).await;
-                        }
-                    }
-                },
-                _ = shutdown_rx.recv() => {
-                    break;
-                }
-            }
-        }
-
-        info!("TCPListener shutdown");
-    }.instrument(Span::current()));
-
-    rx
-}
-
 #[instrument(skip_all)]
-async fn run_tcp_connection_pool<T: Transport>(
-    bind_addr: String,
-    mut data_ch_rx: mpsc::Receiver<T::Stream>,
+async fn run_tcp_connection_pool(
+    mut data_ch_rx: mpsc::Receiver<TcpStream>,
+    mut visitor_rx: mpsc::Receiver<HttpVisitor>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
-    shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
 
-    'pool: while let Some(mut visitor) = visitor_rx.recv().await {
+    'pool: while let Some(visitor) = visitor_rx.recv().await {
+        let HttpVisitor {
+            mut stream,
+            prefetched,
+        } = visitor;
+
         loop {
             if let Some(mut ch) = data_ch_rx.recv().await {
-                if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                let ok = write_and_flush(&mut ch, &cmd).await.is_ok()
+                    && write_and_flush(&mut ch, &prefetched).await.is_ok();
+
+                if ok {
                     tokio::spawn(async move {
-                        let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                        let _ = copy_bidirectional(&mut ch, &mut stream).await;
                     });
                     break;
                 } else {
@@ -653,62 +510,5 @@ async fn run_tcp_connection_pool<T: Transport>(
     }
 
     info!("Shutdown");
-    Ok(())
-}
-
-#[instrument(skip_all)]
-async fn run_udp_connection_pool<T: Transport>(
-    bind_addr: String,
-    mut data_ch_rx: mpsc::Receiver<T::Stream>,
-    _data_ch_req_tx: mpsc::UnboundedSender<bool>,
-    mut shutdown_rx: broadcast::Receiver<bool>,
-) -> Result<()> {
-    // TODO: Load balance
-
-    let l = retry_notify_with_deadline(
-        listen_backoff(),
-        || async { Ok(UdpSocket::bind(&bind_addr).await?) },
-        |e, duration| {
-            warn!("{:#}. Retry in {:?}", e, duration);
-        },
-        &mut shutdown_rx,
-    )
-    .await
-    .with_context(|| "Failed to listen for the service")?;
-
-    info!("Listening at {}", &bind_addr);
-
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
-
-    // Receive one data channel
-    let mut conn = data_ch_rx
-        .recv()
-        .await
-        .ok_or_else(|| anyhow!("No available data channels"))?;
-    write_and_flush(&mut conn, &cmd).await?;
-
-    let mut buf = [0u8; UDP_BUFFER_SIZE];
-    loop {
-        tokio::select! {
-            // Forward inbound traffic to the client
-            val = l.recv_from(&mut buf) => {
-                let (n, from) = val?;
-                UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
-            },
-
-            // Forward outbound traffic from the client to the visitor
-            hdr_len = conn.read_u8() => {
-                let t = UdpTraffic::read(&mut conn, hdr_len?).await?;
-                l.send_to(&t.data, t.from).await?;
-            }
-
-            _ = shutdown_rx.recv() => {
-                break;
-            }
-        }
-    }
-
-    debug!("UDP pool dropped");
-
     Ok(())
 }

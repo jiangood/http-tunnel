@@ -32,7 +32,7 @@
           };
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = [ final.pkg-config ];
-          buildInputs = [ final.zlib ] ++ final.lib.optionals final.stdenv.isLinux [ final.openssl ];
+          buildInputs = [ final.zlib ];
           doCheck = false;
           meta = {
             description = "A lightweight and high-performance reverse proxy for NAT traversal";

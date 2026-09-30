@@ -1,14 +1,14 @@
 use anyhow::{Ok, Result};
-use common::{run_rathole_client, PING, PONG};
+use common::run_rathole_client;
 use rand::Rng;
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, UdpSocket},
+    net::TcpStream,
     sync::broadcast,
     time,
 };
-use tracing::{debug, info, instrument};
+use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::common::run_rathole_server;
@@ -16,16 +16,9 @@ use crate::common::run_rathole_server;
 mod common;
 
 const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
-const PINGPONG_SERVER_ADDR: &str = "127.0.0.1:8081";
-const ECHO_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2334";
-const PINGPONG_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2335";
+const HTTP_ENTRY_ADDR: &str = "127.0.0.1:2334";
+const ECHO_HOST: &str = "echo.test";
 const HITTER_NUM: usize = 4;
-
-#[derive(Clone, Copy, Debug)]
-enum Type {
-    Tcp,
-    Udp,
-}
 
 fn init() {
     let level = "info";
@@ -37,93 +30,15 @@ fn init() {
 }
 
 #[tokio::test]
-async fn tcp() -> Result<()> {
+async fn http_routing() -> Result<()> {
     init();
 
-    // Spawn a echo server
+    // Spawn a echo server as the local HTTP service behind the NAT
     tokio::spawn(async move {
         if let Err(e) = common::tcp::echo_server(ECHO_SERVER_ADDR).await {
             panic!("Failed to run the echo server for testing: {:?}", e);
         }
     });
-
-    // Spawn a pingpong server
-    tokio::spawn(async move {
-        if let Err(e) = common::tcp::pingpong_server(PINGPONG_SERVER_ADDR).await {
-            panic!("Failed to run the pingpong server for testing: {:?}", e);
-        }
-    });
-
-    test("tests/for_tcp/tcp_transport.toml", Type::Tcp).await?;
-
-    #[cfg(any(
-         // FIXME: Self-signed certificate on macOS nativetls requires manual interference.
-         all(target_os = "macos", feature = "rustls"),
-         // On other OS accept run with either
-         all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
-     ))]
-    test("tests/for_tcp/tls_transport.toml", Type::Tcp).await?;
-
-    #[cfg(feature = "noise")]
-    test("tests/for_tcp/noise_transport.toml", Type::Tcp).await?;
-
-    #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-    test("tests/for_tcp/websocket_transport.toml", Type::Tcp).await?;
-
-    #[cfg(not(target_os = "macos"))]
-    #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-    test("tests/for_tcp/websocket_tls_transport.toml", Type::Tcp).await?;
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn udp() -> Result<()> {
-    init();
-
-    // Spawn a echo server
-    tokio::spawn(async move {
-        if let Err(e) = common::udp::echo_server(ECHO_SERVER_ADDR).await {
-            panic!("Failed to run the echo server for testing: {:?}", e);
-        }
-    });
-
-    // Spawn a pingpong server
-    tokio::spawn(async move {
-        if let Err(e) = common::udp::pingpong_server(PINGPONG_SERVER_ADDR).await {
-            panic!("Failed to run the pingpong server for testing: {:?}", e);
-        }
-    });
-
-    test("tests/for_udp/tcp_transport.toml", Type::Udp).await?;
-
-    #[cfg(any(
-         // FIXME: Self-signed certificate on macOS nativetls requires manual interference.
-         all(target_os = "macos", feature = "rustls"),
-         // On other OS accept run with either
-         all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
-     ))]
-    test("tests/for_udp/tls_transport.toml", Type::Udp).await?;
-
-    #[cfg(feature = "noise")]
-    test("tests/for_udp/noise_transport.toml", Type::Udp).await?;
-
-    #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-    test("tests/for_udp/websocket_transport.toml", Type::Udp).await?;
-
-    #[cfg(not(target_os = "macos"))]
-    #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-    test("tests/for_udp/websocket_tls_transport.toml", Type::Udp).await?;
-
-    Ok(())
-}
-
-#[instrument]
-async fn test(config_path: &'static str, t: Type) -> Result<()> {
-    if cfg!(not(all(feature = "client", feature = "server"))) {
-        // Skip the test if the client or the server is not enabled
-        return Ok(());
-    }
 
     let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
@@ -131,7 +46,7 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
     // Start the client
     info!("start the client");
     let client = tokio::spawn(async move {
-        run_rathole_client(config_path, client_shutdown_rx)
+        run_rathole_client("tests/for_tcp/tcp_transport.toml", client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -142,16 +57,17 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
     // Start the server
     info!("start the server");
     let server = tokio::spawn(async move {
-        run_rathole_server(config_path, server_shutdown_rx)
+        run_rathole_server("tests/for_tcp/tcp_transport.toml", server_shutdown_rx)
             .await
             .unwrap();
     });
     time::sleep(Duration::from_millis(2500)).await; // Wait for the client to retry
 
-    info!("echo");
-    echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await.unwrap();
-    info!("pingpong");
-    pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED, t)
+    info!("route by Host");
+    http_echo_hitter(HTTP_ENTRY_ADDR, ECHO_HOST).await.unwrap();
+
+    info!("unknown Host returns 404");
+    http_404_check(HTTP_ENTRY_ADDR, "unknown.test")
         .await
         .unwrap();
 
@@ -163,18 +79,14 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
     info!("restart the client");
     let client_shutdown_rx = client_shutdown_tx.subscribe();
     let client = tokio::spawn(async move {
-        run_rathole_client(config_path, client_shutdown_rx)
+        run_rathole_client("tests/for_tcp/tcp_transport.toml", client_shutdown_rx)
             .await
             .unwrap();
     });
     time::sleep(Duration::from_secs(1)).await; // Wait for the client to start
 
-    info!("echo");
-    echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await.unwrap();
-    info!("pingpong");
-    pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED, t)
-        .await
-        .unwrap();
+    info!("route by Host");
+    http_echo_hitter(HTTP_ENTRY_ADDR, ECHO_HOST).await.unwrap();
 
     // Simulate the server crash and restart
     info!("shutdown the server");
@@ -184,26 +96,20 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
     info!("restart the server");
     let server_shutdown_rx = server_shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
-        run_rathole_server(config_path, server_shutdown_rx)
+        run_rathole_server("tests/for_tcp/tcp_transport.toml", server_shutdown_rx)
             .await
             .unwrap();
     });
     time::sleep(Duration::from_millis(2500)).await; // Wait for the client to retry
 
     // Simulate heavy load
-    info!("lots of echo and pingpong");
+    info!("lots of requests");
 
     let mut v = Vec::new();
 
-    for _ in 0..HITTER_NUM / 2 {
+    for _ in 0..HITTER_NUM {
         v.push(tokio::spawn(async move {
-            echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await.unwrap();
-        }));
-
-        v.push(tokio::spawn(async move {
-            pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED, t)
-                .await
-                .unwrap();
+            http_echo_hitter(HTTP_ENTRY_ADDR, ECHO_HOST).await.unwrap();
         }));
     }
 
@@ -221,86 +127,45 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
     Ok(())
 }
 
-async fn echo_hitter(addr: &'static str, t: Type) -> Result<()> {
-    match t {
-        Type::Tcp => tcp_echo_hitter(addr).await,
-        Type::Udp => udp_echo_hitter(addr).await,
-    }
-}
-
-async fn pingpong_hitter(addr: &'static str, t: Type) -> Result<()> {
-    match t {
-        Type::Tcp => tcp_pingpong_hitter(addr).await,
-        Type::Udp => udp_pingpong_hitter(addr).await,
-    }
-}
-
-async fn tcp_echo_hitter(addr: &'static str) -> Result<()> {
+/// Send a request with the given `Host` and expect the whole request to be echoed back
+/// (the local service is a raw echo server, so it echoes the header together with the body)
+async fn http_echo_hitter(addr: &'static str, host: &'static str) -> Result<()> {
     let mut conn = TcpStream::connect(addr).await?;
 
-    let mut wr = [0u8; 1024];
-    let mut rd = [0u8; 1024];
-    for _ in 0..100 {
-        rand::thread_rng().fill(&mut wr);
-        conn.write_all(&wr).await?;
-        conn.read_exact(&mut rd).await?;
-        assert_eq!(wr, rd);
-    }
+    let mut body = [0u8; 1024];
+    rand::thread_rng().fill(&mut body);
+
+    let head = format!(
+        "POST /echo HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+        host,
+        body.len()
+    );
+
+    let mut request = head.into_bytes();
+    request.extend_from_slice(&body);
+
+    conn.write_all(&request).await?;
+
+    let mut response = vec![0u8; request.len()];
+    conn.read_exact(&mut response).await?;
+
+    assert_eq!(response, request);
 
     Ok(())
 }
 
-async fn udp_echo_hitter(addr: &'static str) -> Result<()> {
-    let conn = UdpSocket::bind("127.0.0.1:0").await?;
-    conn.connect(addr).await?;
-
-    let mut wr = [0u8; 128];
-    let mut rd = [0u8; 128];
-    for _ in 0..3 {
-        rand::thread_rng().fill(&mut wr);
-
-        conn.send(&wr).await?;
-        debug!("send");
-
-        conn.recv(&mut rd).await?;
-        debug!("recv");
-
-        assert_eq!(wr, rd);
-    }
-    Ok(())
-}
-
-async fn tcp_pingpong_hitter(addr: &'static str) -> Result<()> {
+async fn http_404_check(addr: &'static str, host: &'static str) -> Result<()> {
     let mut conn = TcpStream::connect(addr).await?;
 
-    let wr = PING.as_bytes();
-    let mut rd = [0u8; PONG.len()];
+    let request = format!("GET / HTTP/1.1\r\nHost: {}\r\n\r\n", host);
+    conn.write_all(request.as_bytes()).await?;
 
-    for _ in 0..100 {
-        conn.write_all(wr).await?;
-        conn.read_exact(&mut rd).await?;
-        assert_eq!(rd, PONG.as_bytes());
-    }
+    let mut response = Vec::new();
+    conn.read_to_end(&mut response).await?;
 
-    Ok(())
-}
-
-async fn udp_pingpong_hitter(addr: &'static str) -> Result<()> {
-    let conn = UdpSocket::bind("127.0.0.1:0").await?;
-    conn.connect(&addr).await?;
-
-    let wr = PING.as_bytes();
-    let mut rd = [0u8; PONG.len()];
-
-    for _ in 0..3 {
-        conn.send(wr).await?;
-        debug!("ping");
-
-        conn.recv(&mut rd).await?;
-        debug!("pong");
-
-        assert_eq!(rd, PONG.as_bytes());
-    }
+    let text = String::from_utf8_lossy(&response);
+    debug!("{}", text);
+    assert!(text.starts_with("HTTP/1.1 404"), "unexpected response: {}", text);
 
     Ok(())
 }

@@ -1,0 +1,11 @@
+[server]
+bind_addr = "0.0.0.0:2333"
+http_bind_addr = "0.0.0.0:80"
+default_token = "default_token_if_not_specify"
+
+# The same host cannot be routed to two services
+[server.services.service1]
+hosts = ["same.example.com"]
+
+[server.services.service2]
+hosts = ["same.example.com"]

@@ -1,0 +1,6 @@
+[client]
+remote_addr = "example.com:2333"
+
+# The token of the service is missing and there is no default token
+[client.services.service1]
+local_addr = "127.0.0.1:1081"

@@ -1,5 +1,4 @@
 FROM rust:bookworm as builder
-RUN apt update && apt install -y libssl-dev
 WORKDIR /home/rust/src
 COPY . .
 ARG FEATURES

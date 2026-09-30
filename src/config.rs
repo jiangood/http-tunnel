@@ -5,9 +5,6 @@ use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::path::Path;
 use tokio::fs;
-use url::Url;
-
-use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAULT_NODELAY};
 
 /// Application-layer heartbeat interval in secs
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
@@ -40,31 +37,14 @@ impl From<&str> for MaskedString {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq, Eq, Default)]
-pub enum TransportType {
-    #[default]
-    #[serde(rename = "tcp")]
-    Tcp,
-    #[serde(rename = "tls")]
-    Tls,
-    #[serde(rename = "noise")]
-    Noise,
-    #[serde(rename = "websocket")]
-    Websocket,
-}
-
 /// Per service config
 /// All Option are optional in configuration but must be Some value in runtime
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ClientServiceConfig {
-    #[serde(rename = "type", default = "default_service_type")]
-    pub service_type: ServiceType,
     #[serde(skip)]
     pub name: String,
     pub local_addr: String,
-    #[serde(default)] // Default to false
-    pub prefer_ipv6: bool,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
@@ -79,29 +59,16 @@ impl ClientServiceConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ServiceType {
-    #[serde(rename = "tcp")]
-    #[default]
-    Tcp,
-    #[serde(rename = "udp")]
-    Udp,
-}
-
-fn default_service_type() -> ServiceType {
-    Default::default()
-}
-
 /// Per service config
 /// All Option are optional in configuration but must be Some value in runtime
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ServerServiceConfig {
-    #[serde(rename = "type", default = "default_service_type")]
-    pub service_type: ServiceType,
     #[serde(skip)]
     pub name: String,
-    pub bind_addr: String,
+    /// The hosts (the `Host` header) that are routed to this service
+    #[serde(default)]
+    pub hosts: Vec<String>,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
 }
@@ -113,81 +80,6 @@ impl ServerServiceConfig {
             ..Default::default()
         }
     }
-}
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct TlsConfig {
-    pub hostname: Option<String>,
-    pub trusted_root: Option<String>,
-    pub pkcs12: Option<String>,
-    pub pkcs12_password: Option<MaskedString>,
-}
-
-fn default_noise_pattern() -> String {
-    String::from("Noise_NK_25519_ChaChaPoly_BLAKE2s")
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct NoiseConfig {
-    #[serde(default = "default_noise_pattern")]
-    pub pattern: String,
-    pub local_private_key: Option<MaskedString>,
-    pub remote_public_key: Option<String>,
-    // TODO: Maybe psk can be added
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct WebsocketConfig {
-    pub tls: bool,
-}
-
-fn default_nodelay() -> bool {
-    DEFAULT_NODELAY
-}
-
-fn default_keepalive_secs() -> u64 {
-    DEFAULT_KEEPALIVE_SECS
-}
-
-fn default_keepalive_interval() -> u64 {
-    DEFAULT_KEEPALIVE_INTERVAL
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct TcpConfig {
-    #[serde(default = "default_nodelay")]
-    pub nodelay: bool,
-    #[serde(default = "default_keepalive_secs")]
-    pub keepalive_secs: u64,
-    #[serde(default = "default_keepalive_interval")]
-    pub keepalive_interval: u64,
-    pub proxy: Option<Url>,
-}
-
-impl Default for TcpConfig {
-    fn default() -> Self {
-        Self {
-            nodelay: default_nodelay(),
-            keepalive_secs: default_keepalive_secs(),
-            keepalive_interval: default_keepalive_interval(),
-            proxy: None,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Default)]
-#[serde(deny_unknown_fields)]
-pub struct TransportConfig {
-    #[serde(rename = "type")]
-    pub transport_type: TransportType,
-    #[serde(default)]
-    pub tcp: TcpConfig,
-    pub tls: Option<TlsConfig>,
-    pub noise: Option<NoiseConfig>,
-    pub websocket: Option<WebsocketConfig>,
 }
 
 fn default_heartbeat_timeout() -> u64 {
@@ -203,10 +95,7 @@ fn default_client_retry_interval() -> u64 {
 pub struct ClientConfig {
     pub remote_addr: String,
     pub default_token: Option<MaskedString>,
-    pub prefer_ipv6: Option<bool>,
     pub services: HashMap<String, ClientServiceConfig>,
-    #[serde(default)]
-    pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_timeout")]
     pub heartbeat_timeout: u64,
     #[serde(default = "default_client_retry_interval")]
@@ -220,11 +109,12 @@ fn default_heartbeat_interval() -> u64 {
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    /// The address that the server listens for clients (control/data channels)
     pub bind_addr: String,
+    /// The address that the server listens for HTTP visitors, routed by the `Host` header
+    pub http_bind_addr: String,
     pub default_token: Option<MaskedString>,
     pub services: HashMap<String, ServerServiceConfig>,
-    #[serde(default)]
-    pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
 }
@@ -256,6 +146,9 @@ impl Config {
     }
 
     fn validate_server_config(server: &mut ServerConfig) -> Result<()> {
+        // host -> service name
+        let mut seen: HashMap<String, String> = HashMap::new();
+
         // Validate services
         for (name, s) in &mut server.services {
             s.name = name.clone();
@@ -265,9 +158,23 @@ impl Config {
                     bail!("The token of service {} is not set", name);
                 }
             }
-        }
 
-        Config::validate_transport_config(&server.transport, true)?;
+            if s.hosts.is_empty() {
+                bail!("The `hosts` of service {} is empty", name);
+            }
+
+            for h in &mut s.hosts {
+                *h = h.to_lowercase();
+                if let Some(prev) = seen.insert(h.clone(), name.clone()) {
+                    bail!(
+                        "The host `{}` is used by both service `{}` and `{}`",
+                        h,
+                        prev,
+                        name
+                    );
+                }
+            }
+        }
 
         Ok(())
     }
@@ -287,43 +194,7 @@ impl Config {
             }
         }
 
-        Config::validate_transport_config(&client.transport, false)?;
-
         Ok(())
-    }
-
-    fn validate_transport_config(config: &TransportConfig, is_server: bool) -> Result<()> {
-        config
-            .tcp
-            .proxy
-            .as_ref()
-            .map_or(Ok(()), |u| match u.scheme() {
-                "socks5" => Ok(()),
-                "http" => Ok(()),
-                _ => Err(anyhow!(format!("Unknown proxy scheme: {}", u.scheme()))),
-            })?;
-        match config.transport_type {
-            TransportType::Tcp => Ok(()),
-            TransportType::Tls => {
-                let tls_config = config
-                    .tls
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("Missing TLS configuration"))?;
-                if is_server {
-                    tls_config
-                        .pkcs12
-                        .as_ref()
-                        .and(tls_config.pkcs12_password.as_ref())
-                        .ok_or_else(|| anyhow!("Missing `pkcs12` or `pkcs12_password`"))?;
-                }
-                Ok(())
-            }
-            TransportType::Noise => {
-                // The check is done in transport
-                Ok(())
-            }
-            TransportType::Websocket => Ok(()),
-        }
     }
 
     pub async fn from_file(path: &Path) -> Result<Config> {
@@ -401,9 +272,8 @@ mod tests {
         cfg.services.insert(
             "foo1".into(),
             ServerServiceConfig {
-                service_type: ServiceType::Tcp,
                 name: "foo1".into(),
-                bind_addr: "127.0.0.1:80".into(),
+                hosts: vec!["foo1.example.com".into()],
                 token: None,
                 ..Default::default()
             },
@@ -441,6 +311,24 @@ mod tests {
                 .0,
             "4"
         );
+
+        // Empty hosts is rejected
+        cfg.services.get_mut("foo1").unwrap().hosts = vec![];
+        assert!(Config::validate_server_config(&mut cfg).is_err());
+
+        // Duplicate host is rejected
+        cfg.services.get_mut("foo1").unwrap().hosts = vec!["a.example.com".into()];
+        cfg.services.insert(
+            "foo2".into(),
+            ServerServiceConfig {
+                name: "foo2".into(),
+                hosts: vec!["a.example.com".into()],
+                token: Some("4".into()),
+                ..Default::default()
+            },
+        );
+        assert!(Config::validate_server_config(&mut cfg).is_err());
+
         Ok(())
     }
 
@@ -451,7 +339,6 @@ mod tests {
         cfg.services.insert(
             "foo1".into(),
             ClientServiceConfig {
-                service_type: ServiceType::Tcp,
                 name: "foo1".into(),
                 local_addr: "127.0.0.1:80".into(),
                 token: None,
