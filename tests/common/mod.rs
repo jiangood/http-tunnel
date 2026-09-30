@@ -12,21 +12,25 @@ pub async fn run_rathole_server(
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let cli = rathole::Cli {
-        config_path: Some(PathBuf::from(config_path)),
-        server: true,
-        client: false,
+        cmd: rathole::Command::Server(rathole::ServerArgs {
+            config_path: PathBuf::from(config_path),
+        }),
     };
     rathole::run(cli, shutdown_rx).await
 }
 
 pub async fn run_rathole_client(
-    config_path: &str,
+    name: &str,
+    remote: &str,
+    token: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let cli = rathole::Cli {
-        config_path: Some(PathBuf::from(config_path)),
-        server: false,
-        client: true,
+        cmd: rathole::Command::Client(rathole::ClientArgs {
+            name: name.to_string(),
+            remote: remote.to_string(),
+            token: token.to_string(),
+        }),
     };
     rathole::run(cli, shutdown_rx).await
 }

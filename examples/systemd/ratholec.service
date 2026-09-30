@@ -8,10 +8,15 @@ Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
 
+# The token is read from the environment, so that it doesn't show up in `ps`
 # with root
-ExecStart=/usr/bin/rathole -c /etc/rathole/rathole.toml
+EnvironmentFile=-/etc/rathole/client.env
 # without root
-# ExecStart=%h/.local/bin/rathole -c %h/.local/etc/rathole/rathole.toml
+# EnvironmentFile=-%h/.local/etc/rathole/client.env
+
+# The `--remote` must be the address of your server, and the `--name` must be
+# defined in the configuration of the server
+ExecStart=/usr/bin/rathole client --remote example.com:2333 --name home
 
 [Install]
 WantedBy=multi-user.target

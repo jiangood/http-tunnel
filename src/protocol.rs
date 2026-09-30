@@ -1,9 +1,13 @@
 pub const HASH_WIDTH_IN_BYTES: usize = 32;
 
+use crate::helper::write_and_flush;
 use anyhow::{bail, Context, Result};
 use lazy_static::lazy_static;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+
+/// The maximum size of a length-prefixed payload, to reject a malformed length
+const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
 
 type ProtocolVersion = u8;
 const _PROTO_V0: u8 = 0u8;
@@ -13,10 +17,17 @@ pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V1;
 
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 
+/// The variants are named after the kind of channel they establish, so the shared
+/// `ChannelHello` postfix is intended
+#[allow(clippy::enum_variant_names)]
 #[derive(Deserialize, Serialize, Debug)]
 pub enum Hello {
-    ControlChannelHello(ProtocolVersion, Digest), // sha256sum(service name)
-    DataChannelHello(ProtocolVersion, Digest),    // session key provided by CreateDataChannel
+    /// Sent by a client to represent a service. sha256sum(service name)
+    ControlChannelHello(ProtocolVersion, Digest),
+    /// Sent by a client to establish a data channel. The session key handed out by the control channel
+    DataChannelHello(ProtocolVersion, Digest),
+    /// Sent by a client to ask for its configuration. sha256sum(client name)
+    ConfigChannelHello(ProtocolVersion, Digest),
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -36,7 +47,7 @@ impl std::fmt::Display for Ack {
             "{}",
             match self {
                 Ack::Ok => "Ok",
-                Ack::ServiceNotExist => "Service not exist",
+                Ack::ServiceNotExist => "No such a client or service",
                 Ack::AuthFailed => "Incorrect token",
             }
         )
@@ -102,25 +113,18 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
         .with_context(|| "Failed to read hello")?;
     let hello = bincode::deserialize(&buf).with_context(|| "Failed to deserialize hello")?;
 
-    match hello {
-        Hello::ControlChannelHello(v, _) => {
-            if v != CURRENT_PROTO_VERSION {
-                bail!(
-                    "Protocol version mismatched. Expected {}, got {}.",
-                    CURRENT_PROTO_VERSION,
-                    v
-                );
-            }
-        }
-        Hello::DataChannelHello(v, _) => {
-            if v != CURRENT_PROTO_VERSION {
-                bail!(
-                    "Protocol version mismatched. Expected {}, got {}.",
-                    CURRENT_PROTO_VERSION,
-                    v
-                );
-            }
-        }
+    let v = match hello {
+        Hello::ControlChannelHello(v, _) => v,
+        Hello::DataChannelHello(v, _) => v,
+        Hello::ConfigChannelHello(v, _) => v,
+    };
+
+    if v != CURRENT_PROTO_VERSION {
+        bail!(
+            "Protocol version mismatched. Expected {}, got {}.",
+            CURRENT_PROTO_VERSION,
+            v
+        );
     }
 
     Ok(hello)
@@ -160,4 +164,70 @@ pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
         .await
         .with_context(|| "Failed to read cmd")?;
     bincode::deserialize(&bytes).with_context(|| "Failed to deserialize data cmd")
+}
+
+/// Write a bincode payload prefixed by its length in bytes (big-endian u32)
+pub async fn write_payload<T, W>(conn: &mut W, payload: &T) -> Result<()>
+where
+    T: Serialize,
+    W: AsyncWrite + Unpin,
+{
+    let bytes = bincode::serialize(payload).with_context(|| "Failed to serialize the payload")?;
+    if bytes.len() > MAX_PAYLOAD_SIZE {
+        bail!("The payload is too large: {} bytes", bytes.len());
+    }
+
+    write_and_flush(conn, &(bytes.len() as u32).to_be_bytes())
+        .await
+        .with_context(|| "Failed to write the payload length")?;
+    write_and_flush(conn, &bytes)
+        .await
+        .with_context(|| "Failed to write the payload")?;
+
+    Ok(())
+}
+
+/// Read a bincode payload prefixed by its length in bytes (big-endian u32)
+pub async fn read_payload<T, R>(conn: &mut R) -> Result<T>
+where
+    T: DeserializeOwned,
+    R: AsyncRead + Unpin,
+{
+    let mut len = [0u8; 4];
+    conn.read_exact(&mut len)
+        .await
+        .with_context(|| "Failed to read the payload length")?;
+
+    let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_PAYLOAD_SIZE {
+        bail!("The payload is too large: {} bytes", len);
+    }
+
+    let mut buf = vec![0u8; len];
+    conn.read_exact(&mut buf)
+        .await
+        .with_context(|| "Failed to read the payload")?;
+
+    bincode::deserialize(&buf).with_context(|| "Failed to deserialize the payload")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hello_packet_size() {
+        let d = digest(b"foo");
+        let sizes: Vec<usize> = [
+            Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d),
+            Hello::DataChannelHello(CURRENT_PROTO_VERSION, d),
+            Hello::ConfigChannelHello(CURRENT_PROTO_VERSION, d),
+        ]
+        .iter()
+        .map(|h| bincode::serialized_size(h).unwrap() as usize)
+        .collect();
+
+        assert!(sizes.iter().all(|s| *s == sizes[0]), "{:?}", sizes);
+        assert_eq!(sizes[0], PACKET_LEN.hello);
+    }
 }

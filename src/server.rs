@@ -1,13 +1,13 @@
-use crate::config::{Config, ServerConfig, ServerServiceConfig};
+use crate::config::{ClientConfig, MaskedString, ServerConfig, ServerServiceConfig};
 use crate::constants::listen_backoff;
 use crate::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
-use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
+use crate::protocol::Hello::{ConfigChannelHello, ControlChannelHello, DataChannelHello};
 use crate::protocol::{
     self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, HASH_WIDTH_IN_BYTES,
 };
 use crate::transport::SocketOpts;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
 
@@ -22,6 +22,7 @@ use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
 type ServiceDigest = protocol::Digest; // SHA256 of a service name
+type ClientDigest = protocol::Digest; // SHA256 of a client name
 type Nonce = protocol::Digest; // Also called `session_key`
 
 const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP services
@@ -35,19 +36,30 @@ pub(crate) struct HttpVisitor {
     pub prefetched: Vec<u8>,
 }
 
+// A client of `[clients]`, together with the config that is pushed to it
+#[derive(Clone)]
+struct ServerClient {
+    name: String,
+    token: MaskedString,
+    config: ClientConfig,
+}
+
+// A service, together with the token of the client that serves it
+#[derive(Clone)]
+struct ServiceRuntime {
+    config: ServerServiceConfig,
+    token: MaskedString,
+}
+
 // A hash map of ControlChannelHandles, indexed by ServiceDigest or Nonce
 // See also MultiMap
 pub(crate) type ControlChannelMap = MultiMap<ServiceDigest, Nonce, ControlChannelHandle>;
 
 // The entrypoint of running a server
-pub async fn run_server(config: Config, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    let config = match config.server {
-            Some(config) => config,
-            None => {
-                return Err(anyhow!("Try to run as a server, but the configuration is missing. Please add the `[server]` block"))
-            }
-        };
-
+pub async fn run_server(
+    config: ServerConfig,
+    shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
     let mut server = Server::from(config).await?;
     server.run(shutdown_rx).await?;
 
@@ -56,24 +68,50 @@ pub async fn run_server(config: Config, shutdown_rx: broadcast::Receiver<bool>) 
 
 // Server holds all states of running a server
 struct Server {
-    // `[server]` config
+    // The whole config
     config: Arc<ServerConfig>,
 
-    // `[server.services]` config, indexed by ServiceDigest
-    services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
+    // `[clients.<client>.services]`, indexed by ServiceDigest
+    services: Arc<RwLock<HashMap<ServiceDigest, ServiceRuntime>>>,
+    // `[clients]`, indexed by the digest of the client name
+    clients: Arc<RwLock<HashMap<ClientDigest, ServerClient>>>,
     // Collection of control channels
     control_channels: Arc<RwLock<ControlChannelMap>>,
     // `Host` -> ServiceDigest
     routing_table: Arc<RwLock<crate::http::RoutingTable>>,
 }
 
-// Generate a hash map of services which is indexed by ServiceDigest
+// Generate the services of all the clients, indexed by ServiceDigest
 fn generate_service_hashmap(
     server_config: &ServerConfig,
-) -> HashMap<ServiceDigest, ServerServiceConfig> {
+) -> HashMap<ServiceDigest, ServiceRuntime> {
     let mut ret = HashMap::new();
-    for u in &server_config.services {
-        ret.insert(protocol::digest(u.0.as_bytes()), (*u.1).clone());
+    for client in server_config.clients.values() {
+        for (name, s) in &client.services {
+            ret.insert(
+                protocol::digest(name.as_bytes()),
+                ServiceRuntime {
+                    config: s.clone(),
+                    token: client.token.clone(),
+                },
+            );
+        }
+    }
+    ret
+}
+
+// Generate the clients, indexed by the digest of their name
+fn generate_client_hashmap(server_config: &ServerConfig) -> HashMap<ClientDigest, ServerClient> {
+    let mut ret = HashMap::new();
+    for (name, client) in &server_config.clients {
+        ret.insert(
+            protocol::digest(name.as_bytes()),
+            ServerClient {
+                name: name.clone(),
+                token: client.token.clone(),
+                config: client.to_client_config(),
+            },
+        );
     }
     ret
 }
@@ -81,25 +119,29 @@ fn generate_service_hashmap(
 // Generate a routing table which maps a `Host` to a ServiceDigest
 fn generate_routing_table(server_config: &ServerConfig) -> crate::http::RoutingTable {
     let mut ret = HashMap::new();
-    for (name, s) in &server_config.services {
-        let digest = protocol::digest(name.as_bytes());
-        for host in &s.hosts {
-            ret.insert(host.clone(), digest);
+    for client in server_config.clients.values() {
+        for (name, s) in &client.services {
+            let digest = protocol::digest(name.as_bytes());
+            for host in &s.hosts {
+                ret.insert(host.clone(), digest);
+            }
         }
     }
     ret
 }
 
 impl Server {
-    // Create a server from `[server]`
+    // Create a server from the config
     pub async fn from(config: ServerConfig) -> Result<Server> {
         let config = Arc::new(config);
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
+        let clients = Arc::new(RwLock::new(generate_client_hashmap(&config)));
         let routing_table = Arc::new(RwLock::new(generate_routing_table(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
         Ok(Server {
             config,
             services,
+            clients,
             control_channels,
             routing_table,
         })
@@ -107,7 +149,7 @@ impl Server {
 
     // The entry point of Server
     pub async fn run(&mut self, mut shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-        // Listen at `server.bind_addr` for the control and data channels of clients
+        // Listen at `bind_addr` for the control and data channels of clients
         let l: TcpListener = retry_notify_with_deadline(
             listen_backoff(),
             || async { Ok(TcpListener::bind(&self.config.bind_addr).await?) },
@@ -117,7 +159,7 @@ impl Server {
             &mut shutdown_rx,
         )
         .await
-        .with_context(|| "Failed to listen at `server.bind_addr`")?;
+        .with_context(|| "Failed to listen at `bind_addr`")?;
 
         info!("Listening at {}", self.config.bind_addr);
 
@@ -162,10 +204,11 @@ impl Server {
                                     match conn.with_context(|| "Failed to do transport handshake") {
                                         Ok(conn) => {
                                             let services = self.services.clone();
+                                            let clients = self.clients.clone();
                                             let control_channels = self.control_channels.clone();
                                             let server_config = self.config.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
+                                                if let Err(err) = handle_connection(conn, services, clients, control_channels, server_config).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -202,10 +245,11 @@ async fn handshake(conn: TcpStream) -> Result<TcpStream> {
     Ok(conn)
 }
 
-// Handle connections to `server.bind_addr`
+// Handle connections to `bind_addr`
 async fn handle_connection(
     mut conn: TcpStream,
-    services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
+    services: Arc<RwLock<HashMap<ServiceDigest, ServiceRuntime>>>,
+    clients: Arc<RwLock<HashMap<ClientDigest, ServerClient>>>,
     control_channels: Arc<RwLock<ControlChannelMap>>,
     server_config: Arc<ServerConfig>,
 ) -> Result<()> {
@@ -222,6 +266,9 @@ async fn handle_connection(
             )
             .await?;
         }
+        ConfigChannelHello(_, client_digest) => {
+            do_config_channel_handshake(conn, clients, client_digest).await?;
+        }
         DataChannelHello(_, nonce) => {
             do_data_channel_handshake(conn, control_channels, nonce).await?;
         }
@@ -229,9 +276,72 @@ async fn handle_connection(
     Ok(())
 }
 
+// Push the config of a client to it. The client doesn't have any config of its own
+async fn do_config_channel_handshake(
+    mut conn: TcpStream,
+    clients: Arc<RwLock<HashMap<ClientDigest, ServerClient>>>,
+    client_digest: ClientDigest,
+) -> Result<()> {
+    info!("Try to handshake a config channel");
+
+    SocketOpts::for_control_channel().apply(&conn);
+
+    // Generate a nonce
+    let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];
+    rand::thread_rng().fill_bytes(&mut nonce);
+
+    // Send hello
+    let hello_send = Hello::ConfigChannelHello(
+        protocol::CURRENT_PROTO_VERSION,
+        nonce.clone().try_into().unwrap(),
+    );
+    conn.write_all(&bincode::serialize(&hello_send).unwrap())
+        .await?;
+    conn.flush().await?;
+
+    // Lookup the client
+    let client = clients.read().await.get(&client_digest).cloned();
+    let Some(client) = client else {
+        conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
+            .await?;
+        bail!("No such a client {}", hex::encode(client_digest));
+    };
+
+    // Calculate the checksum
+    let mut concat = Vec::from(client.token.as_bytes());
+    concat.append(&mut nonce);
+
+    // Read auth
+    let protocol::Auth(d) = read_auth(&mut conn).await?;
+
+    // Validate
+    let session_key = protocol::digest(&concat);
+    if session_key != d {
+        conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
+            .await?;
+        debug!(
+            "Expect {}, but got {}",
+            hex::encode(session_key),
+            hex::encode(d)
+        );
+        bail!("Client {} failed the authentication", client.name);
+    }
+
+    conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
+        .await?;
+    conn.flush().await?;
+
+    // Push the config
+    protocol::write_payload(&mut conn, &client.config).await?;
+
+    info!(client = %client.name, services = client.config.services.len(), "Config pushed");
+
+    Ok(())
+}
+
 async fn do_control_channel_handshake(
     mut conn: TcpStream,
-    services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
+    services: Arc<RwLock<HashMap<ServiceDigest, ServiceRuntime>>>,
     control_channels: Arc<RwLock<ControlChannelMap>>,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
@@ -254,7 +364,7 @@ async fn do_control_channel_handshake(
     conn.flush().await?;
 
     // Lookup the service
-    let service_config = match services.read().await.get(&service_digest) {
+    let service = match services.read().await.get(&service_digest) {
         Some(v) => v,
         None => {
             conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
@@ -264,10 +374,11 @@ async fn do_control_channel_handshake(
     }
     .to_owned();
 
+    let service_config = service.config;
     let service_name = &service_config.name;
 
-    // Calculate the checksum
-    let mut concat = Vec::from(service_config.token.as_ref().unwrap().as_bytes());
+    // Calculate the checksum with the token of the client that serves the service
+    let mut concat = Vec::from(service.token.as_bytes());
     concat.append(&mut nonce);
 
     // Read auth
@@ -379,10 +490,9 @@ impl ControlChannelHandle {
 
         tokio::spawn(
             async move {
-                if let Err(e) =
-                    run_tcp_connection_pool(data_ch_rx, visitor_rx, data_ch_req_tx)
-                        .await
-                        .with_context(|| "Failed to run TCP connection pool")
+                if let Err(e) = run_tcp_connection_pool(data_ch_rx, visitor_rx, data_ch_req_tx)
+                    .await
+                    .with_context(|| "Failed to run TCP connection pool")
                 {
                     error!("{:#}", e);
                 }

@@ -1,5 +1,6 @@
-use clap::{AppSettings, ArgGroup, Parser};
+use clap::{AppSettings, Args, Parser, Subcommand};
 use lazy_static::lazy_static;
+use std::path::PathBuf;
 
 lazy_static! {
     static ref VERSION: &'static str =
@@ -26,31 +27,46 @@ cargo Features:      {}
     );
 }
 
-#[derive(Parser, Debug, Default, Clone)]
+#[derive(Parser, Debug, Clone)]
 #[clap(
     about,
     version(*VERSION),
     long_version(LONG_VERSION.as_str()),
     setting(AppSettings::DeriveDisplayOrder)
 )]
-#[clap(group(
-            ArgGroup::new("cmds")
-                .required(true)
-                .args(&["CONFIG"]),
-        ))]
 pub struct Cli {
+    #[clap(subcommand)]
+    pub cmd: Command,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Run as a server. The configuration file defines all the clients and their services
+    Server(ServerArgs),
+    /// Run as a client. The client is configured by the server, so it takes no configuration file
+    Client(ClientArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ServerArgs {
     /// The path to the configuration file
-    ///
-    /// Running as a client or a server is automatically determined
-    /// according to the configuration file.
     #[clap(parse(from_os_str), name = "CONFIG")]
-    pub config_path: Option<std::path::PathBuf>,
+    pub config_path: PathBuf,
+}
 
-    /// Run as a server
-    #[clap(long, short, group = "mode")]
-    pub server: bool,
+#[derive(Args, Debug, Clone)]
+pub struct ClientArgs {
+    /// The address of the server, e.g. `example.com:2333`
+    #[clap(long, short)]
+    pub remote: String,
 
-    /// Run as a client
-    #[clap(long, short, group = "mode")]
-    pub client: bool,
+    /// The name of the client. It must be defined in the server's configuration
+    #[clap(long, short)]
+    pub name: String,
+
+    /// The token of the client. It must match the one in the server's configuration
+    ///
+    /// It can also be passed via the `RATHOLE_TOKEN` environment variable
+    #[clap(long, short, env = "RATHOLE_TOKEN", hide_env_values = true)]
+    pub token: String,
 }

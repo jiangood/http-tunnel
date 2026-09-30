@@ -14,6 +14,9 @@ A secure, stable and high-performance HTTP reverse proxy for NAT traversal, writ
 
 `rathole` exposes HTTP services on a device behind the NAT to the Internet, via a server with a public IP. The server listens on a single HTTP port and routes each request to the right service according to the `Host` header. The traffic between the server and the client is carried over a plain TCP tunnel.
 
+The whole configuration lives on the server. A client is configured by the server: it takes no configuration file, and
+the server pushes it the services that it should forward.
+
 <!-- TOC -->
 
 - [rathole](#rathole)
@@ -31,9 +34,10 @@ A secure, stable and high-performance HTTP reverse proxy for NAT traversal, writ
 ## Features
 
 - **HTTP Reverse Proxy** One public HTTP port serves all services. Requests are routed to the correct service by the `Host` header. WebSocket and other protocol upgrades work transparently, as the traffic is piped through as it is.
+- **Single Point of Configuration** Only the server is configured. A client is started with the address of the server, its name and its token, and the server pushes it the services to forward.
 - **High Performance** Much higher throughput can be achieved than frp, and more stable when handling a large volume of connections.
 - **Low Resource Consumption** Consumes much fewer memory than similar tools.
-- **Security** Tokens of services are mandatory and service-wise. The server and clients are responsible for their own configs.
+- **Security** Every client is authenticated with its own token, and a client can only serve the services that are assigned to it on the server.
 
 ## Quickstart
 
@@ -49,42 +53,41 @@ Create `server.toml` with the following content and accommodate it to your needs
 
 ```toml
 # server.toml
-[server]
 bind_addr = "0.0.0.0:2333" # `2333` specifies the port that rathole listens for clients
 http_bind_addr = "0.0.0.0:80" # `80` specifies the HTTP entrypoint that visitors connect to
-default_token = "use_a_secret_that_only_you_know"
 
-[server.services.my_nas]
+[clients.home_nas] # The name of the client
+token = "use_a_secret_that_only_you_know" # The token of the client
+
+[clients.home_nas.services.my_nas]
 hosts = ["nas.example.com"] # Requests with this `Host` are forwarded to `my_nas`
+local_addr = "127.0.0.1:80" # The address of the NAS web UI, as seen from the NAS
 ```
 
 Then run:
 
 ```bash
-./rathole server.toml
+./rathole server server.toml
 ```
 
 2. On the host which is behind the NAT (your NAS)
 
-Create `client.toml` with the following content and accommodate it to your needs.
-
-```toml
-# client.toml
-[client]
-remote_addr = "myserver.com:2333" # The address of the server. The port must be the same with the port in `server.bind_addr`
-default_token = "use_a_secret_that_only_you_know"
-
-[client.services.my_nas]
-local_addr = "127.0.0.1:80" # The address of the local HTTP service that needs to be forwarded
-```
-
-Then run:
+The client needs no configuration file. Just tell it where the server is, which name it was given in the configuration
+of the server, and its token:
 
 ```bash
-./rathole client.toml
+./rathole client --remote myserver.com:2333 --name home_nas --token use_a_secret_that_only_you_know
 ```
 
-3. Now the client will try to connect to the server `myserver.com` on port `2333`. Any HTTP request to the server on port `80` with `Host: nas.example.com` will be forwarded to the client's port `80`.
+or pass the token in the environment, so that it doesn't show up in `ps`:
+
+```bash
+RATHOLE_TOKEN=use_a_secret_that_only_you_know ./rathole client --remote myserver.com:2333 --name home_nas
+```
+
+3. Now the client will try to connect to the server `myserver.com` on port `2333`, and the server pushes it the services
+   of `home_nas`, including `my_nas`. Any HTTP request to the server on port `80` with `Host: nas.example.com` will be
+   forwarded to the NAS on port `80`.
 
 So you can visit `http://nas.example.com` (with `nas.example.com` resolving to your server) to reach the NAS web UI.
 
@@ -92,44 +95,46 @@ To run `rathole` as a background service on Linux, checkout the [systemd example
 
 ## Configuration
 
-`rathole` can automatically determine to run in the server mode or the client mode, according to the content of the configuration file, if only one of `[server]` and `[client]` block is present, like the example in [Quickstart](#quickstart).
-
-But the `[client]` and `[server]` block can also be put in one file. Then on the server side, run `rathole --server config.toml` and on the client side, run `rathole --client config.toml` to explicitly tell `rathole` the running mode.
+All the configuration lives in one file, and it's the configuration of the server. Services are grouped by the client
+that serves them, and each client is identified by a name and authenticated by its own token.
 
 Before heading to the full configuration specification, it's recommend to skim [the configuration examples](./examples) to get a feeling of the configuration format.
 
 Here is the full configuration specification:
 
 ```toml
-[client]
-remote_addr = "example.com:2333" # Necessary. The address of the server
-default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
-heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second
-
-[client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
-token = "whatever" # Necessary if `client.default_token` not set
-local_addr = "127.0.0.1:1081" # Necessary. The address of the local HTTP service that needs to be forwarded
-nodelay = true # Optional. Determine whether to enable TCP_NODELAY, to improve the latency but decrease the bandwidth. Default: true
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
-
-[client.services.service2] # Multiple services can be defined
-local_addr = "127.0.0.1:1082"
-
-[server]
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
 http_bind_addr = "0.0.0.0:80" # Necessary. The HTTP entrypoint. Visitors are routed by the `Host` header
-default_token = "default_token_if_not_specify" # Optional
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
 
-[server.services.service1] # The service name must be identical to the client side
-token = "whatever" # Necessary if `server.default_token` not set
-hosts = ["service1.example.com"] # Necessary. Requests with these `Host` values are routed to this service
-nodelay = true # Optional. Same as the client
+[clients.home] # A client. The name `home` must be identical to the `--name` of the client
+token = "use_a_secret_that_only_you_know" # Necessary. The token of the client. It can also be given by the `RATHOLE_TOKEN` environment variable
+heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `heartbeat_interval`. Default: 40 seconds
+retry_interval = 1 # Optional. The interval between retries of the client to connect to the server. Default: 1 second
+nodelay = true # Optional. The default TCP_NODELAY of the services of this client. Default: true
 
-[server.services.service2]
+[clients.home.services.service1] # A service of `home`. The name `service1` can change arbitrarily
+hosts = ["service1.example.com"] # Necessary. Requests with these `Host` values are routed to this service
+local_addr = "127.0.0.1:1081" # Necessary. The address of the local HTTP service on the client side
+nodelay = true # Optional. Determine whether to enable TCP_NODELAY, to improve the latency but decrease the bandwidth. Default: inherits the client
+retry_interval = 1 # Optional. The interval between retries to connect to the server. Default: inherits the client
+
+[clients.home.services.service2] # Multiple services can be defined
 hosts = ["service2.example.com", "www.service2.example.com"]
+local_addr = "127.0.0.1:1082"
+
+[clients.office] # Multiple clients can be defined. Each of them is started with `--name office`
+token = "another_secret"
+nodelay = false # Applied to all the services of `office` unless a service overrides it
+
+[clients.office.services.service3]
+hosts = ["service3.example.com"]
+local_addr = "127.0.0.1:1083"
 ```
+
+The names of the services are global: two clients cannot define a service with the same name, and the same `Host`
+cannot be claimed by two services. Restarting the server and the clients is needed to apply a change of the
+configuration. The clients fetch their configuration once, when they start.
 
 ### Routing
 
@@ -144,7 +149,7 @@ Routing is done once per connection, on its first request. A keep-alive connecti
 `rathole`, like many other Rust programs, use environment variables to control the logging level. `info`, `warn`, `error`, `debug`, `trace` are available.
 
 ```shell
-RUST_LOG=error ./rathole config.toml
+RUST_LOG=error ./rathole server config.toml
 ```
 
 will run `rathole` with only error level logging.
@@ -155,7 +160,8 @@ If `RUST_LOG` is not present, the default logging level is `info`.
 
 `rathole` enables TCP_NODELAY by default, which should benefit the latency and interactive applications. However, it slightly decreases the bandwidth.
 
-If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false`, either globally per service.
+If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false`, either for a whole client or
+per service.
 
 ## Benchmark
 

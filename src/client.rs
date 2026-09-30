@@ -1,4 +1,5 @@
-use crate::config::{ClientConfig, ClientServiceConfig, Config};
+use crate::cli::ClientArgs;
+use crate::config::{ClientConfig, ClientServiceConfig, MaskedString};
 use crate::constants::run_control_chan_backoff;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
@@ -18,46 +19,53 @@ use tokio::sync::{broadcast, oneshot};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, instrument, warn, Instrument, Span};
 
-// The entrypoint of running a client
-pub async fn run_client(config: Config, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    let config = config.client.ok_or_else(|| {
-        anyhow!(
-        "Try to run as a client, but the configuration is missing. Please add the `[client]` block"
-    )
-    })?;
+// The interval between retries to fetch the config, before the client gets one
+const DEFAULT_FETCH_RETRY_INTERVAL_SECS: u64 = 1;
 
-    let mut client = Client::from(config).await?;
+// The entrypoint of running a client
+pub async fn run_client(args: ClientArgs, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
+    let mut client = Client::new(args);
     client.run(shutdown_rx).await
 }
 
-type ServiceDigest = protocol::Digest;
-type Nonce = protocol::Digest;
-
 // Holds the state of a client
 struct Client {
-    config: ClientConfig,
+    args: ClientArgs,
     service_handles: HashMap<String, ControlChannelHandle>,
 }
 
 impl Client {
-    // Create a Client from `[client]` config block
-    async fn from(config: ClientConfig) -> Result<Client> {
-        Ok(Client {
-            config,
+    fn new(args: ClientArgs) -> Client {
+        Client {
+            args,
             service_handles: HashMap::new(),
-        })
+        }
     }
 
     // The entrypoint of Client
     async fn run(&mut self, mut shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-        for (name, config) in &self.config.services {
-            // Create a control channel for each service defined
+        // The client has no config of its own. It's pushed by the server
+        let config = match fetch_config(&self.args, &shutdown_rx).await {
+            Ok(config) => config,
+            Err(e) => {
+                if is_shutdown(&mut shutdown_rx) {
+                    return Ok(());
+                }
+                return Err(e);
+            }
+        };
+
+        let token = MaskedString::from(self.args.token.as_str());
+
+        for service in &config.services {
+            // Create a control channel for each service pushed by the server
             let handle = ControlChannelHandle::new(
-                (*config).clone(),
-                self.config.remote_addr.clone(),
-                self.config.heartbeat_timeout,
+                (*service).clone(),
+                token.clone(),
+                self.args.remote.clone(),
+                config.heartbeat_timeout,
             );
-            self.service_handles.insert(name.clone(), handle);
+            self.service_handles.insert(service.name.clone(), handle);
         }
 
         // Wait for the shutdown signal
@@ -75,6 +83,107 @@ impl Client {
 
         Ok(())
     }
+}
+
+// Check whether the shutdown signal has arrived
+fn is_shutdown(shutdown_rx: &mut broadcast::Receiver<bool>) -> bool {
+    shutdown_rx.try_recv() != Err(broadcast::error::TryRecvError::Empty)
+}
+
+// Fetch the config from the server, retrying until it succeeds or the client shuts down
+async fn fetch_config(
+    args: &ClientArgs,
+    shutdown_rx: &broadcast::Receiver<bool>,
+) -> Result<ClientConfig> {
+    // Subscribe a new receiver, so that the shutdown signal isn't consumed here
+    let mut shutdown_rx = shutdown_rx.resubscribe();
+
+    // Retry at least every 100ms
+    let backoff = ExponentialBackoff {
+        max_interval: Duration::from_secs(DEFAULT_FETCH_RETRY_INTERVAL_SECS),
+        max_elapsed_time: None,
+        ..Default::default()
+    };
+
+    tokio::select! {
+        v = retry_notify(
+            backoff,
+            || async {
+                try_fetch_config(args)
+                    .await
+                    .map_err(backoff::Error::transient)
+            },
+            |e, duration| {
+                error!("{:#}. Retry in {:?}", e, duration);
+            },
+        ) => v,
+        _ = shutdown_rx.recv() => Err(anyhow!("shutdown")),
+    }
+}
+
+async fn try_fetch_config(args: &ClientArgs) -> Result<ClientConfig> {
+    let mut remote_addr = AddrMaybeCached::new(&args.remote);
+    remote_addr.resolve().await.with_context(|| {
+        format!(
+            "Failed to resolve the address of the server {}",
+            args.remote
+        )
+    })?;
+
+    let mut conn = connect(&remote_addr)
+        .await
+        .with_context(|| format!("Failed to connect to {}", remote_addr))?;
+    SocketOpts::for_control_channel().apply(&conn);
+
+    // Send hello. The client identifies itself by its name
+    debug!("Sending hello");
+    let hello_send = Hello::ConfigChannelHello(
+        CURRENT_PROTO_VERSION,
+        protocol::digest(args.name.as_bytes()),
+    );
+    conn.write_all(&bincode::serialize(&hello_send).unwrap())
+        .await?;
+    conn.flush().await?;
+
+    // Read hello
+    debug!("Reading hello");
+    let nonce = match read_hello(&mut conn).await? {
+        ConfigChannelHello(_, d) => d,
+        _ => {
+            bail!("Unexpected type of hello");
+        }
+    };
+
+    // Send auth
+    debug!("Sending auth");
+    let mut concat = Vec::from(args.token.as_bytes());
+    concat.extend_from_slice(&nonce);
+
+    let session_key = protocol::digest(&concat);
+    let auth = Auth(session_key);
+    conn.write_all(&bincode::serialize(&auth).unwrap()).await?;
+    conn.flush().await?;
+
+    // Read ack
+    debug!("Reading ack");
+    match read_ack(&mut conn).await? {
+        Ack::Ok => {}
+        v => {
+            return Err(anyhow!("{}", v))
+                .with_context(|| format!("Failed to get the config of the client {}", args.name));
+        }
+    }
+
+    // Read the config pushed by the server
+    let config: ClientConfig = protocol::read_payload(&mut conn)
+        .await
+        .with_context(|| "Failed to read the config")?;
+    info!(
+        "Got the config from the server. {} service(s)",
+        config.services.len()
+    );
+
+    Ok(config)
 }
 
 struct RunDataChannelArgs {
@@ -147,11 +256,15 @@ async fn run_data_channel_for_tcp(mut conn: TcpStream, local_addr: &str) -> Resu
 // Control channel
 struct ControlChannel {
     digest: ServiceDigest,              // SHA256 of the service name
-    service: ClientServiceConfig,       // `[client.services.foo]` config block
+    service: ClientServiceConfig,       // Pushed by the server
+    token: MaskedString,                // The token given by `--token`
     shutdown_rx: oneshot::Receiver<u8>, // Receives the shutdown signal
-    remote_addr: String,                // `client.remote_addr`
+    remote_addr: String,                // `--remote`
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
 }
+
+type ServiceDigest = protocol::Digest;
+type Nonce = protocol::Digest;
 
 // Handle of a control channel
 // Dropping it will also drop the actual control channel
@@ -189,7 +302,7 @@ impl ControlChannel {
 
         // Send auth
         debug!("Sending auth");
-        let mut concat = Vec::from(self.service.token.as_ref().unwrap().as_bytes());
+        let mut concat = Vec::from(self.token.as_bytes());
         concat.extend_from_slice(&nonce);
 
         let session_key = protocol::digest(&concat);
@@ -254,6 +367,7 @@ impl ControlChannelHandle {
     #[instrument(name="handle", skip_all, fields(service = %service.name))]
     fn new(
         service: ClientServiceConfig,
+        token: MaskedString,
         remote_addr: String,
         heartbeat_timeout: u64,
     ) -> ControlChannelHandle {
@@ -262,11 +376,12 @@ impl ControlChannelHandle {
         info!("Starting {}", hex::encode(digest));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        let mut retry_backoff = run_control_chan_backoff(service.retry_interval.unwrap());
+        let mut retry_backoff = run_control_chan_backoff(service.retry_interval);
 
         let mut s = ControlChannel {
             digest,
             service,
+            token,
             shutdown_rx,
             remote_addr,
             heartbeat_timeout,

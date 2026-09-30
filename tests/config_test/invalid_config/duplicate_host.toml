@@ -1,11 +1,16 @@
-[server]
 bind_addr = "0.0.0.0:2333"
 http_bind_addr = "0.0.0.0:80"
-default_token = "default_token_if_not_specify"
 
-# The same host cannot be routed to two services
-[server.services.service1]
-hosts = ["same.example.com"]
+[clients.home]
+token = "123"
 
-[server.services.service2]
-hosts = ["same.example.com"]
+[clients.home.services.foo1]
+hosts = ["foo1.example.com"]
+local_addr = "127.0.0.1:80"
+
+[clients.office]
+token = "456"
+
+[clients.office.services.foo2]
+hosts = ["foo1.example.com"]
+local_addr = "127.0.0.1:81"

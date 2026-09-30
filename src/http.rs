@@ -30,7 +30,7 @@ pub(crate) async fn serve(
 ) -> Result<()> {
     let l = TcpListener::bind(&bind_addr)
         .await
-        .with_context(|| format!("Failed to listen at `server.http_bind_addr` ({})", bind_addr))?;
+        .with_context(|| format!("Failed to listen at `http_bind_addr` ({})", bind_addr))?;
     info!("HTTP listening at {}", bind_addr);
 
     loop {
@@ -100,10 +100,7 @@ async fn handle_visitor(
     debug!("Routing visitor {} to the host `{}`", addr, host);
 
     if visitor_tx
-        .send(HttpVisitor {
-            stream,
-            prefetched,
-        })
+        .send(HttpVisitor { stream, prefetched })
         .await
         .is_err()
     {

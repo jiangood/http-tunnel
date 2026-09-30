@@ -6,13 +6,15 @@
 [![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/rapiz1/rathole)](https://github.com/rapiz1/rathole/releases)
 ![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/rapiz1/rathole/rust.yml?branch=main)
 [![GitHub all releases](https://img.shields.io/github/downloads/rapiz1/rathole/total)](https://github.com/rapiz1/rathole/releases)
-[![Docker Pulls](https://img.shields.io/docker/pulls/rapiz1/rathole)](https://hub.docker.com/r/rapiz1/rathole)
+![Docker Pulls](https://img.shields.io/docker/pulls/rapiz1/rathole)
 
 [English](README.md) | [简体中文](README-zh.md)
 
 安全、稳定、高性能的 HTTP 内网穿透工具，用 Rust 语言编写
 
 `rathole` 可以将 NAT 后的设备上的 HTTP 服务通过具有公网 IP 的服务器暴露在公网上。服务端只监听一个 HTTP 端口，并根据请求的 `Host` 头把请求路由到对应的服务。服务端与客户端之间的流量通过一条普通的 TCP 隧道承载。
+
+所有的配置都放在服务端。客户端由服务端配置：客户端不需要配置文件，服务端会把需要转发的服务下发给它。
 
 <!-- TOC -->
 
@@ -24,16 +26,17 @@
     - [Logging](#logging)
     - [Tuning](#tuning)
   - [Benchmark](#benchmark)
-  - [Development Status](#development-status)
+  - [Planning](#planning)
 
 <!-- /TOC -->
 
 ## Features
 
 - **HTTP 反向代理** 一个公网 HTTP 端口即可服务所有服务，按 `Host` 头路由。WebSocket 及其他协议升级可原样透传。
+- **只在服务端配置** 只有服务端需要配置。客户端只需给出服务端地址、自己的名字和 token，服务端会把要转发的服务下发给它。
 - **高性能** 具有更高的吞吐量，高并发下更稳定。见[Benchmark](#benchmark)
 - **低资源消耗** 内存占用远低于同类工具。见[Benchmark](#benchmark)
-- **安全性** 每个服务单独强制鉴权。Server 和 Client 负责各自的配置。
+- **安全性** 每个客户端用自己的 token 鉴权，且只能代理服务端分配给它的服务。
 
 ## Quickstart
 
@@ -49,42 +52,40 @@
 
 ```toml
 # server.toml
-[server]
 bind_addr = "0.0.0.0:2333" # `2333` 配置了服务端监听客户端连接的端口
 http_bind_addr = "0.0.0.0:80" # `80` 配置了供访问者连接的 HTTP 入口
-default_token = "use_a_secret_that_only_you_know"
 
-[server.services.my_nas]
+[clients.home_nas] # 客户端的名字
+token = "use_a_secret_that_only_you_know" # 客户端的 token
+
+[clients.home_nas.services.my_nas]
 hosts = ["nas.example.com"] # 具有该 `Host` 的请求会被转发到 `my_nas`
+local_addr = "127.0.0.1:80" # NAS 上的 Web 界面地址，从 NAS 的角度看
 ```
 
 然后运行:
 
 ```bash
-./rathole server.toml
+./rathole server server.toml
 ```
 
 2. 在 NAT 后面的主机（你的 NAS）上
 
-创建 `client.toml`，内容如下，并根据你的需要进行调整。
-
-```toml
-# client.toml
-[client]
-remote_addr = "myserver.com:2333" # 服务器的地址。端口必须与 `server.bind_addr` 中的端口相同。
-default_token = "use_a_secret_that_only_you_know"
-
-[client.services.my_nas]
-local_addr = "127.0.0.1:80" # 需要被转发的本地 HTTP 服务的地址
-```
-
-然后运行：
+客户端不需要配置文件。只需要告诉它服务端的地址、它在服务端配置中的名字，以及它的 token：
 
 ```bash
-./rathole client.toml
+./rathole client --remote myserver.com:2333 --name home_nas --token use_a_secret_that_only_you_know
 ```
 
-3. 现在 `rathole` 客户端会连接运行在 `myserver.com:2333`的 `rathole` 服务器，任何到服务器 `80` 端口、`Host: nas.example.com` 的 HTTP 请求将被转发到客户端所在主机的 `80` 端口。
+或者用环境变量传入 token，这样它就不会出现在 `ps` 里：
+
+```bash
+RATHOLE_TOKEN=use_a_secret_that_only_you_know ./rathole client --remote myserver.com:2333 --name home_nas
+```
+
+3. 现在 `rathole` 客户端会连接运行在 `myserver.com:2333` 的 `rathole` 服务器，服务端会把 `home_nas` 的服务（包括
+   `my_nas`）下发给它。任何到服务器 `80` 端口、`Host: nas.example.com` 的 HTTP 请求将被转发到客户端所在主机的 `80`
+   端口。
 
 所以你可以在 `nas.example.com` 解析到你的服务器后，访问 `http://nas.example.com`。
 
@@ -92,44 +93,45 @@ local_addr = "127.0.0.1:80" # 需要被转发的本地 HTTP 服务的地址
 
 ## Configuration
 
-如果只有一个 `[server]` 和 `[client]` 块存在的话，`rathole` 可以根据配置文件的内容自动决定在服务器模式或客户端模式下运行，就像 [Quickstart](#quickstart) 中的例子。
-
-但 `[client]` 和 `[server]` 块也可以放在一个文件中。然后在服务器端，运行 `rathole --server config.toml`。在客户端，运行 `rathole --client config.toml` 来明确告诉 `rathole` 运行模式。
+所有的配置都在一个文件里，而且它是服务端的配置。服务按「服务它的客户端」分组，每个客户端由一个名字标识，并用各自的
+token 鉴权。
 
 **推荐首先查看 [examples](./examples) 中的配置示例来快速理解配置格式**，如果有不清楚的地方再查阅完整配置格式。
 
 下面是完整的配置格式。
 
 ```toml
-[client]
-remote_addr = "example.com:2333" # Necessary. The address of the server
-default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
-heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second
-
-[client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
-token = "whatever" # Necessary if `client.default_token` not set
-local_addr = "127.0.0.1:1081" # Necessary. The address of the local HTTP service that needs to be forwarded
-nodelay = true # Optional. Determine whether to enable TCP_NODELAY, to improve the latency but decrease the bandwidth. Default: true
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
-
-[client.services.service2] # Multiple services can be defined
-local_addr = "127.0.0.1:1082"
-
-[server]
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
 http_bind_addr = "0.0.0.0:80" # Necessary. The HTTP entrypoint. Visitors are routed by the `Host` header
-default_token = "default_token_if_not_specify" # Optional
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
 
-[server.services.service1] # The service name must be identical to the client side
-token = "whatever" # Necessary if `server.default_token` not set
-hosts = ["service1.example.com"] # Necessary. Requests with these `Host` values are routed to this service
-nodelay = true # Optional. Same as the client
+[clients.home] # 一个客户端。名字 `home` 必须和客户端的 `--name` 一致
+token = "use_a_secret_that_only_you_know" # Necessary. 客户端的 token，也可以通过 `RATHOLE_TOKEN` 环境变量传入
+heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `heartbeat_interval`. Default: 40 seconds
+retry_interval = 1 # Optional. 客户端连接服务端的重试间隔。Default: 1 second
+nodelay = true # Optional. 该客户端下所有服务默认是否启用 TCP_NODELAY。Default: true
 
-[server.services.service2]
+[clients.home.services.service1] # `home` 的一个服务，名字 `service1` 可以任意取
+hosts = ["service1.example.com"] # Necessary. 具有这些 `Host` 的请求会被路由到该服务
+local_addr = "127.0.0.1:1081" # Necessary. 该服务在客户端侧的本地地址
+nodelay = true # Optional. 是否启用 TCP_NODELAY。Default: 继承该客户端的配置
+retry_interval = 1 # Optional. 连接服务端的重试间隔。Default: 继承该客户端的配置
+
+[clients.home.services.service2] # 可以定义多个服务
 hosts = ["service2.example.com", "www.service2.example.com"]
+local_addr = "127.0.0.1:1082"
+
+[clients.office] # 可以定义多个客户端，各自用 `--name office` 启动
+token = "another_secret"
+nodelay = false # 除非服务单独覆盖，否则作用于 `office` 的所有服务
+
+[clients.office.services.service3]
+hosts = ["service3.example.com"]
+local_addr = "127.0.0.1:1083"
 ```
+
+服务名是全局的：两个客户端不能定义同名的服务，同一个 `Host` 也不能被两个服务占用。修改配置后需要重启服务端和客户端
+才能生效，客户端只在启动时拉取一次配置。
 
 ### Routing
 
@@ -148,7 +150,7 @@ hosts = ["service2.example.com", "www.service2.example.com"]
 比如将日志级别设置为 `error`:
 
 ```shell
-RUST_LOG=error ./rathole config.toml
+RUST_LOG=error ./rathole server config.toml
 ```
 
 如果 `RUST_LOG` 不存在，默认的日志级别是 `info`。
@@ -157,7 +159,7 @@ RUST_LOG=error ./rathole config.toml
 
 rathole 默认启用 TCP_NODELAY。这能够减少延迟并使交互式应用受益。但它会减少一些带宽。
 
-如果带宽更重要，TCP_NODELAY 仍然可以通过配置 `nodelay = false` 关闭（按服务配置）。
+如果带宽更重要，TCP_NODELAY 仍然可以通过配置 `nodelay = false` 关闭（按客户端或按服务配置）。
 
 ## Benchmark
 
@@ -169,11 +171,8 @@ rathole 的延迟与 [frp](https://github.com/fatedier/frp) 相近，在高并�
 ![tcp_bitrate](./docs/img/tcp_bitrate.svg)
 ![mem](./docs/img/mem-graph.png)
 
-## Development Status
+## Planning
 
-`rathole` 正在积极开发中
-
-- [x] HTTP 反向代理
 - [ ] 用于配置的 HTTP APIs
 
 [Out of Scope](./docs/out-of-scope.md) 列举了没有计划开发的特性并说明了原因。

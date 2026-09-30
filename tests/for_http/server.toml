@@ -1,0 +1,10 @@
+bind_addr = "0.0.0.0:2333"
+http_bind_addr = "0.0.0.0:2334"
+heartbeat_interval = 30
+
+[clients.home]
+token = "a_secret_token"
+
+[clients.home.services.echo]
+hosts = ["echo.test"]
+local_addr = "127.0.0.1:8080"

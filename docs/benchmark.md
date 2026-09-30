@@ -16,20 +16,19 @@
 
 rathole with the following configuration:
 ```toml
-[client]
-remote_addr = "localhost:2333"
-default_token = "123"
-
-[client.services.bench]
-local_addr = "127.0.0.1:80"
-
-[server]
 bind_addr = "0.0.0.0:2333"
 http_bind_addr = "0.0.0.0:80"
-default_token = "123"
 
-[server.services.bench]
+[clients.bench]
+token = "123"
+
+[clients.bench.services.bench]
 hosts = ["bench.test"]
+local_addr = "127.0.0.1:80"
+```
+and the client started with:
+```
+$ rathole client --remote localhost:2333 --name bench --token 123
 ```
 
 frp 0.38.0 with the following configuration:

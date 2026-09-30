@@ -2,8 +2,15 @@ bind_addr = "0.0.0.0:2333"
 http_bind_addr = "0.0.0.0:80"
 
 [clients.home]
-heartbeat_timeout = 40
+token = "123"
 
 [clients.home.services.foo1]
 hosts = ["foo1.example.com"]
 local_addr = "127.0.0.1:80"
+
+[clients.office]
+token = "456"
+
+[clients.office.services.foo1]
+hosts = ["office.example.com"]
+local_addr = "127.0.0.1:81"

@@ -1,22 +1,19 @@
-[client]
-remote_addr = "example.com:2333" # Necessary. The address of the server
-default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
-
-[client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
-token = "whatever" # Necessary if `client.default_token` not set
-local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
-
-[client.services.service2] # Multiple services can be defined
-local_addr = "127.0.0.1:1082"
-
-[server]
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients
 http_bind_addr = "0.0.0.0:80" # Necessary. The HTTP entrypoint, routed by the `Host` header
-default_token = "default_token_if_not_specify" # Optional
+heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
 
-[server.services.service1] # The service name must be identical to the client side
-token = "whatever" # Necessary if `server.default_token` not set
-hosts = ["service1.example.com"] # Necessary. The hosts that are routed to this service
+[clients.home] # The name must be identical to the `--name` of the client
+token = "use_a_secret_that_only_you_know" # Necessary. The token of the client
+heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `heartbeat_interval`. Default: 40 seconds
+retry_interval = 1 # Optional. The interval between retries to connect to the server. Default: 1 second
+nodelay = true # Optional. The default TCP_NODELAY of the services of this client. Default: true
 
-[server.services.service2]
+[clients.home.services.service1]
+hosts = ["service1.example.com"] # Necessary. Requests with these `Host` values are routed to this service
+local_addr = "127.0.0.1:1081" # Necessary. The address of the service on the client side
+nodelay = false # Optional. Same as `clients.<client>.nodelay`
+retry_interval = 3 # Optional. Same as `clients.<client>.retry_interval`
+
+[clients.home.services.service2]
 hosts = ["service2.example.com", "www.service2.example.com"]
+local_addr = "127.0.0.1:1082"

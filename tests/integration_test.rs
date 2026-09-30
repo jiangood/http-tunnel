@@ -17,6 +17,10 @@ mod common;
 
 const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
 const HTTP_ENTRY_ADDR: &str = "127.0.0.1:2334";
+const SERVER_CONFIG: &str = "tests/for_http/server.toml";
+const SERVER_ADDR: &str = "127.0.0.1:2333";
+const CLIENT_NAME: &str = "home";
+const CLIENT_TOKEN: &str = "a_secret_token";
 const ECHO_HOST: &str = "echo.test";
 const HITTER_NUM: usize = 4;
 
@@ -46,7 +50,7 @@ async fn http_routing() -> Result<()> {
     // Start the client
     info!("start the client");
     let client = tokio::spawn(async move {
-        run_rathole_client("tests/for_tcp/tcp_transport.toml", client_shutdown_rx)
+        run_rathole_client(CLIENT_NAME, SERVER_ADDR, CLIENT_TOKEN, client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -57,7 +61,7 @@ async fn http_routing() -> Result<()> {
     // Start the server
     info!("start the server");
     let server = tokio::spawn(async move {
-        run_rathole_server("tests/for_tcp/tcp_transport.toml", server_shutdown_rx)
+        run_rathole_server(SERVER_CONFIG, server_shutdown_rx)
             .await
             .unwrap();
     });
@@ -79,7 +83,7 @@ async fn http_routing() -> Result<()> {
     info!("restart the client");
     let client_shutdown_rx = client_shutdown_tx.subscribe();
     let client = tokio::spawn(async move {
-        run_rathole_client("tests/for_tcp/tcp_transport.toml", client_shutdown_rx)
+        run_rathole_client(CLIENT_NAME, SERVER_ADDR, CLIENT_TOKEN, client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -96,7 +100,7 @@ async fn http_routing() -> Result<()> {
     info!("restart the server");
     let server_shutdown_rx = server_shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
-        run_rathole_server("tests/for_tcp/tcp_transport.toml", server_shutdown_rx)
+        run_rathole_server(SERVER_CONFIG, server_shutdown_rx)
             .await
             .unwrap();
     });
@@ -165,7 +169,11 @@ async fn http_404_check(addr: &'static str, host: &'static str) -> Result<()> {
 
     let text = String::from_utf8_lossy(&response);
     debug!("{}", text);
-    assert!(text.starts_with("HTTP/1.1 404"), "unexpected response: {}", text);
+    assert!(
+        text.starts_with("HTTP/1.1 404"),
+        "unexpected response: {}",
+        text
+    );
 
     Ok(())
 }

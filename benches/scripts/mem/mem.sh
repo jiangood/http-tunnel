@@ -22,13 +22,13 @@ kill $(jobs -p)
 
 echo rathole
 
-pid_s=$(ps aux | grep "rathole -s" | head -n 1 | awk '{print $2}')
+pid_s=$(ps aux | grep "rathole server" | head -n 1 | awk '{print $2}')
 while true; do
 	ps --pid $pid_s -o rsz= >> ratholec-mem.log
 sleep 1
 done &
 
-pid_c=$(ps aux | grep "rathole -c" | head -n 1 | awk '{print $2}')
+pid_c=$(ps aux | grep "rathole client" | head -n 1 | awk '{print $2}')
 while true; do
 	ps --pid $pid_c -o rsz= >> ratholes-mem.log
 sleep 1

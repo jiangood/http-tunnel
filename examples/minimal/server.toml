@@ -1,7 +1,9 @@
-[server]
 bind_addr = "0.0.0.0:2333" # The address that the server listens for clients
 http_bind_addr = "0.0.0.0:80" # The HTTP entrypoint, routed by the `Host` header
-default_token = "123"
 
-[server.services.foo1]
+[clients.home] # The name must be identical to the `--name` of the client
+token = "123" # The token of the client
+
+[clients.home.services.foo1]
 hosts = ["foo1.example.com"] # Requests with this `Host` are forwarded to service `foo1`
+local_addr = "127.0.0.1:80" # The address of the service on the client side
