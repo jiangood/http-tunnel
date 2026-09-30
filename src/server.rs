@@ -17,7 +17,7 @@ use backoff::ExponentialBackoff;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{copy_bidirectional, AsyncWriteExt};
@@ -64,7 +64,7 @@ pub(crate) type ControlChannelMap = MultiMap<ServiceDigest, Nonce, ControlChanne
 // `id` identifies the connection that owns the handle, so that a connection only
 // removes its own handle when it goes away.
 struct ConfigChannelHandle {
-    id: u64,
+    id: usize,
     tx: mpsc::Sender<ClientConfig>,
 }
 
@@ -86,7 +86,7 @@ pub(crate) struct ServerState {
     // The config channels of the connected clients, keyed by the client digest
     config_channels: RwLock<HashMap<ClientDigest, ConfigChannelHandle>>,
     // A monotonically increasing id, identifying a config channel connection
-    next_conn_id: AtomicU64,
+    next_conn_id: AtomicUsize,
     // Serialize the configuration changes, so that two concurrent applies can't
     // overwrite each other
     apply_lock: Mutex<()>,
@@ -180,7 +180,7 @@ impl ServerState {
             control_channels: RwLock::new(ControlChannelMap::new()),
             routing_table: RwLock::new(routing_table),
             config_channels: RwLock::new(HashMap::new()),
-            next_conn_id: AtomicU64::new(0),
+            next_conn_id: AtomicUsize::new(0),
             apply_lock: Mutex::new(()),
         }
     }
