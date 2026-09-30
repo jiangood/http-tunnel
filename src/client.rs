@@ -11,11 +11,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::future::retry_notify;
 use backoff::ExponentialBackoff;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{copy_bidirectional, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, instrument, warn, Instrument, Span};
 
@@ -44,35 +44,29 @@ impl Client {
 
     // The entrypoint of Client
     async fn run(&mut self, mut shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-        // The client has no config of its own. It's pushed by the server
-        let config = match fetch_config(&self.args, &shutdown_rx).await {
-            Ok(config) => config,
-            Err(e) => {
-                if is_shutdown(&mut shutdown_rx) {
-                    return Ok(());
-                }
-                return Err(e);
-            }
-        };
+        // The client has no config of its own. It's pushed by the server, and the
+        // server keeps the config channel open to push the updates made through the
+        // administration API.
+        let (config_tx, mut config_rx) = mpsc::channel::<ClientConfig>(4);
 
-        let token = MaskedString::from(self.args.token.as_str());
-
-        for service in &config.services {
-            // Create a control channel for each service pushed by the server
-            let handle = ControlChannelHandle::new(
-                (*service).clone(),
-                token.clone(),
-                self.args.remote.clone(),
-                config.heartbeat_timeout,
-            );
-            self.service_handles.insert(service.name.clone(), handle);
+        {
+            let args = self.args.clone();
+            let shutdown_rx = shutdown_rx.resubscribe();
+            tokio::spawn(async move {
+                run_config_session(args, config_tx, shutdown_rx).await;
+            });
         }
 
-        // Wait for the shutdown signal
-        match shutdown_rx.recv().await {
-            Ok(_) => {}
-            Err(err) => {
-                error!("Unable to listen for shutdown signal: {}", err);
+        loop {
+            tokio::select! {
+                maybe = config_rx.recv() => {
+                    match maybe {
+                        Some(config) => self.reconcile(config),
+                        // The config session gave up, which shouldn't happen
+                        None => break,
+                    }
+                }
+                _ = shutdown_rx.recv() => break,
             }
         }
 
@@ -83,6 +77,49 @@ impl Client {
 
         Ok(())
     }
+
+    // Make the pushed config effective: start the new services, stop the removed
+    // ones, and restart the ones whose config changed.
+    fn reconcile(&mut self, config: ClientConfig) {
+        let token = MaskedString::from(self.args.token.as_str());
+
+        let names: HashSet<&str> = config.services.iter().map(|s| s.name.as_str()).collect();
+
+        let stale: Vec<String> = self
+            .service_handles
+            .keys()
+            .filter(|n| !names.contains(n.as_str()))
+            .cloned()
+            .collect();
+        for name in stale {
+            if let Some(handle) = self.service_handles.remove(&name) {
+                info!("Stopping the service `{}`", name);
+                handle.shutdown();
+            }
+        }
+
+        for service in &config.services {
+            let restart = match self.service_handles.get(&service.name) {
+                Some(handle) => !handle.matches(service, config.heartbeat_timeout),
+                None => true,
+            };
+            if !restart {
+                continue;
+            }
+
+            if let Some(handle) = self.service_handles.remove(&service.name) {
+                handle.shutdown();
+            }
+
+            let handle = ControlChannelHandle::new(
+                service.clone(),
+                token.clone(),
+                self.args.remote.clone(),
+                config.heartbeat_timeout,
+            );
+            self.service_handles.insert(service.name.clone(), handle);
+        }
+    }
 }
 
 // Check whether the shutdown signal has arrived
@@ -90,38 +127,49 @@ fn is_shutdown(shutdown_rx: &mut broadcast::Receiver<bool>) -> bool {
     shutdown_rx.try_recv() != Err(broadcast::error::TryRecvError::Empty)
 }
 
-// Fetch the config from the server, retrying until it succeeds or the client shuts down
-async fn fetch_config(
-    args: &ClientArgs,
-    shutdown_rx: &broadcast::Receiver<bool>,
-) -> Result<ClientConfig> {
-    // Subscribe a new receiver, so that the shutdown signal isn't consumed here
-    let mut shutdown_rx = shutdown_rx.resubscribe();
-
-    // Retry at least every 100ms
-    let backoff = ExponentialBackoff {
+// Keep a config channel open, feeding the pushed configs to the reconciliation loop.
+// It reconnects with a backoff when the channel drops.
+async fn run_config_session(
+    args: ClientArgs,
+    tx: mpsc::Sender<ClientConfig>,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+) {
+    let mut backoff = ExponentialBackoff {
         max_interval: Duration::from_secs(DEFAULT_FETCH_RETRY_INTERVAL_SECS),
         max_elapsed_time: None,
         ..Default::default()
     };
 
-    tokio::select! {
-        v = retry_notify(
-            backoff,
-            || async {
-                try_fetch_config(args)
-                    .await
-                    .map_err(backoff::Error::transient)
-            },
-            |e, duration| {
-                error!("{:#}. Retry in {:?}", e, duration);
-            },
-        ) => v,
-        _ = shutdown_rx.recv() => Err(anyhow!("shutdown")),
+    loop {
+        if let Err(e) = run_config_connection(&args, &tx, &shutdown_rx).await {
+            if is_shutdown(&mut shutdown_rx) {
+                return;
+            }
+            error!("{:#}", e);
+        }
+
+        if is_shutdown(&mut shutdown_rx) {
+            return;
+        }
+
+        let duration = backoff
+            .next_backoff()
+            .unwrap_or(Duration::from_secs(DEFAULT_FETCH_RETRY_INTERVAL_SECS));
+        tokio::select! {
+            _ = time::sleep(duration) => {}
+            _ = shutdown_rx.recv() => return,
+        }
     }
 }
 
-async fn try_fetch_config(args: &ClientArgs) -> Result<ClientConfig> {
+// Fetch the config and then keep reading the config updates pushed by the server
+async fn run_config_connection(
+    args: &ClientArgs,
+    tx: &mpsc::Sender<ClientConfig>,
+    shutdown_rx: &broadcast::Receiver<bool>,
+) -> Result<()> {
+    let mut shutdown_rx = shutdown_rx.resubscribe();
+
     let mut remote_addr = AddrMaybeCached::new(&args.remote);
     remote_addr.resolve().await.with_context(|| {
         format!(
@@ -174,16 +222,24 @@ async fn try_fetch_config(args: &ClientArgs) -> Result<ClientConfig> {
         }
     }
 
-    // Read the config pushed by the server
-    let config: ClientConfig = protocol::read_payload(&mut conn)
-        .await
-        .with_context(|| "Failed to read the config")?;
-    info!(
-        "Got the config from the server. {} service(s)",
-        config.services.len()
-    );
+    info!("Config channel established");
 
-    Ok(config)
+    // Read the config pushed by the server, including the later updates
+    loop {
+        tokio::select! {
+            config = protocol::read_payload::<ClientConfig, _>(&mut conn) => {
+                let config = config.with_context(|| "Failed to read the config")?;
+                info!(
+                    "Got the config from the server. {} service(s)",
+                    config.services.len()
+                );
+                if tx.send(config).await.is_err() {
+                    bail!("The client is shutting down");
+                }
+            }
+            _ = shutdown_rx.recv() => return Ok(()),
+        }
+    }
 }
 
 struct RunDataChannelArgs {
@@ -270,6 +326,17 @@ type Nonce = protocol::Digest;
 // Dropping it will also drop the actual control channel
 struct ControlChannelHandle {
     shutdown_tx: oneshot::Sender<u8>,
+    // Keep the config that the channel was created with, so that it can be compared
+    // with the config pushed later
+    service: ClientServiceConfig,
+    heartbeat_timeout: u64,
+}
+
+impl ControlChannelHandle {
+    // Whether the channel is already serving the given config
+    fn matches(&self, service: &ClientServiceConfig, heartbeat_timeout: u64) -> bool {
+        &self.service == service && self.heartbeat_timeout == heartbeat_timeout
+    }
 }
 
 impl ControlChannel {
@@ -378,6 +445,7 @@ impl ControlChannelHandle {
 
         let mut retry_backoff = run_control_chan_backoff(service.retry_interval);
 
+        let handle_service = service.clone();
         let mut s = ControlChannel {
             digest,
             service,
@@ -419,7 +487,11 @@ impl ControlChannelHandle {
             .instrument(Span::current()),
         );
 
-        ControlChannelHandle { shutdown_tx }
+        ControlChannelHandle {
+            shutdown_tx,
+            service: handle_service,
+            heartbeat_timeout,
+        }
     }
 
     fn shutdown(self) {

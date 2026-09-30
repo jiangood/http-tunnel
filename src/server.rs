@@ -1,28 +1,33 @@
-use crate::config::{ClientConfig, MaskedString, ServerConfig, ServerServiceConfig};
+use crate::config::{
+    ClientConfig, MaskedString, ServerClientConfig, ServerConfig, ServerServiceConfig,
+};
 use crate::constants::listen_backoff;
 use crate::helper::{retry_notify_with_deadline, write_and_flush};
+use crate::http::RoutingTable;
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ConfigChannelHello, ControlChannelHello, DataChannelHello};
 use crate::protocol::{
     self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, HASH_WIDTH_IN_BYTES,
 };
 use crate::transport::SocketOpts;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
 
 use rand::RngCore;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{copy_bidirectional, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
-type ServiceDigest = protocol::Digest; // SHA256 of a service name
-type ClientDigest = protocol::Digest; // SHA256 of a client name
+pub(crate) type ServiceDigest = protocol::Digest; // SHA256 of a service name
+pub(crate) type ClientDigest = protocol::Digest; // SHA256 of a client name
 type Nonce = protocol::Digest; // Also called `session_key`
 
 const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP services
@@ -37,16 +42,16 @@ pub(crate) struct HttpVisitor {
 }
 
 // A client of `[clients]`, together with the config that is pushed to it
-#[derive(Clone)]
-struct ServerClient {
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ServerClient {
     name: String,
     token: MaskedString,
     config: ClientConfig,
 }
 
 // A service, together with the token of the client that serves it
-#[derive(Clone)]
-struct ServiceRuntime {
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ServiceRuntime {
     config: ServerServiceConfig,
     token: MaskedString,
 }
@@ -55,30 +60,62 @@ struct ServiceRuntime {
 // See also MultiMap
 pub(crate) type ControlChannelMap = MultiMap<ServiceDigest, Nonce, ControlChannelHandle>;
 
+// A registered config channel, so that the config updates can be pushed to the client.
+// `id` identifies the connection that owns the handle, so that a connection only
+// removes its own handle when it goes away.
+struct ConfigChannelHandle {
+    id: u64,
+    tx: mpsc::Sender<ClientConfig>,
+}
+
+// ServerState holds all the mutable state of a running server. It's shared by the
+// server tasks and the administration API.
+pub(crate) struct ServerState {
+    // The path of the config file, to write the changes back to
+    pub(crate) config_path: PathBuf,
+    // The authoritative configuration, mutated by the administration API
+    pub(crate) config: RwLock<ServerConfig>,
+    // `[clients.<client>.services]`, indexed by ServiceDigest
+    pub(crate) services: RwLock<HashMap<ServiceDigest, ServiceRuntime>>,
+    // `[clients]`, indexed by the digest of the client name
+    pub(crate) clients: RwLock<HashMap<ClientDigest, ServerClient>>,
+    // Collection of control channels
+    pub(crate) control_channels: RwLock<ControlChannelMap>,
+    // `Host` -> ServiceDigest
+    pub(crate) routing_table: RwLock<RoutingTable>,
+    // The config channels of the connected clients, keyed by the client digest
+    config_channels: RwLock<HashMap<ClientDigest, ConfigChannelHandle>>,
+    // A monotonically increasing id, identifying a config channel connection
+    next_conn_id: AtomicU64,
+    // Serialize the configuration changes, so that two concurrent applies can't
+    // overwrite each other
+    apply_lock: Mutex<()>,
+}
+
 // The entrypoint of running a server
 pub async fn run_server(
     config: ServerConfig,
+    config_path: PathBuf,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let mut server = Server::from(config).await?;
+    let mut server = Server::from(config, config_path).await?;
     server.run(shutdown_rx).await?;
 
     Ok(())
 }
 
+// The settings of the administration API, derived from the config
+struct ApiConfig {
+    bind_addr: String,
+    token: String,
+}
+
 // Server holds all states of running a server
 struct Server {
-    // The whole config
-    config: Arc<ServerConfig>,
-
-    // `[clients.<client>.services]`, indexed by ServiceDigest
-    services: Arc<RwLock<HashMap<ServiceDigest, ServiceRuntime>>>,
-    // `[clients]`, indexed by the digest of the client name
-    clients: Arc<RwLock<HashMap<ClientDigest, ServerClient>>>,
-    // Collection of control channels
-    control_channels: Arc<RwLock<ControlChannelMap>>,
-    // `Host` -> ServiceDigest
-    routing_table: Arc<RwLock<crate::http::RoutingTable>>,
+    state: Arc<ServerState>,
+    bind_addr: String,
+    http_bind_addr: String,
+    api: Option<ApiConfig>,
 }
 
 // Generate the services of all the clients, indexed by ServiceDigest
@@ -117,7 +154,7 @@ fn generate_client_hashmap(server_config: &ServerConfig) -> HashMap<ClientDigest
 }
 
 // Generate a routing table which maps a `Host` to a ServiceDigest
-fn generate_routing_table(server_config: &ServerConfig) -> crate::http::RoutingTable {
+fn generate_routing_table(server_config: &ServerConfig) -> RoutingTable {
     let mut ret = HashMap::new();
     for client in server_config.clients.values() {
         for (name, s) in &client.services {
@@ -130,20 +167,241 @@ fn generate_routing_table(server_config: &ServerConfig) -> crate::http::RoutingT
     ret
 }
 
+impl ServerState {
+    fn new(config: ServerConfig, config_path: PathBuf) -> ServerState {
+        let services = generate_service_hashmap(&config);
+        let clients = generate_client_hashmap(&config);
+        let routing_table = generate_routing_table(&config);
+        ServerState {
+            config_path,
+            config: RwLock::new(config),
+            services: RwLock::new(services),
+            clients: RwLock::new(clients),
+            control_channels: RwLock::new(ControlChannelMap::new()),
+            routing_table: RwLock::new(routing_table),
+            config_channels: RwLock::new(HashMap::new()),
+            next_conn_id: AtomicU64::new(0),
+            apply_lock: Mutex::new(()),
+        }
+    }
+
+    /// Apply a change to the configuration and make it effective at runtime.
+    ///
+    /// The candidate is validated and written back to the config file first, so that
+    /// a failed write leaves the runtime untouched. Then the derived maps are rebuilt,
+    /// the tunnels of the removed or changed services are dropped, and the client
+    /// configs are pushed to the affected connected clients.
+    pub(crate) async fn apply<F>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut ServerConfig) -> Result<()>,
+    {
+        let _guard = self.apply_lock.lock().await;
+
+        let mut config = self.config.read().await.clone();
+        f(&mut config)?;
+        ServerConfig::validate(&mut config)?;
+
+        self.persist(&config)
+            .await
+            .with_context(|| "Failed to write the config back")?;
+
+        let new_services = generate_service_hashmap(&config);
+        let new_clients = generate_client_hashmap(&config);
+        let new_routing_table = generate_routing_table(&config);
+
+        // Diff the clients before the map is replaced
+        let (changed_clients, removed_clients) = {
+            let old = self.clients.read().await;
+            let changed: Vec<ClientDigest> = new_clients
+                .iter()
+                .filter(|(d, c)| old.get(*d) != Some(*c))
+                .map(|(d, _)| *d)
+                .collect();
+            let removed: Vec<ClientDigest> = old
+                .keys()
+                .filter(|d| !new_clients.contains_key(*d))
+                .copied()
+                .collect();
+            (changed, removed)
+        };
+
+        // Drop the control channels of the removed or changed services. Dropping the
+        // handle shuts the control channel down, so the client reconnects and picks up
+        // the change.
+        {
+            let old_services = self.services.read().await;
+            let mut ccs = self.control_channels.write().await;
+            for (digest, old) in old_services.iter() {
+                if new_services.get(digest) != Some(old) {
+                    ccs.remove1(digest);
+                }
+            }
+        }
+
+        // Replace the derived maps
+        *self.services.write().await = new_services;
+        *self.routing_table.write().await = new_routing_table;
+
+        // Drop the config channels of the removed clients
+        {
+            let mut chans = self.config_channels.write().await;
+            for d in &removed_clients {
+                chans.remove(d);
+            }
+        }
+
+        // Push the new config to the connected clients whose config changed
+        {
+            let chans = self.config_channels.read().await;
+            for d in &changed_clients {
+                if let Some(handle) = chans.get(d) {
+                    if let Some(client) = new_clients.get(d) {
+                        let _ = handle.tx.try_send(client.config.clone());
+                    }
+                }
+            }
+        }
+
+        *self.clients.write().await = new_clients;
+        *self.config.write().await = config;
+
+        Ok(())
+    }
+
+    /// Write the configuration back to the config file atomically
+    async fn persist(&self, config: &ServerConfig) -> Result<()> {
+        let s = config.to_toml()?;
+        let tmp = self.config_path.with_extension("toml.tmp");
+        tokio::fs::write(&tmp, s.as_bytes())
+            .await
+            .with_context(|| format!("Failed to write the temporary config {:?}", tmp))?;
+        tokio::fs::rename(&tmp, &self.config_path)
+            .await
+            .with_context(|| format!("Failed to replace the config {:?}", self.config_path))?;
+        Ok(())
+    }
+
+    /// Create a client
+    pub(crate) async fn create_client(
+        &self,
+        name: String,
+        client: ServerClientConfig,
+    ) -> Result<()> {
+        if name.is_empty() {
+            bail!("The name of the client must not be empty");
+        }
+        self.apply(move |config| {
+            if config.clients.contains_key(&name) {
+                bail!("The client `{}` already exists", name);
+            }
+            config.clients.insert(name, client);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Read the current configuration
+    pub(crate) async fn snapshot(&self) -> ServerConfig {
+        self.config.read().await.clone()
+    }
+
+    /// Update a client in place
+    pub(crate) async fn update_client<F>(&self, name: &str, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut ServerClientConfig) -> Result<()>,
+    {
+        let name = name.to_string();
+        self.apply(move |config| {
+            let client = config
+                .clients
+                .get_mut(&name)
+                .ok_or_else(|| anyhow!("No such a client `{}`", name))?;
+            f(client)
+        })
+        .await
+    }
+
+    /// Delete a client together with its services
+    pub(crate) async fn delete_client(&self, name: &str) -> Result<()> {
+        let name = name.to_string();
+        self.apply(move |config| {
+            if config.clients.remove(&name).is_none() {
+                bail!("No such a client `{}`", name);
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Create or replace a service of a client
+    pub(crate) async fn put_service(
+        &self,
+        client: &str,
+        service: String,
+        service_config: ServerServiceConfig,
+    ) -> Result<()> {
+        if service.is_empty() {
+            bail!("The name of the service must not be empty");
+        }
+        let client = client.to_string();
+        self.apply(move |config| {
+            let c = config
+                .clients
+                .get_mut(&client)
+                .ok_or_else(|| anyhow!("No such a client `{}`", client))?;
+            c.services.insert(service, service_config);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Delete a service of a client
+    pub(crate) async fn delete_service(&self, client: &str, service: &str) -> Result<()> {
+        let client = client.to_string();
+        let service = service.to_string();
+        self.apply(move |config| {
+            let c = config
+                .clients
+                .get_mut(&client)
+                .ok_or_else(|| anyhow!("No such a client `{}`", client))?;
+            if c.services.remove(&service).is_none() {
+                bail!("No such a service `{}` of the client `{}`", service, client);
+            }
+            Ok(())
+        })
+        .await
+    }
+}
+
 impl Server {
     // Create a server from the config
-    pub async fn from(config: ServerConfig) -> Result<Server> {
-        let config = Arc::new(config);
-        let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
-        let clients = Arc::new(RwLock::new(generate_client_hashmap(&config)));
-        let routing_table = Arc::new(RwLock::new(generate_routing_table(&config)));
-        let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
+    pub async fn from(mut config: ServerConfig, config_path: PathBuf) -> Result<Server> {
+        ServerConfig::validate(&mut config)?;
+
+        let api = match (&config.api_bind_addr, &config.api_token) {
+            (Some(bind_addr), Some(token)) => Some(ApiConfig {
+                bind_addr: bind_addr.clone(),
+                token: token.to_string(),
+            }),
+            (Some(_), None) => bail!(
+                "`api_bind_addr` is set but `api_token` is not. The administration API requires a token"
+            ),
+            (None, Some(_)) => {
+                warn!("`api_token` is set but `api_bind_addr` is not. The administration API is disabled");
+                None
+            }
+            (None, None) => None,
+        };
+
+        let bind_addr = config.bind_addr.clone();
+        let http_bind_addr = config.http_bind_addr.clone();
+        let state = Arc::new(ServerState::new(config, config_path));
+
         Ok(Server {
-            config,
-            services,
-            clients,
-            control_channels,
-            routing_table,
+            state,
+            bind_addr,
+            http_bind_addr,
+            api,
         })
     }
 
@@ -152,7 +410,7 @@ impl Server {
         // Listen at `bind_addr` for the control and data channels of clients
         let l: TcpListener = retry_notify_with_deadline(
             listen_backoff(),
-            || async { Ok(TcpListener::bind(&self.config.bind_addr).await?) },
+            || async { Ok(TcpListener::bind(&self.bind_addr).await?) },
             |e, duration| {
                 error!("{:#}. Retry in {:?}", e, duration);
             },
@@ -161,15 +419,25 @@ impl Server {
         .await
         .with_context(|| "Failed to listen at `bind_addr`")?;
 
-        info!("Listening at {}", self.config.bind_addr);
+        info!("Listening at {}", self.bind_addr);
 
         // Run the HTTP entrypoint which routes visitors by the `Host` header
         let http_task = tokio::spawn(crate::http::serve(
-            self.config.http_bind_addr.clone(),
-            self.routing_table.clone(),
-            self.control_channels.clone(),
+            self.http_bind_addr.clone(),
+            self.state.clone(),
             shutdown_rx.resubscribe(),
         ));
+
+        // Run the administration API and the web UI, if configured
+        let api_task = match &self.api {
+            Some(api) => Some(tokio::spawn(crate::admin::serve(
+                api.bind_addr.clone(),
+                api.token.clone(),
+                self.state.clone(),
+                shutdown_rx.resubscribe(),
+            ))),
+            None => None,
+        };
 
         // Retry at least every 100ms
         let mut backoff = ExponentialBackoff {
@@ -203,12 +471,9 @@ impl Server {
                                 Ok(conn) => {
                                     match conn.with_context(|| "Failed to do transport handshake") {
                                         Ok(conn) => {
-                                            let services = self.services.clone();
-                                            let clients = self.clients.clone();
-                                            let control_channels = self.control_channels.clone();
-                                            let server_config = self.config.clone();
+                                            let state = self.state.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, clients, control_channels, server_config).await {
+                                                if let Err(err) = handle_connection(conn, state).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -233,6 +498,15 @@ impl Server {
         }
 
         let _ = http_task.await;
+        if let Some(api_task) = api_task {
+            let _ = api_task.await;
+        }
+
+        // Drop the tunnels and the config channels, so that the clients reconnect (and
+        // pick up the fresh state) when the server is restarted. Without this, the
+        // in-process tasks of this server would keep the connections alive.
+        *self.state.control_channels.write().await = ControlChannelMap::new();
+        self.state.config_channels.write().await.clear();
 
         info!("Shutdown");
 
@@ -246,40 +520,29 @@ async fn handshake(conn: TcpStream) -> Result<TcpStream> {
 }
 
 // Handle connections to `bind_addr`
-async fn handle_connection(
-    mut conn: TcpStream,
-    services: Arc<RwLock<HashMap<ServiceDigest, ServiceRuntime>>>,
-    clients: Arc<RwLock<HashMap<ClientDigest, ServerClient>>>,
-    control_channels: Arc<RwLock<ControlChannelMap>>,
-    server_config: Arc<ServerConfig>,
-) -> Result<()> {
+async fn handle_connection(mut conn: TcpStream, state: Arc<ServerState>) -> Result<()> {
     // Read hello
     let hello = read_hello(&mut conn).await?;
     match hello {
         ControlChannelHello(_, service_digest) => {
-            do_control_channel_handshake(
-                conn,
-                services,
-                control_channels,
-                service_digest,
-                server_config,
-            )
-            .await?;
+            do_control_channel_handshake(conn, state, service_digest).await?;
         }
         ConfigChannelHello(_, client_digest) => {
-            do_config_channel_handshake(conn, clients, client_digest).await?;
+            do_config_channel_handshake(conn, state, client_digest).await?;
         }
         DataChannelHello(_, nonce) => {
-            do_data_channel_handshake(conn, control_channels, nonce).await?;
+            do_data_channel_handshake(conn, state, nonce).await?;
         }
     }
     Ok(())
 }
 
-// Push the config of a client to it. The client doesn't have any config of its own
+// Push the config of a client to it, and keep the config channel open to push the
+// updates made through the administration API. The client doesn't have any config
+// of its own.
 async fn do_config_channel_handshake(
     mut conn: TcpStream,
-    clients: Arc<RwLock<HashMap<ClientDigest, ServerClient>>>,
+    state: Arc<ServerState>,
     client_digest: ClientDigest,
 ) -> Result<()> {
     info!("Try to handshake a config channel");
@@ -300,7 +563,7 @@ async fn do_config_channel_handshake(
     conn.flush().await?;
 
     // Lookup the client
-    let client = clients.read().await.get(&client_digest).cloned();
+    let client = state.clients.read().await.get(&client_digest).cloned();
     let Some(client) = client else {
         conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
             .await?;
@@ -331,20 +594,60 @@ async fn do_config_channel_handshake(
         .await?;
     conn.flush().await?;
 
-    // Push the config
-    protocol::write_payload(&mut conn, &client.config).await?;
+    // Register the config channel before pushing, so that a change made through the
+    // API in the meantime isn't missed. Replacing a previous handle drops its sender,
+    // which makes the stale connection exit.
+    let (tx, mut rx) = mpsc::channel::<ClientConfig>(CHAN_SIZE);
+    let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut chans = state.config_channels.write().await;
+        chans.insert(client_digest, ConfigChannelHandle { id: conn_id, tx });
+    }
 
+    // Push the freshest config, then the later updates, until the client goes away
+    let push_result = {
+        let latest = state.clients.read().await.get(&client_digest).cloned();
+        match latest {
+            Some(latest) => run_config_push(&mut conn, &latest, &mut rx).await,
+            None => Ok(()),
+        }
+    };
+
+    // Only remove our own handle, so that a reconnected client isn't dropped
+    {
+        let mut chans = state.config_channels.write().await;
+        if chans.get(&client_digest).map(|h| h.id) == Some(conn_id) {
+            chans.remove(&client_digest);
+        }
+    }
+
+    push_result
+}
+
+// Push the config of a client to it, then the pushed updates, until the channel fails
+async fn run_config_push(
+    conn: &mut TcpStream,
+    client: &ServerClient,
+    rx: &mut mpsc::Receiver<ClientConfig>,
+) -> Result<()> {
+    protocol::write_payload(conn, &client.config).await?;
     info!(client = %client.name, services = client.config.services.len(), "Config pushed");
+
+    while let Some(config) = rx.recv().await {
+        if let Err(e) = protocol::write_payload(conn, &config).await {
+            debug!("Failed to push the config to {}: {:#}", client.name, e);
+            break;
+        }
+        info!(client = %client.name, services = config.services.len(), "Config pushed");
+    }
 
     Ok(())
 }
 
 async fn do_control_channel_handshake(
     mut conn: TcpStream,
-    services: Arc<RwLock<HashMap<ServiceDigest, ServiceRuntime>>>,
-    control_channels: Arc<RwLock<ControlChannelMap>>,
+    state: Arc<ServerState>,
     service_digest: ServiceDigest,
-    server_config: Arc<ServerConfig>,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
@@ -364,7 +667,7 @@ async fn do_control_channel_handshake(
     conn.flush().await?;
 
     // Lookup the service
-    let service = match services.read().await.get(&service_digest) {
+    let service = match state.services.read().await.get(&service_digest) {
         Some(v) => v,
         None => {
             conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
@@ -396,7 +699,8 @@ async fn do_control_channel_handshake(
         );
         bail!("Service {} failed the authentication", service_name);
     } else {
-        let mut h = control_channels.write().await;
+        let heartbeat_interval = state.config.read().await.heartbeat_interval;
+        let mut h = state.control_channels.write().await;
 
         // If there's already a control channel for the service, then drop the old one.
         // Because a control channel doesn't report back when it's dead,
@@ -415,8 +719,7 @@ async fn do_control_channel_handshake(
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");
-        let handle =
-            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
+        let handle = ControlChannelHandle::new(conn, service_config, heartbeat_interval);
 
         // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);
@@ -427,13 +730,13 @@ async fn do_control_channel_handshake(
 
 async fn do_data_channel_handshake(
     conn: TcpStream,
-    control_channels: Arc<RwLock<ControlChannelMap>>,
+    state: Arc<ServerState>,
     nonce: Nonce,
 ) -> Result<()> {
     debug!("Try to handshake a data channel");
 
     // Validate
-    let control_channels_guard = control_channels.read().await;
+    let control_channels_guard = state.control_channels.read().await;
     match control_channels_guard.get2(&nonce) {
         Some(handle) => {
             SocketOpts::from_server_cfg(&handle.service).apply(&conn);

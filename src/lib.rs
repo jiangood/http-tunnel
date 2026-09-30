@@ -19,6 +19,8 @@ mod client;
 use client::run_client;
 
 #[cfg(feature = "server")]
+mod admin;
+#[cfg(feature = "server")]
 mod http;
 #[cfg(feature = "server")]
 mod server;
@@ -38,7 +40,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
             {
                 let config = crate::config::ServerConfig::from_file(&args.config_path).await?;
                 debug!("{:?}", config);
-                run_server(config, shutdown_rx).await
+                run_server(config, args.config_path.clone(), shutdown_rx).await
             }
         }
         Command::Client(args) => {

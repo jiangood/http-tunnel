@@ -84,9 +84,11 @@ pub struct ServerServiceConfig {
     pub local_addr: String,
     /// Whether to enable TCP_NODELAY. Defaults to `[clients.<client>].nodelay`,
     /// then to `true`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodelay: Option<bool>,
     /// The interval between retries to connect to the server. Defaults to
     /// `[clients.<client>].retry_interval`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_interval: Option<u64>,
 }
 
@@ -101,10 +103,13 @@ pub struct ServerClientConfig {
     /// The token of the client. It's the only way for the client to authenticate
     pub token: MaskedString,
     /// Application-layer heartbeat timeout in secs. 0 disables it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat_timeout: Option<u64>,
     /// The interval between retries to connect to the server
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_interval: Option<u64>,
     /// Whether to enable TCP_NODELAY for the services of this client
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodelay: Option<bool>,
     pub services: HashMap<String, ServerServiceConfig>,
 }
@@ -153,7 +158,16 @@ pub struct ServerConfig {
     pub http_bind_addr: String,
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
+    /// The address that the administration API and the minimal web UI listen at.
+    /// The API is only started when both this and `api_token` are set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_bind_addr: Option<String>,
+    /// The token required by the administration API (`Authorization: Bearer <token>`).
+    /// The API is only started when both this and `api_bind_addr` are set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<MaskedString>,
     /// The clients that are allowed to connect, indexed by the name of the client
+    #[serde(default)]
     pub clients: HashMap<String, ServerClientConfig>,
 }
 
@@ -189,21 +203,21 @@ impl ServerConfig {
         })
     }
 
-    fn validate(config: &mut ServerConfig) -> Result<()> {
-        if config.clients.is_empty() {
-            bail!("No client is defined in `[clients]`");
-        }
-
+    /// Validate a configuration and normalize it in place: fill the names from the
+    /// map keys, lowercase the hosts, and reject the ambiguous definitions.
+    ///
+    /// A client without any service is allowed, so that a configuration can be built
+    /// incrementally through the administration API. The rules that are enforced:
+    /// a client must have a token, the service names are global, a host belongs to a
+    /// single service, and the tokens are unique (a duplicated token would let a
+    /// client impersonate another one).
+    pub fn validate(config: &mut ServerConfig) -> Result<()> {
         // host -> service name and service name -> client name
         let mut seen_hosts: HashMap<String, String> = HashMap::new();
         let mut seen_services: HashMap<String, String> = HashMap::new();
 
         for (client_name, client) in &mut config.clients {
             client.name = client_name.clone();
-
-            if client.services.is_empty() {
-                bail!("No service is defined for the client `{}`", client_name);
-            }
 
             for (service_name, s) in &mut client.services {
                 s.name = service_name.clone();
@@ -251,6 +265,10 @@ impl ServerConfig {
         // A duplicated token allows a client to impersonate another one
         let mut seen_tokens: HashMap<String, String> = HashMap::new();
         for (client_name, client) in &config.clients {
+            if client.token.is_empty() {
+                bail!("The token of the client `{}` is empty", client_name);
+            }
+
             if let Some(prev) = seen_tokens.insert(client.token.0.clone(), client_name.clone()) {
                 bail!(
                     "The token of the client `{}` is also used by the client `{}`",
@@ -261,6 +279,12 @@ impl ServerConfig {
         }
 
         Ok(())
+    }
+
+    /// Serialize the configuration back to TOML, so that it can be written back to
+    /// the file after a change made through the administration API.
+    pub fn to_toml(&self) -> Result<String> {
+        toml::to_string(self).with_context(|| "Failed to serialize the config")
     }
 }
 
@@ -354,14 +378,13 @@ mod tests {
             ..Default::default()
         };
 
-        // No client is rejected
-        assert!(ServerConfig::validate(&mut cfg).is_err());
+        // A config without any client is allowed, so that it can be built incrementally
+        assert!(ServerConfig::validate(&mut cfg).is_ok());
 
+        // A client without any service is allowed as well
         cfg.clients
             .insert("home".into(), client("home", "123", vec![]));
-
-        // No service is rejected
-        assert!(ServerConfig::validate(&mut cfg).is_err());
+        assert!(ServerConfig::validate(&mut cfg).is_ok());
 
         cfg.clients.insert(
             "home".into(),
@@ -550,6 +573,73 @@ local_addr = "127.0.0.1:80"
 "#;
         let cfg = ServerConfig::from_str(s)?;
         assert_eq!(cfg.clients["home"].services["foo1"].name, "foo1");
+        Ok(())
+    }
+
+    #[test]
+    fn test_rejects_an_empty_token() -> Result<()> {
+        let s = r#"
+bind_addr = "0.0.0.0:2333"
+http_bind_addr = "0.0.0.0:80"
+
+[clients.home]
+token = ""
+
+[clients.home.services.foo1]
+hosts = ["foo1.example.com"]
+local_addr = "127.0.0.1:80"
+"#;
+        assert!(ServerConfig::from_str(s).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_roundtrip() -> Result<()> {
+        let s = r#"
+bind_addr = "0.0.0.0:2333"
+http_bind_addr = "0.0.0.0:80"
+api_bind_addr = "127.0.0.1:2335"
+api_token = "admin_secret"
+
+[clients.home]
+token = "123"
+heartbeat_timeout = 40
+
+[clients.home.services.foo1]
+hosts = ["foo1.example.com"]
+local_addr = "127.0.0.1:80"
+nodelay = false
+"#;
+        let cfg = ServerConfig::from_str(s)?;
+        let dumped = cfg.to_toml()?;
+        // The dump must be parseable again and preserve the structure
+        let reparsed = ServerConfig::from_str(&dumped)?;
+        assert_eq!(cfg, reparsed);
+        assert!(dumped.contains("api_token = \"admin_secret\""));
+        assert!(dumped.contains("[clients.home.services.foo1]"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_roundtrip_without_optional_fields() -> Result<()> {
+        let s = r#"
+bind_addr = "0.0.0.0:2333"
+http_bind_addr = "0.0.0.0:80"
+
+[clients.home]
+token = "123"
+
+[clients.home.services.foo1]
+hosts = ["foo1.example.com"]
+local_addr = "127.0.0.1:80"
+"#;
+        let cfg = ServerConfig::from_str(s)?;
+        let dumped = cfg.to_toml()?;
+        // `None` options must be omitted rather than serialized as an error
+        assert!(!dumped.contains("api_bind_addr"));
+        assert!(!dumped.contains("nodelay"));
+        let reparsed = ServerConfig::from_str(&dumped)?;
+        assert_eq!(cfg, reparsed);
         Ok(())
     }
 }

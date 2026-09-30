@@ -1,5 +1,5 @@
 use crate::protocol::Digest;
-use crate::server::{ControlChannelMap, HttpVisitor};
+use crate::server::{HttpVisitor, ServerState};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::broadcast;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -24,8 +24,7 @@ pub type RoutingTable = HashMap<String, Digest>;
 /// Only the first request of a connection is inspected, so routing is connection-level.
 pub(crate) async fn serve(
     bind_addr: String,
-    routing_table: Arc<RwLock<RoutingTable>>,
-    control_channels: Arc<RwLock<ControlChannelMap>>,
+    state: Arc<ServerState>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let l = TcpListener::bind(&bind_addr)
@@ -38,10 +37,9 @@ pub(crate) async fn serve(
             ret = l.accept() => {
                 match ret {
                     Ok((stream, addr)) => {
-                        let routing_table = routing_table.clone();
-                        let control_channels = control_channels.clone();
+                        let state = state.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_visitor(stream, addr, routing_table, control_channels).await {
+                            if let Err(e) = handle_visitor(stream, addr, state).await {
                                 debug!("Failed to route visitor {}: {:#}", addr, e);
                             }
                         });
@@ -60,8 +58,7 @@ pub(crate) async fn serve(
 async fn handle_visitor(
     mut stream: TcpStream,
     addr: SocketAddr,
-    routing_table: Arc<RwLock<RoutingTable>>,
-    control_channels: Arc<RwLock<ControlChannelMap>>,
+    state: Arc<ServerState>,
 ) -> Result<()> {
     let (prefetched, host) = time::timeout(
         Duration::from_secs(HEADER_READ_TIMEOUT),
@@ -71,7 +68,7 @@ async fn handle_visitor(
     .map_err(|_| anyhow!("Timed out reading the HTTP header"))??;
 
     let digest = {
-        let rt = routing_table.read().await;
+        let rt = state.routing_table.read().await;
         rt.get(&host).copied()
     };
 
@@ -82,7 +79,7 @@ async fn handle_visitor(
     };
 
     let visitor_tx = {
-        let ccs = control_channels.read().await;
+        let ccs = state.control_channels.read().await;
         ccs.get1(&digest).map(|h| h.visitor_tx.clone())
     };
 

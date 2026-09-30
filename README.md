@@ -28,6 +28,7 @@ the server pushes it the services that it should forward.
     - [Routing](#routing)
     - [Logging](#logging)
     - [Tuning](#tuning)
+  - [Administration API](#administration-api)
   - [Benchmark](#benchmark)
   - [Planning](#planning)
 
@@ -108,6 +109,8 @@ Here is the full configuration specification:
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
 http_bind_addr = "0.0.0.0:80" # Necessary. The HTTP entrypoint. Visitors are routed by the `Host` header
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
+api_bind_addr = "127.0.0.1:2335" # Optional. The address of the administration API and the web UI. Disabled if not set
+api_token = "a_secret_for_the_admin_api" # Optional. The token required by the administration API. Required if `api_bind_addr` is set
 
 [clients.home] # A client. The name `home` must be identical to the `--name` of the client
 token = "use_a_secret_that_only_you_know" # Necessary. The token of the client. It can also be given by the `HTTP_TUNNEL_TOKEN` environment variable
@@ -135,8 +138,8 @@ local_addr = "127.0.0.1:1083"
 ```
 
 The names of the services are global: two clients cannot define a service with the same name, and the same `Host`
-cannot be claimed by two services. Restarting the server and the clients is needed to apply a change of the
-configuration. The clients fetch their configuration once, when they start.
+cannot be claimed by two services. A change of the config file still needs a restart of the server and the clients,
+but the [administration API](#administration-api) applies the changes at runtime instead.
 
 ### Routing
 
@@ -165,6 +168,50 @@ If `RUST_LOG` is not present, the default logging level is `info`.
 If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false`, either for a whole client or
 per service.
 
+## Administration API
+
+The server can expose a small REST API and a web UI to manage the clients and their services at runtime, without a
+restart. It's disabled by default and is enabled by setting `api_bind_addr` and `api_token` in `server.toml`:
+
+```toml
+api_bind_addr = "127.0.0.1:2335"
+api_token = "a_secret_for_the_admin_api"
+```
+
+All the API routes require the header `Authorization: Bearer <api_token>`. Open `http://127.0.0.1:2335/` for a
+minimal web UI.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/status` | A summary of the running server |
+| `GET` | `/api/clients` | List the clients and their services |
+| `POST` | `/api/clients` | Create a client |
+| `GET` | `/api/clients/{client}` | Get a client |
+| `PATCH` | `/api/clients/{client}` | Update a client (token, heartbeat timeout, retry interval, nodelay) |
+| `DELETE` | `/api/clients/{client}` | Delete a client and its services |
+| `GET` | `/api/clients/{client}/services` | List the services of a client |
+| `PUT` | `/api/clients/{client}/services/{service}` | Create or replace a service |
+| `DELETE` | `/api/clients/{client}/services/{service}` | Delete a service |
+
+Every change is written back to the `server.toml` atomically, and is pushed to the connected clients, which start,
+update or stop the corresponding tunnels without a restart. Because the file is rewritten, the comments of a
+`server.toml` that is managed through the API are not preserved.
+
+Two caveats: changing the `token` of a client only affects the server, so the client must be restarted with the new
+`--token`; and the config channel of a client is authenticated by the token, so a client that reconnects with an old
+token is rejected.
+
+```bash
+# Create a client, then add a service to it
+curl -X POST http://127.0.0.1:2335/api/clients \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"home","token":"a_secret_token"}'
+
+curl -X PUT http://127.0.0.1:2335/api/clients/home/services/nas \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"hosts":["nas.example.com"],"local_addr":"127.0.0.1:80"}'
+```
+
 ## Benchmark
 
 `http-tunnel` has similar latency to [frp](https://github.com/fatedier/frp), but can handle a more connections, provide larger bandwidth, with less memory usage.
@@ -177,6 +224,6 @@ For more details, see the separate page [Benchmark](./docs/benchmark.md).
 
 ## Planning
 
-- [ ] HTTP APIs for configuration
+- [x] HTTP APIs for configuration
 
 [Out of Scope](./docs/out-of-scope.md) lists features that are not planned to be implemented and why.

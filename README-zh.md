@@ -27,6 +27,7 @@
     - [Routing](#routing)
     - [Logging](#logging)
     - [Tuning](#tuning)
+  - [管理 API](#管理-api)
   - [Benchmark](#benchmark)
   - [Planning](#planning)
 
@@ -106,6 +107,8 @@ token 鉴权。
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
 http_bind_addr = "0.0.0.0:80" # Necessary. The HTTP entrypoint. Visitors are routed by the `Host` header
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
+api_bind_addr = "127.0.0.1:2335" # Optional. 管理 API 与 Web UI 的监听地址，不设置则关闭
+api_token = "a_secret_for_the_admin_api" # Optional. 管理 API 所需的 token，设置 `api_bind_addr` 时必填
 
 [clients.home] # 一个客户端。名字 `home` 必须和客户端的 `--name` 一致
 token = "use_a_secret_that_only_you_know" # Necessary. 客户端的 token，也可以通过 `HTTP_TUNNEL_TOKEN` 环境变量传入
@@ -132,8 +135,8 @@ hosts = ["service3.example.com"]
 local_addr = "127.0.0.1:1083"
 ```
 
-服务名是全局的：两个客户端不能定义同名的服务，同一个 `Host` 也不能被两个服务占用。修改配置后需要重启服务端和客户端
-才能生效，客户端只在启动时拉取一次配置。
+服务名是全局的：两个客户端不能定义同名的服务，同一个 `Host` 也不能被两个服务占用。直接修改配置文件后仍需重启服务端和
+客户端才能生效；而通过[管理 API](#管理-api) 所做的修改会在运行时即时生效。
 
 ### Routing
 
@@ -163,6 +166,48 @@ http-tunnel 默认启用 TCP_NODELAY。这能够减少延迟并使交互式应�
 
 如果带宽更重要，TCP_NODELAY 仍然可以通过配置 `nodelay = false` 关闭（按客户端或按服务配置）。
 
+## 管理 API
+
+服务端可以暴露一套小型 REST API 和一个 Web UI，用来在运行时管理客户端及其服务，无需重启。它默认关闭，需要在
+`server.toml` 中同时设置 `api_bind_addr` 和 `api_token` 才会启用：
+
+```toml
+api_bind_addr = "127.0.0.1:2335"
+api_token = "a_secret_for_the_admin_api"
+```
+
+所有 API 路由都要求 `Authorization: Bearer <api_token>` 请求头。打开 `http://127.0.0.1:2335/` 即可使用最简的
+Web UI。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/status` | 服务端运行概况 |
+| `GET` | `/api/clients` | 列出客户端及其服务 |
+| `POST` | `/api/clients` | 创建客户端 |
+| `GET` | `/api/clients/{client}` | 获取客户端 |
+| `PATCH` | `/api/clients/{client}` | 修改客户端（token、心跳超时、重试间隔、nodelay） |
+| `DELETE` | `/api/clients/{client}` | 删除客户端及其所有服务 |
+| `GET` | `/api/clients/{client}/services` | 列出某个客户端的服务 |
+| `PUT` | `/api/clients/{client}/services/{service}` | 创建或替换一个服务 |
+| `DELETE` | `/api/clients/{client}/services/{service}` | 删除一个服务 |
+
+每次修改都会原子写回 `server.toml`，并下发给已连接的客户端；客户端会自行启动、更新或停止对应的隧道，无需重启。
+由于配置文件会被整体重写，通过 API 管理时 `server.toml` 中的注释不会保留。
+
+两点注意：修改客户端的 `token` 只影响服务端，客户端需用新的 `--token` 重启；而配置通道本身用 token 鉴权，因此用旧
+token 重连的客户端会被拒绝。
+
+```bash
+# 先创建客户端，再给它添加服务
+curl -X POST http://127.0.0.1:2335/api/clients \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"home","token":"a_secret_token"}'
+
+curl -X PUT http://127.0.0.1:2335/api/clients/home/services/nas \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"hosts":["nas.example.com"],"local_addr":"127.0.0.1:80"}'
+```
+
 ## Benchmark
 
 http-tunnel 的延迟与 [frp](https://github.com/fatedier/frp) 相近，在高并发情况下表现更好，能提供更大的带宽，内存占用更少。
@@ -175,6 +220,6 @@ http-tunnel 的延迟与 [frp](https://github.com/fatedier/frp) 相近，在高�
 
 ## Planning
 
-- [ ] 用于配置的 HTTP APIs
+- [x] 用于配置的 HTTP APIs
 
 [Out of Scope](./docs/out-of-scope.md) 列举了没有计划开发的特性并说明了原因。

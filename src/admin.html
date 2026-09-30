@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>http-tunnel admin</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem; max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; }
+  h2 { font-size: 1.1rem; margin-top: 1.6rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
+  th, td { border: 1px solid #8884; padding: .35rem .5rem; text-align: left; font-size: .9rem; vertical-align: top; }
+  th { background: #8882; }
+  input, button, select { font: inherit; padding: .25rem .4rem; }
+  input[type=text], input[type=password] { width: 100%; box-sizing: border-box; }
+  form { display: grid; grid-template-columns: auto 1fr; gap: .4rem .6rem; align-items: center; max-width: 560px; }
+  form button { grid-column: 2; justify-self: start; }
+  .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+  .muted { color: #888; font-size: .85rem; }
+  .error { color: #c0392b; margin-top: .5rem; white-space: pre-wrap; }
+  .ok { color: #27ae60; }
+  button { cursor: pointer; }
+  .danger { color: #c0392b; }
+  code { background: #8882; padding: 0 .25rem; }
+</style>
+</head>
+<body>
+<h1>http-tunnel <span class="muted">admin</span></h1>
+
+<div class="row">
+  <label for="token">API token</label>
+  <input id="token" type="password" placeholder="api_token" autocomplete="off" style="max-width: 260px">
+  <button onclick="saveToken()">Save</button>
+  <button onclick="refresh()">Refresh</button>
+  <span id="status" class="muted"></span>
+</div>
+<div id="error" class="error"></div>
+
+<h2>Clients</h2>
+<div id="clients"></div>
+
+<h2>Create client</h2>
+<form id="create-client" onsubmit="return onCreateClient(event)">
+  <label for="c-name">Name</label><input id="c-name" type="text" required>
+  <label for="c-token">Token</label><input id="c-token" type="text" required>
+  <label for="c-hb">Heartbeat timeout</label><input id="c-hb" type="text" placeholder="optional">
+  <label for="c-retry">Retry interval</label><input id="c-retry" type="text" placeholder="optional">
+  <label for="c-nodelay">Nodelay</label>
+  <select id="c-nodelay"><option value="">inherit</option><option value="true">true</option><option value="false">false</option></select>
+  <button type="submit">Create</button>
+</form>
+
+<h2>Add / update service</h2>
+<form id="put-service" onsubmit="return onPutService(event)">
+  <label for="s-client">Client</label><input id="s-client" type="text" required>
+  <label for="s-name">Service</label><input id="s-name" type="text" required>
+  <label for="s-hosts">Hosts (comma separated)</label><input id="s-hosts" type="text" placeholder="foo.example.com, www.foo.example.com" required>
+  <label for="s-local">Local addr</label><input id="s-local" type="text" placeholder="127.0.0.1:80" required>
+  <label for="s-nodelay">Nodelay</label>
+  <select id="s-nodelay"><option value="">inherit</option><option value="true">true</option><option value="false">false</option></select>
+  <label for="s-retry">Retry interval</label><input id="s-retry" type="text" placeholder="optional">
+  <button type="submit">Save</button>
+</form>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function token() { return $("token").value.trim(); }
+function saveToken() { localStorage.setItem("http_tunnel_token", token()); setStatus("Token saved"); }
+function setStatus(text, ok) { const s = $("status"); s.textContent = text; s.className = ok ? "ok" : "muted"; }
+function setError(text) { $("error").textContent = text || ""; }
+
+async function api(path, options = {}) {
+  const res = await fetch("/api" + path, {
+    ...options,
+    headers: { "Authorization": "Bearer " + token(), "Content-Type": "application/json", ...(options.headers || {}) },
+  });
+  if (res.status === 204) return null;
+  const text = await res.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+  if (!res.ok) throw new Error((body && body.error) || (body || res.statusText));
+  return body;
+}
+
+function optionalNumber(id) {
+  const v = $(id).value.trim();
+  if (v === "") return undefined;
+  const n = Number(v);
+  if (!Number.isFinite(n)) throw new Error(id + " must be a number");
+  return n;
+}
+function optionalBool(id) {
+  const v = $(id).value;
+  return v === "" ? undefined : v === "true";
+}
+
+async function refresh() {
+  setError("");
+  try {
+    const status = await api("/status");
+    $("status").textContent = status.clients + " client(s), " + status.services + " service(s)";
+    const clients = await api("/clients");
+    renderClients(clients);
+  } catch (e) { setError(String(e.message || e)); }
+}
+
+function renderClients(clients) {
+  const root = $("clients");
+  if (!clients.length) { root.innerHTML = '<p class="muted">No client yet.</p>'; return; }
+  let html = "";
+  for (const c of clients) {
+    html += "<h3>" + esc(c.name) + " <span class=\"muted\">token " + esc(c.token) + "</span></h3>";
+    html += "<table><tr><th>Service</th><th>Hosts</th><th>Local addr</th><th>Nodelay</th><th>Retry</th><th></th></tr>";
+    for (const s of c.services) {
+      html += "<tr><td>" + esc(s.name) + "</td><td>" + esc((s.hosts || []).join(", ")) +
+        "</td><td>" + esc(s.local_addr) + "</td><td>" + esc(str(s.nodelay)) +
+        "</td><td>" + esc(str(s.retry_interval)) + "</td>" +
+        '<td><button class="danger" onclick="delService(\'' + js(c.name) + "','" + js(s.name) + "')\">delete</button></td></tr>";
+    }
+    if (!c.services.length) html += '<tr><td colspan="6" class="muted">No service</td></tr>';
+    html += "</table>";
+    html += '<button class="danger" onclick="delClient(\'' + js(c.name) + "')\">Delete client " + esc(c.name) + "</button>";
+  }
+  root.innerHTML = html;
+}
+
+function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function str(v) { return v === null || v === undefined ? "-" : String(v); }
+function js(s) { return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'"); }
+
+async function onCreateClient(e) {
+  e.preventDefault(); setError("");
+  try {
+    await api("/clients", { method: "POST", body: JSON.stringify({
+      name: $("c-name").value.trim(), token: $("c-token").value.trim(),
+      heartbeat_timeout: optionalNumber("c-hb"), retry_interval: optionalNumber("c-retry"), nodelay: optionalBool("c-nodelay"),
+    })});
+    e.target.reset();
+    setStatus("Client created", true);
+    refresh();
+  } catch (err) { setError(String(err.message || err)); }
+  return false;
+}
+
+async function onPutService(e) {
+  e.preventDefault(); setError("");
+  try {
+    const client = $("s-client").value.trim(), service = $("s-name").value.trim();
+    const hosts = $("s-hosts").value.split(",").map((s) => s.trim()).filter(Boolean);
+    await api("/clients/" + encodeURIComponent(client) + "/services/" + encodeURIComponent(service), {
+      method: "PUT", body: JSON.stringify({
+        hosts, local_addr: $("s-local").value.trim(),
+        nodelay: optionalBool("s-nodelay"), retry_interval: optionalNumber("s-retry"),
+      }),
+    });
+    e.target.reset();
+    setStatus("Service saved", true);
+    refresh();
+  } catch (err) { setError(String(err.message || err)); }
+  return false;
+}
+
+async function delService(client, service) {
+  if (!confirm("Delete service " + service + " of " + client + "?")) return;
+  setError("");
+  try {
+    await api("/clients/" + encodeURIComponent(client) + "/services/" + encodeURIComponent(service), { method: "DELETE" });
+    setStatus("Service deleted", true); refresh();
+  } catch (e) { setError(String(e.message || e)); }
+}
+
+async function delClient(client) {
+  if (!confirm("Delete client " + client + " and all its services?")) return;
+  setError("");
+  try {
+    await api("/clients/" + encodeURIComponent(client), { method: "DELETE" });
+    setStatus("Client deleted", true); refresh();
+  } catch (e) { setError(String(e.message || e)); }
+}
+
+$("token").value = localStorage.getItem("http_tunnel_token") || "";
+if (token()) refresh();
+</script>
+</body>
+</html>
