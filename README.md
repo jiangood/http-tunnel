@@ -39,14 +39,14 @@ the server pushes it the tunnels that it should serve.
 - **HTTP Reverse Proxy** One public HTTP port serves all the tunnels. Requests are routed to the correct tunnel by the `Host` header. WebSocket and other protocol upgrades work transparently, as the traffic is piped through as it is.
 - **Single Point of Configuration** Only the server is configured. A client is started with the address of the server, its name and its token, and the server pushes it the tunnels to serve.
 - **High Performance** Much higher throughput can be achieved than frp, and more stable when handling a large volume of connections.
-- **Low Resource Consumption** Consumes much fewer memory than similar tools.
+- **Low Resource Consumption** Consumes much less memory than similar tools.
 - **Security** Every client is authenticated with its own token, and a client can only serve the tunnels assigned to it on the server.
 
 ## Quickstart
 
 A full-powered `http-tunnel` can be obtained from the [release](https://github.com/jiangood/http-tunnel/releases) page. Or [build from source](docs/build-guide.md) **for other platforms and minimizing the binary**. A [Docker image](https://github.com/jiangood/http-tunnel/pkgs/container/http-tunnel) is also available.
 
-To use `http-tunnel`, you need a server with a public IP, and a device behind the NAT, where some HTTP services that need to be exposed to the Internet.
+To use `http-tunnel`, you need a server with a public IP, and a device behind the NAT with some HTTP services to expose to the Internet.
 
 Assuming you have a NAS at home behind the NAT, and want to expose its web UI at `nas.example.com`:
 
@@ -237,7 +237,7 @@ Ready-to-use files are in [`examples/docker-compose`](./examples/docker-compose)
 All the configuration lives in one file, and it's the configuration of the server. Tunnels are grouped by the client
 that serves them, and each client is identified by a name and authenticated by its own token.
 
-Before heading to the full configuration specification, it's recommend to skim [the configuration examples](./examples) to get a feeling of the configuration format.
+Before heading to the full configuration specification, it's recommended to skim [the configuration examples](./examples) to get a feeling of the configuration format.
 
 Here is the full configuration specification:
 
@@ -345,7 +345,7 @@ curl -X PUT http://127.0.0.1:2335/api/clients/home/tunnels/nas.example.com \
 
 ## Benchmark
 
-`http-tunnel` has similar latency to [frp](https://github.com/fatedier/frp), but can handle a more connections, provide larger bandwidth, with less memory usage.
+`http-tunnel` has similar latency to [frp](https://github.com/fatedier/frp), but can handle more connections and provide larger bandwidth with less memory usage.
 
 For more details, see the separate page [Benchmark](./docs/benchmark.md).
 

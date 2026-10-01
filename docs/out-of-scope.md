@@ -1,6 +1,6 @@
 # Out of Scope
 
-`http-tunnel` focuses on the forwarding for the NAT traversal, rather than being a all-in-one development tool or a load balancer or a gateway. It's designed to *be used with them*, not *replace them*.
+`http-tunnel` focuses on forwarding for NAT traversal, rather than being an all-in-one development tool or a load balancer or a gateway. It's designed to *be used with them*, not *replace them*.
 
 But that doesn't mean it's not useful for other purposes. In the future, more configuration APIs will be added and `http-tunnel` can be used with an external dashboard.
 
@@ -8,7 +8,7 @@ But that doesn't mean it's not useful for other purposes. In the future, more co
 
 - *HTTP Request Logging*
 
-  `http-tunnel` doesn't interference with the application layer traffic. A right place for this kind of stuff is the web server, and a network capture tool.
+  `http-tunnel` doesn't interfere with the application layer traffic. A right place for this kind of stuff is the web server, and a network capture tool.
 
 - *`frp`'s STCP or other setup that requires visitors' side configuration*
 
