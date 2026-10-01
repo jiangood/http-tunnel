@@ -11,8 +11,8 @@ android {
         applicationId = "me.rapiz.httptunnel"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.6.3"
+        versionCode = 2
+        versionName = "0.6.4"
     }
 
     buildTypes {
