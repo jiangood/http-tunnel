@@ -172,7 +172,8 @@ jobs:
       - name: Build the shared library for every ABI
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.1.10909125
-        run: ./android/build.sh
+        # `bash` explicitly: the executable bit isn't tracked on Windows
+        run: bash ./android/build.sh
 
       # The wrapper isn't committed, so it is generated with the pinned version
       - name: Generate the Gradle wrapper
