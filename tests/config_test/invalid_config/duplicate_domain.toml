@@ -8,7 +8,7 @@ token = "123"
 "foo1.example.com" = "127.0.0.1:80"
 
 [clients.office]
-token = "123"
+token = "456"
 
 [clients.office.tunnels]
-"foo2.example.com" = "127.0.0.1:81"
+"foo1.example.com" = "127.0.0.1:81"

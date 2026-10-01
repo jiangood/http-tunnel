@@ -100,7 +100,7 @@ jobs:
             cross: false
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.71.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
@@ -168,7 +168,7 @@ jobs:
 
       # The shared library is built with the Rust toolchain and the NDK, and the
       # APK with the Android SDK and Gradle
-      - uses: dtolnay/rust-toolchain@1.71.0
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
       - uses: Swatinem/rust-cache@v2

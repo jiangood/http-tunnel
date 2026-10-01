@@ -52,7 +52,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
-    /// Run as a server. The configuration file defines all the clients and their services
+    /// Run as a server. The configuration file defines all the clients and their tunnels
     Server(ServerArgs),
     /// Run as a client. The client is configured by the server, so it takes no configuration file
     Client(ClientArgs),

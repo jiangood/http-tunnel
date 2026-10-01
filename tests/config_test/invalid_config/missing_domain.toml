@@ -5,4 +5,4 @@ http_bind_addr = "80"
 token = "123"
 
 [clients.home.tunnels]
-"foo1.example.com" = ""
+"" = "127.0.0.1:80"

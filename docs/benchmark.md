@@ -16,15 +16,14 @@
 
 http-tunnel with the following configuration:
 ```toml
-bind_addr = "0.0.0.0:2333"
-http_bind_addr = "0.0.0.0:80"
+bind_addr = "2333"
+http_bind_addr = "80"
 
 [clients.bench]
 token = "123"
 
-[clients.bench.services.bench]
-hosts = ["bench.test"]
-local_addr = "127.0.0.1:80"
+[clients.bench.tunnels]
+"bench.test" = "127.0.0.1:80"
 ```
 and the client started with:
 ```

@@ -9,10 +9,10 @@
 
 A secure, stable and high-performance HTTP reverse proxy for NAT traversal, written in Rust
 
-`http-tunnel` exposes HTTP services on a device behind the NAT to the Internet, via a server with a public IP. The server listens on a single HTTP port and routes each request to the right service according to the `Host` header. The traffic between the server and the client is carried over a plain TCP tunnel.
+`http-tunnel` exposes HTTP services on a device behind the NAT to the Internet, via a server with a public IP. The server listens on a single HTTP port and routes each request to the right tunnel according to the `Host` header. The traffic between the server and the client is carried over a plain TCP tunnel.
 
 The whole configuration lives on the server. A client is configured by the server: it takes no configuration file, and
-the server pushes it the services that it should forward.
+the server pushes it the tunnels that it should serve.
 
 > `http-tunnel` is a fork of [rathole](https://github.com/rathole-org/rathole), reworked into an HTTP reverse proxy.
 > It is distributed under the Apache-2.0 license, see [LICENSE](./LICENSE).
@@ -36,11 +36,11 @@ the server pushes it the services that it should forward.
 
 ## Features
 
-- **HTTP Reverse Proxy** One public HTTP port serves all services. Requests are routed to the correct service by the `Host` header. WebSocket and other protocol upgrades work transparently, as the traffic is piped through as it is.
-- **Single Point of Configuration** Only the server is configured. A client is started with the address of the server, its name and its token, and the server pushes it the services to forward.
+- **HTTP Reverse Proxy** One public HTTP port serves all the tunnels. Requests are routed to the correct tunnel by the `Host` header. WebSocket and other protocol upgrades work transparently, as the traffic is piped through as it is.
+- **Single Point of Configuration** Only the server is configured. A client is started with the address of the server, its name and its token, and the server pushes it the tunnels to serve.
 - **High Performance** Much higher throughput can be achieved than frp, and more stable when handling a large volume of connections.
 - **Low Resource Consumption** Consumes much fewer memory than similar tools.
-- **Security** Every client is authenticated with its own token, and a client can only serve the services that are assigned to it on the server.
+- **Security** Every client is authenticated with its own token, and a client can only serve the tunnels assigned to it on the server.
 
 ## Quickstart
 
@@ -53,19 +53,18 @@ Assuming you have a NAS at home behind the NAT, and want to expose its web UI at
 1. On the server which has a public IP
 
 Create `server.toml` with the following content and accommodate it to your needs. If the path doesn't exist, the
-server writes a minimal template with the three ports (and the client and service sections commented out) and starts.
+server writes a minimal template with the three ports (and the client and tunnel sections commented out) and starts.
 
 ```toml
 # server.toml
-bind_addr = "0.0.0.0:2333" # `2333` specifies the port that http-tunnel listens for clients
-http_bind_addr = "0.0.0.0:80" # `80` specifies the HTTP entrypoint that visitors connect to
+bind_addr = "2333" # `2333` specifies the port that http-tunnel listens for clients
+http_bind_addr = "80" # `80` specifies the HTTP entrypoint that visitors connect to
 
 [clients.home_nas] # The name of the client
 token = "use_a_secret_that_only_you_know" # The token of the client
 
-[clients.home_nas.services.my_nas]
-hosts = ["nas.example.com"] # Requests with this `Host` are forwarded to `my_nas`
-local_addr = "127.0.0.1:80" # The address of the NAS web UI, as seen from the NAS
+[clients.home_nas.tunnels]
+"nas.example.com" = "127.0.0.1:80" # Requests with this `Host` are forwarded to the NAS web UI, as seen from the NAS
 ```
 
 Then run it from the directory that contains `server.toml`:
@@ -96,8 +95,8 @@ or pass the token in the environment, so that it doesn't show up in `ps`:
 HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know ./http-tunnel client --remote myserver.com:2333 --name home_nas
 ```
 
-3. Now the client will try to connect to the server `myserver.com` on port `2333`, and the server pushes it the services
-   of `home_nas`, including `my_nas`. Any HTTP request to the server on port `80` with `Host: nas.example.com` will be
+3. Now the client will try to connect to the server `myserver.com` on port `2333`, and the server pushes it the tunnels
+   of `home_nas`, including the tunnel `nas.example.com`. Any HTTP request to the server on port `80` with `Host: nas.example.com` will be
    forwarded to the NAS on port `80`.
 
 So you can visit `http://nas.example.com` (with `nas.example.com` resolving to your server) to reach the NAS web UI.
@@ -118,8 +117,8 @@ read-write, and publish the ports of the config you use. No path has to be passe
 
 ```bash
 # server.toml
-# bind_addr = "0.0.0.0:2333"
-# http_bind_addr = "0.0.0.0:80"
+# bind_addr = "2333"
+# http_bind_addr = "80"
 
 docker run -d --name http-tunnel --restart unless-stopped \
   -p 2333:2333 -p 80:80 \
@@ -143,7 +142,8 @@ docker run -d --name http-tunnel --restart unless-stopped --network host \
 that has to reach a service on the host uses `host.docker.internal` as the `local_addr` instead.
 
 If the [administration API](#administration-api) is enabled, publish its port and set `api_bind_addr` to
-`0.0.0.0:2335`, otherwise the container only listens on its own loopback and Docker cannot forward the connections:
+`2335` (a bare port binds to all interfaces), otherwise the container only listens on its own loopback and Docker
+cannot forward the connections:
 
 ```bash
   -p 2335:2335
@@ -234,7 +234,7 @@ Ready-to-use files are in [`examples/docker-compose`](./examples/docker-compose)
 
 ## Configuration
 
-All the configuration lives in one file, and it's the configuration of the server. Services are grouped by the client
+All the configuration lives in one file, and it's the configuration of the server. Tunnels are grouped by the client
 that serves them, and each client is identified by a name and authenticated by its own token.
 
 Before heading to the full configuration specification, it's recommend to skim [the configuration examples](./examples) to get a feeling of the configuration format.
@@ -242,48 +242,42 @@ Before heading to the full configuration specification, it's recommend to skim [
 Here is the full configuration specification:
 
 ```toml
-bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
-http_bind_addr = "0.0.0.0:80" # Necessary. The HTTP entrypoint. Visitors are routed by the `Host` header
-heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
-api_bind_addr = "0.0.0.0:2335" # Optional. The address of the administration API and the web UI. Disabled if not set and exposed to the network when bound to 0.0.0.0
+bind_addr = "2333" # Necessary. The port that the server listens for clients. Use `host:port` to bind a specific interface
+http_bind_addr = "80" # Necessary. The HTTP entrypoint. Visitors are routed by the `Host` header
+api_bind_addr = "2335" # Optional. The administration API and the web UI. Use `127.0.0.1:2335` for local-only access
 api_token = "a_secret_for_the_admin_api" # Optional. The token required by the administration API. Required if `api_bind_addr` is set
 
 [clients.home] # A client. The name `home` must be identical to the `--name` of the client
 token = "use_a_secret_that_only_you_know" # Necessary. The token of the client. It can also be given by the `HTTP_TUNNEL_TOKEN` environment variable
-heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `heartbeat_interval`. Default: 40 seconds
+heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeats sent to this client. 0 disables them. Default: 30 seconds
+heartbeat_timeout = 40 # Optional. The application-layer heartbeat timeout. Set to 0 to disable the test. The value must be greater than `heartbeat_interval`. Default: 40 seconds
 retry_interval = 1 # Optional. The interval between retries of the client to connect to the server. Default: 1 second
-nodelay = true # Optional. The default TCP_NODELAY of the services of this client. Default: true
+nodelay = true # Optional. The default TCP_NODELAY of the tunnels of this client. Default: true
 
-[clients.home.services.service1] # A service of `home`. The name `service1` can change arbitrarily
-hosts = ["service1.example.com"] # Necessary. Requests with these `Host` values are routed to this service
-local_addr = "127.0.0.1:1081" # Necessary. The address of the local HTTP service on the client side
-nodelay = true # Optional. Determine whether to enable TCP_NODELAY, to improve the latency but decrease the bandwidth. Default: inherits the client
-retry_interval = 1 # Optional. The interval between retries to connect to the server. Default: inherits the client
-
-[clients.home.services.service2] # Multiple services can be defined
-hosts = ["service2.example.com", "www.service2.example.com"]
-local_addr = "127.0.0.1:1082"
+[clients.home.tunnels] # Each tunnel is a domain keyed to the `local_addr` of the local service
+"app1.example.com" = "127.0.0.1:1081"
+"app2.example.com" = "127.0.0.1:1082"
+"www.app2.example.com" = "127.0.0.1:1082" # The same address can serve several domains
 
 [clients.office] # Multiple clients can be defined. Each of them is started with `--name office`
 token = "another_secret"
-nodelay = false # Applied to all the services of `office` unless a service overrides it
+nodelay = false # Applied to all the tunnels of `office`
 
-[clients.office.services.service3]
-hosts = ["service3.example.com"]
-local_addr = "127.0.0.1:1083"
+[clients.office.tunnels]
+"app3.example.com" = "127.0.0.1:1083"
 ```
 
-The names of the services are global: two clients cannot define a service with the same name, and the same `Host`
-cannot be claimed by two services. A change of the config file still needs a restart of the server and the clients,
-but the [administration API](#administration-api) applies the changes at runtime instead.
+The client names are global, and a `Host` domain can only be claimed by one tunnel. A change of the config file still
+needs a restart of the server and the clients, but the [administration API](#administration-api) applies the changes at
+runtime instead.
 
 ### Routing
 
-The server accepts HTTP connections on `http_bind_addr`. For every connection, it reads the HTTP request line and the `Host` header (without touching the body), and forwards the connection to the service whose `hosts` contains that host. Host matching is case-insensitive and the port, if any, is ignored.
+The server accepts HTTP connections on `http_bind_addr`. For every connection, it reads the HTTP request line and the `Host` header (without touching the body), and forwards the connection to the tunnel whose domain matches that host. Host matching is case-insensitive and the port, if any, is ignored.
 
-If no service matches the `Host`, the server responds with `404`. If the matched service is not connected yet, it responds with `503`.
+If no tunnel matches the `Host`, the server responds with `404`. If the matched tunnel is not connected yet, it responds with `503`.
 
-Routing is done once per connection, on its first request. A keep-alive connection cannot be re-routed to another service if a later request carries a different `Host`.
+Routing is done once per connection, on its first request. A keep-alive connection cannot be re-routed to another tunnel if a later request carries a different `Host`.
 
 ### Logging
 
@@ -301,34 +295,34 @@ If `RUST_LOG` is not present, the default logging level is `info`.
 
 `http-tunnel` enables TCP_NODELAY by default, which should benefit the latency and interactive applications. However, it slightly decreases the bandwidth.
 
-If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false`, either for a whole client or
-per service.
+If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false` for a whole client.
 
 ## Administration API
 
-The server can expose a small REST API and a web UI to manage the clients and their services at runtime, without a
+The server can expose a small REST API and a web UI to manage the clients and their tunnels at runtime, without a
 restart. It's disabled by default and is enabled by setting `api_bind_addr` and `api_token` in `server.toml`:
 
 ```toml
-api_bind_addr = "0.0.0.0:2335"
+api_bind_addr = "2335"
 api_token = "a_secret_for_the_admin_api"
 ```
 
 All the API routes require the header `Authorization: Bearer <api_token>`. Open `http://127.0.0.1:2335/` for a
-minimal web UI. Binding to `0.0.0.0` makes the API reachable from the network, so protect it with a reverse proxy that
-terminates TLS, a firewall rule, or a private network such as WireGuard; use `127.0.0.1:2335` for local-only access.
+minimal web UI. A bare port binds to `0.0.0.0`, which makes the API reachable from the network, so protect it with a
+reverse proxy that terminates TLS, a firewall rule, or a private network such as WireGuard; use
+`api_bind_addr = "127.0.0.1:2335"` for local-only access.
 
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/api/status` | A summary of the running server |
-| `GET` | `/api/clients` | List the clients and their services |
+| `GET` | `/api/clients` | List the clients and their tunnels |
 | `POST` | `/api/clients` | Create a client |
 | `GET` | `/api/clients/{client}` | Get a client |
-| `PATCH` | `/api/clients/{client}` | Update a client (token, heartbeat timeout, retry interval, nodelay) |
-| `DELETE` | `/api/clients/{client}` | Delete a client and its services |
-| `GET` | `/api/clients/{client}/services` | List the services of a client |
-| `PUT` | `/api/clients/{client}/services/{service}` | Create or replace a service |
-| `DELETE` | `/api/clients/{client}/services/{service}` | Delete a service |
+| `PATCH` | `/api/clients/{client}` | Update a client (token, heartbeat interval, heartbeat timeout, retry interval, nodelay) |
+| `DELETE` | `/api/clients/{client}` | Delete a client and its tunnels |
+| `GET` | `/api/clients/{client}/tunnels` | List the tunnels of a client |
+| `PUT` | `/api/clients/{client}/tunnels/{domain}` | Create or replace a tunnel (`{local_addr}`) |
+| `DELETE` | `/api/clients/{client}/tunnels/{domain}` | Delete a tunnel |
 
 Every change is written back to the `server.toml` atomically, and is pushed to the connected clients, which start,
 update or stop the corresponding tunnels without a restart. Because the file is rewritten, the comments of a
@@ -339,14 +333,14 @@ Two caveats: changing the `token` of a client only affects the server, so the cl
 token is rejected.
 
 ```bash
-# Create a client, then add a service to it
+# Create a client, then add a tunnel to it
 curl -X POST http://127.0.0.1:2335/api/clients \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"name":"home","token":"a_secret_token"}'
 
-curl -X PUT http://127.0.0.1:2335/api/clients/home/services/nas \
+curl -X PUT http://127.0.0.1:2335/api/clients/home/tunnels/nas.example.com \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"hosts":["nas.example.com"],"local_addr":"127.0.0.1:80"}'
+  -d '{"local_addr":"127.0.0.1:80"}'
 ```
 
 ## Benchmark

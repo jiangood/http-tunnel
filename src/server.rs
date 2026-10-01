@@ -1,8 +1,8 @@
 use crate::config::{
-    ClientConfig, MaskedString, ServerClientConfig, ServerConfig, ServerServiceConfig,
+    ClientConfig, MaskedString, ServerClientConfig, ServerConfig, ServerTunnelConfig,
 };
 use crate::constants::listen_backoff;
-use crate::helper::{retry_notify_with_deadline, write_and_flush};
+use crate::helper::{retry_notify_with_deadline, to_bind_addr, write_and_flush};
 use crate::http::RoutingTable;
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ConfigChannelHello, ControlChannelHello, DataChannelHello};
@@ -27,16 +27,16 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
-pub(crate) type ServiceDigest = protocol::Digest; // SHA256 of a service name
+pub(crate) type TunnelDigest = protocol::Digest; // SHA256 of a tunnel name
 pub(crate) type ClientDigest = protocol::Digest; // SHA256 of a client name
 type Nonce = protocol::Digest; // Also called `session_key`
 
-const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP services
+const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP tunnels
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
 // A visitor accepted by the HTTP entrypoint. `prefetched` holds the bytes that were
-// read while sniffing the `Host` header and must be replayed to the service.
+// read while sniffing the `Host` header and must be replayed to the tunnel.
 pub(crate) struct HttpVisitor {
     pub stream: TcpStream,
     pub prefetched: Vec<u8>,
@@ -50,16 +50,17 @@ pub(crate) struct ServerClient {
     config: ClientConfig,
 }
 
-// A service, together with the token of the client that serves it
+// A tunnel, together with the token of the client that serves it
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct ServiceRuntime {
-    config: ServerServiceConfig,
+pub(crate) struct TunnelRuntime {
+    config: ServerTunnelConfig,
     token: MaskedString,
+    heartbeat_interval: u64,
 }
 
-// A hash map of ControlChannelHandles, indexed by ServiceDigest or Nonce
+// A hash map of ControlChannelHandles, indexed by TunnelDigest or Nonce
 // See also MultiMap
-pub(crate) type ControlChannelMap = MultiMap<ServiceDigest, Nonce, ControlChannelHandle>;
+pub(crate) type ControlChannelMap = MultiMap<TunnelDigest, Nonce, ControlChannelHandle>;
 
 // A registered config channel, so that the config updates can be pushed to the client.
 // `id` identifies the connection that owns the handle, so that a connection only
@@ -76,13 +77,13 @@ pub(crate) struct ServerState {
     pub(crate) config_path: PathBuf,
     // The authoritative configuration, mutated by the administration API
     pub(crate) config: RwLock<ServerConfig>,
-    // `[clients.<client>.services]`, indexed by ServiceDigest
-    pub(crate) services: RwLock<HashMap<ServiceDigest, ServiceRuntime>>,
+    // The tunnels of all the clients, indexed by TunnelDigest
+    pub(crate) tunnels: RwLock<HashMap<TunnelDigest, TunnelRuntime>>,
     // `[clients]`, indexed by the digest of the client name
     pub(crate) clients: RwLock<HashMap<ClientDigest, ServerClient>>,
     // Collection of control channels
     pub(crate) control_channels: RwLock<ControlChannelMap>,
-    // `Host` -> ServiceDigest
+    // `Host` -> TunnelDigest
     pub(crate) routing_table: RwLock<RoutingTable>,
     // The config channels of the connected clients, keyed by the client digest
     config_channels: RwLock<HashMap<ClientDigest, ConfigChannelHandle>>,
@@ -119,18 +120,18 @@ struct Server {
     api: Option<ApiConfig>,
 }
 
-// Generate the services of all the clients, indexed by ServiceDigest
-fn generate_service_hashmap(
-    server_config: &ServerConfig,
-) -> HashMap<ServiceDigest, ServiceRuntime> {
+// Generate the tunnels of all the clients, indexed by TunnelDigest
+fn generate_tunnel_hashmap(server_config: &ServerConfig) -> HashMap<TunnelDigest, TunnelRuntime> {
     let mut ret = HashMap::new();
     for client in server_config.clients.values() {
-        for (name, s) in &client.services {
+        let heartbeat_interval = client.heartbeat_interval();
+        for (name, s) in &client.tunnels {
             ret.insert(
                 protocol::digest(name.as_bytes()),
-                ServiceRuntime {
+                TunnelRuntime {
                     config: s.clone(),
                     token: client.token.clone(),
+                    heartbeat_interval,
                 },
             );
         }
@@ -154,15 +155,13 @@ fn generate_client_hashmap(server_config: &ServerConfig) -> HashMap<ClientDigest
     ret
 }
 
-// Generate a routing table which maps a `Host` to a ServiceDigest
+// Generate a routing table which maps a `Host` domain to a TunnelDigest
 fn generate_routing_table(server_config: &ServerConfig) -> RoutingTable {
     let mut ret = HashMap::new();
     for client in server_config.clients.values() {
-        for (name, s) in &client.services {
+        for (name, s) in &client.tunnels {
             let digest = protocol::digest(name.as_bytes());
-            for host in &s.hosts {
-                ret.insert(host.clone(), digest);
-            }
+            ret.insert(s.domain.clone(), digest);
         }
     }
     ret
@@ -170,13 +169,13 @@ fn generate_routing_table(server_config: &ServerConfig) -> RoutingTable {
 
 impl ServerState {
     fn new(config: ServerConfig, config_path: PathBuf) -> ServerState {
-        let services = generate_service_hashmap(&config);
+        let tunnels = generate_tunnel_hashmap(&config);
         let clients = generate_client_hashmap(&config);
         let routing_table = generate_routing_table(&config);
         ServerState {
             config_path,
             config: RwLock::new(config),
-            services: RwLock::new(services),
+            tunnels: RwLock::new(tunnels),
             clients: RwLock::new(clients),
             control_channels: RwLock::new(ControlChannelMap::new()),
             routing_table: RwLock::new(routing_table),
@@ -190,7 +189,7 @@ impl ServerState {
     ///
     /// The candidate is validated and written back to the config file first, so that
     /// a failed write leaves the runtime untouched. Then the derived maps are rebuilt,
-    /// the tunnels of the removed or changed services are dropped, and the client
+    /// the tunnels of the removed or changed tunnels are dropped, and the client
     /// configs are pushed to the affected connected clients.
     pub(crate) async fn apply<F>(&self, f: F) -> Result<()>
     where
@@ -206,7 +205,7 @@ impl ServerState {
             .await
             .with_context(|| "Failed to write the config back")?;
 
-        let new_services = generate_service_hashmap(&config);
+        let new_tunnels = generate_tunnel_hashmap(&config);
         let new_clients = generate_client_hashmap(&config);
         let new_routing_table = generate_routing_table(&config);
 
@@ -226,21 +225,21 @@ impl ServerState {
             (changed, removed)
         };
 
-        // Drop the control channels of the removed or changed services. Dropping the
+        // Drop the control channels of the removed or changed tunnels. Dropping the
         // handle shuts the control channel down, so the client reconnects and picks up
         // the change.
         {
-            let old_services = self.services.read().await;
+            let old_tunnels = self.tunnels.read().await;
             let mut ccs = self.control_channels.write().await;
-            for (digest, old) in old_services.iter() {
-                if new_services.get(digest) != Some(old) {
+            for (digest, old) in old_tunnels.iter() {
+                if new_tunnels.get(digest) != Some(old) {
                     ccs.remove1(digest);
                 }
             }
         }
 
         // Replace the derived maps
-        *self.services.write().await = new_services;
+        *self.tunnels.write().await = new_tunnels;
         *self.routing_table.write().await = new_routing_table;
 
         // Drop the config channels of the removed clients
@@ -322,7 +321,7 @@ impl ServerState {
         .await
     }
 
-    /// Delete a client together with its services
+    /// Delete a client together with its tunnels
     pub(crate) async fn delete_client(&self, name: &str) -> Result<()> {
         let name = name.to_string();
         self.apply(move |config| {
@@ -334,15 +333,15 @@ impl ServerState {
         .await
     }
 
-    /// Create or replace a service of a client
-    pub(crate) async fn put_service(
+    /// Create or replace a tunnel of a client
+    pub(crate) async fn put_tunnel(
         &self,
         client: &str,
-        service: String,
-        service_config: ServerServiceConfig,
+        domain: String,
+        tunnel_config: ServerTunnelConfig,
     ) -> Result<()> {
-        if service.is_empty() {
-            bail!("The name of the service must not be empty");
+        if domain.is_empty() {
+            bail!("The domain of the tunnel must not be empty");
         }
         let client = client.to_string();
         self.apply(move |config| {
@@ -350,23 +349,23 @@ impl ServerState {
                 .clients
                 .get_mut(&client)
                 .ok_or_else(|| anyhow!("No such a client `{}`", client))?;
-            c.services.insert(service, service_config);
+            c.tunnels.insert(domain, tunnel_config);
             Ok(())
         })
         .await
     }
 
-    /// Delete a service of a client
-    pub(crate) async fn delete_service(&self, client: &str, service: &str) -> Result<()> {
+    /// Delete a tunnel of a client
+    pub(crate) async fn delete_tunnel(&self, client: &str, domain: &str) -> Result<()> {
         let client = client.to_string();
-        let service = service.to_string();
+        let domain = domain.to_string();
         self.apply(move |config| {
             let c = config
                 .clients
                 .get_mut(&client)
                 .ok_or_else(|| anyhow!("No such a client `{}`", client))?;
-            if c.services.remove(&service).is_none() {
-                bail!("No such a service `{}` of the client `{}`", service, client);
+            if c.tunnels.remove(&domain).is_none() {
+                bail!("No such a tunnel `{}` of the client `{}`", domain, client);
             }
             Ok(())
         })
@@ -381,7 +380,7 @@ impl Server {
 
         let api = match (&config.api_bind_addr, &config.api_token) {
             (Some(bind_addr), Some(token)) => Some(ApiConfig {
-                bind_addr: bind_addr.clone(),
+                bind_addr: to_bind_addr(bind_addr),
                 token: token.to_string(),
             }),
             (Some(_), None) => bail!(
@@ -394,8 +393,8 @@ impl Server {
             (None, None) => None,
         };
 
-        let bind_addr = config.bind_addr.clone();
-        let http_bind_addr = config.http_bind_addr.clone();
+        let bind_addr = to_bind_addr(&config.bind_addr);
+        let http_bind_addr = to_bind_addr(&config.http_bind_addr);
         let state = Arc::new(ServerState::new(config, config_path));
 
         Ok(Server {
@@ -525,8 +524,8 @@ async fn handle_connection(mut conn: TcpStream, state: Arc<ServerState>) -> Resu
     // Read hello
     let hello = read_hello(&mut conn).await?;
     match hello {
-        ControlChannelHello(_, service_digest) => {
-            do_control_channel_handshake(conn, state, service_digest).await?;
+        ControlChannelHello(_, tunnel_digest) => {
+            do_control_channel_handshake(conn, state, tunnel_digest).await?;
         }
         ConfigChannelHello(_, client_digest) => {
             do_config_channel_handshake(conn, state, client_digest).await?;
@@ -566,7 +565,7 @@ async fn do_config_channel_handshake(
     // Lookup the client
     let client = state.clients.read().await.get(&client_digest).cloned();
     let Some(client) = client else {
-        conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
+        conn.write_all(&bincode::serialize(&Ack::TunnelNotExist).unwrap())
             .await?;
         bail!("No such a client {}", hex::encode(client_digest));
     };
@@ -632,14 +631,14 @@ async fn run_config_push(
     rx: &mut mpsc::Receiver<ClientConfig>,
 ) -> Result<()> {
     protocol::write_payload(conn, &client.config).await?;
-    info!(client = %client.name, services = client.config.services.len(), "Config pushed");
+    info!(client = %client.name, tunnels = client.config.tunnels.len(), "Config pushed");
 
     while let Some(config) = rx.recv().await {
         if let Err(e) = protocol::write_payload(conn, &config).await {
             debug!("Failed to push the config to {}: {:#}", client.name, e);
             break;
         }
-        info!(client = %client.name, services = config.services.len(), "Config pushed");
+        info!(client = %client.name, tunnels = config.tunnels.len(), "Config pushed");
     }
 
     Ok(())
@@ -648,7 +647,7 @@ async fn run_config_push(
 async fn do_control_channel_handshake(
     mut conn: TcpStream,
     state: Arc<ServerState>,
-    service_digest: ServiceDigest,
+    tunnel_digest: TunnelDigest,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
@@ -667,22 +666,23 @@ async fn do_control_channel_handshake(
         .await?;
     conn.flush().await?;
 
-    // Lookup the service
-    let service = match state.services.read().await.get(&service_digest) {
+    // Lookup the tunnel
+    let tunnel = match state.tunnels.read().await.get(&tunnel_digest) {
         Some(v) => v,
         None => {
-            conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
+            conn.write_all(&bincode::serialize(&Ack::TunnelNotExist).unwrap())
                 .await?;
-            bail!("No such a service {}", hex::encode(service_digest));
+            bail!("No such a tunnel {}", hex::encode(tunnel_digest));
         }
     }
     .to_owned();
 
-    let service_config = service.config;
-    let service_name = &service_config.name;
+    let tunnel_config = tunnel.config;
+    let tunnel_name = &tunnel_config.name;
+    let heartbeat_interval = tunnel.heartbeat_interval;
 
-    // Calculate the checksum with the token of the client that serves the service
-    let mut concat = Vec::from(service.token.as_bytes());
+    // Calculate the checksum with the token of the client that serves the tunnel
+    let mut concat = Vec::from(tunnel.token.as_bytes());
     concat.append(&mut nonce);
 
     // Read auth
@@ -698,12 +698,11 @@ async fn do_control_channel_handshake(
             hex::encode(session_key),
             hex::encode(d)
         );
-        bail!("Service {} failed the authentication", service_name);
+        bail!("Tunnel {} failed the authentication", tunnel_name);
     } else {
-        let heartbeat_interval = state.config.read().await.heartbeat_interval;
         let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
 
-        // If there's already a control channel for the service, then drop the old one.
+        // If there's already a control channel for the tunnel, then drop the old one.
         // Because a control channel doesn't report back when it's dead,
         // the handle in the map could be stall, dropping the old handle enables
         // the client to reconnect.
@@ -711,12 +710,12 @@ async fn do_control_channel_handshake(
             .control_channels
             .write()
             .await
-            .remove1(&service_digest)
+            .remove1(&tunnel_digest)
             .is_some()
         {
             warn!(
-                "Dropping previous control channel for service {}",
-                service_name
+                "Dropping previous control channel for tunnel {}",
+                tunnel_name
             );
         }
 
@@ -725,26 +724,26 @@ async fn do_control_channel_handshake(
             .await?;
         conn.flush().await?;
 
-        info!(service = %service_config.name, "Control channel established");
+        info!(tunnel = %tunnel_config.name, "Control channel established");
         let (handle, ch_task) =
-            ControlChannelHandle::new(conn, service_config, heartbeat_interval, conn_id);
+            ControlChannelHandle::new(conn, tunnel_config, heartbeat_interval, conn_id);
 
         // Insert the new handle
         let _ = state
             .control_channels
             .write()
             .await
-            .insert(service_digest, session_key, handle);
+            .insert(tunnel_digest, session_key, handle);
 
         // When the control channel is gone (the client crashed, was stopped, or lost
         // its connection), remove its handle so that the visitors are answered with a
-        // 503 instead of being handed over to a service that will never receive them.
+        // 503 instead of being handed over to a tunnel that will never receive them.
         // Only remove our own handle, so that a reconnected client isn't dropped.
         tokio::spawn(async move {
             let _ = ch_task.await;
             let mut h = state.control_channels.write().await;
-            if h.get1(&service_digest).map(|h| h.id) == Some(conn_id) {
-                h.remove1(&service_digest);
+            if h.get1(&tunnel_digest).map(|h| h.id) == Some(conn_id) {
+                h.remove1(&tunnel_digest);
             }
         });
     }
@@ -763,7 +762,7 @@ async fn do_data_channel_handshake(
     let control_channels_guard = state.control_channels.read().await;
     match control_channels_guard.get2(&nonce) {
         Some(handle) => {
-            SocketOpts::from_server_cfg(&handle.service).apply(&conn);
+            SocketOpts::from_server_cfg(&handle.tunnel).apply(&conn);
 
             // Send the data channel to the corresponding control channel
             handle
@@ -790,16 +789,16 @@ pub(crate) struct ControlChannelHandle {
     // Asks the client for a new data channel. The HTTP entrypoint requests one for
     // every visitor, so that the pool is replenished as it's drained.
     pub(crate) data_ch_req_tx: mpsc::UnboundedSender<bool>,
-    service: ServerServiceConfig,
+    tunnel: ServerTunnelConfig,
 }
 
 impl ControlChannelHandle {
     // Create a control channel handle, where the control channel handling task
     // and the connection pool task are created.
-    #[instrument(name = "handle", skip_all, fields(service = %service.name))]
+    #[instrument(name = "handle", skip_all, fields(tunnel = %tunnel.name))]
     fn new(
         conn: TcpStream,
-        service: ServerServiceConfig,
+        tunnel: ServerTunnelConfig,
         heartbeat_interval: u64,
         id: usize,
     ) -> (ControlChannelHandle, JoinHandle<()>) {
@@ -848,7 +847,7 @@ impl ControlChannelHandle {
         // Run the control channel. Its `JoinHandle` is returned so that the caller can
         // remove the handle from the map once the channel is gone, which lets the
         // visitors be answered with a 503 instead of being handed over to a dead
-        // service.
+        // tunnel.
         let ch_task = tokio::spawn(
             async move {
                 if let Err(err) = ch.run().await {
@@ -865,7 +864,7 @@ impl ControlChannelHandle {
                 data_ch_tx,
                 visitor_tx,
                 data_ch_req_tx: handle_req_tx,
-                service,
+                tunnel,
             },
             ch_task,
         )
@@ -924,7 +923,7 @@ impl ControlChannel {
                 // The client never writes on the control channel, so any read result
                 // means that it's gone. Breaking the loop removes the handle from the
                 // map (see `do_control_channel_handshake`), so that the visitors get a
-                // 503 instead of being handed over to a service that never forwards.
+                // 503 instead of being handed over to a tunnel that never forwards.
                 ret = rd.read(&mut buf) => {
                     match ret {
                         Ok(0) => {
@@ -981,14 +980,14 @@ async fn run_tcp_connection_pool(
                     // Current data channel is broken. Request for a new one
                     if data_ch_req_tx.send(true).is_err() {
                         // The control channel is gone, so no new data channel will come
-                        crate::http::respond_service_unavailable(&mut stream).await;
+                        crate::http::respond_tunnel_unavailable(&mut stream).await;
                         break 'pool;
                     }
                 }
             } else {
                 // The control channel is gone, so no data channel will ever come.
                 // Answer the visitor with a 503 instead of leaving it hanging.
-                crate::http::respond_service_unavailable(&mut stream).await;
+                crate::http::respond_tunnel_unavailable(&mut stream).await;
                 break 'pool;
             }
         }

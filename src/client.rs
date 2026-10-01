@@ -1,5 +1,5 @@
 use crate::cli::ClientArgs;
-use crate::config::{ClientConfig, ClientServiceConfig, MaskedString};
+use crate::config::{ClientConfig, ClientTunnelConfig, MaskedString};
 use crate::constants::run_control_chan_backoff;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
@@ -31,14 +31,14 @@ pub async fn run_client(args: ClientArgs, shutdown_rx: broadcast::Receiver<bool>
 // Holds the state of a client
 struct Client {
     args: ClientArgs,
-    service_handles: HashMap<String, ControlChannelHandle>,
+    tunnel_handles: HashMap<String, ControlChannelHandle>,
 }
 
 impl Client {
     fn new(args: ClientArgs) -> Client {
         Client {
             args,
-            service_handles: HashMap::new(),
+            tunnel_handles: HashMap::new(),
         }
     }
 
@@ -70,54 +70,54 @@ impl Client {
             }
         }
 
-        // Shutdown all services
-        for (_, handle) in self.service_handles.drain() {
+        // Shutdown all tunnels
+        for (_, handle) in self.tunnel_handles.drain() {
             handle.shutdown();
         }
 
         Ok(())
     }
 
-    // Make the pushed config effective: start the new services, stop the removed
+    // Make the pushed config effective: start the new tunnels, stop the removed
     // ones, and restart the ones whose config changed.
     fn reconcile(&mut self, config: ClientConfig) {
         let token = MaskedString::from(self.args.token.as_str());
 
-        let names: HashSet<&str> = config.services.iter().map(|s| s.name.as_str()).collect();
+        let names: HashSet<&str> = config.tunnels.iter().map(|s| s.name.as_str()).collect();
 
         let stale: Vec<String> = self
-            .service_handles
+            .tunnel_handles
             .keys()
             .filter(|n| !names.contains(n.as_str()))
             .cloned()
             .collect();
         for name in stale {
-            if let Some(handle) = self.service_handles.remove(&name) {
-                info!("Stopping the service `{}`", name);
+            if let Some(handle) = self.tunnel_handles.remove(&name) {
+                info!("Stopping the tunnel `{}`", name);
                 handle.shutdown();
             }
         }
 
-        for service in &config.services {
-            let restart = match self.service_handles.get(&service.name) {
-                Some(handle) => !handle.matches(service, config.heartbeat_timeout),
+        for tunnel in &config.tunnels {
+            let restart = match self.tunnel_handles.get(&tunnel.name) {
+                Some(handle) => !handle.matches(tunnel, config.heartbeat_timeout),
                 None => true,
             };
             if !restart {
                 continue;
             }
 
-            if let Some(handle) = self.service_handles.remove(&service.name) {
+            if let Some(handle) = self.tunnel_handles.remove(&tunnel.name) {
                 handle.shutdown();
             }
 
             let handle = ControlChannelHandle::new(
-                service.clone(),
+                tunnel.clone(),
                 token.clone(),
                 self.args.remote.clone(),
                 config.heartbeat_timeout,
             );
-            self.service_handles.insert(service.name.clone(), handle);
+            self.tunnel_handles.insert(tunnel.name.clone(), handle);
         }
     }
 }
@@ -230,8 +230,8 @@ async fn run_config_connection(
             config = protocol::read_payload::<ClientConfig, _>(&mut conn) => {
                 let config = config.with_context(|| "Failed to read the config")?;
                 info!(
-                    "Got the config from the server. {} service(s)",
-                    config.services.len()
+                    "Got the config from the server. {} tunnel(s)",
+                    config.tunnels.len()
                 );
                 if tx.send(config).await.is_err() {
                     bail!("The client is shutting down");
@@ -246,7 +246,7 @@ struct RunDataChannelArgs {
     session_key: Nonce,
     remote_addr: AddrMaybeCached,
     socket_opts: SocketOpts,
-    service: ClientServiceConfig,
+    tunnel: ClientTunnelConfig,
 }
 
 async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<TcpStream> {
@@ -291,7 +291,7 @@ async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
     // Forward
     match read_data_cmd(&mut conn).await? {
         DataChannelCmd::StartForwardTcp => {
-            run_data_channel_for_tcp(conn, &args.service.local_addr).await?;
+            run_data_channel_for_tcp(conn, &args.tunnel.local_addr).await?;
         }
     }
     Ok(())
@@ -311,15 +311,15 @@ async fn run_data_channel_for_tcp(mut conn: TcpStream, local_addr: &str) -> Resu
 
 // Control channel
 struct ControlChannel {
-    digest: ServiceDigest,              // SHA256 of the service name
-    service: ClientServiceConfig,       // Pushed by the server
+    digest: TunnelDigest,               // SHA256 of the tunnel name
+    tunnel: ClientTunnelConfig,         // Pushed by the server
     token: MaskedString,                // The token given by `--token`
     shutdown_rx: oneshot::Receiver<u8>, // Receives the shutdown signal
     remote_addr: String,                // `--remote`
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
 }
 
-type ServiceDigest = protocol::Digest;
+type TunnelDigest = protocol::Digest;
 type Nonce = protocol::Digest;
 
 // Handle of a control channel
@@ -328,14 +328,14 @@ struct ControlChannelHandle {
     shutdown_tx: oneshot::Sender<u8>,
     // Keep the config that the channel was created with, so that it can be compared
     // with the config pushed later
-    service: ClientServiceConfig,
+    tunnel: ClientTunnelConfig,
     heartbeat_timeout: u64,
 }
 
 impl ControlChannelHandle {
     // Whether the channel is already serving the given config
-    fn matches(&self, service: &ClientServiceConfig, heartbeat_timeout: u64) -> bool {
-        &self.service == service && self.heartbeat_timeout == heartbeat_timeout
+    fn matches(&self, tunnel: &ClientTunnelConfig, heartbeat_timeout: u64) -> bool {
+        &self.tunnel == tunnel && self.heartbeat_timeout == heartbeat_timeout
     }
 }
 
@@ -383,7 +383,7 @@ impl ControlChannel {
             Ack::Ok => {}
             v => {
                 return Err(anyhow!("{}", v))
-                    .with_context(|| format!("Authentication failed: {}", self.service.name));
+                    .with_context(|| format!("Authentication failed: {}", self.tunnel.name));
             }
         }
 
@@ -391,12 +391,12 @@ impl ControlChannel {
         info!("Control channel established");
 
         // Socket options for the data channel
-        let socket_opts = SocketOpts::from_client_cfg(&self.service);
+        let socket_opts = SocketOpts::from_client_cfg(&self.tunnel);
         let data_ch_args = Arc::new(RunDataChannelArgs {
             session_key,
             remote_addr,
             socket_opts,
-            service: self.service.clone(),
+            tunnel: self.tunnel.clone(),
         });
 
         loop {
@@ -431,24 +431,24 @@ impl ControlChannel {
 }
 
 impl ControlChannelHandle {
-    #[instrument(name="handle", skip_all, fields(service = %service.name))]
+    #[instrument(name="handle", skip_all, fields(tunnel = %tunnel.name))]
     fn new(
-        service: ClientServiceConfig,
+        tunnel: ClientTunnelConfig,
         token: MaskedString,
         remote_addr: String,
         heartbeat_timeout: u64,
     ) -> ControlChannelHandle {
-        let digest = protocol::digest(service.name.as_bytes());
+        let digest = protocol::digest(tunnel.name.as_bytes());
 
         info!("Starting {}", hex::encode(digest));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        let mut retry_backoff = run_control_chan_backoff(service.retry_interval);
+        let mut retry_backoff = run_control_chan_backoff(tunnel.retry_interval);
 
-        let handle_service = service.clone();
+        let handle_tunnel = tunnel.clone();
         let mut s = ControlChannel {
             digest,
-            service,
+            tunnel,
             token,
             shutdown_rx,
             remote_addr,
@@ -489,7 +489,7 @@ impl ControlChannelHandle {
 
         ControlChannelHandle {
             shutdown_tx,
-            service: handle_service,
+            tunnel: handle_tunnel,
             heartbeat_timeout,
         }
     }

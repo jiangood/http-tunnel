@@ -4,7 +4,7 @@
 //! Every API route requires `Authorization: Bearer <api_token>`; the web UI at `/`
 //! is static and asks for the token.
 
-use crate::config::{ServerClientConfig, ServerServiceConfig};
+use crate::config::{ServerClientConfig, ServerTunnelConfig};
 use crate::server::ServerState;
 use anyhow::{Context, Result};
 use axum::extract::{Path, State};
@@ -39,10 +39,10 @@ pub(crate) async fn serve(
             "/clients/:name",
             get(get_client).patch(patch_client).delete(delete_client),
         )
-        .route("/clients/:name/services", get(list_services))
+        .route("/clients/:name/tunnels", get(list_tunnels))
         .route(
-            "/clients/:name/services/:service",
-            put(put_service).delete(delete_service),
+            "/clients/:name/tunnels/:domain",
+            put(put_tunnel).delete(delete_tunnel),
         )
         .route_layer(middleware::from_fn_with_state(token, auth));
 
@@ -95,12 +95,9 @@ async fn auth<B>(
 // ==== The view returned to the API consumers ====
 
 #[derive(Serialize)]
-struct ServiceView {
-    name: String,
-    hosts: Vec<String>,
+struct TunnelView {
+    domain: String,
     local_addr: String,
-    nodelay: Option<bool>,
-    retry_interval: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -108,34 +105,32 @@ struct ClientView {
     name: String,
     /// The token is always masked in the responses
     token: String,
+    heartbeat_interval: Option<u64>,
     heartbeat_timeout: Option<u64>,
     retry_interval: Option<u64>,
     nodelay: Option<bool>,
-    services: Vec<ServiceView>,
+    tunnels: Vec<TunnelView>,
 }
 
-fn service_view(name: &str, s: &ServerServiceConfig) -> ServiceView {
-    ServiceView {
-        name: name.to_string(),
-        hosts: s.hosts.clone(),
+fn tunnel_view(s: &ServerTunnelConfig) -> TunnelView {
+    TunnelView {
+        domain: s.domain.clone(),
         local_addr: s.local_addr.clone(),
-        nodelay: s.nodelay,
-        retry_interval: s.retry_interval,
     }
 }
 
 fn client_view(name: &str, c: &ServerClientConfig) -> ClientView {
-    let mut services: Vec<ServiceView> =
-        c.services.iter().map(|(n, s)| service_view(n, s)).collect();
-    services.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut tunnels: Vec<TunnelView> = c.tunnels.values().map(tunnel_view).collect();
+    tunnels.sort_by(|a, b| a.domain.cmp(&b.domain));
 
     ClientView {
         name: name.to_string(),
         token: "****".to_string(),
+        heartbeat_interval: c.heartbeat_interval,
         heartbeat_timeout: c.heartbeat_timeout,
         retry_interval: c.retry_interval,
         nodelay: c.nodelay,
-        services,
+        tunnels,
     }
 }
 
@@ -145,6 +140,7 @@ fn client_view(name: &str, c: &ServerClientConfig) -> ClientView {
 struct CreateClient {
     name: String,
     token: String,
+    heartbeat_interval: Option<u64>,
     heartbeat_timeout: Option<u64>,
     retry_interval: Option<u64>,
     nodelay: Option<bool>,
@@ -153,18 +149,15 @@ struct CreateClient {
 #[derive(Deserialize)]
 struct PatchClient {
     token: Option<String>,
+    heartbeat_interval: Option<u64>,
     heartbeat_timeout: Option<u64>,
     retry_interval: Option<u64>,
     nodelay: Option<bool>,
 }
 
 #[derive(Deserialize)]
-struct PutService {
-    #[serde(default)]
-    hosts: Vec<String>,
+struct PutTunnel {
     local_addr: String,
-    nodelay: Option<bool>,
-    retry_interval: Option<u64>,
 }
 
 // ==== The error response ====
@@ -195,10 +188,10 @@ impl From<anyhow::Error> for ApiError {
 
 async fn status(State(state): State<Arc<ServerState>>) -> Json<serde_json::Value> {
     let config = state.snapshot().await;
-    let services: usize = config.clients.values().map(|c| c.services.len()).sum();
+    let tunnels: usize = config.clients.values().map(|c| c.tunnels.len()).sum();
     Json(json!({
         "clients": config.clients.len(),
-        "services": services,
+        "tunnels": tunnels,
         "bind_addr": config.bind_addr,
         "http_bind_addr": config.http_bind_addr,
     }))
@@ -236,10 +229,11 @@ async fn create_client(
     let client = ServerClientConfig {
         name: String::new(),
         token: body.token.into(),
+        heartbeat_interval: body.heartbeat_interval,
         heartbeat_timeout: body.heartbeat_timeout,
         retry_interval: body.retry_interval,
         nodelay: body.nodelay,
-        services: HashMap::new(),
+        tunnels: HashMap::new(),
     };
     let name = body.name;
     state.create_client(name.clone(), client).await?;
@@ -257,6 +251,9 @@ async fn patch_client(
         .update_client(&name, move |c| {
             if let Some(token) = body.token {
                 c.token = token.into();
+            }
+            if let Some(v) = body.heartbeat_interval {
+                c.heartbeat_interval = Some(v);
             }
             if let Some(v) = body.heartbeat_timeout {
                 c.heartbeat_timeout = Some(v);
@@ -283,15 +280,17 @@ async fn delete_client(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn list_services(
+async fn list_tunnels(
     State(state): State<Arc<ServerState>>,
     Path(name): Path<String>,
-) -> Result<Json<Vec<ServiceView>>, ApiError> {
+) -> Result<Json<Vec<TunnelView>>, ApiError> {
     let config = state.snapshot().await;
     match config.clients.get(&name) {
-        Some(c) => Ok(Json(
-            c.services.iter().map(|(n, s)| service_view(n, s)).collect(),
-        )),
+        Some(c) => {
+            let mut tunnels: Vec<TunnelView> = c.tunnels.values().map(tunnel_view).collect();
+            tunnels.sort_by(|a, b| a.domain.cmp(&b.domain));
+            Ok(Json(tunnels))
+        }
         None => Err(ApiError(
             StatusCode::NOT_FOUND,
             format!("No such a client `{}`", name),
@@ -299,31 +298,32 @@ async fn list_services(
     }
 }
 
-async fn put_service(
+async fn put_tunnel(
     State(state): State<Arc<ServerState>>,
-    Path((client, service)): Path<(String, String)>,
-    Json(body): Json<PutService>,
+    Path((client, domain)): Path<(String, String)>,
+    Json(body): Json<PutTunnel>,
 ) -> Result<Response, ApiError> {
-    let service_config = ServerServiceConfig {
-        name: String::new(),
-        hosts: body.hosts,
+    let domain = domain.to_lowercase();
+    let tunnel_config = ServerTunnelConfig {
+        name: domain.clone(),
+        domain: domain.clone(),
         local_addr: body.local_addr,
-        nodelay: body.nodelay,
-        retry_interval: body.retry_interval,
+        nodelay: None,
+        retry_interval: None,
     };
     state
-        .put_service(&client, service.clone(), service_config)
+        .put_tunnel(&client, domain.clone(), tunnel_config)
         .await?;
 
     let config = state.snapshot().await;
-    let view = service_view(&service, &config.clients[&client].services[&service]);
+    let view = tunnel_view(&config.clients[&client].tunnels[&domain]);
     Ok((StatusCode::CREATED, Json(view)).into_response())
 }
 
-async fn delete_service(
+async fn delete_tunnel(
     State(state): State<Arc<ServerState>>,
-    Path((client, service)): Path<(String, String)>,
+    Path((client, domain)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    state.delete_service(&client, &service).await?;
+    state.delete_tunnel(&client, &domain.to_lowercase()).await?;
     Ok(StatusCode::NO_CONTENT)
 }

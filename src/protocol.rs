@@ -22,7 +22,7 @@ pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 #[allow(clippy::enum_variant_names)]
 #[derive(Deserialize, Serialize, Debug)]
 pub enum Hello {
-    /// Sent by a client to represent a service. sha256sum(service name)
+    /// Sent by a client to represent a tunnel. sha256sum(tunnel name)
     ControlChannelHello(ProtocolVersion, Digest),
     /// Sent by a client to establish a data channel. The session key handed out by the control channel
     DataChannelHello(ProtocolVersion, Digest),
@@ -36,7 +36,7 @@ pub struct Auth(pub Digest);
 #[derive(Deserialize, Serialize, Debug)]
 pub enum Ack {
     Ok,
-    ServiceNotExist,
+    TunnelNotExist,
     AuthFailed,
 }
 
@@ -47,7 +47,7 @@ impl std::fmt::Display for Ack {
             "{}",
             match self {
                 Ack::Ok => "Ok",
-                Ack::ServiceNotExist => "No such a client or service",
+                Ack::TunnelNotExist => "No such a client or tunnel",
                 Ack::AuthFailed => "Incorrect token",
             }
         )

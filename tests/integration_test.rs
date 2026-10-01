@@ -36,7 +36,7 @@ fn init() {
 async fn http_routing() -> Result<()> {
     init();
 
-    // Spawn a echo server as the local HTTP service behind the NAT
+    // Spawn a echo server as the local HTTP tunnel behind the NAT
     tokio::spawn(async move {
         if let Err(e) = common::tcp::echo_server(ECHO_SERVER_ADDR).await {
             panic!("Failed to run the echo server for testing: {:?}", e);
@@ -66,7 +66,7 @@ async fn http_routing() -> Result<()> {
     });
     time::sleep(Duration::from_millis(2500)).await; // Wait for the client to retry
 
-    info!("route by Host");
+    info!("tunnel by Host");
     http_echo_hitter(HTTP_ENTRY_ADDR, ECHO_HOST).await.unwrap();
 
     info!("unknown Host returns 404");
@@ -79,8 +79,8 @@ async fn http_routing() -> Result<()> {
     client_shutdown_tx.send(true)?;
     let _ = tokio::join!(client);
 
-    // A visitor must not hang when the service is disconnected: it gets a 503
-    info!("a disconnected service is answered with 503");
+    // A visitor must not hang when the tunnel is disconnected: it gets a 503
+    info!("a disconnected tunnel is answered with 503");
     wait_for_503(HTTP_ENTRY_ADDR, ECHO_HOST).await.unwrap();
 
     info!("restart the client");
@@ -92,7 +92,7 @@ async fn http_routing() -> Result<()> {
     });
     time::sleep(Duration::from_secs(1)).await; // Wait for the client to start
 
-    info!("route by Host");
+    info!("tunnel by Host");
     http_echo_hitter(HTTP_ENTRY_ADDR, ECHO_HOST).await.unwrap();
 
     // The data channel pool only caches `TCP_POOL_SIZE` (8) connections and a visitor
@@ -151,7 +151,7 @@ async fn http_routing() -> Result<()> {
 }
 
 /// Send a request with the given `Host` and expect the whole request to be echoed back
-/// (the local service is a raw echo server, so it echoes the header together with the body)
+/// (the local tunnel is a raw echo server, so it echoes the header together with the body)
 async fn http_echo_hitter(addr: &'static str, host: &'static str) -> Result<()> {
     let mut conn = TcpStream::connect(addr).await?;
 
@@ -221,7 +221,7 @@ async fn wait_for_503(addr: &'static str, host: &'static str) -> Result<()> {
         }
 
         if time::Instant::now() >= deadline {
-            anyhow::bail!("the service didn't answer `503` in time");
+            anyhow::bail!("the tunnel didn't answer `503` in time");
         }
         time::sleep(Duration::from_millis(250)).await;
     }
@@ -245,9 +245,8 @@ api_token = "admin_secret"
 [clients.home]
 token = "a_secret_token"
 
-[clients.home.services.echo]
-hosts = ["echo.test"]
-local_addr = "127.0.0.1:8091"
+[clients.home.tunnels]
+"echo.test" = "127.0.0.1:8091"
 "#;
 
 #[tokio::test]
@@ -258,7 +257,7 @@ async fn admin_api_hot_reload() -> Result<()> {
     let config_path = std::env::temp_dir().join("http_tunnel_admin_test.toml");
     std::fs::write(&config_path, ADMIN_CONFIG)?;
 
-    // An echo server as the local HTTP service behind the NAT
+    // An echo server as the local HTTP tunnel behind the NAT
     tokio::spawn(async move {
         if let Err(e) = common::tcp::echo_server(ADMIN_ECHO_SERVER_ADDR).await {
             panic!("Failed to run the echo server for testing: {:?}", e);
@@ -289,7 +288,7 @@ async fn admin_api_hot_reload() -> Result<()> {
 
     time::sleep(Duration::from_millis(2500)).await;
 
-    info!("the initial service is routed");
+    info!("the initial tunnel is routed");
     http_echo_hitter(ADMIN_HTTP_ENTRY_ADDR, "echo.test")
         .await
         .unwrap();
@@ -320,29 +319,29 @@ async fn admin_api_hot_reload() -> Result<()> {
     assert_eq!(status, 200, "unexpected response: {}", body);
     assert!(body.contains("home"), "unexpected body: {}", body);
 
-    info!("add a service through the API");
+    info!("add a tunnel through the API");
     let (status, body) = api_request(
         ADMIN_API_ADDR,
         "PUT",
-        "/api/clients/home/services/echo2",
+        "/api/clients/home/tunnels/echo2.test",
         Some(ADMIN_TOKEN),
-        Some(r#"{"hosts":["echo2.test"],"local_addr":"127.0.0.1:8091"}"#),
+        Some(r#"{"local_addr":"127.0.0.1:8091"}"#),
     )
     .await?;
     assert_eq!(status, 201, "unexpected response: {}", body);
 
-    // The client picks the new service up without a restart
+    // The client picks the new tunnel up without a restart
     time::sleep(Duration::from_millis(1500)).await;
-    info!("the added service is routed without a restart");
+    info!("the added tunnel is routed without a restart");
     http_echo_hitter(ADMIN_HTTP_ENTRY_ADDR, "echo2.test")
         .await
         .unwrap();
 
-    info!("delete a service through the API");
+    info!("delete a tunnel through the API");
     let (status, body) = api_request(
         ADMIN_API_ADDR,
         "DELETE",
-        "/api/clients/home/services/echo",
+        "/api/clients/home/tunnels/echo.test",
         Some(ADMIN_TOKEN),
         None,
     )
@@ -350,7 +349,7 @@ async fn admin_api_hot_reload() -> Result<()> {
     assert_eq!(status, 204, "unexpected response: {}", body);
 
     time::sleep(Duration::from_millis(500)).await;
-    info!("the deleted service is no longer routed");
+    info!("the deleted tunnel is no longer routed");
     http_404_check(ADMIN_HTTP_ENTRY_ADDR, "echo.test")
         .await
         .unwrap();
@@ -358,12 +357,12 @@ async fn admin_api_hot_reload() -> Result<()> {
     // The change has been written back to the config file
     let written = std::fs::read_to_string(&config_path)?;
     assert!(
-        written.contains("echo2"),
+        written.contains("echo2.test"),
         "the config wasn't written back: {}",
         written
     );
     assert!(
-        !written.contains("[clients.home.services.echo]"),
+        !written.contains("echo.test"),
         "unexpected config: {}",
         written
     );

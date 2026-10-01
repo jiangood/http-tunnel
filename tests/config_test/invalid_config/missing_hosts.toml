@@ -1,9 +1,0 @@
-bind_addr = "0.0.0.0:2333"
-http_bind_addr = "0.0.0.0:80"
-
-[clients.home]
-token = "123"
-
-[clients.home.services.foo1]
-hosts = []
-local_addr = "127.0.0.1:80"

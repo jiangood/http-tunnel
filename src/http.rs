@@ -19,7 +19,7 @@ const HEADER_READ_TIMEOUT: u64 = 5;
 pub type RoutingTable = HashMap<String, Digest>;
 
 /// The HTTP entrypoint of the server. It accepts visitors on `bind_addr`, sniffs the
-/// `Host` header, and hands the visitor over to the corresponding service.
+/// `Host` header, and hands the visitor over to the corresponding tunnel.
 ///
 /// Only the first request of a connection is inspected, so routing is connection-level.
 pub(crate) async fn serve(
@@ -73,8 +73,8 @@ async fn handle_visitor(
     };
 
     let Some(digest) = digest else {
-        debug!("No service for the host `{}`", host);
-        respond(&mut stream, "404 Not Found", "No service for this host\n").await;
+        debug!("No tunnel for the host `{}`", host);
+        respond(&mut stream, "404 Not Found", "No tunnel for this host\n").await;
         return Ok(());
     };
 
@@ -86,7 +86,7 @@ async fn handle_visitor(
 
     let Some((visitor_tx, data_ch_req_tx)) = handle else {
         debug!("No control channel for the host `{}`", host);
-        respond_service_unavailable(&mut stream).await;
+        respond_tunnel_unavailable(&mut stream).await;
         return Ok(());
     };
 
@@ -97,7 +97,7 @@ async fn handle_visitor(
     // that the control channel is gone.
     if data_ch_req_tx.send(true).is_err() {
         debug!("No control channel for the host `{}`", host);
-        respond_service_unavailable(&mut stream).await;
+        respond_tunnel_unavailable(&mut stream).await;
         return Ok(());
     }
 
@@ -108,7 +108,7 @@ async fn handle_visitor(
         .await
         .is_err()
     {
-        warn!("Failed to hand over the visitor to the service `{}`", host);
+        warn!("Failed to hand over the visitor to the tunnel `{}`", host);
     }
 
     Ok(())
@@ -181,14 +181,14 @@ fn normalize_host(raw: &str) -> String {
     host.to_lowercase()
 }
 
-/// Answer a visitor with a `503`, either because no service is connected for its
-/// `Host`, or because the control channel of the service went away after the visitor
+/// Answer a visitor with a `503`, either because no tunnel is connected for its
+/// `Host`, or because the control channel of the tunnel went away after the visitor
 /// was already handed over.
-pub(crate) async fn respond_service_unavailable(stream: &mut TcpStream) {
+pub(crate) async fn respond_tunnel_unavailable(stream: &mut TcpStream) {
     respond(
         stream,
         "503 Service Unavailable",
-        "Service is not connected\n",
+        "The tunnel is not connected\n",
     )
     .await;
 }

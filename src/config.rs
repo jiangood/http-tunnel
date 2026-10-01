@@ -14,6 +14,18 @@ const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 40;
 /// The interval between retries to connect to the server
 const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
 
+/// A bind address is either a bare port (e.g. `"2333"`), which binds to all interfaces
+/// (`0.0.0.0`), or a `host:port`.
+fn validate_bind_addr(addr: &str, name: &str) -> Result<()> {
+    if addr.is_empty() {
+        bail!("`{}` is empty", name);
+    }
+    if addr.parse::<u16>().is_err() && !addr.contains(':') {
+        bail!("`{}` ({}) must be a port or a `host:port`", name, addr);
+    }
+    Ok(())
+}
+
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
 #[derive(Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
@@ -44,12 +56,12 @@ impl From<String> for MaskedString {
     }
 }
 
-/// A service as seen by a client.
+/// A tunnel as seen by a client.
 ///
-/// The server generates it from `[clients.<client>.services.<service>]` and pushes
-/// it to the client, so that the client doesn't need any configuration of its own.
+/// The server generates it from `[clients.<client>]` and pushes it to the client, so
+/// that the client doesn't need any configuration of its own.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
-pub struct ClientServiceConfig {
+pub struct ClientTunnelConfig {
     pub name: String,
     /// The address of the local service on the client side
     pub local_addr: String,
@@ -65,88 +77,185 @@ pub struct ClientServiceConfig {
 /// over a config channel. The client holds no configuration of its own.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct ClientConfig {
-    pub services: Vec<ClientServiceConfig>,
+    pub tunnels: Vec<ClientTunnelConfig>,
     /// Application-layer heartbeat timeout in secs. 0 disables it
     pub heartbeat_timeout: u64,
     /// The interval between retries to connect to the server
     pub retry_interval: u64,
 }
 
-/// A service of `[clients.<client>.services.<service>]`
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct ServerServiceConfig {
-    #[serde(skip)]
+/// A tunnel of `[clients.<client>]`, keyed by its domain.
+///
+/// A tunnel maps a single domain (the `Host` header) to a single `local_addr` on the
+/// client side. The tunnel name is the domain, which is also the identity that the
+/// server pushes to the client.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServerTunnelConfig {
+    /// The name of the tunnel, which is always its `domain`
     pub name: String,
-    /// The hosts (the `Host` header) that are routed to this service
-    #[serde(default)]
-    pub hosts: Vec<String>,
-    /// The address of the service on the client side
+    /// The domain (the `Host` header) that is routed to this tunnel
+    pub domain: String,
+    /// The address of the local service on the client side
     pub local_addr: String,
-    /// Whether to enable TCP_NODELAY. Defaults to `[clients.<client>].nodelay`,
-    /// then to `true`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Whether to enable TCP_NODELAY. Defaults to `[clients.<client>].nodelay`
     pub nodelay: Option<bool>,
     /// The interval between retries to connect to the server. Defaults to
     /// `[clients.<client>].retry_interval`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_interval: Option<u64>,
 }
 
-/// A client of `[clients.<name>]`.
+/// The configuration of a client of `[clients.<name>]`.
 ///
 /// The name is the identity of the client, which is given to the client via `--name`.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
+/// The client-level options apply to all of its tunnels, which are declared in the
+/// `[clients.<name>.tunnels]` sub-table, keyed by domain:
+///
+/// ```toml
+/// [clients.home]
+/// token = "123"
+/// nodelay = true
+///
+/// [clients.home.tunnels]
+/// "nas.example.com" = "127.0.0.1:80"
+/// "git.example.com" = "127.0.0.1:3000"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ServerClientConfig {
-    #[serde(skip)]
+    /// The name of the client, filled from the map key
     pub name: String,
     /// The token of the client. It's the only way for the client to authenticate
     pub token: MaskedString,
+    /// The interval between two application-layer heartbeats, in secs. 0 disables
+    /// sending them
+    pub heartbeat_interval: Option<u64>,
     /// Application-layer heartbeat timeout in secs. 0 disables it
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat_timeout: Option<u64>,
     /// The interval between retries to connect to the server
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_interval: Option<u64>,
-    /// Whether to enable TCP_NODELAY for the services of this client
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Whether to enable TCP_NODELAY for the tunnels of this client. Defaults to true
     pub nodelay: Option<bool>,
-    pub services: HashMap<String, ServerServiceConfig>,
+    /// The tunnels, indexed by their domain
+    pub tunnels: HashMap<String, ServerTunnelConfig>,
+}
+
+impl<'de> Deserialize<'de> for ServerClientConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            token: MaskedString,
+            #[serde(default)]
+            heartbeat_interval: Option<u64>,
+            #[serde(default)]
+            heartbeat_timeout: Option<u64>,
+            #[serde(default)]
+            retry_interval: Option<u64>,
+            #[serde(default)]
+            nodelay: Option<bool>,
+            #[serde(default)]
+            tunnels: HashMap<String, String>,
+        }
+
+        let w = Wire::deserialize(deserializer)?;
+        let tunnels = w
+            .tunnels
+            .into_iter()
+            .map(|(domain, local_addr)| {
+                let tunnel = ServerTunnelConfig {
+                    name: domain.clone(),
+                    domain: domain.clone(),
+                    local_addr,
+                    nodelay: None,
+                    retry_interval: None,
+                };
+                (domain, tunnel)
+            })
+            .collect();
+
+        Ok(ServerClientConfig {
+            name: String::new(),
+            token: w.token,
+            heartbeat_interval: w.heartbeat_interval,
+            heartbeat_timeout: w.heartbeat_timeout,
+            retry_interval: w.retry_interval,
+            nodelay: w.nodelay,
+            tunnels,
+        })
+    }
+}
+
+impl Serialize for ServerClientConfig {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("token", &self.token)?;
+        if let Some(v) = &self.heartbeat_interval {
+            map.serialize_entry("heartbeat_interval", v)?;
+        }
+        if let Some(v) = &self.heartbeat_timeout {
+            map.serialize_entry("heartbeat_timeout", v)?;
+        }
+        if let Some(v) = &self.retry_interval {
+            map.serialize_entry("retry_interval", v)?;
+        }
+        if let Some(v) = &self.nodelay {
+            map.serialize_entry("nodelay", v)?;
+        }
+
+        // The tunnels form a nested table, `[clients.<name>.tunnels]`, keyed by domain
+        if !self.tunnels.is_empty() {
+            let tunnels: std::collections::BTreeMap<&str, &str> = self
+                .tunnels
+                .values()
+                .map(|t| (t.domain.as_str(), t.local_addr.as_str()))
+                .collect();
+            map.serialize_entry("tunnels", &tunnels)?;
+        }
+        map.end()
+    }
 }
 
 impl ServerClientConfig {
+    /// The interval between two application-layer heartbeats sent to the client, in secs
+    pub fn heartbeat_interval(&self) -> u64 {
+        self.heartbeat_interval
+            .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL_SECS)
+    }
+
     /// Build the configuration that is pushed to the client
     pub fn to_client_config(&self) -> ClientConfig {
         let retry_interval = self
             .retry_interval
             .unwrap_or(DEFAULT_CLIENT_RETRY_INTERVAL_SECS);
 
-        let mut services: Vec<ClientServiceConfig> = self
-            .services
+        let mut tunnels: Vec<ClientTunnelConfig> = self
+            .tunnels
             .values()
-            .map(|s| ClientServiceConfig {
-                name: s.name.clone(),
-                local_addr: s.local_addr.clone(),
-                nodelay: s.nodelay.or(self.nodelay),
-                retry_interval: s.retry_interval.unwrap_or(retry_interval),
+            .map(|t| ClientTunnelConfig {
+                name: t.name.clone(),
+                local_addr: t.local_addr.clone(),
+                nodelay: Some(t.nodelay.or(self.nodelay).unwrap_or(true)),
+                retry_interval: t.retry_interval.unwrap_or(retry_interval),
             })
             .collect();
         // Could be arbitrary, but keep it stable for the logs
-        services.sort_by(|a, b| a.name.cmp(&b.name));
+        tunnels.sort_by(|a, b| a.name.cmp(&b.name));
 
         ClientConfig {
-            services,
+            tunnels,
             heartbeat_timeout: self
                 .heartbeat_timeout
                 .unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT_SECS),
             retry_interval,
         }
     }
-}
-
-fn default_heartbeat_interval() -> u64 {
-    DEFAULT_HEARTBEAT_INTERVAL_SECS
 }
 
 /// The configuration of a server. It's the only configuration of `http-tunnel`
@@ -157,8 +266,6 @@ pub struct ServerConfig {
     pub bind_addr: String,
     /// The address that the server listens for HTTP visitors, routed by the `Host` header
     pub http_bind_addr: String,
-    #[serde(default = "default_heartbeat_interval")]
-    pub heartbeat_interval: u64,
     /// The address that the administration API and the minimal web UI listen at.
     /// The API is only started when both this and `api_token` are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,11 +283,11 @@ impl ServerConfig {
     fn from_str(s: &str) -> Result<ServerConfig> {
         let mut config: ServerConfig = toml::from_str(s)
             .map_err(|e| {
-                if s.contains("[server") || s.contains("[client") || s.contains("default_token") {
+                if s.contains("[server") || s.contains("[client]") || s.contains("default_token") {
                     anyhow!(
                         "{}\nNote: `[server]` is no longer needed, and `[client]`, `[server.services]` and \
                          `default_token` are no longer supported. `http-tunnel` only reads the configuration of \
-                         the server: clients and their services are defined in `[clients.<name>]`, and a \
+                         the server: clients and their tunnels are defined in `[clients.<name>]`, and a \
                          client is started with `--remote`, `--name` and `--token`.",
                         e
                     )
@@ -224,79 +331,92 @@ impl ServerConfig {
     pub fn template() -> String {
         const TEMPLATE: &str = "\
              # http-tunnel server configuration.\n\
-             # The clients and their services are defined in `[clients.<name>]`.\n\
+             # The clients and their tunnels are defined in `[clients.<name>]`.\n\
              # See https://github.com/jiangood/http-tunnel#configuration\n\
              \n\
-             bind_addr = \"0.0.0.0:2333\" # The address that the server listens for clients\n\
-             http_bind_addr = \"0.0.0.0:80\" # The HTTP entrypoint, routed by the `Host` header\n\
-             api_bind_addr = \"0.0.0.0:2335\" # The administration API and the web UI, on all interfaces\n\
+             bind_addr = \"2333\" # The port that the server listens for clients\n\
+             http_bind_addr = \"80\" # The HTTP entrypoint, routed by the `Host` header\n\
+             api_bind_addr = \"2335\" # The administration API and the web UI, on all interfaces\n\
              api_token = \"change_me\" # Required by the administration API\n\
              \n\
              # [clients.home]\n\
              # token = \"use_a_secret_that_only_you_know\"\n\
-             \n\
-             # [clients.home.services.my_service]\n\
-             # hosts = [\"my_service.example.com\"]\n\
-             # local_addr = \"127.0.0.1:80\"\n";
+             #\n\
+             # [clients.home.tunnels]\n\
+             # \"my_service.example.com\" = \"127.0.0.1:80\"\n";
         TEMPLATE.to_string()
     }
 
     /// Validate a configuration and normalize it in place: fill the names from the
-    /// map keys, lowercase the hosts, and reject the ambiguous definitions.
+    /// map keys, lowercase the domains, and reject the ambiguous definitions.
     ///
-    /// A client without any service is allowed, so that a configuration can be built
+    /// A client without any tunnel is allowed, so that a configuration can be built
     /// incrementally through the administration API. The rules that are enforced:
-    /// a client must have a token, the service names are global, a host belongs to a
-    /// single service, and the tokens are unique (a duplicated token would let a
-    /// client impersonate another one).
+    /// a client must have a token, a domain belongs to a single tunnel, and the tokens
+    /// are unique (a duplicated token would let a client impersonate another one).
     pub fn validate(config: &mut ServerConfig) -> Result<()> {
-        // host -> service name and service name -> client name
-        let mut seen_hosts: HashMap<String, String> = HashMap::new();
-        let mut seen_services: HashMap<String, String> = HashMap::new();
+        validate_bind_addr(&config.bind_addr, "bind_addr")?;
+        validate_bind_addr(&config.http_bind_addr, "http_bind_addr")?;
+        if let Some(addr) = &config.api_bind_addr {
+            validate_bind_addr(addr, "api_bind_addr")?;
+        }
+
+        // domain -> client name
+        let mut seen_domains: HashMap<String, String> = HashMap::new();
 
         for (client_name, client) in &mut config.clients {
             client.name = client_name.clone();
 
-            for (service_name, s) in &mut client.services {
-                s.name = service_name.clone();
-
-                if s.local_addr.is_empty() {
+            // Validate against the global rules first, without mutating the client, so
+            // that a rejected configuration is left intact.
+            let mut renames: Vec<(String, String)> = Vec::with_capacity(client.tunnels.len());
+            for (key, t) in &client.tunnels {
+                if t.domain.is_empty() {
                     bail!(
-                        "The `local_addr` of the service `{}` of the client `{}` is empty",
-                        service_name,
+                        "A tunnel of the client `{}` has an empty domain",
                         client_name
                     );
                 }
 
-                if s.hosts.is_empty() {
+                if t.local_addr.is_empty() {
                     bail!(
-                        "The `hosts` of the service `{}` of the client `{}` is empty",
-                        service_name,
+                        "The `local_addr` of the tunnel `{}` of the client `{}` is empty",
+                        t.domain,
                         client_name
                     );
                 }
 
-                if let Some(prev) = seen_services.insert(service_name.clone(), client_name.clone())
-                {
+                let domain = t.domain.to_lowercase();
+                if let Some(prev) = seen_domains.insert(domain.clone(), client_name.clone()) {
+                    if prev == *client_name {
+                        bail!(
+                            "The domain `{}` of the client `{}` is defined more than once",
+                            domain,
+                            client_name
+                        );
+                    }
                     bail!(
-                        "The service `{}` is defined by both the client `{}` and `{}`",
-                        service_name,
+                        "The domain `{}` is used by both the client `{}` and `{}`",
+                        domain,
                         prev,
                         client_name
                     );
                 }
 
-                for h in &mut s.hosts {
-                    *h = h.to_lowercase();
-                    if let Some(prev) = seen_hosts.insert(h.clone(), service_name.clone()) {
-                        bail!(
-                            "The host `{}` is used by both the service `{}` and `{}`",
-                            h,
-                            prev,
-                            service_name
-                        );
-                    }
-                }
+                renames.push((key.clone(), domain));
+            }
+
+            // Normalize: re-key the tunnels by their lowercased domain, and resolve the
+            // inherited TCP_NODELAY
+            for (key, domain) in renames {
+                let mut t = client
+                    .tunnels
+                    .remove(&key)
+                    .expect("the tunnel was just read");
+                t.domain = domain.clone();
+                t.name = domain.clone();
+                t.nodelay = Some(t.nodelay.or(client.nodelay).unwrap_or(true));
+                client.tunnels.insert(domain, t);
             }
         }
 
@@ -354,18 +474,14 @@ mod tests {
             .collect())
     }
 
-    fn client(
-        name: &str,
-        token: &str,
-        services: Vec<(&str, &str, Vec<&str>)>,
-    ) -> ServerClientConfig {
-        let mut services_map = HashMap::new();
-        for (sname, local_addr, hosts) in services {
-            services_map.insert(
-                sname.to_string(),
-                ServerServiceConfig {
-                    name: sname.to_string(),
-                    hosts: hosts.into_iter().map(|h| h.to_string()).collect(),
+    fn client(name: &str, token: &str, tunnels: Vec<(&str, &str)>) -> ServerClientConfig {
+        let mut tunnels_map = HashMap::new();
+        for (domain, local_addr) in tunnels {
+            tunnels_map.insert(
+                domain.to_string(),
+                ServerTunnelConfig {
+                    name: domain.to_string(),
+                    domain: domain.to_string(),
                     local_addr: local_addr.to_string(),
                     ..Default::default()
                 },
@@ -374,7 +490,7 @@ mod tests {
         ServerClientConfig {
             name: name.to_string(),
             token: token.into(),
-            services: services_map,
+            tunnels: tunnels_map,
             ..Default::default()
         }
     }
@@ -412,6 +528,8 @@ mod tests {
     #[test]
     fn test_validate_server_config() -> Result<()> {
         let mut cfg = ServerConfig {
+            bind_addr: "2333".into(),
+            http_bind_addr: "80".into(),
             clients: HashMap::new(),
             ..Default::default()
         };
@@ -419,119 +537,79 @@ mod tests {
         // A config without any client is allowed, so that it can be built incrementally
         assert!(ServerConfig::validate(&mut cfg).is_ok());
 
-        // A client without any service is allowed as well
+        // A client without any tunnel is allowed as well
         cfg.clients
             .insert("home".into(), client("home", "123", vec![]));
         assert!(ServerConfig::validate(&mut cfg).is_ok());
 
         cfg.clients.insert(
             "home".into(),
-            client(
-                "home",
-                "123",
-                vec![("foo1", "127.0.0.1:80", vec!["foo1.example.com"])],
-            ),
+            client("home", "123", vec![("foo1.example.com", "127.0.0.1:80")]),
         );
         assert!(ServerConfig::validate(&mut cfg).is_ok());
         assert_eq!(cfg.clients["home"].name, "home");
-        assert_eq!(cfg.clients["home"].services["foo1"].name, "foo1");
+        assert_eq!(
+            cfg.clients["home"].tunnels["foo1.example.com"].name,
+            "foo1.example.com"
+        );
 
         // An empty local_addr is rejected
         cfg.clients
             .get_mut("home")
             .unwrap()
-            .services
-            .get_mut("foo1")
+            .tunnels
+            .get_mut("foo1.example.com")
             .unwrap()
             .local_addr = "".into();
         assert!(ServerConfig::validate(&mut cfg).is_err());
         cfg.clients
             .get_mut("home")
             .unwrap()
-            .services
-            .get_mut("foo1")
+            .tunnels
+            .get_mut("foo1.example.com")
             .unwrap()
             .local_addr = "127.0.0.1:80".into();
 
-        // Empty hosts is rejected
+        // An empty domain is rejected
         cfg.clients
             .get_mut("home")
             .unwrap()
-            .services
-            .get_mut("foo1")
+            .tunnels
+            .get_mut("foo1.example.com")
             .unwrap()
-            .hosts = vec![];
+            .domain = "".into();
         assert!(ServerConfig::validate(&mut cfg).is_err());
         cfg.clients
             .get_mut("home")
             .unwrap()
-            .services
-            .get_mut("foo1")
+            .tunnels
+            .get_mut("foo1.example.com")
             .unwrap()
-            .hosts = vec!["foo1.example.com".into()];
+            .domain = "foo1.example.com".into();
 
-        // The hosts are lowercased
+        // The domains are lowercased, and the tunnels are re-keyed
         cfg.clients
             .get_mut("home")
             .unwrap()
-            .services
-            .get_mut("foo1")
+            .tunnels
+            .get_mut("foo1.example.com")
             .unwrap()
-            .hosts = vec!["Foo1.Example.COM".into()];
+            .domain = "Foo1.Example.COM".into();
         assert!(ServerConfig::validate(&mut cfg).is_ok());
         assert_eq!(
-            cfg.clients["home"].services["foo1"].hosts,
-            vec!["foo1.example.com".to_string()]
+            cfg.clients["home"].tunnels["foo1.example.com"].domain,
+            "foo1.example.com".to_string()
         );
 
-        // A duplicate host is rejected, no matter which client defines it
+        // A duplicate domain is rejected, no matter which client defines it
         cfg.clients.insert(
             "office".into(),
-            client(
-                "office",
-                "456",
-                vec![("foo2", "127.0.0.1:81", vec!["foo1.example.com"])],
-            ),
+            client("office", "456", vec![("Foo1.example.com", "127.0.0.1:81")]),
         );
-        assert!(ServerConfig::validate(&mut cfg).is_err());
-
-        // A duplicate service name is rejected
-        cfg.clients
-            .get_mut("office")
-            .unwrap()
-            .services
-            .get_mut("foo2")
-            .unwrap()
-            .hosts = vec!["foo2.example.com".into()];
-        cfg.clients.get_mut("office").unwrap().services.insert(
-            "foo1".into(),
-            ServerServiceConfig {
-                hosts: vec!["foo2.example.com".into()],
-                local_addr: "127.0.0.1:81".into(),
-                ..Default::default()
-            },
-        );
-        cfg.clients
-            .get_mut("office")
-            .unwrap()
-            .services
-            .remove("foo2");
         assert!(ServerConfig::validate(&mut cfg).is_err());
 
         // A duplicate token is rejected
-        cfg.clients
-            .get_mut("office")
-            .unwrap()
-            .services
-            .remove("foo1");
-        cfg.clients.get_mut("office").unwrap().services.insert(
-            "foo3".into(),
-            ServerServiceConfig {
-                hosts: vec!["foo3.example.com".into()],
-                local_addr: "127.0.0.1:83".into(),
-                ..Default::default()
-            },
-        );
+        cfg.clients.get_mut("office").unwrap().tunnels.clear();
         cfg.clients.get_mut("office").unwrap().token = "123".into();
         assert!(ServerConfig::validate(&mut cfg).is_err());
 
@@ -547,33 +625,33 @@ mod tests {
             "home",
             "123",
             vec![
-                ("foo1", "127.0.0.1:80", vec!["foo1.example.com"]),
-                ("foo2", "127.0.0.1:81", vec!["foo2.example.com"]),
+                ("foo1.example.com", "127.0.0.1:80"),
+                ("foo2.example.com", "127.0.0.1:81"),
             ],
         );
 
         let pushed = c.to_client_config();
-        assert_eq!(pushed.services.len(), 2);
-        assert_eq!(pushed.services[0].name, "foo1");
-        assert_eq!(pushed.services[1].name, "foo2");
+        assert_eq!(pushed.tunnels.len(), 2);
+        assert_eq!(pushed.tunnels[0].name, "foo1.example.com");
+        assert_eq!(pushed.tunnels[1].name, "foo2.example.com");
         assert_eq!(pushed.heartbeat_timeout, DEFAULT_HEARTBEAT_TIMEOUT_SECS);
         assert_eq!(pushed.retry_interval, DEFAULT_CLIENT_RETRY_INTERVAL_SECS);
-        assert!(pushed.services.iter().all(|s| s.retry_interval == 1));
-        assert!(pushed.services.iter().all(|s| s.nodelay.is_none()));
+        assert!(pushed.tunnels.iter().all(|t| t.retry_interval == 1));
+        assert!(pushed.tunnels.iter().all(|t| t.nodelay == Some(true)));
 
-        // The client-level values are inherited by the services
+        // The client-level values are inherited by the tunnels
         let mut c2 = c.clone();
         c2.heartbeat_timeout = Some(0);
         c2.retry_interval = Some(7);
         c2.nodelay = Some(false);
-        c2.services.get_mut("foo2").unwrap().retry_interval = Some(9);
 
         let pushed = c2.to_client_config();
         assert_eq!(pushed.heartbeat_timeout, 0);
         assert_eq!(pushed.retry_interval, 7);
-        assert_eq!(pushed.services[0].retry_interval, 7);
-        assert_eq!(pushed.services[0].nodelay, Some(false));
-        assert_eq!(pushed.services[1].retry_interval, 9);
+        assert_eq!(pushed.tunnels[0].retry_interval, 7);
+        assert_eq!(pushed.tunnels[0].nodelay, Some(false));
+        assert_eq!(pushed.tunnels[1].retry_interval, 7);
+        assert_eq!(pushed.tunnels[1].nodelay, Some(false));
 
         Ok(())
     }
@@ -590,7 +668,7 @@ http_bind_addr = "0.0.0.0:80"
 default_token = "123"
 
 [server.services.foo1]
-hosts = ["foo1.example.com"]
+domain = "foo1.example.com"
 "#;
         let err = format!("{:#}", ServerConfig::from_str(legacy).unwrap_err());
         assert!(err.contains("no longer supported"), "{}", err);
@@ -599,54 +677,79 @@ hosts = ["foo1.example.com"]
     #[test]
     fn test_parse_the_new_config() -> Result<()> {
         let s = r#"
-bind_addr = "0.0.0.0:2333"
-http_bind_addr = "0.0.0.0:80"
+bind_addr = "2333"
+http_bind_addr = "80"
 
 [clients.home]
 token = "123"
+heartbeat_interval = 20
+nodelay = false
 
-[clients.home.services.foo1]
-hosts = ["foo1.example.com"]
-local_addr = "127.0.0.1:80"
+[clients.home.tunnels]
+"foo1.example.com" = "127.0.0.1:80"
+"foo2.example.com" = "127.0.0.1:81"
 "#;
         let cfg = ServerConfig::from_str(s)?;
-        assert_eq!(cfg.clients["home"].services["foo1"].name, "foo1");
+        let home = &cfg.clients["home"];
+        assert_eq!(home.heartbeat_interval, Some(20));
+        assert_eq!(home.nodelay, Some(false));
+        assert_eq!(home.tunnels.len(), 2);
+        let t1 = &home.tunnels["foo1.example.com"];
+        assert_eq!(t1.name, "foo1.example.com");
+        assert_eq!(t1.local_addr, "127.0.0.1:80");
+        // The client-level nodelay is resolved onto the tunnel
+        assert_eq!(t1.nodelay, Some(false));
+        assert_eq!(home.tunnels["foo2.example.com"].local_addr, "127.0.0.1:81");
         Ok(())
     }
 
     #[test]
     fn test_rejects_an_empty_token() -> Result<()> {
         let s = r#"
-bind_addr = "0.0.0.0:2333"
-http_bind_addr = "0.0.0.0:80"
+bind_addr = "2333"
+http_bind_addr = "80"
 
 [clients.home]
 token = ""
 
-[clients.home.services.foo1]
-hosts = ["foo1.example.com"]
-local_addr = "127.0.0.1:80"
+[clients.home.tunnels]
+"foo1.example.com" = "127.0.0.1:80"
 "#;
         assert!(ServerConfig::from_str(s).is_err());
         Ok(())
     }
 
     #[test]
+    fn test_rejects_an_unknown_client_field() {
+        let s = r#"
+bind_addr = "2333"
+http_bind_addr = "80"
+
+[clients.home]
+token = "123"
+tokenz = "oops"
+"#;
+        assert!(ServerConfig::from_str(s).is_err());
+    }
+
+    #[test]
     fn test_config_roundtrip() -> Result<()> {
         let s = r#"
-bind_addr = "0.0.0.0:2333"
-http_bind_addr = "0.0.0.0:80"
+bind_addr = "2333"
+http_bind_addr = "80"
 api_bind_addr = "127.0.0.1:2335"
 api_token = "admin_secret"
 
 [clients.home]
 token = "123"
+heartbeat_interval = 20
 heartbeat_timeout = 40
-
-[clients.home.services.foo1]
-hosts = ["foo1.example.com"]
-local_addr = "127.0.0.1:80"
+retry_interval = 2
 nodelay = false
+
+[clients.home.tunnels]
+"foo1.example.com" = "127.0.0.1:80"
+"foo2.example.com" = "127.0.0.1:81"
 "#;
         let cfg = ServerConfig::from_str(s)?;
         let dumped = cfg.to_toml()?;
@@ -654,7 +757,9 @@ nodelay = false
         let reparsed = ServerConfig::from_str(&dumped)?;
         assert_eq!(cfg, reparsed);
         assert!(dumped.contains("api_token = \"admin_secret\""));
-        assert!(dumped.contains("[clients.home.services.foo1]"));
+        assert!(dumped.contains("[clients.home]"));
+        assert!(dumped.contains("[clients.home.tunnels]"));
+        assert!(dumped.contains("\"foo1.example.com\" = \"127.0.0.1:80\""));
         Ok(())
     }
 
@@ -662,9 +767,9 @@ nodelay = false
     fn test_template_is_valid() -> Result<()> {
         let s = ServerConfig::template();
         let cfg = ServerConfig::from_str(&s)?;
-        assert_eq!(cfg.bind_addr, "0.0.0.0:2333");
-        assert_eq!(cfg.http_bind_addr, "0.0.0.0:80");
-        assert_eq!(cfg.api_bind_addr.as_deref(), Some("0.0.0.0:2335"));
+        assert_eq!(cfg.bind_addr, "2333");
+        assert_eq!(cfg.http_bind_addr, "80");
+        assert_eq!(cfg.api_bind_addr.as_deref(), Some("2335"));
         assert!(cfg.api_token.is_some());
         // The sample client is commented out
         assert!(cfg.clients.is_empty());
@@ -674,15 +779,14 @@ nodelay = false
     #[test]
     fn test_config_roundtrip_without_optional_fields() -> Result<()> {
         let s = r#"
-bind_addr = "0.0.0.0:2333"
-http_bind_addr = "0.0.0.0:80"
+bind_addr = "2333"
+http_bind_addr = "80"
 
 [clients.home]
 token = "123"
 
-[clients.home.services.foo1]
-hosts = ["foo1.example.com"]
-local_addr = "127.0.0.1:80"
+[clients.home.tunnels]
+"foo1.example.com" = "127.0.0.1:80"
 "#;
         let cfg = ServerConfig::from_str(s)?;
         let dumped = cfg.to_toml()?;
@@ -692,5 +796,24 @@ local_addr = "127.0.0.1:80"
         let reparsed = ServerConfig::from_str(&dumped)?;
         assert_eq!(cfg, reparsed);
         Ok(())
+    }
+
+    #[test]
+    fn test_to_bind_addr() {
+        assert_eq!(crate::helper::to_bind_addr("2333"), "0.0.0.0:2333");
+        assert_eq!(
+            crate::helper::to_bind_addr("127.0.0.1:2333"),
+            "127.0.0.1:2333"
+        );
+        assert_eq!(crate::helper::to_bind_addr("[::]:2333"), "[::]:2333");
+    }
+
+    #[test]
+    fn test_rejects_a_bad_bind_addr() {
+        let s = r#"
+bind_addr = "nope"
+http_bind_addr = "80"
+"#;
+        assert!(ServerConfig::from_str(s).is_err());
     }
 }

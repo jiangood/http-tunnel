@@ -20,6 +20,16 @@ pub async fn to_socket_addr<A: ToSocketAddrs>(addr: A) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("Failed to lookup the host"))
 }
 
+/// Normalize a bind address: a bare port (e.g. `"2333"`) is bound to all interfaces,
+/// while a `host:port` is returned as-is.
+pub fn to_bind_addr(addr: &str) -> String {
+    if addr.parse::<u16>().is_ok() {
+        format!("0.0.0.0:{}", addr)
+    } else {
+        addr.to_string()
+    }
+}
+
 // Wrapper of retry_notify
 pub async fn retry_notify_with_deadline<I, E, Fn, Fut, B, N>(
     backoff: B,
