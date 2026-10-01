@@ -7,8 +7,6 @@
 ![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/jiangood/http-tunnel/rust.yml?branch=main)
 [![GitHub all releases](https://img.shields.io/github/downloads/jiangood/http-tunnel/total)](https://github.com/jiangood/http-tunnel/releases)
 
-[English](README.md) | [简体中文](README-zh.md)
-
 A secure, stable and high-performance HTTP reverse proxy for NAT traversal, written in Rust
 
 `http-tunnel` exposes HTTP services on a device behind the NAT to the Internet, via a server with a public IP. The server listens on a single HTTP port and routes each request to the right service according to the `Host` header. The traffic between the server and the client is carried over a plain TCP tunnel.
@@ -24,6 +22,7 @@ the server pushes it the services that it should forward.
 - [http-tunnel](#http-tunnel)
   - [Features](#features)
   - [Quickstart](#quickstart)
+  - [Docker](#docker)
   - [Configuration](#configuration)
     - [Routing](#routing)
     - [Logging](#logging)
@@ -94,7 +93,61 @@ HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know ./http-tunnel client --remote 
 
 So you can visit `http://nas.example.com` (with `nas.example.com` resolving to your server) to reach the NAS web UI.
 
-To run `http-tunnel` as a background service on Linux, checkout the [systemd examples](./examples/systemd).
+To run `http-tunnel` as a background service on Linux, checkout the [systemd examples](./examples/systemd). To run it in a container, see [Docker](#docker).
+
+## Docker
+
+A [Docker image](https://github.com/jiangood/http-tunnel/pkgs/container/http-tunnel) is published to the GitHub
+Container Registry for `linux/amd64` and `linux/arm64`. It's a [distroless](https://github.com/GoogleContainerTools/distroless)
+image, so it only contains `http-tunnel` and has no shell.
+
+The server needs the configuration file, which it also writes back to when it's changed through the
+[administration API](#administration-api). Mount it read-write, and publish the ports of the config you use:
+
+```bash
+# server.toml
+# bind_addr = "0.0.0.0:2333"
+# http_bind_addr = "0.0.0.0:80"
+
+docker run -d --name http-tunnel --restart unless-stopped \
+  -p 2333:2333 -p 80:80 \
+  -v "$PWD/server.toml:/app/server.toml" \
+  ghcr.io/jiangood/http-tunnel:latest server /app/server.toml
+```
+
+The client takes no configuration file, so it only needs the arguments:
+
+```bash
+docker run -d --name http-tunnel --restart unless-stopped --network host \
+  ghcr.io/jiangood/http-tunnel:latest client \
+  --remote myserver.com:2333 --name home_nas --token use_a_secret_that_only_you_know
+```
+
+`--network host` is the simplest way for the client to reach the services on the host. On Docker Desktop a client
+that has to reach a service on the host uses `host.docker.internal` as the `local_addr` instead.
+
+If the [administration API](#administration-api) is enabled, publish its port too (keep it bound to the loopback
+address of the host unless it's behind a reverse proxy):
+
+```bash
+  -p 127.0.0.1:2335:2335
+```
+
+The image is built with the default features (both the server and the client). To build a smaller image that only
+serves as a server, pass `--build-arg FEATURES=server`:
+
+```bash
+docker build --build-arg FEATURES=server -t http-tunnel-server .
+```
+
+The token can also be passed through the `HTTP_TUNNEL_TOKEN` environment variable, which keeps it out of the
+container's arguments:
+
+```bash
+docker run -d --name http-tunnel --network host \
+  -e HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know \
+  ghcr.io/jiangood/http-tunnel:latest client --remote myserver.com:2333 --name home_nas
+```
 
 ## Configuration
 
