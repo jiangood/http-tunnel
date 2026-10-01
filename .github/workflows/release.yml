@@ -50,36 +50,12 @@ jobs:
             name: armv7-linux-musleabihf
             exe: http-tunnel
             cross: true
-          - os: ubuntu-latest
-            target: mips-unknown-linux-gnu
-            name: mips-linux-gnu
-            exe: http-tunnel
-            cross: true
-          - os: ubuntu-latest
-            target: mips-unknown-linux-musl
-            name: mips-linux-musl
-            exe: http-tunnel
-            cross: true
-          - os: ubuntu-latest
-            target: mipsel-unknown-linux-gnu
-            name: mipsel-linux-gnu
-            exe: http-tunnel
-            cross: true
-          - os: ubuntu-latest
-            target: mipsel-unknown-linux-musl
-            name: mipsel-linux-musl
-            exe: http-tunnel
-            cross: true
-          - os: ubuntu-latest
-            target: mips64-unknown-linux-gnuabi64
-            name: mips64-linux-gnuabi64
-            exe: http-tunnel
-            cross: true
-          - os: ubuntu-latest
-            target: mips64el-unknown-linux-gnuabi64
-            name: mips64el-linux-gnuabi64
-            exe: http-tunnel
-            cross: true
+
+          # The `mips*` targets are Tier 3: they have no prebuilt `std` for the
+          # current stable toolchain, so `cross` fails with `can't find crate for
+          # core`. They were only buildable while the toolchain happened to match
+          # the one bundled in the cross image. Restore them with `build-std` on
+          # nightly if mips releases are needed again.
 
           - os: macos-latest
             target: x86_64-apple-darwin
