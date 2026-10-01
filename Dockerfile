@@ -8,6 +8,9 @@ ARG TARGETARCH
 # `server` only needs a bind mount of the directory that holds it:
 #   docker run -v "$PWD:/app" ... http-tunnel server
 WORKDIR /app
-COPY build-out/${TARGETARCH}/http-tunnel .
+# The mode is set explicitly: the release workflow gets the binaries through
+# upload-artifact/download-artifact, which do not preserve the executable bit.
+# The distroless stage has no shell, so it cannot chmod after the copy.
+COPY --chmod=0755 build-out/${TARGETARCH}/http-tunnel .
 USER 1000:1000
 ENTRYPOINT ["./http-tunnel"]
