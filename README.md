@@ -108,7 +108,8 @@ To run `http-tunnel` as a background service on Linux, checkout the [systemd exa
 
 A [Docker image](https://github.com/jiangood/http-tunnel/pkgs/container/http-tunnel) is published to the GitHub
 Container Registry for `linux/amd64` and `linux/arm64`. It's a [distroless](https://github.com/GoogleContainerTools/distroless)
-image, so it only contains `http-tunnel` and has no shell.
+image, so it only contains `http-tunnel` and has no shell. The binary is installed at `/usr/local/bin/http-tunnel`,
+outside the working directory, so mounting a directory over the working directory doesn't hide it.
 
 The server reads `server.toml` from its working directory (`/app` in the image), which it also writes back to when
 it's changed through the [administration API](#administration-api). Mount the directory that holds `server.toml`
