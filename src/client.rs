@@ -263,7 +263,7 @@ async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<TcpS
         || async {
             connect(&args.remote_addr)
                 .await
-                .with_context(|| format!("Failed to connect to {}", &args.remote_addr))
+                .with_context(|| format!("Failed to connect to {}", args.remote_addr))
                 .map_err(backoff::Error::transient)
         },
         |e, duration| {
@@ -347,7 +347,7 @@ impl ControlChannel {
 
         let mut conn = connect(&remote_addr)
             .await
-            .with_context(|| format!("Failed to connect to {}", &self.remote_addr))?;
+            .with_context(|| format!("Failed to connect to {}", self.remote_addr))?;
         SocketOpts::for_control_channel().apply(&conn);
 
         // Send hello
