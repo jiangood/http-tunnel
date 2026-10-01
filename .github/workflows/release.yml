@@ -22,65 +22,80 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            name: x86_64-linux-gnu
             exe: http-tunnel
             cross: false
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            name: x86_64-linux-musl
             exe: http-tunnel
             cross: false
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
+            name: aarch64-linux-musl
             exe: http-tunnel
             cross: true
           - os: ubuntu-latest
             target: arm-unknown-linux-musleabi
+            name: arm-linux-musleabi
             exe: http-tunnel
             cross: true
           - os: ubuntu-latest
             target: arm-unknown-linux-musleabihf
+            name: arm-linux-musleabihf
             exe: http-tunnel
             cross: true
           - os: ubuntu-latest
             target: armv7-unknown-linux-musleabihf
+            name: armv7-linux-musleabihf
             exe: http-tunnel
             cross: true
           - os: ubuntu-latest
             target: mips-unknown-linux-gnu
+            name: mips-linux-gnu
             exe: http-tunnel
             cross: true
           - os: ubuntu-latest
             target: mips-unknown-linux-musl
+            name: mips-linux-musl
             exe: http-tunnel
             cross: true
           - os: ubuntu-latest
             target: mipsel-unknown-linux-gnu
+            name: mipsel-linux-gnu
             exe: http-tunnel
             cross: true
           - os: ubuntu-latest
             target: mipsel-unknown-linux-musl
+            name: mipsel-linux-musl
             exe: http-tunnel
             cross: true
           - os: ubuntu-latest
             target: mips64-unknown-linux-gnuabi64
+            name: mips64-linux-gnuabi64
             exe: http-tunnel
             cross: true
           - os: ubuntu-latest
             target: mips64el-unknown-linux-gnuabi64
+            name: mips64el-linux-gnuabi64
             exe: http-tunnel
             cross: true
 
           - os: macos-latest
             target: x86_64-apple-darwin
+            name: x86_64-darwin
             exe: http-tunnel
             cross: false
 
           - os: macos-latest
             target: aarch64-apple-darwin
+            name: aarch64-darwin
             exe: http-tunnel
             cross: false
 
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            name: x86_64-windows
             exe: http-tunnel.exe
             cross: false
     steps:
@@ -126,20 +141,20 @@ jobs:
           args: -q --best --lzma
       - uses: actions/upload-artifact@v4
         with:
-          name: http-tunnel-${{ matrix.target }}
+          name: http-tunnel-${{ matrix.name }}
           path: target/${{ matrix.target }}/release/${{ matrix.exe }}
       - name: Zip Release
         uses: TheDoctor0/zip-release@0.7.6
         with:
           type: zip
-          filename: http-tunnel-${{ matrix.target }}.zip
+          filename: http-tunnel-${{ matrix.name }}.zip
           directory: target/${{ matrix.target }}/release/
           path: ${{ matrix.exe }}
       - name: Publish
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: target/${{ matrix.target }}/release/http-tunnel-${{ matrix.target }}.zip
+          files: target/${{ matrix.target }}/release/http-tunnel-${{ matrix.name }}.zip
           generate_release_notes: true
           draft: true
 
@@ -219,13 +234,13 @@ jobs:
       - name: Download the static musl binaries
         uses: actions/download-artifact@v4
         with:
-          pattern: http-tunnel-*-unknown-linux-musl
+          pattern: http-tunnel-*-linux-musl
           path: build-out
       - name: Lay out the binaries by architecture
         run: |
           mkdir -p build-out/amd64 build-out/arm64
-          cp build-out/http-tunnel-x86_64-unknown-linux-musl/http-tunnel build-out/amd64/
-          cp build-out/http-tunnel-aarch64-unknown-linux-musl/http-tunnel build-out/arm64/
+          cp build-out/http-tunnel-x86_64-linux-musl/http-tunnel build-out/amd64/
+          cp build-out/http-tunnel-aarch64-linux-musl/http-tunnel build-out/arm64/
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
