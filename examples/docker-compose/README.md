@@ -6,7 +6,8 @@ This directory lists Docker Compose files that run `http-tunnel` in a container,
   `docker compose up -d`.
 - [`client/`](./client) runs the client on the host behind the NAT.
 
-The published image (`ghcr.io/jiangood/http-tunnel`) is distroless: it only contains the binary and has no shell.
+The published image (`ghcr.io/jiangood/http-tunnel`) is distroless: it only contains the binary and has no shell. It
+runs as root, so it can write the mounted directory without any `chown` on the host.
 
 The server holds the whole configuration of a deployment, so it reads `server.toml` from its working directory
 (`/app` in the image). The directory is mounted read-write because the server generates a minimal `server.toml` if
