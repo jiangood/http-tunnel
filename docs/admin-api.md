@@ -4,13 +4,15 @@ The server can expose a REST API and a minimal web UI to manage the clients and 
 is disabled by default and is enabled by setting both `api_bind_addr` and `api_token` in `server.toml`:
 
 ```toml
-api_bind_addr = "127.0.0.1:2335"
+api_bind_addr = "0.0.0.0:2335"
 api_token = "a_secret_for_the_admin_api"
 ```
 
 If `api_bind_addr` is set without `api_token`, the server refuses to start. Every request to `/api/*` must carry the
 header `Authorization: Bearer <api_token>`; otherwise it is answered with `401 Unauthorized`. `GET /` serves a
-minimal web UI which asks for the token and keeps it in the browser's `localStorage`.
+minimal web UI which asks for the token and keeps it in the browser's `localStorage`. Binding to `0.0.0.0` makes the
+API reachable from the network, so protect it with a reverse proxy that terminates TLS, a firewall rule, or a private
+network such as WireGuard; use `127.0.0.1:2335` for local-only access.
 
 ## Resources
 

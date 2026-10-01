@@ -229,7 +229,7 @@ impl ServerConfig {
              \n\
              bind_addr = \"0.0.0.0:2333\" # The address that the server listens for clients\n\
              http_bind_addr = \"0.0.0.0:80\" # The HTTP entrypoint, routed by the `Host` header\n\
-             api_bind_addr = \"127.0.0.1:2335\" # The administration API and the web UI\n\
+             api_bind_addr = \"0.0.0.0:2335\" # The administration API and the web UI, on all interfaces\n\
              api_token = \"change_me\" # Required by the administration API\n\
              \n\
              # [clients.home]\n\
@@ -664,7 +664,7 @@ nodelay = false
         let cfg = ServerConfig::from_str(&s)?;
         assert_eq!(cfg.bind_addr, "0.0.0.0:2333");
         assert_eq!(cfg.http_bind_addr, "0.0.0.0:80");
-        assert_eq!(cfg.api_bind_addr.as_deref(), Some("127.0.0.1:2335"));
+        assert_eq!(cfg.api_bind_addr.as_deref(), Some("0.0.0.0:2335"));
         assert!(cfg.api_token.is_some());
         // The sample client is commented out
         assert!(cfg.clients.is_empty());

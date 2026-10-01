@@ -140,12 +140,16 @@ docker run -d --name http-tunnel --restart unless-stopped --network host \
 `--network host` is the simplest way for the client to reach the services on the host. On Docker Desktop a client
 that has to reach a service on the host uses `host.docker.internal` as the `local_addr` instead.
 
-If the [administration API](#administration-api) is enabled, publish its port too (keep it bound to the loopback
-address of the host unless it's behind a reverse proxy):
+If the [administration API](#administration-api) is enabled, publish its port and set `api_bind_addr` to
+`0.0.0.0:2335`, otherwise the container only listens on its own loopback and Docker cannot forward the connections:
 
 ```bash
-  -p 127.0.0.1:2335:2335
+  -p 2335:2335
 ```
+
+This exposes the admin API on every interface of the host. Put it behind a reverse proxy with TLS, restrict the source
+addresses with a firewall, or bind it to the loopback address (`-p 127.0.0.1:2335:2335` together with
+`api_bind_addr = "127.0.0.1:2335"`) when it's only managed locally.
 
 The image only contains the binary: it's assembled from the static musl build, so nothing is compiled inside it. To
 build it locally, compile the musl binary and place it under `build-out/<arch>/` first:
@@ -182,7 +186,7 @@ services:
     ports:
       - "2333:2333" # Clients connect here
       - "80:80" # Visitors connect here
-      - "127.0.0.1:2335:2335" # Administration API, drop unless it's enabled
+      - "2335:2335" # Administration API, exposed on all interfaces, drop unless it's enabled
     volumes:
       - ./:/app # Holds server.toml, must be writable
 ```
@@ -239,7 +243,7 @@ Here is the full configuration specification:
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
 http_bind_addr = "0.0.0.0:80" # Necessary. The HTTP entrypoint. Visitors are routed by the `Host` header
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
-api_bind_addr = "127.0.0.1:2335" # Optional. The address of the administration API and the web UI. Disabled if not set
+api_bind_addr = "0.0.0.0:2335" # Optional. The address of the administration API and the web UI. Disabled if not set and exposed to the network when bound to 0.0.0.0
 api_token = "a_secret_for_the_admin_api" # Optional. The token required by the administration API. Required if `api_bind_addr` is set
 
 [clients.home] # A client. The name `home` must be identical to the `--name` of the client
@@ -304,12 +308,13 @@ The server can expose a small REST API and a web UI to manage the clients and th
 restart. It's disabled by default and is enabled by setting `api_bind_addr` and `api_token` in `server.toml`:
 
 ```toml
-api_bind_addr = "127.0.0.1:2335"
+api_bind_addr = "0.0.0.0:2335"
 api_token = "a_secret_for_the_admin_api"
 ```
 
 All the API routes require the header `Authorization: Bearer <api_token>`. Open `http://127.0.0.1:2335/` for a
-minimal web UI.
+minimal web UI. Binding to `0.0.0.0` makes the API reachable from the network, so protect it with a reverse proxy that
+terminates TLS, a firewall rule, or a private network such as WireGuard; use `127.0.0.1:2335` for local-only access.
 
 | Method | Path | Description |
 | --- | --- | --- |

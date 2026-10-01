@@ -12,6 +12,6 @@ services:
     ports:
       - "2333:2333" # Clients connect here
       - "80:80" # Visitors connect here
-      - "127.0.0.1:2335:2335" # Administration API, drop unless it's enabled
+      - "2335:2335" # Administration API, exposed on all interfaces, drop unless it's enabled
     volumes:
       - ./:/app # Holds server.toml, must be writable
