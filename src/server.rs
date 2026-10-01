@@ -787,6 +787,9 @@ pub(crate) struct ControlChannelHandle {
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<TcpStream>,
     pub(crate) visitor_tx: mpsc::Sender<HttpVisitor>,
+    // Asks the client for a new data channel. The HTTP entrypoint requests one for
+    // every visitor, so that the pool is replenished as it's drained.
+    pub(crate) data_ch_req_tx: mpsc::UnboundedSender<bool>,
     service: ServerServiceConfig,
 }
 
@@ -818,6 +821,9 @@ impl ControlChannelHandle {
                 error!("Failed to request data channel {}", e);
             };
         }
+
+        // The HTTP entrypoint keeps a sender to request a data channel per visitor
+        let handle_req_tx = data_ch_req_tx.clone();
 
         tokio::spawn(
             async move {
@@ -858,6 +864,7 @@ impl ControlChannelHandle {
                 _shutdown_tx: shutdown_tx,
                 data_ch_tx,
                 visitor_tx,
+                data_ch_req_tx: handle_req_tx,
                 service,
             },
             ch_task,

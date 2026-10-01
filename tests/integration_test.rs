@@ -95,6 +95,22 @@ async fn http_routing() -> Result<()> {
     info!("route by Host");
     http_echo_hitter(HTTP_ENTRY_ADDR, ECHO_HOST).await.unwrap();
 
+    // The data channel pool only caches `TCP_POOL_SIZE` (8) connections and a visitor
+    // consumes one, so more visitors than that only work if the pool is replenished.
+    info!("more visitors than the data channel pool");
+    for i in 0..16 {
+        let r = time::timeout(
+            Duration::from_secs(5),
+            http_echo_hitter(HTTP_ENTRY_ADDR, ECHO_HOST),
+        )
+        .await;
+        assert!(
+            matches!(r, std::result::Result::Ok(std::result::Result::Ok(_))),
+            "visitor {} hung or failed",
+            i
+        );
+    }
+
     // Simulate the server crash and restart
     info!("shutdown the server");
     server_shutdown_tx.send(true)?;

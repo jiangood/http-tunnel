@@ -78,16 +78,28 @@ async fn handle_visitor(
         return Ok(());
     };
 
-    let visitor_tx = {
+    let handle = {
         let ccs = state.control_channels.read().await;
-        ccs.get1(&digest).map(|h| h.visitor_tx.clone())
+        ccs.get1(&digest)
+            .map(|h| (h.visitor_tx.clone(), h.data_ch_req_tx.clone()))
     };
 
-    let Some(visitor_tx) = visitor_tx else {
+    let Some((visitor_tx, data_ch_req_tx)) = handle else {
         debug!("No control channel for the host `{}`", host);
         respond_service_unavailable(&mut stream).await;
         return Ok(());
     };
+
+    // Ask the client for a data channel to forward this visitor through. The pool
+    // caches `TCP_POOL_SIZE` channels, but a visitor consumes one and a closed
+    // connection never gives it back, so without a request per visitor the pool
+    // runs out and the later connections would wait forever. A failed send means
+    // that the control channel is gone.
+    if data_ch_req_tx.send(true).is_err() {
+        debug!("No control channel for the host `{}`", host);
+        respond_service_unavailable(&mut stream).await;
+        return Ok(());
+    }
 
     debug!("Routing visitor {} to the host `{}`", addr, host);
 
