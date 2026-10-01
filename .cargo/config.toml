@@ -1,5 +1,0 @@
-# `libgit2-sys` (pulled in by `vergen`'s `git` feature) calls into `advapi32` on
-# Windows but does not request it, and recent Rust toolchains no longer link it
-# implicitly. Link it explicitly.
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-arg=advapi32.lib"]

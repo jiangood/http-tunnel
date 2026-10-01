@@ -94,9 +94,11 @@ atty = "0.2"
 tracing-android = { version = "0.2", optional = true }
 
 [build-dependencies]
+# The `git` feature is deliberately left out: it pulls in libgit2, whose build
+# script does not link `advapi32` on Windows with recent toolchains, which breaks
+# the build there. The version is taken from `VERGEN_BUILD_SEMVER` instead.
 vergen = { version = "7.4.2", default-features = false, features = [
     "build",
-    "git",
     "cargo",
 ] }
 anyhow = "1.0"
