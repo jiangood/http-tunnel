@@ -1,3 +1,10 @@
 /target
 perf.data
 perf.data.old
+
+# The Gradle and Android projects of the mobile client
+/android/.gradle
+/android/build
+/android/local.properties
+/android/app/build
+/android/app/src/main/jniLibs

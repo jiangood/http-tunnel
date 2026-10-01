@@ -11,12 +11,19 @@ pub use config::ServerConfig;
 
 use anyhow::Result;
 use tokio::sync::broadcast;
+#[cfg(feature = "server")]
 use tracing::debug;
 
 #[cfg(feature = "client")]
 mod client;
 #[cfg(feature = "client")]
 use client::run_client;
+
+// The C API embedded by the Android client (see `android/`). It reuses the
+// client, so it can only be compiled together with it, and it is exposed for the
+// `http_tunnel_mobile` cdylib (`src/mobile_ffi.rs`) to re-export.
+#[cfg(all(feature = "mobile", feature = "client"))]
+pub mod mobile;
 
 #[cfg(feature = "server")]
 mod admin;
@@ -27,11 +34,14 @@ mod server;
 #[cfg(feature = "server")]
 use server::run_server;
 
+#[allow(unused_variables)]
 pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
     // Raise `nofile` limit on linux and mac
+    #[cfg(any(feature = "server", feature = "client"))]
     fdlimit::raise_fd_limit();
 
     match args.cmd {
+        #[allow(unused_variables)]
         Command::Server(args) => {
             #[cfg(not(feature = "server"))]
             crate::helper::feature_not_compile("server");
@@ -43,6 +53,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                 run_server(config, args.config_path.clone(), shutdown_rx).await
             }
         }
+        #[allow(unused_variables)]
         Command::Client(args) => {
             #[cfg(not(feature = "client"))]
             crate::helper::feature_not_compile("client");

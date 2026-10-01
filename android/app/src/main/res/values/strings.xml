@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">http-tunnel</string>
+    <string name="remote_hint">Server address, e.g. example.com:2333</string>
+    <string name="name_hint">Client name, as defined on the server</string>
+    <string name="token_hint">Token</string>
+    <string name="start">Start</string>
+    <string name="stop">Stop</string>
+    <string name="status_stopped">Stopped</string>
+    <string name="status_running">Running</string>
+    <string name="notification_channel_name">Tunnel</string>
+    <string name="notification_channel_description">Keeps the client running in the background</string>
+    <string name="notification_title">http-tunnel is running</string>
+    <string name="notification_text">Serving the services assigned by the server</string>
+    <string name="start_failed">Failed to start. Fill in the server, the name and the token.</string>
+</resources>

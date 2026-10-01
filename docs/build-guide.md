@@ -46,3 +46,40 @@ upx --best --lzma http-tunnel
 ```
 
 At the time of writting the build guide, the produced binary for `x86_64-unknown-linux-glibc` has the size of **574 KiB**, while `frpc` has the size of **~10 MiB**, which is much larger.
+
+## Android
+
+The client runs unchanged on Android, as it only makes outgoing TCP connections.
+The Android client is a small Gradle project in [`android/`](../android) whose UI
+calls the same client code through a C API (`--features mobile`, see
+[`src/mobile.rs`](../src/mobile.rs) and the `http_tunnel_mobile` cdylib in
+[`src/mobile_ffi.rs`](../src/mobile_ffi.rs)).
+
+The prerequisites are the Android SDK, the Android NDK and the Rust targets:
+
+```sh
+rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+```
+
+With `ANDROID_NDK_HOME` (or `ANDROID_NDK_ROOT`) set, build the shared library and
+copy it into the Gradle project. With no arguments, every installed target of the
+three above is built; pass a target to build only one:
+
+```sh
+./android/build.sh                        # arm64-v8a, armeabi-v7a and x86_64
+./android/build.sh x86_64-linux-android   # for an emulator
+```
+
+Then build the APK:
+
+```sh
+cd android
+./gradlew assembleDebug        # android/app/build/outputs/apk/debug/app-debug.apk
+./gradlew installDebug         # or install it on a connected device
+```
+
+`gradlew` is the Gradle wrapper, which isn't committed with the project. Run
+`gradle wrapper` once in `android/` to create it, or build with an installed
+Gradle of a compatible version. The build also needs `android/local.properties`
+with `sdk.dir=<path to the Android SDK>`; see
+[`android/local.properties.example`](../android/local.properties.example).

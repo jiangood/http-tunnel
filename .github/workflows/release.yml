@@ -142,6 +142,66 @@ jobs:
           files: target/${{ matrix.target }}/release/http-tunnel-${{ matrix.target }}.zip
           generate_release_notes: true
           draft: true
+
+  android:
+    name: Build the Android client
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The shared library is built with the Rust toolchain and the NDK, and the
+      # APK with the Android SDK and Gradle
+      - uses: dtolnay/rust-toolchain@1.71.0
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Set up the Android SDK and the NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "ndk;26.1.10909125"
+
+      - name: Build the shared library for every ABI
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.1.10909125
+        run: ./android/build.sh
+
+      # The wrapper isn't committed, so it is generated with the pinned version
+      - name: Generate the Gradle wrapper
+        working-directory: android
+        run: gradle wrapper --gradle-version 8.7
+
+      - name: Build the APK
+        working-directory: android
+        # Debug, because a release APK would be unsigned without a keystore
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Rename the APK
+        run: |
+          mkdir -p android-apk
+          cp android/app/build/outputs/apk/debug/app-debug.apk \
+            android-apk/http-tunnel-android.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: http-tunnel-android
+          path: android-apk/http-tunnel-android.apk
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: android-apk/http-tunnel-android.apk
+          draft: true
+
   docker:
     name: Publish to GitHub Container Registry
     if: startsWith(github.ref, 'refs/tags/')

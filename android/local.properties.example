@@ -1,0 +1,3 @@
+# The Android SDK location. Create this file for your machine:
+# sdk.dir=C:\\Users\\you\\AppData\\Local\\Android\\Sdk
+# It is not committed (see .gitignore).
