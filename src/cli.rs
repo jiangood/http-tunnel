@@ -5,7 +5,9 @@ use std::path::PathBuf;
 // `build.rs` emits the `VERGEN_*` variables as `cargo:rustc-env`, so they are
 // available to every target of the crate. They are read with `option_env!` and
 // fall back to `unknown` so that the mobile `cdylib` (and any other consumer of
-// the library) still builds if a variable is ever missing.
+// the library) still builds if a variable is ever missing. The git-derived
+// variables are not reported because `build.rs` leaves the `git` feature of
+// `vergen` disabled (see `build.rs`).
 macro_rules! build_env {
     ($name:literal) => {
         option_env!($name).unwrap_or("unknown")
@@ -13,25 +15,17 @@ macro_rules! build_env {
 }
 
 lazy_static! {
-    static ref VERSION: &'static str = option_env!("VERGEN_GIT_SEMVER_LIGHTWEIGHT")
-        .or(option_env!("VERGEN_BUILD_SEMVER"))
-        .unwrap_or("unknown");
+    static ref VERSION: &'static str = build_env!("VERGEN_BUILD_SEMVER");
     static ref LONG_VERSION: String = format!(
         "
 Build Timestamp:     {}
 Build Version:       {}
-Commit SHA:          {:?}
-Commit Date:         {:?}
-Commit Branch:       {:?}
 cargo Target Triple: {}
 cargo Profile:       {}
 cargo Features:      {}
 ",
         build_env!("VERGEN_BUILD_TIMESTAMP"),
         build_env!("VERGEN_BUILD_SEMVER"),
-        option_env!("VERGEN_GIT_SHA"),
-        option_env!("VERGEN_GIT_COMMIT_TIMESTAMP"),
-        option_env!("VERGEN_GIT_BRANCH"),
         build_env!("VERGEN_CARGO_TARGET_TRIPLE"),
         build_env!("VERGEN_CARGO_PROFILE"),
         build_env!("VERGEN_CARGO_FEATURES")

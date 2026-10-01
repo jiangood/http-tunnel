@@ -1,7 +1,5 @@
 # http-tunnel
 
-![http-tunnel-logo](./docs/img/http-tunnel-logo.png)
-
 [![GitHub stars](https://img.shields.io/github/stars/jiangood/http-tunnel)](https://github.com/jiangood/http-tunnel/stargazers)
 [![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/jiangood/http-tunnel)](https://github.com/jiangood/http-tunnel/releases)
 ![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/jiangood/http-tunnel/rust.yml?branch=main)
@@ -29,7 +27,6 @@ the server pushes it the tunnels that it should serve.
     - [Logging](#logging)
     - [Tuning](#tuning)
   - [Administration API](#administration-api)
-  - [Benchmark](#benchmark)
   - [Planning](#planning)
 
 <!-- /TOC -->
@@ -342,16 +339,6 @@ curl -X PUT http://127.0.0.1:2335/api/clients/home/tunnels/nas.example.com \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"local_addr":"127.0.0.1:80"}'
 ```
-
-## Benchmark
-
-`http-tunnel` has similar latency to [frp](https://github.com/fatedier/frp), but can handle more connections and provide larger bandwidth with less memory usage.
-
-For more details, see the separate page [Benchmark](./docs/benchmark.md).
-
-![http_throughput](./docs/img/http_throughput.svg)
-![tcp_bitrate](./docs/img/tcp_bitrate.svg)
-![mem](./docs/img/mem-graph.png)
 
 ## Planning
 

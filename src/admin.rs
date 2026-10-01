@@ -305,11 +305,9 @@ async fn put_tunnel(
 ) -> Result<Response, ApiError> {
     let domain = domain.to_lowercase();
     let tunnel_config = ServerTunnelConfig {
-        name: domain.clone(),
         domain: domain.clone(),
         local_addr: body.local_addr,
         nodelay: None,
-        retry_interval: None,
     };
     state
         .put_tunnel(&client, domain.clone(), tunnel_config)

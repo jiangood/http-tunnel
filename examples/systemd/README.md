@@ -104,5 +104,4 @@ To run multiple instances at once, simply add another configuration, say `app2.t
 (`~/.local/etc/http-tunnel` for non-root), then run `sudo systemctl enable http-tunnel-server@app2 --now`
 (`systemctl --user enable http-tunnel-server@app2 --now` for non-root) to start an instance for that configuration.
 
-The same applies to `http-tunnel-client@.service` for `http-tunnel client` and `http-tunnel@.service` which is the same as
-`http-tunnel-server@.service`.
+The same applies to `http-tunnel-client@.service` for `http-tunnel client`.

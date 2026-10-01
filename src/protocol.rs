@@ -10,7 +10,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
 
 type ProtocolVersion = u8;
-const _PROTO_V0: u8 = 0u8;
 const PROTO_V1: u8 = 1u8;
 
 pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V1;

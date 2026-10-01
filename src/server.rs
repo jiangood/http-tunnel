@@ -683,7 +683,7 @@ async fn do_control_channel_handshake(
     .to_owned();
 
     let tunnel_config = tunnel.config;
-    let tunnel_name = &tunnel_config.name;
+    let tunnel_name = &tunnel_config.domain;
     let heartbeat_interval = tunnel.heartbeat_interval;
 
     // Calculate the checksum with the token of the client that serves the tunnel
@@ -729,7 +729,7 @@ async fn do_control_channel_handshake(
             .await?;
         conn.flush().await?;
 
-        info!(tunnel = %tunnel_config.name, "Control channel established");
+        info!(tunnel = %tunnel_config.domain, "Control channel established");
         let (handle, ch_task) =
             ControlChannelHandle::new(conn, tunnel_config, heartbeat_interval, conn_id);
 
@@ -800,7 +800,7 @@ pub(crate) struct ControlChannelHandle {
 impl ControlChannelHandle {
     // Create a control channel handle, where the control channel handling task
     // and the connection pool task are created.
-    #[instrument(name = "handle", skip_all, fields(tunnel = %tunnel.name))]
+    #[instrument(name = "handle", skip_all, fields(tunnel = %tunnel.domain))]
     fn new(
         conn: TcpStream,
         tunnel: ServerTunnelConfig,

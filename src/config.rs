@@ -80,8 +80,6 @@ pub struct ClientConfig {
     pub tunnels: Vec<ClientTunnelConfig>,
     /// Application-layer heartbeat timeout in secs. 0 disables it
     pub heartbeat_timeout: u64,
-    /// The interval between retries to connect to the server
-    pub retry_interval: u64,
 }
 
 /// A tunnel of `[clients.<client>]`, keyed by its domain.
@@ -91,17 +89,12 @@ pub struct ClientConfig {
 /// server pushes to the client.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ServerTunnelConfig {
-    /// The name of the tunnel, which is always its `domain`
-    pub name: String,
     /// The domain (the `Host` header) that is routed to this tunnel
     pub domain: String,
     /// The address of the local service on the client side
     pub local_addr: String,
     /// Whether to enable TCP_NODELAY. Defaults to `[clients.<client>].nodelay`
     pub nodelay: Option<bool>,
-    /// The interval between retries to connect to the server. Defaults to
-    /// `[clients.<client>].retry_interval`
-    pub retry_interval: Option<u64>,
 }
 
 /// The configuration of a client of `[clients.<name>]`.
@@ -165,11 +158,9 @@ impl<'de> Deserialize<'de> for ServerClientConfig {
             .into_iter()
             .map(|(domain, local_addr)| {
                 let tunnel = ServerTunnelConfig {
-                    name: domain.clone(),
                     domain: domain.clone(),
                     local_addr,
                     nodelay: None,
-                    retry_interval: None,
                 };
                 (domain, tunnel)
             })
@@ -239,10 +230,10 @@ impl ServerClientConfig {
             .tunnels
             .values()
             .map(|t| ClientTunnelConfig {
-                name: t.name.clone(),
+                name: t.domain.clone(),
                 local_addr: t.local_addr.clone(),
                 nodelay: Some(t.nodelay.or(self.nodelay).unwrap_or(true)),
-                retry_interval: t.retry_interval.unwrap_or(retry_interval),
+                retry_interval,
             })
             .collect();
         // Could be arbitrary, but keep it stable for the logs
@@ -253,7 +244,6 @@ impl ServerClientConfig {
             heartbeat_timeout: self
                 .heartbeat_timeout
                 .unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT_SECS),
-            retry_interval,
         }
     }
 }
@@ -414,7 +404,6 @@ impl ServerConfig {
                     .remove(&key)
                     .expect("the tunnel was just read");
                 t.domain = domain.clone();
-                t.name = domain.clone();
                 t.nodelay = Some(t.nodelay.or(client.nodelay).unwrap_or(true));
                 client.tunnels.insert(domain, t);
             }
@@ -480,7 +469,6 @@ mod tests {
             tunnels_map.insert(
                 domain.to_string(),
                 ServerTunnelConfig {
-                    name: domain.to_string(),
                     domain: domain.to_string(),
                     local_addr: local_addr.to_string(),
                     ..Default::default()
@@ -548,10 +536,6 @@ mod tests {
         );
         assert!(ServerConfig::validate(&mut cfg).is_ok());
         assert_eq!(cfg.clients["home"].name, "home");
-        assert_eq!(
-            cfg.clients["home"].tunnels["foo1.example.com"].name,
-            "foo1.example.com"
-        );
 
         // An empty local_addr is rejected
         cfg.clients
@@ -635,7 +619,6 @@ mod tests {
         assert_eq!(pushed.tunnels[0].name, "foo1.example.com");
         assert_eq!(pushed.tunnels[1].name, "foo2.example.com");
         assert_eq!(pushed.heartbeat_timeout, DEFAULT_HEARTBEAT_TIMEOUT_SECS);
-        assert_eq!(pushed.retry_interval, DEFAULT_CLIENT_RETRY_INTERVAL_SECS);
         assert!(pushed.tunnels.iter().all(|t| t.retry_interval == 1));
         assert!(pushed.tunnels.iter().all(|t| t.nodelay == Some(true)));
 
@@ -647,7 +630,6 @@ mod tests {
 
         let pushed = c2.to_client_config();
         assert_eq!(pushed.heartbeat_timeout, 0);
-        assert_eq!(pushed.retry_interval, 7);
         assert_eq!(pushed.tunnels[0].retry_interval, 7);
         assert_eq!(pushed.tunnels[0].nodelay, Some(false));
         assert_eq!(pushed.tunnels[1].retry_interval, 7);
@@ -695,7 +677,7 @@ nodelay = false
         assert_eq!(home.nodelay, Some(false));
         assert_eq!(home.tunnels.len(), 2);
         let t1 = &home.tunnels["foo1.example.com"];
-        assert_eq!(t1.name, "foo1.example.com");
+        assert_eq!(t1.domain, "foo1.example.com");
         assert_eq!(t1.local_addr, "127.0.0.1:80");
         // The client-level nodelay is resolved onto the tunnel
         assert_eq!(t1.nodelay, Some(false));

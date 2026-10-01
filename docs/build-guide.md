@@ -45,8 +45,6 @@ strip http-tunnel
 upx --best --lzma http-tunnel
 ```
 
-At the time of writing the build guide, the produced binary for `x86_64-unknown-linux-glibc` has the size of **574 KiB**, while `frpc` has the size of **~10 MiB**, which is much larger.
-
 ## Android
 
 The client runs unchanged on Android, as it only makes outgoing TCP connections.

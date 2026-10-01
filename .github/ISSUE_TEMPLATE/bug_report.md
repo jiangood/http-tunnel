@@ -25,7 +25,8 @@ Configuration used to reproduce the behavior:
 If you encountered a panic, please re-run with `RUST_BACKTRACE=1` to provide the backtrace. -->
 
 **Environment:**
- - OS: <!-- Please fill in distribution if you're using linux-->
-- `http-tunnel --version` output: 
+- Role: <!-- client or server -->
+- OS and, on Linux, the distribution:
 - CPU architecture:
-- rustc version:
+- `http-tunnel --version` output:
+- If you built from source, `rustc --version`:

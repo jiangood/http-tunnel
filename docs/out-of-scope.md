@@ -1,19 +1,13 @@
 # Out of Scope
 
-`http-tunnel` focuses on forwarding for NAT traversal, rather than being an all-in-one development tool or a load balancer or a gateway. It's designed to *be used with them*, not *replace them*.
-
-But that doesn't mean it's not useful for other purposes. In the future, more configuration APIs will be added and `http-tunnel` can be used with an external dashboard.
+`http-tunnel` focuses on HTTP forwarding for NAT traversal, rather than being an all-in-one development tool or a load balancer or a gateway. It's designed to *be used with them*, not *replace them*.
 
 > Make each program do one thing well.
 
 - *HTTP Request Logging*
 
-  `http-tunnel` doesn't interfere with the application layer traffic. A right place for this kind of stuff is the web server, and a network capture tool.
+  `http-tunnel` doesn't interfere with the application layer traffic beyond reading the first request's `Host` header to route the connection. A right place for this kind of stuff is the web server, and a network capture tool.
 
 - *`frp`'s STCP or other setup that requires visitors' side configuration*
 
-  If that kind of setup is possible, then there are a lot more tools available. You may want to consider secure tunnels like wireguard or zerotier. `http-tunnel` primarily focuses on NAT traversal by forwarding, which doesn't require any setup for visitors. 
-
-- *Caching `local_ip`'s DNS records*
-
-  As responded in [issue #183](https://github.com/rapiz1/http-tunnel/issues/183), `local_ip` cache is not feasible because we have no reliable way to detect ip change. Handle DNS TTL and so on should be done with a DNS server, not a client. Caching ip is generally dangerous for clients. If you care about the `local_ip` query you can set up a local DNS server and enable caching. Then the local lookup should be trivial.
+  If that kind of setup is possible, then there are a lot more tools available. You may want to consider secure tunnels like wireguard or zerotier. `http-tunnel` primarily focuses on NAT traversal by forwarding, which doesn't require any setup for visitors.
