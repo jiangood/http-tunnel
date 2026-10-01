@@ -5,6 +5,7 @@ use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::path::Path;
 use tokio::fs;
+use tracing::info;
 
 /// Application-layer heartbeat interval in secs
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
@@ -195,12 +196,49 @@ impl ServerConfig {
     }
 
     pub async fn from_file(path: &Path) -> Result<ServerConfig> {
-        let s: String = fs::read_to_string(path)
-            .await
-            .with_context(|| format!("Failed to read the config {:?}", path))?;
+        let s: String = match fs::read_to_string(path).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Generate a default config with the three ports, so that the server
+                // can start without a config file
+                let s = ServerConfig::template();
+                fs::write(path, s.as_bytes())
+                    .await
+                    .with_context(|| format!("Failed to create the config {:?}", path))?;
+                info!("{:?} was not found. A default config was generated", path);
+                return ServerConfig::from_str(&s);
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("Failed to read the config {:?}", path))
+            }
+        };
+
         ServerConfig::from_str(&s).with_context(|| {
             "Configuration is invalid. Please refer to the configuration specification."
         })
+    }
+
+    /// A minimal template that is written when the config file doesn't exist.
+    /// It only sets the three ports, so that a fresh server can start and be
+    /// configured through the administration API.
+    pub fn template() -> String {
+        const TEMPLATE: &str = "\
+             # http-tunnel server configuration.\n\
+             # The clients and their services are defined in `[clients.<name>]`.\n\
+             # See https://github.com/jiangood/http-tunnel#configuration\n\
+             \n\
+             bind_addr = \"0.0.0.0:2333\" # The address that the server listens for clients\n\
+             http_bind_addr = \"0.0.0.0:80\" # The HTTP entrypoint, routed by the `Host` header\n\
+             api_bind_addr = \"127.0.0.1:2335\" # The administration API and the web UI\n\
+             api_token = \"change_me\" # Required by the administration API\n\
+             \n\
+             # [clients.home]\n\
+             # token = \"use_a_secret_that_only_you_know\"\n\
+             \n\
+             # [clients.home.services.my_service]\n\
+             # hosts = [\"my_service.example.com\"]\n\
+             # local_addr = \"127.0.0.1:80\"\n";
+        TEMPLATE.to_string()
     }
 
     /// Validate a configuration and normalize it in place: fill the names from the
@@ -617,6 +655,19 @@ nodelay = false
         assert_eq!(cfg, reparsed);
         assert!(dumped.contains("api_token = \"admin_secret\""));
         assert!(dumped.contains("[clients.home.services.foo1]"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_template_is_valid() -> Result<()> {
+        let s = ServerConfig::template();
+        let cfg = ServerConfig::from_str(&s)?;
+        assert_eq!(cfg.bind_addr, "0.0.0.0:2333");
+        assert_eq!(cfg.http_bind_addr, "0.0.0.0:80");
+        assert_eq!(cfg.api_bind_addr.as_deref(), Some("127.0.0.1:2335"));
+        assert!(cfg.api_token.is_some());
+        // The sample client is commented out
+        assert!(cfg.clients.is_empty());
         Ok(())
     }
 

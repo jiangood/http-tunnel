@@ -51,7 +51,8 @@ Assuming you have a NAS at home behind the NAT, and want to expose its web UI at
 
 1. On the server which has a public IP
 
-Create `server.toml` with the following content and accommodate it to your needs.
+Create `server.toml` with the following content and accommodate it to your needs. If the path doesn't exist, the
+server writes a minimal template with the three ports (and the client and service sections commented out) and starts.
 
 ```toml
 # server.toml
