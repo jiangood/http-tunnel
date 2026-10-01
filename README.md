@@ -134,11 +134,14 @@ address of the host unless it's behind a reverse proxy):
   -p 127.0.0.1:2335:2335
 ```
 
-The image is built with the default features (both the server and the client). To build a smaller image that only
-serves as a server, pass `--build-arg FEATURES=server`:
+The image only contains the binary: it's assembled from the static musl build, so nothing is compiled inside it. To
+build it locally, compile the musl binary and place it under `build-out/<arch>/` first:
 
 ```bash
-docker build --build-arg FEATURES=server -t http-tunnel-server .
+cargo build --release --target x86_64-unknown-linux-musl
+mkdir -p build-out/amd64
+cp target/x86_64-unknown-linux-musl/release/http-tunnel build-out/amd64/
+docker build --build-arg TARGETARCH=amd64 -t http-tunnel .
 ```
 
 The token can also be passed through the `HTTP_TUNNEL_TOKEN` environment variable, which keeps it out of the
