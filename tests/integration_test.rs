@@ -375,6 +375,79 @@ async fn admin_api_hot_reload() -> Result<()> {
     Ok(())
 }
 
+// ==== The fatal config error test ====
+
+const FATAL_SERVER_ADDR: &str = "127.0.0.1:2453";
+
+const FATAL_CONFIG: &str = r#"
+bind_addr = "127.0.0.1:2453"
+http_bind_addr = "127.0.0.1:2454"
+
+[clients.home]
+token = "a_secret_token"
+
+[clients.home.tunnels]
+"echo.test" = "127.0.0.1:8092"
+"#;
+
+/// A client that the server rejects with a definitive reason must exit with an error
+/// instead of retrying forever: an unknown name gets `TunnelNotExist`, a wrong token
+/// gets `AuthFailed`. The timeout fails the test if the client keeps retrying.
+#[tokio::test]
+async fn client_exits_on_fatal_config_error() -> Result<()> {
+    init();
+
+    let config_path = std::env::temp_dir().join("http_tunnel_fatal_test.toml");
+    std::fs::write(&config_path, FATAL_CONFIG)?;
+    let config_path_str = config_path.to_str().unwrap().to_string();
+
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let server = tokio::spawn(async move {
+        run_http_tunnel_server(&config_path_str, server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    // Wait for the server to listen, so that the client reaches the handshake
+    time::sleep(Duration::from_secs(1)).await;
+
+    info!("an unknown name must end the client");
+    let (_tx, rx) = broadcast::channel(1);
+    let err = time::timeout(
+        Duration::from_secs(5),
+        run_http_tunnel_client("unknown", FATAL_SERVER_ADDR, CLIENT_TOKEN, rx),
+    )
+    .await
+    .expect("the client kept retrying on an unknown name")
+    .expect_err("the client must fail on an unknown name");
+    assert!(
+        format!("{:#}", err).contains("unknown"),
+        "unexpected error: {:#}",
+        err
+    );
+
+    info!("a wrong token must end the client");
+    let (_tx, rx) = broadcast::channel(1);
+    let err = time::timeout(
+        Duration::from_secs(5),
+        run_http_tunnel_client(CLIENT_NAME, FATAL_SERVER_ADDR, "wrong_token", rx),
+    )
+    .await
+    .expect("the client kept retrying on a wrong token")
+    .expect_err("the client must fail on a wrong token");
+    assert!(
+        format!("{:#}", err).contains("token"),
+        "unexpected error: {:#}",
+        err
+    );
+
+    info!("shutdown the server");
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server);
+
+    Ok(())
+}
+
 /// Send a minimal HTTP request and return the status code and the body
 async fn api_request(
     addr: &str,

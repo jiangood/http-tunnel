@@ -49,33 +49,52 @@ impl Client {
         // administration API.
         let (config_tx, mut config_rx) = mpsc::channel::<ClientConfig>(4);
 
-        {
+        // Keep the handle instead of dropping it, so that a definitive failure of the
+        // config session (unknown name, wrong token) makes the client exit non-zero
+        // rather than being retried silently forever
+        let config_session = {
             let args = self.args.clone();
             let shutdown_rx = shutdown_rx.resubscribe();
-            tokio::spawn(async move {
-                run_config_session(args, config_tx, shutdown_rx).await;
-            });
-        }
+            tokio::spawn(async move { run_config_session(args, config_tx, shutdown_rx).await })
+        };
 
+        let mut shutting_down = false;
         loop {
             tokio::select! {
                 maybe = config_rx.recv() => {
                     match maybe {
                         Some(config) => self.reconcile(config),
-                        // The config session gave up, which shouldn't happen
+                        // The config session ended and dropped the sender, so its
+                        // result is awaited below
                         None => break,
                     }
                 }
-                _ = shutdown_rx.recv() => break,
+                _ = shutdown_rx.recv() => {
+                    shutting_down = true;
+                    break;
+                }
             }
         }
+
+        // Stop the config session if it is still running. A requested shutdown wins,
+        // otherwise its result is propagated, so that a fatal error exits the client.
+        let result = if shutting_down {
+            config_session.abort();
+            let _ = config_session.await;
+            Ok(())
+        } else {
+            match config_session.await {
+                Ok(result) => result,
+                Err(e) => Err(anyhow!("The config session panicked: {:#}", e)),
+            }
+        };
 
         // Shutdown all tunnels
         for (_, handle) in self.tunnel_handles.drain() {
             handle.shutdown();
         }
 
-        Ok(())
+        result
     }
 
     // Make the pushed config effective: start the new tunnels, stop the removed
@@ -127,13 +146,32 @@ fn is_shutdown(shutdown_rx: &mut broadcast::Receiver<bool>) -> bool {
     shutdown_rx.try_recv() != Err(broadcast::error::TryRecvError::Empty)
 }
 
+/// A config-session error that the server reported as definitive, e.g. the client
+/// name is unknown or its token is wrong. Retrying cannot fix it, so the error is
+/// marked to make the client exit instead of reconnecting forever.
+#[derive(Debug)]
+struct FatalConfigError(anyhow::Error);
+
+impl std::fmt::Display for FatalConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for FatalConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 // Keep a config channel open, feeding the pushed configs to the reconciliation loop.
-// It reconnects with a backoff when the channel drops.
+// It reconnects with a backoff when the channel drops, but returns immediately on a
+// definitive rejection from the server.
 async fn run_config_session(
     args: ClientArgs,
     tx: mpsc::Sender<ClientConfig>,
     mut shutdown_rx: broadcast::Receiver<bool>,
-) {
+) -> Result<()> {
     let mut backoff = ExponentialBackoff {
         max_interval: Duration::from_secs(DEFAULT_FETCH_RETRY_INTERVAL_SECS),
         max_elapsed_time: None,
@@ -143,13 +181,18 @@ async fn run_config_session(
     loop {
         if let Err(e) = run_config_connection(&args, &tx, &shutdown_rx).await {
             if is_shutdown(&mut shutdown_rx) {
-                return;
+                return Ok(());
+            }
+            // A definitive rejection is not going to succeed on a retry, so give the
+            // error back to the caller and let the client exit
+            if e.downcast_ref::<FatalConfigError>().is_some() {
+                return Err(e);
             }
             error!("{:#}", e);
         }
 
         if is_shutdown(&mut shutdown_rx) {
-            return;
+            return Ok(());
         }
 
         let duration = backoff
@@ -157,7 +200,7 @@ async fn run_config_session(
             .unwrap_or(Duration::from_secs(DEFAULT_FETCH_RETRY_INTERVAL_SECS));
         tokio::select! {
             _ = time::sleep(duration) => {}
-            _ = shutdown_rx.recv() => return,
+            _ = shutdown_rx.recv() => return Ok(()),
         }
     }
 }
@@ -216,9 +259,21 @@ async fn run_config_connection(
     debug!("Reading ack");
     match read_ack(&mut conn).await? {
         Ack::Ok => {}
-        v => {
-            return Err(anyhow!("{}", v))
-                .with_context(|| format!("Failed to get the config of the client {}", args.name));
+        // The server rejected the config channel in a way that a retry cannot fix, so
+        // mark the error fatal and let the client exit instead of retrying forever
+        Ack::TunnelNotExist => {
+            return Err(FatalConfigError(anyhow!(
+                "The client `{}` is not configured on the server",
+                args.name
+            ))
+            .into());
+        }
+        Ack::AuthFailed => {
+            return Err(FatalConfigError(anyhow!(
+                "The token of the client `{}` is incorrect",
+                args.name
+            ))
+            .into());
         }
     }
 

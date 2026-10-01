@@ -562,11 +562,18 @@ async fn do_config_channel_handshake(
         .await?;
     conn.flush().await?;
 
+    // Read auth. It is read before the lookup so that an unknown client is rejected
+    // only once its auth has been drained: closing the connection with unread data
+    // sends a reset instead of the ack, and the client would misread the definitive
+    // rejection as a transient network failure and retry forever
+    let protocol::Auth(d) = read_auth(&mut conn).await?;
+
     // Lookup the client
     let client = state.clients.read().await.get(&client_digest).cloned();
     let Some(client) = client else {
         conn.write_all(&bincode::serialize(&Ack::TunnelNotExist).unwrap())
             .await?;
+        conn.flush().await?;
         bail!("No such a client {}", hex::encode(client_digest));
     };
 
@@ -574,14 +581,12 @@ async fn do_config_channel_handshake(
     let mut concat = Vec::from(client.token.as_bytes());
     concat.append(&mut nonce);
 
-    // Read auth
-    let protocol::Auth(d) = read_auth(&mut conn).await?;
-
     // Validate
     let session_key = protocol::digest(&concat);
     if session_key != d {
         conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
             .await?;
+        conn.flush().await?;
         debug!(
             "Expect {}, but got {}",
             hex::encode(session_key),
