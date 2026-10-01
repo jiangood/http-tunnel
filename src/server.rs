@@ -20,9 +20,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{copy_bidirectional, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, split, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
@@ -700,13 +701,19 @@ async fn do_control_channel_handshake(
         bail!("Service {} failed the authentication", service_name);
     } else {
         let heartbeat_interval = state.config.read().await.heartbeat_interval;
-        let mut h = state.control_channels.write().await;
+        let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
 
         // If there's already a control channel for the service, then drop the old one.
         // Because a control channel doesn't report back when it's dead,
         // the handle in the map could be stall, dropping the old handle enables
         // the client to reconnect.
-        if h.remove1(&service_digest).is_some() {
+        if state
+            .control_channels
+            .write()
+            .await
+            .remove1(&service_digest)
+            .is_some()
+        {
             warn!(
                 "Dropping previous control channel for service {}",
                 service_name
@@ -719,10 +726,27 @@ async fn do_control_channel_handshake(
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");
-        let handle = ControlChannelHandle::new(conn, service_config, heartbeat_interval);
+        let (handle, ch_task) =
+            ControlChannelHandle::new(conn, service_config, heartbeat_interval, conn_id);
 
         // Insert the new handle
-        let _ = h.insert(service_digest, session_key, handle);
+        let _ = state
+            .control_channels
+            .write()
+            .await
+            .insert(service_digest, session_key, handle);
+
+        // When the control channel is gone (the client crashed, was stopped, or lost
+        // its connection), remove its handle so that the visitors are answered with a
+        // 503 instead of being handed over to a service that will never receive them.
+        // Only remove our own handle, so that a reconnected client isn't dropped.
+        tokio::spawn(async move {
+            let _ = ch_task.await;
+            let mut h = state.control_channels.write().await;
+            if h.get1(&service_digest).map(|h| h.id) == Some(conn_id) {
+                h.remove1(&service_digest);
+            }
+        });
     }
 
     Ok(())
@@ -756,6 +780,9 @@ async fn do_data_channel_handshake(
 }
 
 pub(crate) struct ControlChannelHandle {
+    // Identifies the connection that owns the handle, so that it only removes its own
+    // handle when it goes away
+    id: usize,
     // Shutdown the control channel by dropping it
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<TcpStream>,
@@ -771,7 +798,8 @@ impl ControlChannelHandle {
         conn: TcpStream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
-    ) -> ControlChannelHandle {
+        id: usize,
+    ) -> (ControlChannelHandle, JoinHandle<()>) {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
 
@@ -811,8 +839,11 @@ impl ControlChannelHandle {
             heartbeat_interval,
         };
 
-        // Run the control channel
-        tokio::spawn(
+        // Run the control channel. Its `JoinHandle` is returned so that the caller can
+        // remove the handle from the map once the channel is gone, which lets the
+        // visitors be answered with a 503 instead of being handed over to a dead
+        // service.
+        let ch_task = tokio::spawn(
             async move {
                 if let Err(err) = ch.run().await {
                     error!("{:#}", err);
@@ -821,12 +852,16 @@ impl ControlChannelHandle {
             .instrument(Span::current()),
         );
 
-        ControlChannelHandle {
-            _shutdown_tx: shutdown_tx,
-            data_ch_tx,
-            visitor_tx,
-            service,
-        }
+        (
+            ControlChannelHandle {
+                id,
+                _shutdown_tx: shutdown_tx,
+                data_ch_tx,
+                visitor_tx,
+                service,
+            },
+            ch_task,
+        )
     }
 }
 
@@ -839,25 +874,31 @@ struct ControlChannel {
 }
 
 impl ControlChannel {
-    async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
-        write_and_flush(&mut self.conn, data)
-            .await
-            .with_context(|| "Failed to write control cmds")?;
-        Ok(())
-    }
     // Run a control channel
     #[instrument(skip_all)]
-    async fn run(mut self) -> Result<()> {
+    async fn run(self) -> Result<()> {
+        let ControlChannel {
+            conn,
+            mut shutdown_rx,
+            mut data_ch_req_rx,
+            heartbeat_interval,
+        } = self;
+
         let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
         let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
+
+        // Split the connection, so that the writes and the read that watches for the
+        // client going away don't borrow the same half.
+        let (mut rd, mut wr) = split(conn);
+        let mut buf = [0u8; 1024];
 
         // Wait for data channel requests and the shutdown signal
         loop {
             tokio::select! {
-                val = self.data_ch_req_rx.recv() => {
+                val = data_ch_req_rx.recv() => {
                     match val {
                         Some(_) => {
-                            if let Err(e) = self.write_and_flush(&create_ch_cmd).await {
+                            if let Err(e) = write_and_flush(&mut wr, &create_ch_cmd).await {
                                 error!("{:#}", e);
                                 break;
                             }
@@ -867,14 +908,33 @@ impl ControlChannel {
                         }
                     }
                 },
-                _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
-                            if let Err(e) = self.write_and_flush(&heartbeat).await {
+                _ = time::sleep(Duration::from_secs(heartbeat_interval)), if heartbeat_interval != 0 => {
+                            if let Err(e) = write_and_flush(&mut wr, &heartbeat).await {
                                 error!("{:#}", e);
                                 break;
                             }
                 }
+                // The client never writes on the control channel, so any read result
+                // means that it's gone. Breaking the loop removes the handle from the
+                // map (see `do_control_channel_handshake`), so that the visitors get a
+                // 503 instead of being handed over to a service that never forwards.
+                ret = rd.read(&mut buf) => {
+                    match ret {
+                        Ok(0) => {
+                            debug!("Control channel reached the end of the stream");
+                            break;
+                        }
+                        Ok(n) => {
+                            debug!("Ignoring {} unexpected byte(s) on the control channel", n);
+                        }
+                        Err(e) => {
+                            debug!("Control channel read failed: {:#}", e);
+                            break;
+                        }
+                    }
+                }
                 // Wait for the shutdown signal
-                _ = self.shutdown_rx.recv() => {
+                _ = shutdown_rx.recv() => {
                     break;
                 }
             }
@@ -913,10 +973,15 @@ async fn run_tcp_connection_pool(
                 } else {
                     // Current data channel is broken. Request for a new one
                     if data_ch_req_tx.send(true).is_err() {
+                        // The control channel is gone, so no new data channel will come
+                        crate::http::respond_service_unavailable(&mut stream).await;
                         break 'pool;
                     }
                 }
             } else {
+                // The control channel is gone, so no data channel will ever come.
+                // Answer the visitor with a 503 instead of leaving it hanging.
+                crate::http::respond_service_unavailable(&mut stream).await;
                 break 'pool;
             }
         }

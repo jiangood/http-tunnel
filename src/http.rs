@@ -85,12 +85,7 @@ async fn handle_visitor(
 
     let Some(visitor_tx) = visitor_tx else {
         debug!("No control channel for the host `{}`", host);
-        respond(
-            &mut stream,
-            "503 Service Unavailable",
-            "Service is not connected\n",
-        )
-        .await;
+        respond_service_unavailable(&mut stream).await;
         return Ok(());
     };
 
@@ -172,6 +167,18 @@ fn normalize_host(raw: &str) -> String {
         }
     };
     host.to_lowercase()
+}
+
+/// Answer a visitor with a `503`, either because no service is connected for its
+/// `Host`, or because the control channel of the service went away after the visitor
+/// was already handed over.
+pub(crate) async fn respond_service_unavailable(stream: &mut TcpStream) {
+    respond(
+        stream,
+        "503 Service Unavailable",
+        "Service is not connected\n",
+    )
+    .await;
 }
 
 async fn respond(stream: &mut TcpStream, status: &str, body: &str) {

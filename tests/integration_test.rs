@@ -79,6 +79,10 @@ async fn http_routing() -> Result<()> {
     client_shutdown_tx.send(true)?;
     let _ = tokio::join!(client);
 
+    // A visitor must not hang when the service is disconnected: it gets a 503
+    info!("a disconnected service is answered with 503");
+    wait_for_503(HTTP_ENTRY_ADDR, ECHO_HOST).await.unwrap();
+
     info!("restart the client");
     let client_shutdown_rx = client_shutdown_tx.subscribe();
     let client = tokio::spawn(async move {
@@ -175,6 +179,36 @@ async fn http_404_check(addr: &'static str, host: &'static str) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Poll until the host is answered with a `503`, with a timeout. It fails if the request
+/// hangs, which is what happened before the handle of a disconnected control channel was
+/// removed from the map.
+async fn wait_for_503(addr: &'static str, host: &'static str) -> Result<()> {
+    let deadline = time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut conn = TcpStream::connect(addr).await?;
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            host
+        );
+        conn.write_all(request.as_bytes()).await?;
+
+        let mut response = Vec::new();
+        if let std::result::Result::Ok(std::result::Result::Ok(_)) =
+            time::timeout(Duration::from_secs(2), conn.read_to_end(&mut response)).await
+        {
+            let text = String::from_utf8_lossy(&response);
+            if text.starts_with("HTTP/1.1 503") {
+                return Ok(());
+            }
+        }
+
+        if time::Instant::now() >= deadline {
+            anyhow::bail!("the service didn't answer `503` in time");
+        }
+        time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 // ==== The administration API test ====
