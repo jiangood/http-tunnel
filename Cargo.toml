@@ -41,7 +41,7 @@ client = []
 
 # The mobile client. It embeds the client and exposes a small C API that the
 # Android UI calls through JNI
-mobile = ["dep:android_logger"]
+mobile = ["dep:tracing-android"]
 
 # Feature to enable tokio-console. Disabled by default.
 # Don't enable it unless for debugging purposes.
@@ -87,7 +87,11 @@ console-subscriber = { version = "0.1", optional = true, features = [
     "parking_lot",
 ] }
 atty = "0.2"
-android_logger = { version = "0.13", optional = true }
+# The mobile client logs through `tracing`, and logcat is fed by this layer. It
+# only builds for Android, so it is declared for that target (see
+# `src/mobile.rs`).
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-android = { version = "0.2", optional = true }
 
 [build-dependencies]
 vergen = { version = "7.4.2", default-features = false, features = [

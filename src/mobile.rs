@@ -54,18 +54,30 @@ unsafe fn read_str(ptr: *const c_char) -> Option<String> {
     CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_owned())
 }
 
-/// Initialize the Android logger. Causes no side effect on other platforms, and
-/// is safe to call more than once.
+/// Initialize logging for Android.
 ///
-/// The log level can be changed with `adb shell setprop log.tag.http-tunnel debug`.
+/// The client logs through `tracing`. Logcat is fed by `tracing-android`, a
+/// `tracing` layer that writes each event to logcat, so it is installed here as
+/// part of the subscriber that the client expects. It causes no side effect on
+/// other platforms, and is safe to call more than once.
+///
+/// The log level defaults to `info` and follows `RUST_LOG`, like the CLI.
 #[no_mangle]
 pub extern "C" fn http_tunnel_mobile_init() {
     #[cfg(target_os = "android")]
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_max_level(tracing::Level::INFO)
-            .with_tag("http-tunnel"),
-    );
+    {
+        use tracing_subscriber::prelude::*;
+
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+        // `try_init` rather than `init`: the Kotlin layer may call this more than
+        // once across restarts, and a second install is not an error
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_android::layer("http-tunnel").expect("Failed to build the logcat layer"))
+            .try_init();
+    }
 }
 
 /// Start the client.
