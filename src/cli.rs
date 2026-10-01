@@ -49,8 +49,8 @@ pub enum Command {
 
 #[derive(Args, Debug, Clone)]
 pub struct ServerArgs {
-    /// The path to the configuration file
-    #[clap(parse(from_os_str), name = "CONFIG")]
+    /// The path to the configuration file (defaults to `server.toml` in the current directory)
+    #[clap(parse(from_os_str), name = "CONFIG", default_value = "server.toml")]
     pub config_path: PathBuf,
 }
 

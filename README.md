@@ -67,10 +67,17 @@ hosts = ["nas.example.com"] # Requests with this `Host` are forwarded to `my_nas
 local_addr = "127.0.0.1:80" # The address of the NAS web UI, as seen from the NAS
 ```
 
-Then run:
+Then run it from the directory that contains `server.toml`:
 
 ```bash
-./http-tunnel server server.toml
+./http-tunnel server
+```
+
+The configuration file is optional and defaults to `server.toml` in the current directory. A different path can also
+be given explicitly:
+
+```bash
+./http-tunnel server /path/to/server.toml
 ```
 
 2. On the host which is behind the NAT (your NAS)
@@ -102,8 +109,9 @@ A [Docker image](https://github.com/jiangood/http-tunnel/pkgs/container/http-tun
 Container Registry for `linux/amd64` and `linux/arm64`. It's a [distroless](https://github.com/GoogleContainerTools/distroless)
 image, so it only contains `http-tunnel` and has no shell.
 
-The server needs the configuration file, which it also writes back to when it's changed through the
-[administration API](#administration-api). Mount it read-write, and publish the ports of the config you use:
+The server reads `server.toml` from its working directory (`/app` in the image), which it also writes back to when
+it's changed through the [administration API](#administration-api). Mount the directory that holds `server.toml`
+read-write, and publish the ports of the config you use. No path has to be passed on the command line:
 
 ```bash
 # server.toml
@@ -112,9 +120,13 @@ The server needs the configuration file, which it also writes back to when it's 
 
 docker run -d --name http-tunnel --restart unless-stopped \
   -p 2333:2333 -p 80:80 \
-  -v "$PWD/server.toml:/app/server.toml" \
-  ghcr.io/jiangood/http-tunnel:latest server /app/server.toml
+  -v "$PWD:/app" \
+  ghcr.io/jiangood/http-tunnel:latest server
 ```
+
+The mounted folder must be writable: if `server.toml` is missing, the server generates a minimal template there and
+starts, and the administration API rewrites it in place. If the folder is read-only, pass an explicit path to a
+writable location instead.
 
 The client takes no configuration file, so it only needs the arguments:
 
