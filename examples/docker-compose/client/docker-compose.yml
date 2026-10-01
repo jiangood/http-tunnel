@@ -1,0 +1,20 @@
+# Docker Compose example for the client.
+#
+# The client takes no configuration file: the address of the server, the name
+# of the client and its token are passed as an argument and an environment
+# variable. `--name` must match a `[clients.<name>]` key in `server.toml`.
+#
+# `network_mode: host` lets the client reach services listening on the host.
+# On Docker Desktop use `host.docker.internal` as the `local_addr` instead.
+services:
+  http-tunnel:
+    image: ghcr.io/jiangood/http-tunnel:latest
+    container_name: http-tunnel
+    restart: unless-stopped
+    network_mode: host
+    command: client --remote myserver.com:2333 --name home_nas
+    environment:
+      # Keeps the token out of the container's arguments, so it doesn't show
+      # up in `ps`. Set it in a `.env` file next to this file instead of
+      # hardcoding it here.
+      - HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know

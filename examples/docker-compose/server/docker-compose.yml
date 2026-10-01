@@ -1,0 +1,17 @@
+# Docker Compose example for the server.
+#
+# Run `docker compose up -d` from this directory, next to `server.toml`.
+# The directory is mounted at `/app`, which is the working directory of the
+# image, so the server finds `server.toml` without an explicit path.
+services:
+  http-tunnel:
+    image: ghcr.io/jiangood/http-tunnel:latest
+    container_name: http-tunnel
+    restart: unless-stopped
+    command: server
+    ports:
+      - "2333:2333" # Clients connect here
+      - "80:80" # Visitors connect here
+      - "127.0.0.1:2335:2335" # Administration API, drop unless it's enabled
+    volumes:
+      - ./:/app # Holds server.toml, must be writable

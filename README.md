@@ -23,6 +23,7 @@ the server pushes it the services that it should forward.
   - [Features](#features)
   - [Quickstart](#quickstart)
   - [Docker](#docker)
+    - [Docker Compose](#docker-compose)
   - [Configuration](#configuration)
     - [Routing](#routing)
     - [Logging](#logging)
@@ -164,6 +165,66 @@ docker run -d --name http-tunnel --network host \
   -e HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know \
   ghcr.io/jiangood/http-tunnel:latest client --remote myserver.com:2333 --name home_nas
 ```
+
+### Docker Compose
+
+The same containers can be managed with Docker Compose. On the server, put this `docker-compose.yml` in the directory
+that holds `server.toml` (or use [`examples/docker-compose/server`](./examples/docker-compose/server)):
+
+```yaml
+# docker-compose.yml
+services:
+  http-tunnel:
+    image: ghcr.io/jiangood/http-tunnel:latest
+    container_name: http-tunnel
+    restart: unless-stopped
+    command: server
+    ports:
+      - "2333:2333" # Clients connect here
+      - "80:80" # Visitors connect here
+      - "127.0.0.1:2335:2335" # Administration API, drop unless it's enabled
+    volumes:
+      - ./:/app # Holds server.toml, must be writable
+```
+
+Then start it with:
+
+```bash
+docker compose up -d
+```
+
+On the host behind the NAT (the client), use a second `docker-compose.yml`, or
+[`examples/docker-compose/client`](./examples/docker-compose/client). It takes no configuration file, so the server
+address, name and token are passed as arguments and environment variables:
+
+```yaml
+# docker-compose.yml
+services:
+  http-tunnel:
+    image: ghcr.io/jiangood/http-tunnel:latest
+    container_name: http-tunnel
+    restart: unless-stopped
+    network_mode: host
+    command: client --remote myserver.com:2333 --name home_nas
+    environment:
+      - HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know
+```
+
+To build the image locally instead of pulling it, keep the `build` section and the `build-out/<arch>/` layout
+described above:
+
+```yaml
+services:
+  http-tunnel:
+    build:
+      context: .
+      args:
+        TARGETARCH: amd64
+    # ...
+```
+
+Ready-to-use files are in [`examples/docker-compose`](./examples/docker-compose), with a directory for the
+[server](./examples/docker-compose/server) and one for the [client](./examples/docker-compose/client).
 
 ## Configuration
 
