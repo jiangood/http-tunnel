@@ -94,12 +94,16 @@ for target in "${targets[@]}"; do
     fi
 
     echo "Building $target ($abi)"
+    # The linker is passed through the environment. `CC_<target>` and
+    # `CARGO_TARGET_<TARGET>_LINKER` contain dashes, so they can't be `export`ed
+    # by name; cargo reads them from its config instead, which accepts any key.
     (
         cd "$ROOT"
-        export "CC_$target=$cc"
         export "CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER=$linker"
         # The client plus the JNI cdylib (`http_tunnel_mobile`), never the server
         cargo build --release --no-default-features --features client,mobile \
+            --config "env.CC_$target.force = true" \
+            --config "env.CC_$target.value = '$cc'" \
             --example http_tunnel_mobile --target "$target"
     )
 
