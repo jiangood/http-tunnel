@@ -56,8 +56,11 @@ visitor waited for until `DATA_CHANNEL_WAIT_TIMEOUT`, stops counting instead of
 leaking, so a client that cannot open channels doesn't leave the pool stuck. A
 visitor that finds the pool empty waits for a warm channel, bounded by
 `DATA_CHANNEL_WAIT_TIMEOUT`, after which it is answered with `504` rather than
-hanging. The visitors waiting for a channel don't block each other: each one is
-forwarded by its own task.
+hanging. A single dispatcher task owns the channel receiver and hands each
+channel that arrives to the next waiting visitor, so the waiters never queue on
+a lock; a visitor that closes its connection while it waits is noticed through a
+`peek` and gives up, and the channel that was reserved for it is dropped instead
+of being spent on a dead visitor.
 
 On shutdown, after the HTTP listener stops accepting, the server waits for the
 in-flight visitors (up to `DRAIN_TIMEOUT`, 30 seconds) before it tears the

@@ -15,7 +15,7 @@ use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
 
 use rand::RngCore;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -27,7 +27,7 @@ use tokio::io::{
     ReadBuf,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
@@ -1166,10 +1166,6 @@ impl DataChannelPool {
         );
     }
 
-    pub(crate) fn is_closed(&self) -> bool {
-        self.req_tx.is_closed()
-    }
-
     fn metrics(&self) -> &Arc<ServerMetrics> {
         &self.metrics
     }
@@ -1366,16 +1362,21 @@ impl ControlChannel {
     }
 }
 
+/// A pool dispatcher. It owns the receiver of the data channels and a queue of
+/// visitors waiting for one, matches them, and drops the surplus once the
+/// demand decays. The waiters never hold a lock, so a visitor that gives up
+/// doesn't block the others.
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool(
-    data_ch_rx: mpsc::Receiver<TcpStream>,
+    mut data_ch_rx: mpsc::Receiver<TcpStream>,
     mut visitor_rx: mpsc::Receiver<HttpVisitor>,
     data_pool: DataChannelPool,
 ) -> Result<()> {
-    // The receiver is shared, so that every visitor waits for its own data
-    // channel independently. Waiting in a single loop would block the visitors
-    // that arrive later behind the one that is waiting.
-    let data_ch_rx = Arc::new(Mutex::new(data_ch_rx));
+    // The visitors that are waiting for a channel, in arrival order
+    let (waiters_tx, mut waiters_rx) = mpsc::unbounded_channel::<oneshot::Sender<TcpStream>>();
+    // The channels that arrived and were not handed to a visitor yet
+    let mut warm: VecDeque<TcpStream> = VecDeque::new();
+    let mut waiters: VecDeque<oneshot::Sender<TcpStream>> = VecDeque::new();
 
     let mut replenish = time::interval(Duration::from_millis(POOL_REPLENISH_INTERVAL_MS));
     replenish.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
@@ -1388,36 +1389,45 @@ async fn run_tcp_connection_pool(
                 let Some(visitor) = visitor else {
                     break;
                 };
-                let data_ch_rx = data_ch_rx.clone();
+                let waiters_tx = waiters_tx.clone();
                 let data_pool = data_pool.clone();
                 tokio::spawn(
                     async move {
-                        if let Err(e) = forward_visitor(visitor, data_ch_rx, data_pool).await {
+                        if let Err(e) = forward_visitor(visitor, waiters_tx, data_pool).await {
                             warn!("Failed to forward a visitor: {:#}", e);
                         }
                     }
                     .in_current_span(),
                 );
             }
+            channel = data_ch_rx.recv() => {
+                let Some(channel) = channel else {
+                    break;
+                };
+                warm.push_back(channel);
+                serve_waiters(&mut warm, &mut waiters, &data_pool);
+            }
+            waiter = waiters_rx.recv() => {
+                let Some(waiter) = waiter else {
+                    break;
+                };
+                waiters.push_back(waiter);
+                serve_waiters(&mut warm, &mut waiters, &data_pool);
+            }
             _ = replenish.tick() => {
                 data_pool.replenish();
-                if data_pool.is_closed() {
-                    break;
+                // Collect the channels that are queued in the channel, then
+                // drop the surplus that the decayed demand no longer wants, so
+                // an idle tunnel doesn't hold connections open.
+                while let Ok(channel) = data_ch_rx.try_recv() {
+                    warm.push_back(channel);
                 }
-                // Drop the warm channels that the decayed demand no longer
-                // wants, so an idle tunnel doesn't hold connections open. The
-                // lock is only tried, never awaited: a visitor waiting for a
-                // channel keeps it, and the trimming just waits for a later
-                // tick.
-                if data_pool.warm_over_target() {
-                    if let Ok(mut rx) = data_ch_rx.try_lock() {
-                        while data_pool.warm_over_target() {
-                            if rx.try_recv().is_ok() {
-                                data_pool.drop_warm();
-                            } else {
-                                break;
-                            }
-                        }
+                serve_waiters(&mut warm, &mut waiters, &data_pool);
+                while data_pool.warm_over_target() {
+                    if warm.pop_front().is_some() {
+                        data_pool.drop_warm();
+                    } else {
+                        break;
                     }
                 }
             }
@@ -1428,13 +1438,32 @@ async fn run_tcp_connection_pool(
     Ok(())
 }
 
+/// Hand the warm channels to the visitors that are waiting, dropping a channel
+/// whose visitor gave up in the meantime.
+fn serve_waiters(
+    warm: &mut VecDeque<TcpStream>,
+    waiters: &mut VecDeque<oneshot::Sender<TcpStream>>,
+    data_pool: &DataChannelPool,
+) {
+    while !warm.is_empty() && !waiters.is_empty() {
+        let channel = warm.pop_front().unwrap();
+        let waiter = waiters.pop_front().unwrap();
+        match waiter.send(channel) {
+            Ok(()) => data_pool.consume(),
+            // The visitor went away while waiting, so the channel is dropped
+            Err(_) => data_pool.drop_warm(),
+        }
+    }
+}
+
 /// Forward one visitor through a data channel, waiting for one when the pool is
 /// empty. The wait is bounded, so a visitor is answered with a `504` instead of
-/// hanging forever when the client cannot open a data channel.
+/// hanging forever when the client cannot open a data channel. It also ends
+/// early when the visitor goes away, so a dead visitor doesn't waste a channel.
 #[instrument(skip_all)]
 async fn forward_visitor(
     visitor: HttpVisitor,
-    data_ch_rx: Arc<Mutex<mpsc::Receiver<TcpStream>>>,
+    waiters_tx: mpsc::UnboundedSender<oneshot::Sender<TcpStream>>,
     data_pool: DataChannelPool,
 ) -> Result<()> {
     let HttpVisitor {
@@ -1445,32 +1474,17 @@ async fn forward_visitor(
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
 
     loop {
-        let received = time::timeout(Duration::from_secs(DATA_CHANNEL_WAIT_TIMEOUT), async {
-            let mut rx = data_ch_rx.lock().await;
-            rx.recv().await
-        })
-        .await;
+        let (waiter_tx, waiter_rx) = oneshot::channel();
+        if waiters_tx.send(waiter_tx).is_err() {
+            // The pool is gone, so no data channel will ever come.
+            crate::http::respond_tunnel_unavailable(&mut stream, data_pool.metrics()).await;
+            return Ok(());
+        }
 
-        match received {
-            Err(_) => {
-                debug!("Timed out waiting for a data channel");
-                // The requests that were in flight never arrived; forget them
-                // so that the pool can be replenished again.
-                data_pool.forget_inflight();
-                crate::http::respond_gateway_timeout(&mut stream, data_pool.metrics()).await;
-                return Ok(());
-            }
-            Ok(None) => {
-                // The control channel is gone, so no data channel will ever come.
-                // Answer the visitor with a 503 instead of leaving it hanging.
-                crate::http::respond_tunnel_unavailable(&mut stream, data_pool.metrics()).await;
-                return Ok(());
-            }
-            Ok(Some(mut ch)) => {
-                data_pool.consume();
-
-                let ok = write_and_flush(&mut ch, &cmd).await.is_ok()
-                    && write_and_flush(&mut ch, &prefetched).await.is_ok();
+        match wait_for_channel(&mut stream, waiter_rx).await {
+            ChannelWait::Got(mut channel) => {
+                let ok = write_and_flush(&mut channel, &cmd).await.is_ok()
+                    && write_and_flush(&mut channel, &prefetched).await.is_ok();
 
                 if ok {
                     let guard = data_pool.forward_guard();
@@ -1482,7 +1496,7 @@ async fn forward_visitor(
                             let _activity = activity;
                             let mut stream = stream;
                             let _ = copy_bidirectional_with_sizes(
-                                &mut ch,
+                                &mut channel,
                                 &mut stream,
                                 COPY_BUF_SIZE,
                                 COPY_BUF_SIZE,
@@ -1497,6 +1511,68 @@ async fn forward_visitor(
                 // The current data channel is broken. Top the pool up (bounded
                 // by its target) and wait for a replacement channel.
                 data_pool.replenish();
+            }
+            ChannelWait::TimedOut => {
+                debug!("Timed out waiting for a data channel");
+                // The requests that were in flight never arrived; forget them
+                // so that the pool can be replenished again.
+                data_pool.forget_inflight();
+                crate::http::respond_gateway_timeout(&mut stream, data_pool.metrics()).await;
+                return Ok(());
+            }
+            ChannelWait::VisitorGone => {
+                // The channel that was requested for this visitor is dropped by
+                // the dispatcher when it arrives.
+                debug!("The visitor went away while waiting for a data channel");
+                return Ok(());
+            }
+            ChannelWait::PoolClosed => {
+                // The control channel is gone, so no data channel will ever come.
+                crate::http::respond_tunnel_unavailable(&mut stream, data_pool.metrics()).await;
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// The outcome of waiting for a data channel.
+enum ChannelWait {
+    Got(TcpStream),
+    TimedOut,
+    VisitorGone,
+    PoolClosed,
+}
+
+/// Wait for a data channel, a timeout, or for the visitor to disconnect. The
+/// visitor is watched with `peek`, which doesn't consume the request body; once
+/// any data is seen it's left alone, since only the EOF means it's gone.
+async fn wait_for_channel(
+    stream: &mut TcpStream,
+    mut waiter_rx: oneshot::Receiver<TcpStream>,
+) -> ChannelWait {
+    let deadline = time::sleep(Duration::from_secs(DATA_CHANNEL_WAIT_TIMEOUT));
+    tokio::pin!(deadline);
+    let mut peek_buf = [0u8; 1];
+    let mut watch_disconnect = true;
+
+    loop {
+        tokio::select! {
+            received = &mut waiter_rx => {
+                return match received {
+                    Ok(channel) => ChannelWait::Got(channel),
+                    Err(_) => ChannelWait::PoolClosed,
+                };
+            }
+            _ = &mut deadline => return ChannelWait::TimedOut,
+            peeked = stream.peek(&mut peek_buf), if watch_disconnect => {
+                match peeked {
+                    // The visitor closed its side; stop waiting for a channel
+                    Ok(0) => return ChannelWait::VisitorGone,
+                    // There is a request body in flight, so the visitor is
+                    // alive; stop watching the socket and wait for the channel
+                    Ok(_) => watch_disconnect = false,
+                    Err(_) => return ChannelWait::VisitorGone,
+                }
             }
         }
     }
