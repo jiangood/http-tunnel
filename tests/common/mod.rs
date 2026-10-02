@@ -25,11 +25,22 @@ pub async fn run_http_tunnel_client(
     token: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
+    run_http_tunnel_client_with_api(name, remote, token, None, shutdown_rx).await
+}
+
+pub async fn run_http_tunnel_client_with_api(
+    name: &str,
+    remote: &str,
+    token: &str,
+    api_port: Option<u16>,
+    shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
     let cli = http_tunnel::Cli {
         cmd: http_tunnel::Command::Client(http_tunnel::ClientArgs {
             name: name.to_string(),
             remote: remote.to_string(),
             token: token.to_string(),
+            api_port,
         }),
     };
     http_tunnel::run(cli, shutdown_rx).await

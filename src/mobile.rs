@@ -115,6 +115,9 @@ pub unsafe extern "C" fn http_tunnel_mobile_start(
         remote,
         name,
         token,
+        // The mobile UI drives the client through the C API, so it doesn't need
+        // the administration API
+        api_port: None,
     };
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
 

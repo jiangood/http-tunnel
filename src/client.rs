@@ -3,8 +3,9 @@ use crate::config::{ClientConfig, ClientTunnelConfig, MaskedString};
 use crate::constants::run_control_chan_backoff;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
-    self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
-    DataChannelCmd, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
+    self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ClientConfigRequest,
+    ControlChannelCmd, DataChannelCmd, ServerConfigPush, CURRENT_PROTO_VERSION,
+    HASH_WIDTH_IN_BYTES,
 };
 use crate::transport::{connect, AddrMaybeCached, SocketOpts};
 use anyhow::{anyhow, bail, Context, Result};
@@ -15,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{copy_bidirectional_with_sizes, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, instrument, warn, Instrument, Span};
 
@@ -27,16 +28,115 @@ const DEFAULT_FETCH_RETRY_INTERVAL_SECS: u64 = 1;
 // syscalls on large transfers.
 const COPY_BUF_SIZE: usize = 64 * 1024;
 
+// How long a change submitted through the administration API waits for the
+// server to answer before giving up
+#[cfg_attr(not(feature = "client-api"), allow(dead_code))]
+const CONFIG_REQUEST_TIMEOUT_SECS: u64 = 10;
+
 // The entrypoint of running a client
 pub async fn run_client(args: ClientArgs, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
     let mut client = Client::new(args);
     client.run(shutdown_rx).await
 }
 
+// A change to its own tunnels that the administration API asks the config
+// connection to forward to the server. The `reply` carries the server's verdict
+// back to the API handler.
+struct TunnelRequest {
+    msg: ClientConfigRequest,
+    reply: oneshot::Sender<Result<(), String>>,
+}
+
+// The state of a client that is shared between the config connection and the
+// administration API. The server remains the source of truth: `tunnels` is the
+// config it pushed last, and a change is a request that the server validates and
+// pushes back.
+// The request machinery (`requester`, `request_lock` and the API-only methods)
+// is unused when the API is compiled out, so the dead-code lint is relaxed there
+#[cfg_attr(not(feature = "client-api"), allow(dead_code))]
+pub(crate) struct ClientState {
+    // The tunnels of the config that the server pushed last
+    tunnels: RwLock<HashMap<String, ClientTunnelConfig>>,
+    // The sender of the live config connection, if any. A request sent while no
+    // connection is established is refused instead of being queued indefinitely.
+    requester: RwLock<Option<mpsc::Sender<TunnelRequest>>>,
+    // Serializes the requests, so that each reply matches the request sent first
+    request_lock: tokio::sync::Mutex<()>,
+}
+
+#[cfg_attr(not(feature = "client-api"), allow(dead_code))]
+impl ClientState {
+    fn new() -> ClientState {
+        ClientState {
+            tunnels: RwLock::new(HashMap::new()),
+            requester: RwLock::new(None),
+            request_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    // Replace the cached config with the one that the server pushed last
+    async fn set_tunnels(&self, config: &ClientConfig) {
+        let tunnels = config
+            .tunnels
+            .iter()
+            .map(|t| (t.name.clone(), t.clone()))
+            .collect();
+        *self.tunnels.write().await = tunnels;
+    }
+
+    // The tunnels that the client is serving, sorted by name for a stable output
+    pub(crate) async fn tunnels(&self) -> Vec<ClientTunnelConfig> {
+        let mut tunnels: Vec<ClientTunnelConfig> =
+            self.tunnels.read().await.values().cloned().collect();
+        tunnels.sort_by(|a, b| a.name.cmp(&b.name));
+        tunnels
+    }
+
+    // Register (or clear) the sender of the live config connection
+    async fn set_requester(&self, tx: Option<mpsc::Sender<TunnelRequest>>) {
+        *self.requester.write().await = tx;
+    }
+
+    // Whether a config connection is established, so that the API can report it
+    pub(crate) async fn connected(&self) -> bool {
+        self.requester.read().await.is_some()
+    }
+
+    // Submit a change to the server over the live config connection and wait for
+    // its verdict. `Err` carries the reason that the server gave, or a message
+    // that the request could not be delivered.
+    pub(crate) async fn submit(&self, msg: ClientConfigRequest) -> Result<(), String> {
+        // One request at a time, so that the reply of a request is never mistaken
+        // for the reply of another one
+        let _guard = self.request_lock.lock().await;
+
+        let Some(tx) = self.requester.read().await.clone() else {
+            return Err("The client is not connected to the server".to_string());
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let request = TunnelRequest {
+            msg,
+            reply: reply_tx,
+        };
+        if tx.send(request).await.is_err() {
+            return Err("The client is not connected to the server".to_string());
+        }
+
+        match time::timeout(Duration::from_secs(CONFIG_REQUEST_TIMEOUT_SECS), reply_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("The connection to the server was closed".to_string()),
+            Err(_) => Err("The server did not answer the request in time".to_string()),
+        }
+    }
+}
+
 // Holds the state of a client
 struct Client {
     args: ClientArgs,
     tunnel_handles: HashMap<String, ControlChannelHandle>,
+    // Shared with the config connection and the administration API
+    state: Arc<ClientState>,
 }
 
 impl Client {
@@ -44,6 +144,7 @@ impl Client {
         Client {
             args,
             tunnel_handles: HashMap::new(),
+            state: Arc::new(ClientState::new()),
         }
     }
 
@@ -59,9 +160,42 @@ impl Client {
         // rather than being retried silently forever
         let config_session = {
             let args = self.args.clone();
+            let state = self.state.clone();
             let shutdown_rx = shutdown_rx.resubscribe();
-            tokio::spawn(async move { run_config_session(args, config_tx, shutdown_rx).await })
+            tokio::spawn(
+                async move { run_config_session(args, config_tx, state, shutdown_rx).await },
+            )
         };
+
+        // Run the administration API when a port is configured. A build without
+        // the `client-api` feature has nothing to serve, so it only warns.
+        #[cfg(feature = "client-api")]
+        let api_task = match self.args.api_port {
+            Some(port) => {
+                let state = self.state.clone();
+                let token = self.args.token.clone();
+                let name = self.args.name.clone();
+                let remote = self.args.remote.clone();
+                let shutdown_rx = shutdown_rx.resubscribe();
+                Some(tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::client_api::serve(port, token, name, remote, state, shutdown_rx)
+                            .await
+                    {
+                        error!("{:#}", e);
+                    }
+                }))
+            }
+            None => None,
+        };
+
+        #[cfg(not(feature = "client-api"))]
+        if self.args.api_port.is_some() {
+            warn!(
+                "`--api-port` is set, but this build has no `client-api` feature. \
+                 The client administration API is disabled"
+            );
+        }
 
         let mut shutting_down = false;
         loop {
@@ -93,6 +227,13 @@ impl Client {
                 Err(e) => Err(anyhow!("The config session panicked: {:#}", e)),
             }
         };
+
+        // Stop the administration API if it is running
+        #[cfg(feature = "client-api")]
+        if let Some(api_task) = api_task {
+            api_task.abort();
+            let _ = api_task.await;
+        }
 
         // Shutdown all tunnels
         for (_, handle) in self.tunnel_handles.drain() {
@@ -175,6 +316,7 @@ impl std::error::Error for FatalConfigError {
 async fn run_config_session(
     args: ClientArgs,
     tx: mpsc::Sender<ClientConfig>,
+    state: Arc<ClientState>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let mut backoff = ExponentialBackoff {
@@ -184,7 +326,7 @@ async fn run_config_session(
     };
 
     loop {
-        if let Err(e) = run_config_connection(&args, &tx, &shutdown_rx).await {
+        if let Err(e) = run_config_connection(&args, &tx, &state, &shutdown_rx).await {
             if is_shutdown(&mut shutdown_rx) {
                 return Ok(());
             }
@@ -210,10 +352,13 @@ async fn run_config_session(
     }
 }
 
-// Fetch the config and then keep reading the config updates pushed by the server
+// Fetch the config and then keep reading the config updates pushed by the
+// server. It also forwards the changes requested by the administration API and
+// feeds the resulting config to the reconciliation loop.
 async fn run_config_connection(
     args: &ClientArgs,
     tx: &mpsc::Sender<ClientConfig>,
+    state: &Arc<ClientState>,
     shutdown_rx: &broadcast::Receiver<bool>,
 ) -> Result<()> {
     let mut shutdown_rx = shutdown_rx.resubscribe();
@@ -284,22 +429,71 @@ async fn run_config_connection(
 
     info!("Config channel established");
 
-    // Read the config pushed by the server, including the later updates
-    loop {
+    let (mut rd, mut wr) = conn.into_split();
+
+    // Register the requester before reading, so that a request made as soon as the
+    // connection is up is delivered instead of being refused
+    let (req_tx, mut req_rx) = mpsc::channel::<TunnelRequest>(4);
+    state.set_requester(Some(req_tx)).await;
+
+    // The API serializes its requests, so at most one is in flight
+    let mut pending: Option<oneshot::Sender<Result<(), String>>> = None;
+
+    let result = loop {
         tokio::select! {
-            config = protocol::read_payload::<ClientConfig, _>(&mut conn) => {
-                let config = config.with_context(|| "Failed to read the config")?;
-                info!(
-                    "Got the config from the server. {} tunnel(s)",
-                    config.tunnels.len()
-                );
-                if tx.send(config).await.is_err() {
-                    bail!("The client is shutting down");
+            // A config pushed by the server, or the verdict on a request
+            push = protocol::read_payload::<ServerConfigPush, _>(&mut rd) => {
+                match push {
+                    Ok(ServerConfigPush::Config(config)) => {
+                        state.set_tunnels(&config).await;
+                        info!(
+                            "Got the config from the server. {} tunnel(s)",
+                            config.tunnels.len()
+                        );
+                        if tx.send(config).await.is_err() {
+                            break Err(anyhow!("The client is shutting down"));
+                        }
+                    }
+                    Ok(ServerConfigPush::Applied(config)) => {
+                        state.set_tunnels(&config).await;
+                        if let Some(reply) = pending.take() {
+                            let _ = reply.send(Ok(()));
+                        }
+                    }
+                    Ok(ServerConfigPush::Rejected(reason)) => {
+                        if let Some(reply) = pending.take() {
+                            let _ = reply.send(Err(reason));
+                        }
+                    }
+                    Err(e) => {
+                        break Err(e).with_context(|| "Failed to read the config");
+                    }
                 }
             }
-            _ = shutdown_rx.recv() => return Ok(()),
+            // A change requested through the administration API
+            req = req_rx.recv() => {
+                if let Some(req) = req {
+                    if let Err(e) = protocol::write_payload(&mut wr, &req.msg).await {
+                        let _ = req
+                            .reply
+                            .send(Err("The connection to the server was closed".to_string()));
+                        break Err(e).with_context(|| "Failed to write the config request");
+                    }
+                    pending = Some(req.reply);
+                }
+            }
+            _ = shutdown_rx.recv() => break Ok(()),
         }
+    };
+
+    // Stop accepting requests and fail the one that is still in flight, so that
+    // the API handler doesn't wait for the whole timeout
+    state.set_requester(None).await;
+    if let Some(reply) = pending.take() {
+        let _ = reply.send(Err("The connection to the server was closed".to_string()));
     }
+
+    result
 }
 
 struct RunDataChannelArgs {

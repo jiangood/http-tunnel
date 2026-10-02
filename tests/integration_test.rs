@@ -375,6 +375,172 @@ async fn admin_api_hot_reload() -> Result<()> {
     Ok(())
 }
 
+// ==== The client administration API test ====
+
+const CLIENT_API_ECHO_SERVER_ADDR: &str = "127.0.0.1:8093";
+const CLIENT_API_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2464";
+const CLIENT_API_ADDR: &str = "127.0.0.1:2465";
+const CLIENT_API_SERVER_ADDR: &str = "127.0.0.1:2463";
+const CLIENT_API_TOKEN: &str = "a_secret_token";
+
+// The client starts without any tunnel: they are all created through its API
+const CLIENT_API_CONFIG: &str = r#"
+server_port = 2463
+http_port = 2464
+
+[clients.home]
+token = "a_secret_token"
+"#;
+
+/// A tunnel created, listed and deleted through the client administration API is
+/// validated by the server, which stays the source of truth, and routed without a
+/// restart of either side.
+#[cfg(feature = "client-api")]
+#[tokio::test]
+async fn client_api_manages_tunnels() -> Result<()> {
+    init();
+
+    let config_path = std::env::temp_dir().join("http_tunnel_client_api_test.toml");
+    std::fs::write(&config_path, CLIENT_API_CONFIG)?;
+    let config_path_str = config_path.to_str().unwrap().to_string();
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(CLIENT_API_ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the echo server for testing: {:?}", e);
+        }
+    });
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    let server = tokio::spawn(async move {
+        run_http_tunnel_server(&config_path_str, server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    let client = tokio::spawn(async move {
+        common::run_http_tunnel_client_with_api(
+            "home",
+            CLIENT_API_SERVER_ADDR,
+            CLIENT_API_TOKEN,
+            Some(2465),
+            client_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+
+    time::sleep(Duration::from_millis(2500)).await;
+
+    info!("the client API reports the connected client");
+    let (status, body) = api_request(
+        CLIENT_API_ADDR,
+        "GET",
+        "/api/status",
+        Some(CLIENT_API_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(
+        body.contains("\"connected\":true"),
+        "unexpected body: {}",
+        body
+    );
+    assert!(body.contains("home"), "unexpected body: {}", body);
+
+    info!("the client API has no tunnel yet");
+    let (status, body) = api_request(
+        CLIENT_API_ADDR,
+        "GET",
+        "/api/tunnels",
+        Some(CLIENT_API_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert_eq!(body.trim(), "[]", "unexpected body: {}", body);
+
+    info!("the client API rejects a request without the token");
+    let (status, _) = api_request(CLIENT_API_ADDR, "GET", "/api/tunnels", None, None).await?;
+    assert_eq!(status, 401, "expected 401");
+
+    info!("add a tunnel through the client API");
+    let (status, body) = api_request(
+        CLIENT_API_ADDR,
+        "PUT",
+        "/api/tunnels/echo.test",
+        Some(CLIENT_API_TOKEN),
+        Some(r#"{"local_addr":"127.0.0.1:8093"}"#),
+    )
+    .await?;
+    assert_eq!(status, 201, "unexpected response: {}", body);
+    assert!(body.contains("127.0.0.1:8093"), "unexpected body: {}", body);
+
+    // The server applies the change and the client starts the tunnel
+    time::sleep(Duration::from_millis(1500)).await;
+    info!("the added tunnel is routed without a restart");
+    http_echo_hitter(CLIENT_API_HTTP_ENTRY_ADDR, "echo.test")
+        .await
+        .unwrap();
+
+    info!("the client API lists the added tunnel");
+    let (status, body) = api_request(
+        CLIENT_API_ADDR,
+        "GET",
+        "/api/tunnels",
+        Some(CLIENT_API_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(body.contains("echo.test"), "unexpected body: {}", body);
+
+    info!("the server wrote the change back to its config");
+    let written = std::fs::read_to_string(&config_path)?;
+    assert!(
+        written.contains("echo.test"),
+        "the config wasn't written back: {}",
+        written
+    );
+
+    info!("delete the tunnel through the client API");
+    let (status, body) = api_request(
+        CLIENT_API_ADDR,
+        "DELETE",
+        "/api/tunnels/echo.test",
+        Some(CLIENT_API_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 204, "unexpected response: {}", body);
+
+    time::sleep(Duration::from_millis(500)).await;
+    info!("the deleted tunnel is no longer routed");
+    http_404_check(CLIENT_API_HTTP_ENTRY_ADDR, "echo.test")
+        .await
+        .unwrap();
+
+    info!("deleting an unknown tunnel is rejected with 404");
+    let (status, body) = api_request(
+        CLIENT_API_ADDR,
+        "DELETE",
+        "/api/tunnels/unknown.test",
+        Some(CLIENT_API_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 404, "unexpected response: {}", body);
+
+    info!("shutdown the server and the client");
+    server_shutdown_tx.send(true)?;
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server, client);
+
+    Ok(())
+}
+
 // ==== The fatal config error test ====
 
 const FATAL_SERVER_ADDR: &str = "127.0.0.1:2453";

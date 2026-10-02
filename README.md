@@ -27,6 +27,7 @@ the server pushes it the tunnels that it should serve.
     - [Logging](#logging)
     - [Tuning](#tuning)
   - [Administration API](#administration-api)
+  - [Client Administration API](#client-administration-api)
   - [Planning](#planning)
 
 <!-- /TOC -->
@@ -91,6 +92,9 @@ or pass the token in the environment, so that it doesn't show up in `ps`:
 ```bash
 HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know ./http-tunnel client --remote myserver.com:2333 --name home_nas
 ```
+
+Pass `--api-port 2336` to expose the [client administration API](#client-administration-api), which maintains the
+client's tunnels at runtime.
 
 3. Now the client will try to connect to the server `myserver.com` on port `2333`, and the server pushes it the tunnels
    of `home_nas`, including the tunnel `nas.example.com`. Any HTTP request to the server on port `80` with `Host: nas.example.com` will be
@@ -356,9 +360,40 @@ curl -X PUT http://127.0.0.1:2335/api/clients/home/tunnels/nas.example.com \
   -d '{"local_addr":"127.0.0.1:80"}'
 ```
 
+## Client Administration API
+
+The client can also expose a REST API to maintain its own tunnels at runtime. It is disabled by default and is
+enabled by passing `--api-port`:
+
+```bash
+./http-tunnel client --remote myserver.com:2333 --name home_nas \
+  --token use_a_secret_that_only_you_know --api-port 2336
+```
+
+All the routes require `Authorization: Bearer <token>`, reusing the client token, so there is no second secret. The
+server stays the source of truth: a change is forwarded over the config channel, validated and persisted by the
+server, and pushed back to the client, which starts, updates or stops the tunnel without a restart of either side.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/status` | The client identity, its connection state and its tunnel count |
+| `GET` | `/api/tunnels` | List the tunnels the client is serving |
+| `PUT` | `/api/tunnels/{domain}` | Create or replace a tunnel (`{local_addr}`) |
+| `DELETE` | `/api/tunnels/{domain}` | Delete a tunnel |
+
+```bash
+curl -X PUT http://127.0.0.1:2336/api/tunnels/nas.example.com \
+  -H "Authorization: Bearer $CLIENT_TOKEN" -H "Content-Type: application/json" \
+  -d '{"local_addr":"127.0.0.1:80"}'
+```
+
+The API binds to `0.0.0.0`, so protect it the same way as the server API. See
+[`docs/client-api.md`](./docs/client-api.md) for the details and the caveats.
+
 ## Planning
 
 - [x] HTTP APIs for configuration
+- [x] Client administration API to maintain a client's own tunnels
 
 [Out of Scope](./docs/out-of-scope.md) lists features that are not planned to be implemented and why.
 

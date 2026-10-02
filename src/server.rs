@@ -7,7 +7,8 @@ use crate::http::RoutingTable;
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ConfigChannelHello, ControlChannelHello, DataChannelHello};
 use crate::protocol::{
-    self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, HASH_WIDTH_IN_BYTES,
+    self, read_auth, read_hello, Ack, ClientConfigRequest, ControlChannelCmd, DataChannelCmd,
+    Hello, ServerConfigPush, HASH_WIDTH_IN_BYTES,
 };
 use crate::transport::SocketOpts;
 use anyhow::{anyhow, bail, Context, Result};
@@ -814,7 +815,7 @@ async fn do_config_channel_handshake(
     let push_result = {
         let latest = state.clients.read().await.get(&client_digest).cloned();
         match latest {
-            Some(latest) => run_config_push(&mut conn, &latest, &mut rx).await,
+            Some(latest) => run_config_push(conn, &latest, state.clone(), &mut rx).await,
             None => Ok(()),
         }
     };
@@ -830,24 +831,91 @@ async fn do_config_channel_handshake(
     push_result
 }
 
-// Push the config of a client to it, then the pushed updates, until the channel fails
+// Push the config of a client to it, then the pushed updates, until the channel
+// fails. The client can also request changes to its own tunnels on this channel;
+// they are validated and applied by the server, which then pushes the resulting
+// config back.
 async fn run_config_push(
-    conn: &mut TcpStream,
+    conn: TcpStream,
     client: &ServerClient,
+    state: Arc<ServerState>,
     rx: &mut mpsc::Receiver<ClientConfig>,
 ) -> Result<()> {
-    protocol::write_payload(conn, &client.config).await?;
+    let (mut rd, mut wr) = conn.into_split();
+
+    protocol::write_payload(&mut wr, &ServerConfigPush::Config(client.config.clone())).await?;
     info!(client = %client.name, tunnels = client.config.tunnels.len(), "Config pushed");
 
-    while let Some(config) = rx.recv().await {
-        if let Err(e) = protocol::write_payload(conn, &config).await {
-            debug!("Failed to push the config to {}: {:#}", client.name, e);
-            break;
+    loop {
+        tokio::select! {
+            // A config change pushed by the server (the administration API, or the
+            // answer to a request of this very client)
+            config = rx.recv() => {
+                let Some(config) = config else {
+                    break;
+                };
+                let tunnels = config.tunnels.len();
+                if let Err(e) = protocol::write_payload(&mut wr, &ServerConfigPush::Config(config)).await {
+                    debug!("Failed to push the config to {}: {:#}", client.name, e);
+                    break;
+                }
+                info!(client = %client.name, tunnels, "Config pushed");
+            }
+            // A change to its own tunnels requested by the client
+            req = protocol::read_payload::<ClientConfigRequest, _>(&mut rd) => {
+                let req = match req {
+                    Ok(req) => req,
+                    Err(e) => {
+                        debug!("Failed to read a config request from {}: {:#}", client.name, e);
+                        break;
+                    }
+                };
+                let push = match handle_config_request(&state, &client.name, req).await {
+                    Ok(config) => ServerConfigPush::Applied(config),
+                    Err(e) => ServerConfigPush::Rejected(format!("{:#}", e)),
+                };
+                if let Err(e) = protocol::write_payload(&mut wr, &push).await {
+                    debug!("Failed to answer the config request of {}: {:#}", client.name, e);
+                    break;
+                }
+            }
         }
-        info!(client = %client.name, tunnels = config.tunnels.len(), "Config pushed");
     }
 
     Ok(())
+}
+
+// Apply a change that a client requested to its own tunnels. The whole
+// configuration is validated and persisted by `ServerState`, so the global rules
+// (unique domains and tokens) always hold, and the resulting config is returned
+// to be acknowledged to the client.
+async fn handle_config_request(
+    state: &Arc<ServerState>,
+    client: &str,
+    req: ClientConfigRequest,
+) -> Result<ClientConfig> {
+    match req {
+        ClientConfigRequest::PutTunnel { domain, local_addr } => {
+            let domain = domain.to_lowercase();
+            let tunnel = ServerTunnelConfig {
+                domain: domain.clone(),
+                local_addr,
+                nodelay: None,
+            };
+            state.put_tunnel(client, domain, tunnel).await?;
+        }
+        ClientConfigRequest::DeleteTunnel { domain } => {
+            state.delete_tunnel(client, &domain.to_lowercase()).await?;
+        }
+    }
+
+    let config = state.snapshot().await;
+    let client_config = config
+        .clients
+        .get(client)
+        .ok_or_else(|| anyhow!("No such a client `{}`", client))?
+        .to_client_config();
+    Ok(client_config)
 }
 
 async fn do_control_channel_handshake(

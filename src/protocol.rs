@@ -1,5 +1,6 @@
 pub const HASH_WIDTH_IN_BYTES: usize = 32;
 
+use crate::config::ClientConfig;
 use crate::helper::write_and_flush;
 use anyhow::{bail, Context, Result};
 use lazy_static::lazy_static;
@@ -10,9 +11,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
 
 type ProtocolVersion = u8;
-const PROTO_V1: u8 = 1u8;
+const PROTO_V2: u8 = 2u8;
 
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V1;
+// V2 makes the config channel bidirectional: the server wraps the pushed config
+// in `ServerConfigPush` and accepts `ClientConfigRequest` from the client. A V1
+// client and a V2 server can't understand each other's config channel, so the
+// version is bumped to reject the pair explicitly instead of failing to
+// deserialize.
+pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V2;
 
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 
@@ -62,6 +68,34 @@ pub enum ControlChannelCmd {
 #[derive(Deserialize, Serialize, Debug)]
 pub enum DataChannelCmd {
     StartForwardTcp,
+}
+
+/// A change to its own tunnels that a client asks the server to apply, sent over
+/// the config channel.
+///
+/// The server stays authoritative: it validates the change against the whole
+/// configuration, persists it, and pushes the resulting config back (see
+/// `ServerConfigPush`). A domain that is owned by another client, or an empty or
+/// malformed address, is rejected.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum ClientConfigRequest {
+    /// Create or replace the tunnel of `domain`, forwarded to `local_addr`
+    PutTunnel { domain: String, local_addr: String },
+    /// Remove the tunnel of `domain`
+    DeleteTunnel { domain: String },
+}
+
+/// A message pushed by the server over the config channel.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum ServerConfigPush {
+    /// The full configuration of the client, which it reconciles its running
+    /// tunnels with. Sent first and then again whenever the config changes
+    Config(ClientConfig),
+    /// The change requested by the client was applied. Carries the resulting
+    /// config so that the client's view is fresh as soon as the request returns
+    Applied(ClientConfig),
+    /// The change requested by the client was rejected, with the reason
+    Rejected(String),
 }
 
 pub fn digest(data: &[u8]) -> Digest {
@@ -228,5 +262,42 @@ mod tests {
 
         assert!(sizes.iter().all(|s| *s == sizes[0]), "{:?}", sizes);
         assert_eq!(sizes[0], PACKET_LEN.hello);
+    }
+
+    #[test]
+    fn test_config_channel_messages_roundtrip() {
+        let mut config = ClientConfig::default();
+        config.tunnels.push(crate::config::ClientTunnelConfig {
+            name: "echo.test".to_string(),
+            local_addr: "127.0.0.1:8080".to_string(),
+            nodelay: Some(true),
+            retry_interval: 1,
+        });
+
+        let requests = [
+            ClientConfigRequest::PutTunnel {
+                domain: "echo.test".to_string(),
+                local_addr: "127.0.0.1:8080".to_string(),
+            },
+            ClientConfigRequest::DeleteTunnel {
+                domain: "echo.test".to_string(),
+            },
+        ];
+        for req in requests {
+            let bytes = bincode::serialize(&req).unwrap();
+            let back: ClientConfigRequest = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(back, req);
+        }
+
+        let pushes = [
+            ServerConfigPush::Config(config.clone()),
+            ServerConfigPush::Applied(config),
+            ServerConfigPush::Rejected("The domain is already used".to_string()),
+        ];
+        for push in pushes {
+            let bytes = bincode::serialize(&push).unwrap();
+            let back: ServerConfigPush = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(back, push);
+        }
     }
 }

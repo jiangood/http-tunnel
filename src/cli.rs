@@ -74,4 +74,12 @@ pub struct ClientArgs {
     /// It can also be passed via the `HTTP_TUNNEL_TOKEN` environment variable
     #[clap(long, short, env = "HTTP_TUNNEL_TOKEN", hide_env_values = true)]
     pub token: String,
+
+    /// The port of the client administration API. The API is disabled unless set.
+    ///
+    /// It listens on all interfaces (`0.0.0.0`) and requires
+    /// `Authorization: Bearer <token>`. It's only compiled in with the
+    /// `client-api` feature (on by default)
+    #[clap(long)]
+    pub api_port: Option<u16>,
 }

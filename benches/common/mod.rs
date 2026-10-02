@@ -91,6 +91,7 @@ impl Harness {
                     name: CLIENT_NAME.to_string(),
                     remote: SERVER_ADDR.to_string(),
                     token: CLIENT_TOKEN.to_string(),
+                    api_port: None,
                 }),
             };
             let _ = http_tunnel::run(cli, client_rx).await;

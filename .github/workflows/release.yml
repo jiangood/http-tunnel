@@ -100,10 +100,10 @@ jobs:
           tool: cross
       - name: Run tests
         if: matrix.cross
-        run: cross test --release --target ${{ matrix.target }} --verbose --no-default-features --features server,client
+        run: cross test --release --target ${{ matrix.target }} --verbose --no-default-features --features server,client,client-api
       - name: Build release
         if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }} --no-default-features --features server,client
+        run: cross build --release --target ${{ matrix.target }} --no-default-features --features server,client,client-api
 
       - name: Run UPX
         # Upx may not support some platforms. Ignore the errors

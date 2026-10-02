@@ -1,6 +1,6 @@
 [package]
 name = "http-tunnel"
-version = "0.8.5"
+version = "0.9.0"
 edition = "2021"
 authors = ["Yujia Qiao <code@rapiz.me>", "jiangood"]
 description = "A secure, stable and high-performance HTTP reverse proxy for NAT traversal"
@@ -38,12 +38,16 @@ harness = false
 default = [
     "server",
     "client",
+    "client-api",
 ]
 
 # Run as a server
 server = ["dep:axum", "dep:serde_json"]
 # Run as a client
 client = []
+# The administration API of the client. Kept out of `client` so that a minimal
+# client build (e.g. the Android cdylib) doesn't pull in an HTTP server
+client-api = ["dep:axum"]
 
 # The mobile client. It embeds the client and exposes a small C API that the
 # Android UI calls through JNI
