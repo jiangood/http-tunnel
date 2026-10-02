@@ -286,15 +286,15 @@ pub async fn run_server(
 
 // The settings of the administration API, derived from the config
 struct ApiConfig {
-    bind_addr: String,
+    port: u16,
     token: String,
 }
 
 // Server holds all states of running a server
 struct Server {
     state: Arc<ServerState>,
-    bind_addr: String,
-    http_bind_addr: String,
+    server_addr: String,
+    http_port: u16,
     api: Option<ApiConfig>,
 }
 
@@ -558,52 +558,54 @@ impl Server {
     pub async fn from(mut config: ServerConfig, config_path: PathBuf) -> Result<Server> {
         ServerConfig::validate(&mut config)?;
 
-        let api = match (&config.api_bind_addr, &config.api_token) {
-            (Some(bind_addr), Some(token)) => Some(ApiConfig {
-                bind_addr: to_bind_addr(bind_addr),
+        let api = match (config.api_port, &config.api_token) {
+            (Some(port), Some(token)) => Some(ApiConfig {
+                port,
                 token: token.to_string(),
             }),
             (Some(_), None) => bail!(
-                "`api_bind_addr` is set but `api_token` is not. The administration API requires a token"
+                "`api_port` is set but `api_token` is not. The administration API requires a token"
             ),
             (None, Some(_)) => {
-                warn!("`api_token` is set but `api_bind_addr` is not. The administration API is disabled");
+                warn!(
+                    "`api_token` is set but `api_port` is not. The administration API is disabled"
+                );
                 None
             }
             (None, None) => None,
         };
 
-        let bind_addr = to_bind_addr(&config.bind_addr);
-        let http_bind_addr = to_bind_addr(&config.http_bind_addr);
+        let server_addr = to_bind_addr(config.server_port);
+        let http_port = config.http_port;
         let state = Arc::new(ServerState::new(config, config_path));
 
         Ok(Server {
             state,
-            bind_addr,
-            http_bind_addr,
+            server_addr,
+            http_port,
             api,
         })
     }
 
     // The entry point of Server
     pub async fn run(&mut self, mut shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-        // Listen at `bind_addr` for the control and data channels of clients
+        // Listen at `server_port` for the control and data channels of clients
         let l: TcpListener = retry_notify_with_deadline(
             listen_backoff(),
-            || async { Ok(TcpListener::bind(&self.bind_addr).await?) },
+            || async { Ok(TcpListener::bind(&self.server_addr).await?) },
             |e, duration| {
                 error!("{:#}. Retry in {:?}", e, duration);
             },
             &mut shutdown_rx,
         )
         .await
-        .with_context(|| "Failed to listen at `bind_addr`")?;
+        .with_context(|| "Failed to listen at `server_port`")?;
 
-        info!("Listening at {}", self.bind_addr);
+        info!("Listening at {}", self.server_addr);
 
         // Run the HTTP entrypoint which routes visitors by the `Host` header
         let http_task = tokio::spawn(crate::http::serve(
-            self.http_bind_addr.clone(),
+            self.http_port,
             self.state.clone(),
             shutdown_rx.resubscribe(),
         ));
@@ -611,7 +613,7 @@ impl Server {
         // Run the administration API and the web UI, if configured
         let api_task = match &self.api {
             Some(api) => Some(tokio::spawn(crate::admin::serve(
-                api.bind_addr.clone(),
+                api.port,
                 api.token.clone(),
                 self.state.clone(),
                 shutdown_rx.resubscribe(),
@@ -718,7 +720,7 @@ async fn handshake(conn: TcpStream) -> Result<TcpStream> {
     Ok(conn)
 }
 
-// Handle connections to `bind_addr`
+// Handle connections to `server_port`
 async fn handle_connection(mut conn: TcpStream, state: Arc<ServerState>) -> Result<()> {
     // Read hello
     let hello = read_hello(&mut conn).await?;

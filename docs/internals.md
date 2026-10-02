@@ -26,13 +26,13 @@ A data channel is a TCP connection between the *server* and the *client* that on
 
 ## The Process
 
-When `http-tunnel` starts in the client mode, it connects to `bind_addr` and establishes a config channel. It identifies itself by the name given with `--name`, and the server challenges it by a nonce, so that the client is required to authenticate with the token given with `--token`. In this way, the server knows which *client* of its configuration the connection belongs to.
+When `http-tunnel` starts in the client mode, it connects to `server_port` and establishes a config channel. It identifies itself by the name given with `--name`, and the server challenges it by a nonce, so that the client is required to authenticate with the token given with `--token`. In this way, the server knows which *client* of its configuration the connection belongs to.
 
 Then the server pushes the *tunnels* of that client over the config channel, and keeps the channel open, so that the later changes made through the administration API are pushed to the client as well. Each of the tunnels carries the `local_addr` on the client side, so the client doesn't need any configuration file.
 
-The client then creates one connection to `bind_addr` for each of the tunnels. These connections act as control channels. When a control channel starts, the server challenges the client by a nonce, the client is required to authenticate as the tunnel it wants to represent, with the token of the client it belongs to. Then that tunnel is set up.
+The client then creates one connection to `server_port` for each of the tunnels. These connections act as control channels. When a control channel starts, the server challenges the client by a nonce, the client is required to authenticate as the tunnel it wants to represent, with the token of the client it belongs to. Then that tunnel is set up.
 
-The server also listens on `http_bind_addr` for HTTP visitors. When a visitor connects, the server reads the HTTP request line and the `Host` header, and looks up
+The server also listens on `http_port` for HTTP visitors. When a visitor connects, the server reads the HTTP request line and the `Host` header, and looks up
 the tunnel that claims that domain. Then it asks the client for a data channel through the corresponding control
 channel, and hands the visitor over to the tunnel's connection pool. The client connects to the server to create a
 data channel, and the prefetched header bytes are replayed along with the rest of the connection. In this way, a

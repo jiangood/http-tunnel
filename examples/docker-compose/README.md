@@ -27,9 +27,9 @@ cd server
 docker compose up -d
 ```
 
-The three published ports map the `bind_addr` (clients), the `http_bind_addr` (visitors) and the `api_bind_addr`
+The three published ports map the `server_port` (clients), the `http_port` (visitors) and the `api_port`
 (administration API). The API port is published on every interface of the host and can be dropped if the API is not
-enabled. Set `api_bind_addr = "2335"` in `server.toml` so the container accepts the forwarded connections,
+enabled. Set `api_port = 2335` in `server.toml` so the container accepts the forwarded connections,
 and restrict the access with a reverse proxy, a firewall, or a private network.
 
 A minimal `server.toml` is provided in [`../minimal/server.toml`](../minimal/server.toml).

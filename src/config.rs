@@ -14,18 +14,6 @@ const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 40;
 /// The interval between retries to connect to the server
 const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
 
-/// A bind address is either a bare port (e.g. `"2333"`), which binds to all interfaces
-/// (`0.0.0.0`), or a `host:port`.
-fn validate_bind_addr(addr: &str, name: &str) -> Result<()> {
-    if addr.is_empty() {
-        bail!("`{}` is empty", name);
-    }
-    if addr.parse::<u16>().is_err() && !addr.contains(':') {
-        bail!("`{}` ({}) must be a port or a `host:port`", name, addr);
-    }
-    Ok(())
-}
-
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
 #[derive(Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
@@ -252,16 +240,19 @@ impl ServerClientConfig {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    /// The address that the server listens for clients (config/control/data channels)
-    pub bind_addr: String,
-    /// The address that the server listens for HTTP visitors, routed by the `Host` header
-    pub http_bind_addr: String,
-    /// The address that the administration API and the minimal web UI listen at.
-    /// The API is only started when both this and `api_token` are set.
+    /// The port that the server listens for clients (config/control/data channels).
+    /// It listens on all interfaces (`0.0.0.0`).
+    pub server_port: u16,
+    /// The port that the server listens for HTTP visitors, routed by the `Host` header.
+    /// It listens on all interfaces (`0.0.0.0`).
+    pub http_port: u16,
+    /// The port that the administration API and the minimal web UI listen at, on all
+    /// interfaces (`0.0.0.0`). The API is only started when both this and `api_token`
+    /// are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_bind_addr: Option<String>,
+    pub api_port: Option<u16>,
     /// The token required by the administration API (`Authorization: Bearer <token>`).
-    /// The API is only started when both this and `api_bind_addr` are set.
+    /// The API is only started when both this and `api_port` are set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_token: Option<MaskedString>,
     /// The clients that are allowed to connect, indexed by the name of the client
@@ -324,9 +315,9 @@ impl ServerConfig {
              # The clients and their tunnels are defined in `[clients.<name>]`.\n\
              # See https://github.com/jiangood/http-tunnel#configuration\n\
              \n\
-             bind_addr = \"2333\" # The port that the server listens for clients\n\
-             http_bind_addr = \"80\" # The HTTP entrypoint, routed by the `Host` header\n\
-             api_bind_addr = \"2335\" # The administration API and the web UI, on all interfaces\n\
+             server_port = 2333 # The port that the server listens for clients\n\
+             http_port = 80 # The HTTP entrypoint, routed by the `Host` header\n\
+             api_port = 2335 # The administration API and the web UI, on all interfaces\n\
              api_token = \"change_me\" # Required by the administration API\n\
              \n\
              # [clients.home]\n\
@@ -345,12 +336,6 @@ impl ServerConfig {
     /// a client must have a token, a domain belongs to a single tunnel, and the tokens
     /// are unique (a duplicated token would let a client impersonate another one).
     pub fn validate(config: &mut ServerConfig) -> Result<()> {
-        validate_bind_addr(&config.bind_addr, "bind_addr")?;
-        validate_bind_addr(&config.http_bind_addr, "http_bind_addr")?;
-        if let Some(addr) = &config.api_bind_addr {
-            validate_bind_addr(addr, "api_bind_addr")?;
-        }
-
         // domain -> client name
         let mut seen_domains: HashMap<String, String> = HashMap::new();
 
@@ -522,8 +507,8 @@ mod tests {
     #[test]
     fn test_validate_server_config() -> Result<()> {
         let mut cfg = ServerConfig {
-            bind_addr: "2333".into(),
-            http_bind_addr: "80".into(),
+            server_port: 2333,
+            http_port: 80,
             clients: HashMap::new(),
             ..Default::default()
         };
@@ -665,8 +650,8 @@ domain = "foo1.example.com"
     #[test]
     fn test_parse_the_new_config() -> Result<()> {
         let s = r#"
-bind_addr = "2333"
-http_bind_addr = "80"
+server_port = 2333
+http_port = 80
 
 [clients.home]
 token = "123"
@@ -694,8 +679,8 @@ nodelay = false
     #[test]
     fn test_rejects_an_empty_token() -> Result<()> {
         let s = r#"
-bind_addr = "2333"
-http_bind_addr = "80"
+server_port = 2333
+http_port = 80
 
 [clients.home]
 token = ""
@@ -710,8 +695,8 @@ token = ""
     #[test]
     fn test_rejects_an_unknown_client_field() {
         let s = r#"
-bind_addr = "2333"
-http_bind_addr = "80"
+server_port = 2333
+http_port = 80
 
 [clients.home]
 token = "123"
@@ -723,9 +708,9 @@ tokenz = "oops"
     #[test]
     fn test_config_roundtrip() -> Result<()> {
         let s = r#"
-bind_addr = "2333"
-http_bind_addr = "80"
-api_bind_addr = "127.0.0.1:2335"
+server_port = 2333
+http_port = 80
+api_port = 2335
 api_token = "admin_secret"
 
 [clients.home]
@@ -755,9 +740,9 @@ nodelay = false
     fn test_template_is_valid() -> Result<()> {
         let s = ServerConfig::template();
         let cfg = ServerConfig::from_str(&s)?;
-        assert_eq!(cfg.bind_addr, "2333");
-        assert_eq!(cfg.http_bind_addr, "80");
-        assert_eq!(cfg.api_bind_addr.as_deref(), Some("2335"));
+        assert_eq!(cfg.server_port, 2333);
+        assert_eq!(cfg.http_port, 80);
+        assert_eq!(cfg.api_port, Some(2335));
         assert!(cfg.api_token.is_some());
         // The sample client is commented out
         assert!(cfg.clients.is_empty());
@@ -767,8 +752,8 @@ nodelay = false
     #[test]
     fn test_config_roundtrip_without_optional_fields() -> Result<()> {
         let s = r#"
-bind_addr = "2333"
-http_bind_addr = "80"
+server_port = 2333
+http_port = 80
 
 [clients.home]
 token = "123"
@@ -779,7 +764,7 @@ token = "123"
         let cfg = ServerConfig::from_str(s)?;
         let dumped = cfg.to_toml()?;
         // `None` options must be omitted rather than serialized as an error
-        assert!(!dumped.contains("api_bind_addr"));
+        assert!(!dumped.contains("api_port"));
         assert!(!dumped.contains("nodelay"));
         let reparsed = ServerConfig::from_str(&dumped)?;
         assert_eq!(cfg, reparsed);
@@ -788,19 +773,21 @@ token = "123"
 
     #[test]
     fn test_to_bind_addr() {
-        assert_eq!(crate::helper::to_bind_addr("2333"), "0.0.0.0:2333");
-        assert_eq!(
-            crate::helper::to_bind_addr("127.0.0.1:2333"),
-            "127.0.0.1:2333"
-        );
-        assert_eq!(crate::helper::to_bind_addr("[::]:2333"), "[::]:2333");
+        assert_eq!(crate::helper::to_bind_addr(2333), "0.0.0.0:2333");
+        assert_eq!(crate::helper::to_bind_addr(80), "0.0.0.0:80");
     }
 
     #[test]
-    fn test_rejects_a_bad_bind_addr() {
+    fn test_rejects_a_bad_port() {
         let s = r#"
-bind_addr = "nope"
-http_bind_addr = "80"
+server_port = "nope"
+http_port = 80
+"#;
+        assert!(ServerConfig::from_str(s).is_err());
+
+        let s = r#"
+server_port = 70000
+http_port = 80
 "#;
         assert!(ServerConfig::from_str(s).is_err());
     }

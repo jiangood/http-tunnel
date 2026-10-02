@@ -20,14 +20,10 @@ pub async fn to_socket_addr<A: ToSocketAddrs>(addr: A) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("Failed to lookup the host"))
 }
 
-/// Normalize a bind address: a bare port (e.g. `"2333"`) is bound to all interfaces,
-/// while a `host:port` is returned as-is.
-pub fn to_bind_addr(addr: &str) -> String {
-    if addr.parse::<u16>().is_ok() {
-        format!("0.0.0.0:{}", addr)
-    } else {
-        addr.to_string()
-    }
+/// Format the socket address of a port. The host is always `0.0.0.0`, so that
+/// every listener binds to all interfaces.
+pub fn to_bind_addr(port: u16) -> String {
+    format!("0.0.0.0:{}", port)
 }
 
 /// Normalize a domain coming from a `Host` header value, an absolute-form

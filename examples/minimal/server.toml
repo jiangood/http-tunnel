@@ -1,5 +1,5 @@
-bind_addr = "2333" # The port that the server listens for clients
-http_bind_addr = "80" # The HTTP entrypoint, routed by the `Host` header
+server_port = 2333 # The port that the server listens for clients
+http_port = 80 # The HTTP entrypoint, routed by the `Host` header
 
 [clients.home] # The name must be identical to the `--name` of the client
 token = "123" # The token of the client

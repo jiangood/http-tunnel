@@ -56,19 +56,20 @@ impl RoutingTable {
     }
 }
 
-/// The HTTP entrypoint of the server. It accepts visitors on `bind_addr`, sniffs the
+/// The HTTP entrypoint of the server. It accepts visitors on `http_port`, sniffs the
 /// `Host` header, and hands the visitor over to the corresponding tunnel.
 ///
 /// Only the first request of a connection is inspected, so routing is connection-level.
 pub(crate) async fn serve(
-    bind_addr: String,
+    port: u16,
     state: Arc<ServerState>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let l = TcpListener::bind(&bind_addr)
+    let addr = crate::helper::to_bind_addr(port);
+    let l = TcpListener::bind(&addr)
         .await
-        .with_context(|| format!("Failed to listen at `http_bind_addr` ({})", bind_addr))?;
-    info!("HTTP listening at {}", bind_addr);
+        .with_context(|| format!("Failed to listen at `http_port` ({})", port))?;
+    info!("HTTP listening at {}", addr);
 
     loop {
         tokio::select! {

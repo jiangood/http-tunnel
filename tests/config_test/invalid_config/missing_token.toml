@@ -1,5 +1,5 @@
-bind_addr = "2333"
-http_bind_addr = "80"
+server_port = 2333
+http_port = 80
 
 [clients.home]
 heartbeat_timeout = 40

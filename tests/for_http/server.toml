@@ -1,5 +1,5 @@
-bind_addr = "2333"
-http_bind_addr = "2334"
+server_port = 2333
+http_port = 2334
 
 [clients.home]
 token = "a_secret_token"

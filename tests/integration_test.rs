@@ -237,9 +237,9 @@ const ADMIN_TOKEN: &str = "admin_secret";
 const ADMIN_CLIENT_TOKEN: &str = "a_secret_token";
 
 const ADMIN_CONFIG: &str = r#"
-bind_addr = "127.0.0.1:2443"
-http_bind_addr = "127.0.0.1:2444"
-api_bind_addr = "127.0.0.1:2445"
+server_port = 2443
+http_port = 2444
+api_port = 2445
 api_token = "admin_secret"
 
 [clients.home]
@@ -380,8 +380,8 @@ async fn admin_api_hot_reload() -> Result<()> {
 const FATAL_SERVER_ADDR: &str = "127.0.0.1:2453";
 
 const FATAL_CONFIG: &str = r#"
-bind_addr = "127.0.0.1:2453"
-http_bind_addr = "127.0.0.1:2454"
+server_port = 2453
+http_port = 2454
 
 [clients.home]
 token = "a_secret_token"

@@ -54,8 +54,8 @@ server writes a minimal template with the three ports (and the client and tunnel
 
 ```toml
 # server.toml
-bind_addr = "2333" # `2333` specifies the port that http-tunnel listens for clients
-http_bind_addr = "80" # `80` specifies the HTTP entrypoint that visitors connect to
+server_port = 2333 # `2333` specifies the port that http-tunnel listens for clients
+http_port = 80 # `80` specifies the HTTP entrypoint that visitors connect to
 
 [clients.home_nas] # The name of the client
 token = "use_a_secret_that_only_you_know" # The token of the client
@@ -114,8 +114,8 @@ read-write, and publish the ports of the config you use. No path has to be passe
 
 ```bash
 # server.toml
-# bind_addr = "2333"
-# http_bind_addr = "80"
+# server_port = 2333
+# http_port = 80
 
 docker run -d --name http-tunnel --restart unless-stopped \
   -p 2333:2333 -p 80:80 \
@@ -138,17 +138,16 @@ docker run -d --name http-tunnel --restart unless-stopped --network host \
 `--network host` is the simplest way for the client to reach the services on the host. On Docker Desktop a client
 that has to reach a service on the host uses `host.docker.internal` as the `local_addr` instead.
 
-If the [administration API](#administration-api) is enabled, publish its port and set `api_bind_addr` to
-`2335` (a bare port binds to all interfaces), otherwise the container only listens on its own loopback and Docker
-cannot forward the connections:
+If the [administration API](#administration-api) is enabled, publish its port and set `api_port = 2335`, otherwise
+the container doesn't accept the forwarded connections:
 
 ```bash
   -p 2335:2335
 ```
 
 This exposes the admin API on every interface of the host. Put it behind a reverse proxy with TLS, restrict the source
-addresses with a firewall, or bind it to the loopback address (`-p 127.0.0.1:2335:2335` together with
-`api_bind_addr = "127.0.0.1:2335"`) when it's only managed locally.
+addresses with a firewall, or publish the port on the host loopback only (`-p 127.0.0.1:2335:2335`) when it's only
+managed locally.
 
 The image only contains the binary: it's assembled from the static musl build, so nothing is compiled inside it. To
 build it locally, compile the musl binary and place it under `build-out/<arch>/` first:
@@ -239,10 +238,10 @@ Before heading to the full configuration specification, it's recommended to skim
 Here is the full configuration specification:
 
 ```toml
-bind_addr = "2333" # Necessary. The port that the server listens for clients. Use `host:port` to bind a specific interface
-http_bind_addr = "80" # Necessary. The HTTP entrypoint. Visitors are routed by the `Host` header
-api_bind_addr = "2335" # Optional. The administration API and the web UI. Use `127.0.0.1:2335` for local-only access
-api_token = "a_secret_for_the_admin_api" # Optional. The token required by the administration API. Required if `api_bind_addr` is set
+server_port = 2333 # Necessary. The port that the server listens for clients, on all interfaces
+http_port = 80 # Necessary. The HTTP entrypoint. Visitors are routed by the `Host` header
+api_port = 2335 # Optional. The administration API and the web UI, on all interfaces
+api_token = "a_secret_for_the_admin_api" # Optional. The token required by the administration API. Required if `api_port` is set
 
 [clients.home] # A client. The name `home` must be identical to the `--name` of the client
 token = "use_a_secret_that_only_you_know" # Necessary. The token of the client. It can also be given by the `HTTP_TUNNEL_TOKEN` environment variable
@@ -270,7 +269,7 @@ runtime instead.
 
 ### Routing
 
-The server accepts HTTP connections on `http_bind_addr`. For every connection, it reads the HTTP request line and the `Host` header (without touching the body), and forwards the connection to the tunnel whose domain matches that host. Host matching is case-insensitive, the port, if any, is ignored, and the trailing dot of a fully qualified name (e.g. `nas.example.com.`) is stripped. An absolute-form request line (`GET http://host/path HTTP/1.1`, as sent by proxy clients) is routed by the authority of the target. A request with several `Host` headers is rejected with `400`.
+The server accepts HTTP connections on `http_port`. For every connection, it reads the HTTP request line and the `Host` header (without touching the body), and forwards the connection to the tunnel whose domain matches that host. Host matching is case-insensitive, the port, if any, is ignored, and the trailing dot of a fully qualified name (e.g. `nas.example.com.`) is stripped. An absolute-form request line (`GET http://host/path HTTP/1.1`, as sent by proxy clients) is routed by the authority of the target. A request with several `Host` headers is rejected with `400`.
 
 A tunnel domain may be a wildcard, `*.example.com`, which matches any subdomain
 at any depth but not the apex `example.com`. An exact domain always wins over a
@@ -314,17 +313,17 @@ what trades against memory.
 ## Administration API
 
 The server can expose a small REST API and a web UI to manage the clients and their tunnels at runtime, without a
-restart. It's disabled by default and is enabled by setting `api_bind_addr` and `api_token` in `server.toml`:
+restart. It's disabled by default and is enabled by setting `api_port` and `api_token` in `server.toml`:
 
 ```toml
-api_bind_addr = "2335"
+api_port = 2335
 api_token = "a_secret_for_the_admin_api"
 ```
 
 All the API routes require the header `Authorization: Bearer <api_token>`. Open `http://127.0.0.1:2335/` for a
-minimal web UI. A bare port binds to `0.0.0.0`, which makes the API reachable from the network, so protect it with a
-reverse proxy that terminates TLS, a firewall rule, or a private network such as WireGuard; use
-`api_bind_addr = "127.0.0.1:2335"` for local-only access.
+minimal web UI. The API binds to `0.0.0.0`, which makes it reachable from the network, so protect it with a
+reverse proxy that terminates TLS, a firewall rule, or a private network such as WireGuard; publish the port on the
+host loopback only (e.g. `-p 127.0.0.1:2335:2335` in Docker) for local-only access.
 
 | Method | Path | Description |
 | --- | --- | --- |

@@ -1,6 +1,6 @@
 //! The administration API and the minimal web UI.
 //!
-//! It's only started when both `api_bind_addr` and `api_token` are set in the config.
+//! It's only started when both `api_port` and `api_token` are set in the config.
 //! Every API route requires `Authorization: Bearer <api_token>`; the web UI at `/`
 //! is static and asks for the token.
 
@@ -17,20 +17,20 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 /// Run the administration API until the shutdown signal arrives
 pub(crate) async fn serve(
-    bind_addr: String,
+    port: u16,
     token: String,
     state: Arc<ServerState>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let addr = crate::helper::to_socket_addr(&bind_addr)
-        .await
-        .with_context(|| format!("Failed to resolve the `api_bind_addr` ({})", bind_addr))?;
+    // The API listens on all interfaces (`0.0.0.0`)
+    let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
 
     let api = Router::new()
         .route("/status", get(status))
@@ -51,7 +51,7 @@ pub(crate) async fn serve(
         .nest("/api", api)
         .with_state(state);
 
-    info!("Administration API listening at {}", bind_addr);
+    info!("Administration API listening at {}", addr);
 
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
@@ -192,8 +192,8 @@ async fn status(State(state): State<Arc<ServerState>>) -> Json<serde_json::Value
     Json(json!({
         "clients": config.clients.len(),
         "tunnels": tunnels,
-        "bind_addr": config.bind_addr,
-        "http_bind_addr": config.http_bind_addr,
+        "server_port": config.server_port,
+        "http_port": config.http_port,
         "metrics": {
             "active_visitors": state.activity.active(),
             "http": state.metrics.snapshot(),
