@@ -1166,6 +1166,21 @@ impl DataChannelPool {
         );
     }
 
+    /// The pool task is ending, so its channels go away with it. `pool_outstanding`
+    /// is a server-wide counter shared by every pool, so the channels that are
+    /// still counted here have to be removed from it; otherwise a control
+    /// channel that reconnects would leave its old pool's count behind.
+    fn discard(&self) {
+        let lost = self.warm.swap(0, Ordering::Relaxed) + self.inflight.swap(0, Ordering::Relaxed);
+        if lost > 0 {
+            let _ = self.metrics.pool_outstanding.try_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |v| Some(v.saturating_sub(lost)),
+            );
+        }
+    }
+
     fn metrics(&self) -> &Arc<ServerMetrics> {
         &self.metrics
     }
@@ -1433,6 +1448,10 @@ async fn run_tcp_connection_pool(
             }
         }
     }
+
+    // The channels that were still queued or on their way are gone with this
+    // pool; remove them from the server-wide counter.
+    data_pool.discard();
 
     info!("Shutdown");
     Ok(())
