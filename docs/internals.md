@@ -43,7 +43,12 @@ of at least `POOL_MIN` channels, topped up every 100 ms, and it asks for one
 more channel for every visitor that is routed. Following the number of visitors
 instead of the number of active forwardings matters for short-lived connections,
 whose forwardings are over almost instantly: the pool would otherwise stay tiny
-and the throughput would be bounded by the round-trip time.
+and the throughput would be bounded by the round-trip time. On top of that base
+buffer the pool keeps as many warm channels as the recent demand, a
+high-water mark of the requests that were in flight which decays on every
+replenish tick. A burst can then be served from the channels that are already
+warm instead of waiting for a round trip, and an idle tunnel trims the surplus
+back down to `POOL_MIN`.
 
 The channels are counted as *warm* (arrived, waiting to be consumed) and *in
 flight* (requested, not arrived yet) separately. A request that fails, or that a

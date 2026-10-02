@@ -37,6 +37,7 @@ pub(crate) type ClientDigest = protocol::Digest; // SHA256 of a client name
 type Nonce = protocol::Digest; // Also called `session_key`
 
 const POOL_MIN: usize = 8; // Minimum number of warm data channels kept per tunnel
+const POOL_DEMAND_DECAY: usize = 8; // The remembered demand shrinks by 1/8 per replenish tick
 const POOL_REPLENISH_INTERVAL_MS: u64 = 100; // How often the data channel pool is topped up
 const DATA_CHANNEL_WAIT_TIMEOUT: u64 = 10; // Seconds to wait for a data channel before answering a visitor with 504
 const DRAIN_TIMEOUT: u64 = 30; // Seconds to wait for in-flight visitors on shutdown
@@ -1003,6 +1004,10 @@ pub(crate) struct DataChannelPool {
     warm: Arc<AtomicUsize>,
     // Visitors currently being forwarded
     active: Arc<AtomicUsize>,
+    // A decaying high-water mark of the requests that were in flight, used to
+    // keep the pool warm for the next burst instead of only for the visitors
+    // that are being forwarded right now
+    demand: Arc<AtomicUsize>,
     // The server-wide counters, mirrored so that the pool is visible in the API
     metrics: Arc<ServerMetrics>,
 }
@@ -1014,16 +1019,14 @@ impl DataChannelPool {
             inflight: Arc::new(AtomicUsize::new(0)),
             warm: Arc::new(AtomicUsize::new(0)),
             active: Arc::new(AtomicUsize::new(0)),
+            demand: Arc::new(AtomicUsize::new(0)),
             metrics,
         }
     }
 
     /// Ask the client for a data channel. Returns `false` when the control
-    /// channel is gone, so no data channel will ever come. The HTTP entrypoint
-    /// calls this once per waiting visitor, so the number of channels on their
-    /// way follows the number of visitors and short-lived connections are not
-    /// throttled by the (transient) number of active forwardings.
-    pub(crate) fn request(&self) -> bool {
+    /// channel is gone, so no data channel will ever come.
+    fn request(&self) -> bool {
         self.inflight.fetch_add(1, Ordering::Relaxed);
         self.metrics.pool_outstanding.fetch_add(1, Ordering::Relaxed);
         if self.req_tx.send(true).is_err() {
@@ -1032,6 +1035,22 @@ impl DataChannelPool {
             return false;
         }
         true
+    }
+
+    /// Ask the client for a data channel on behalf of a visitor. The HTTP
+    /// entrypoint calls this once per visitor, so the number of channels on
+    /// their way follows the number of visitors and short-lived connections are
+    /// not throttled by the (transient) number of active forwardings. The
+    /// backlog is remembered so that the pool stays warm for the next burst.
+    pub(crate) fn request_for_visitor(&self) -> bool {
+        self.note_demand();
+        self.request()
+    }
+
+    /// Remember how many requests were waiting, as a decaying high-water mark.
+    fn note_demand(&self) {
+        let sample = self.inflight.load(Ordering::Relaxed);
+        self.demand.fetch_max(sample, Ordering::Relaxed);
     }
 
     /// A requested data channel arrived and was handed to the pool receiver. It
@@ -1074,6 +1093,7 @@ impl DataChannelPool {
             Ordering::Relaxed,
             |v| Some(v.saturating_sub(1)),
         );
+        self.note_demand();
     }
 
     /// Forget the requests that never arrived. A visitor that waited for a data
@@ -1090,15 +1110,32 @@ impl DataChannelPool {
         }
     }
 
-    /// The number of warm channels to keep: enough for the visitors that are
-    /// being forwarded, plus a small buffer.
+    /// The number of channels to keep warm and on their way: the base buffer
+    /// plus the recent demand, so that a burst is served without waiting for a
+    /// fresh round trip. The demand decays, so an idle tunnel shrinks back to
+    /// the base buffer.
     fn target(&self) -> usize {
-        self.active.load(Ordering::Relaxed) + POOL_MIN
+        POOL_MIN + self.demand.load(Ordering::Relaxed)
+    }
+
+    /// How many warm channels are wanted once the ones that are still on their
+    /// way are accounted for.
+    fn warm_target(&self) -> usize {
+        self.target()
+            .saturating_sub(self.inflight.load(Ordering::Relaxed))
     }
 
     /// Top the pool up to the target, counting both the channels that are warm
     /// and the ones that are already on their way.
     pub(crate) fn replenish(&self) {
+        // Age the remembered demand, so it follows a burst down again. At
+        // least one is subtracted, otherwise the integer division would floor
+        // to zero and the demand would never reach zero.
+        let demand = self.demand.load(Ordering::Relaxed);
+        let decay = (demand / POOL_DEMAND_DECAY).max(1);
+        self.demand
+            .store(demand.saturating_sub(decay), Ordering::Relaxed);
+
         while self.warm.load(Ordering::Relaxed) + self.inflight.load(Ordering::Relaxed)
             < self.target()
         {
@@ -1106,6 +1143,27 @@ impl DataChannelPool {
                 break;
             }
         }
+    }
+
+    /// Whether there are more warm channels than the target wants, so the
+    /// caller should drain and drop one.
+    fn warm_over_target(&self) -> bool {
+        self.warm.load(Ordering::Relaxed) > self.warm_target()
+    }
+
+    /// A warm channel was dropped by the trimming. It was already counted as
+    /// outstanding, so stop counting it.
+    fn drop_warm(&self) {
+        let _ = self.warm.try_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(1)),
+        );
+        let _ = self.metrics.pool_outstanding.try_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(1)),
+        );
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -1120,6 +1178,7 @@ impl DataChannelPool {
     fn forward_guard(&self) -> ForwardGuard {
         self.active.fetch_add(1, Ordering::Relaxed);
         self.metrics.pool_active.fetch_add(1, Ordering::Relaxed);
+        self.note_demand();
         ForwardGuard {
             active: self.active.clone(),
             metrics: self.metrics.clone(),
@@ -1344,6 +1403,22 @@ async fn run_tcp_connection_pool(
                 data_pool.replenish();
                 if data_pool.is_closed() {
                     break;
+                }
+                // Drop the warm channels that the decayed demand no longer
+                // wants, so an idle tunnel doesn't hold connections open. The
+                // lock is only tried, never awaited: a visitor waiting for a
+                // channel keeps it, and the trimming just waits for a later
+                // tick.
+                if data_pool.warm_over_target() {
+                    if let Ok(mut rx) = data_ch_rx.try_lock() {
+                        while data_pool.warm_over_target() {
+                            if rx.try_recv().is_ok() {
+                                data_pool.drop_warm();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }

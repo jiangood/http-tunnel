@@ -165,7 +165,7 @@ async fn handle_visitor(
     // step with the visitors, instead of with the (transient) number of active
     // forwardings. The pool forgets the requests that never arrive. A failed
     // request means that the control channel is gone.
-    if !data_pool.request() {
+    if !data_pool.request_for_visitor() {
         debug!("No control channel for the host `{}`", host);
         respond_tunnel_unavailable(&mut stream, &state.metrics).await;
         return Ok(());
