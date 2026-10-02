@@ -4,95 +4,89 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>http-tunnel admin</title>
-<link id="pico" rel="stylesheet" href="https://cdn.bootcdn.net/ajax/libs/picocss/2.1.1/pico.min.css">
-<script>
-  // Load Pico.css from the first reachable CDN. The primary is a CDN that is
-  // reachable from mainland China; the rest are fallbacks.
-  (function () {
-    var urls = [
-      "https://cdn.bootcdn.net/ajax/libs/picocss/2.1.1/pico.min.css",
-      "https://lib.baomitu.com/picocss/2.1.1/pico.min.css",
-      "https://cdn.jsdelivr.net/npm/@picocss/pico@2.1.1/css/pico.min.css"
-    ];
-    var i = 0, link = document.getElementById("pico");
-    function advance() { if (++i < urls.length) link.href = urls[i]; }
-    link.addEventListener("error", advance);
-    // The probe catches a request that hangs and only fails after `load`.
-    window.addEventListener("load", function () {
-      var ok = getComputedStyle(document.documentElement)
-        .getPropertyValue("--pico-font-size");
-      if (!ok) advance();
-    });
-  })();
-</script>
 <style>
-  /* Only what Pico doesn't cover. */
-  .muted { opacity: .7; font-size: .85rem; }
-  .error { color: var(--pico-del-color, #c0392b); margin-top: .5rem; white-space: pre-wrap; }
-  .ok { color: var(--pico-ins-color, #27ae60); }
-  button.danger {
-    --pico-background-color: transparent;
-    --pico-border-color: var(--pico-del-color, #c0392b);
-    --pico-color: var(--pico-del-color, #c0392b);
-  }
-  button.danger:hover, button.danger:focus {
-    --pico-background-color: var(--pico-del-color, #c0392b);
-    --pico-color: #fff;
-  }
-  .client { border-top: 1px solid var(--pico-muted-border-color, #8884); padding-top: 1rem; margin-top: 1rem; }
-  .client h3 { margin-bottom: .25rem; }
+  /* Minimal; tabs use the native hidden attribute. */
+  body { font-size: .9rem; margin: 1rem; max-width: 62rem; }
+  input, select, button { font-size: inherit; }
+  fieldset { border: 1px solid #bbb; padding: .4rem .6rem; margin: 0 0 .6rem; }
+  legend { padding: 0 .3rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ccc; padding: .15rem .35rem; text-align: left; }
+  th { background: #f3f3f3; }
+  .tabs button { margin-right: .25rem; }
+  .tabs button[aria-selected="true"] { font-weight: bold; }
+  .hint { color: #777; }
+  .err { color: #c00; white-space: pre-wrap; }
+  .ok { color: #070; }
+  code { font-size: .85em; }
 </style>
 </head>
 <body>
-<main class="container">
-<h1>http-tunnel <span class="muted">admin</span></h1>
 
-<div role="group">
-  <input id="token" type="password" placeholder="api_token" autocomplete="off">
-  <button class="secondary" onclick="saveToken()">Save</button>
-  <button class="outline" onclick="refresh()">Refresh</button>
+<div>
+  <b>http-tunnel <span class="hint">admin</span></b>
+  <span id="status" class="hint"></span>
 </div>
-<span id="status" class="muted"></span>
-<div id="error" class="error"></div>
 
-<h2>Clients</h2>
-<div id="clients"></div>
+<p>
+  <input id="token" type="password" placeholder="api_token" autocomplete="off">
+  <button type="button" onclick="saveToken()">Save</button>
+  <button type="button" onclick="refresh()">Refresh</button>
+</p>
 
-<h2>Create client</h2>
-<form id="create-client" onsubmit="return onCreateClient(event)">
-  <label for="c-name">Name</label>
-  <input id="c-name" type="text" required>
-  <label for="c-token">Token</label>
-  <input id="c-token" type="text" required>
-  <label for="c-hbi">Heartbeat interval</label>
-  <input id="c-hbi" type="text" placeholder="optional">
-  <label for="c-hb">Heartbeat timeout</label>
-  <input id="c-hb" type="text" placeholder="optional">
-  <label for="c-retry">Retry interval</label>
-  <input id="c-retry" type="text" placeholder="optional">
-  <label for="c-nodelay">Nodelay</label>
-  <select id="c-nodelay"><option value="">inherit</option><option value="true">true</option><option value="false">false</option></select>
-  <button type="submit">Create</button>
-</form>
+<div id="error" class="err"></div>
 
-<h2>Add / update tunnel</h2>
-<form id="put-tunnel" onsubmit="return onPutTunnel(event)">
-  <label for="t-client">Client</label>
-  <input id="t-client" type="text" required>
-  <label for="t-domain">Domain</label>
-  <input id="t-domain" type="text" placeholder="foo.example.com" required>
-  <label for="t-local">Local addr</label>
-  <input id="t-local" type="text" placeholder="127.0.0.1:80" required>
-  <button type="submit">Save</button>
-</form>
-</main>
+<div class="tabs">
+  <button type="button" aria-selected="true" onclick="showTab('clients', this)">Clients</button>
+  <button type="button" aria-selected="false" onclick="showTab('create', this)">Create client</button>
+  <button type="button" aria-selected="false" onclick="showTab('tunnel', this)">Add / update tunnel</button>
+</div>
+
+<section id="tab-clients">
+  <div id="clients"></div>
+</section>
+
+<section id="tab-create" hidden>
+  <form id="create-client" onsubmit="return onCreateClient(event)">
+    <fieldset>
+      <legend>Create client</legend>
+      <p><label for="c-name" style="display:inline-block;min-width:9rem">Name</label><input id="c-name" type="text" required></p>
+      <p><label for="c-token" style="display:inline-block;min-width:9rem">Token</label><input id="c-token" type="text" required></p>
+      <p><label for="c-hbi" style="display:inline-block;min-width:9rem">Heartbeat interval</label><input id="c-hbi" type="text" placeholder="optional"></p>
+      <p><label for="c-hb" style="display:inline-block;min-width:9rem">Heartbeat timeout</label><input id="c-hb" type="text" placeholder="optional"></p>
+      <p><label for="c-retry" style="display:inline-block;min-width:9rem">Retry interval</label><input id="c-retry" type="text" placeholder="optional"></p>
+      <p><label for="c-nodelay" style="display:inline-block;min-width:9rem">Nodelay</label>
+        <select id="c-nodelay"><option value="">inherit</option><option value="true">true</option><option value="false">false</option></select>
+      </p>
+      <p><button type="submit">Create</button></p>
+    </fieldset>
+  </form>
+</section>
+
+<section id="tab-tunnel" hidden>
+  <form id="put-tunnel" onsubmit="return onPutTunnel(event)">
+    <fieldset>
+      <legend>Add / update tunnel</legend>
+      <p><label for="t-client" style="display:inline-block;min-width:9rem">Client</label><input id="t-client" type="text" required></p>
+      <p><label for="t-domain" style="display:inline-block;min-width:9rem">Domain</label><input id="t-domain" type="text" placeholder="foo.example.com" required></p>
+      <p><label for="t-local" style="display:inline-block;min-width:9rem">Local addr</label><input id="t-local" type="text" placeholder="127.0.0.1:80" required></p>
+      <p><button type="submit">Save</button></p>
+    </fieldset>
+  </form>
+</section>
 
 <script>
 const $ = (id) => document.getElementById(id);
 
+function showTab(id, btn) {
+  ["clients", "create", "tunnel"].forEach((t) => { $("tab-" + t).hidden = t !== id; });
+  const tabs = btn.parentNode.querySelectorAll("button");
+  for (const b of tabs) b.setAttribute("aria-selected", String(b === btn));
+}
+
 function token() { return $("token").value.trim(); }
 function saveToken() { localStorage.setItem("http_tunnel_token", token()); setStatus("Token saved"); }
-function setStatus(text, ok) { const s = $("status"); s.textContent = text; s.className = ok ? "ok" : "muted"; }
+function setStatus(text, ok) { const s = $("status"); s.textContent = text; s.className = ok ? "ok" : "hint"; }
 function setError(text) { $("error").textContent = text || ""; }
 
 async function api(path, options = {}) {
@@ -132,21 +126,20 @@ async function refresh() {
 
 function renderClients(clients) {
   const root = $("clients");
-  if (!clients.length) { root.innerHTML = '<p class="muted">No client yet.</p>'; return; }
+  if (!clients.length) { root.innerHTML = '<p class="hint">No client yet.</p>'; return; }
   let html = "";
   for (const c of clients) {
-    html += '<section class="client">';
-    html += "<h3>" + esc(c.name) + " <span class=\"muted\">token " + esc(c.token) + "</span></h3>";
-    html += "<table><thead><tr><th>Domain</th><th>Local addr</th><th></th></tr></thead><tbody>";
+    html += "<fieldset>";
+    html += "<legend><b>" + esc(c.name) + "</b> <code>" + esc(c.token) + "</code></legend>";
+    html += '<table><thead><tr><th>Domain</th><th>Local addr</th><th></th></tr></thead><tbody>';
     for (const t of c.tunnels) {
-      html += "<tr><td>" + esc(t.domain) + "</td><td>" + esc(t.local_addr) +
-        "</td>" +
-        '<td><button class="danger" onclick="delTunnel(\'' + js(c.name) + "','" + js(t.domain) + "')\">delete</button></td></tr>";
+      html += "<tr><td>" + esc(t.domain) + "</td><td>" + esc(t.local_addr) + "</td>" +
+        '<td><button type="button" onclick="delTunnel(\'' + js(c.name) + "','" + js(t.domain) + "')\">delete</button></td></tr>";
     }
-    if (!c.tunnels.length) html += '<tr><td colspan="3" class="muted">No tunnel</td></tr>';
+    if (!c.tunnels.length) html += '<tr><td colspan="3" class="hint">No tunnel</td></tr>';
     html += "</tbody></table>";
-    html += '<button class="danger" onclick="delClient(\'' + js(c.name) + "')\">Delete client " + esc(c.name) + "</button>";
-    html += "</section>";
+    html += '<p><button type="button" onclick="delClient(\'' + js(c.name) + "')\">Delete client</button></p>";
+    html += "</fieldset>";
   }
   root.innerHTML = html;
 }
