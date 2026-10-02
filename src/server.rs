@@ -1019,8 +1019,11 @@ impl DataChannelPool {
     }
 
     /// Ask the client for a data channel. Returns `false` when the control
-    /// channel is gone, so no data channel will ever come.
-    fn request(&self) -> bool {
+    /// channel is gone, so no data channel will ever come. The HTTP entrypoint
+    /// calls this once per waiting visitor, so the number of channels on their
+    /// way follows the number of visitors and short-lived connections are not
+    /// throttled by the (transient) number of active forwardings.
+    pub(crate) fn request(&self) -> bool {
         self.inflight.fetch_add(1, Ordering::Relaxed);
         self.metrics.pool_outstanding.fetch_add(1, Ordering::Relaxed);
         if self.req_tx.send(true).is_err() {
@@ -1057,9 +1060,9 @@ impl DataChannelPool {
         );
     }
 
-    /// A data channel was taken out of the pool. The pool is topped up right
-    /// away instead of waiting for the next replenish tick, which matters when
-    /// the visitors are short-lived connections.
+    /// A data channel was taken out of the pool. The visitor already asked for
+    /// its own channel when it was routed, so this only updates the counters
+    /// instead of asking for another one (which would double the requests).
     fn consume(&self) {
         let _ = self.warm.try_update(
             Ordering::Relaxed,
@@ -1071,7 +1074,6 @@ impl DataChannelPool {
             Ordering::Relaxed,
             |v| Some(v.saturating_sub(1)),
         );
-        self.replenish();
     }
 
     /// Forget the requests that never arrived. A visitor that waited for a data
@@ -1114,12 +1116,10 @@ impl DataChannelPool {
         &self.metrics
     }
 
-    /// A guard that counts a visitor as active for as long as it's forwarded.
-    /// Growing `active` also grows the target, so the pool is topped up.
+    /// A guard that counts a visitor as active for as long as it's forwarded
     fn forward_guard(&self) -> ForwardGuard {
         self.active.fetch_add(1, Ordering::Relaxed);
         self.metrics.pool_active.fetch_add(1, Ordering::Relaxed);
-        self.replenish();
         ForwardGuard {
             active: self.active.clone(),
             metrics: self.metrics.clone(),

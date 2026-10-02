@@ -39,15 +39,20 @@ data channel, and the prefetched header bytes are replayed along with the rest o
 forwarding is set up. The server also requests a few data channels in advance and caches them, to improve the latency.
 
 The cached data channels are managed by `DataChannelPool`. It keeps a warm pool
-whose size follows the number of visitors currently being forwarded: at least
-`POOL_MIN`, plus one for each active visitor, with no hard upper bound. The pool
-is topped up as soon as a channel is consumed and when a visitor starts being
-forwarded, without waiting for the periodic replenish every 100 ms. A visitor
-that finds the pool empty waits for a warm channel, bounded by
+of at least `POOL_MIN` channels, topped up every 100 ms, and it asks for one
+more channel for every visitor that is routed. Following the number of visitors
+instead of the number of active forwardings matters for short-lived connections,
+whose forwardings are over almost instantly: the pool would otherwise stay tiny
+and the throughput would be bounded by the round-trip time.
+
+The channels are counted as *warm* (arrived, waiting to be consumed) and *in
+flight* (requested, not arrived yet) separately. A request that fails, or that a
+visitor waited for until `DATA_CHANNEL_WAIT_TIMEOUT`, stops counting instead of
+leaking, so a client that cannot open channels doesn't leave the pool stuck. A
+visitor that finds the pool empty waits for a warm channel, bounded by
 `DATA_CHANNEL_WAIT_TIMEOUT`, after which it is answered with `504` rather than
-hanging; the requests that never arrived are then forgotten, so a client that
-could not open them doesn't leave the pool stuck. The visitors waiting for a
-channel don't block each other: each one is forwarded by its own task.
+hanging. The visitors waiting for a channel don't block each other: each one is
+forwarded by its own task.
 
 On shutdown, after the HTTP listener stops accepting, the server waits for the
 in-flight visitors (up to `DRAIN_TIMEOUT`, 30 seconds) before it tears the
