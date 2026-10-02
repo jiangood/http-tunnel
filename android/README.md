@@ -71,8 +71,10 @@ filter in `src/mobile.rs`.)
   service with a permanent notification. Doze can still throttle the network of
   the device; the built-in retry recovers when the device wakes up.
 - **The credentials are stored in clear text** in the private preferences of the
-  app, so that the tunnel can start again after a reboot. `MODE_PRIVATE` is the
+  app, so that the fields are prefilled on the next launch. `MODE_PRIVATE` is the
   only protection; don't use a token that is valuable on its own.
+- **The tunnel doesn't start on its own after a reboot.** Open the app and tap
+  **Start**; the fields are prefilled from the last start.
 - **The `local_addr` values name the phone itself.** A tunnel of the client is
   reached at `local_addr`, as seen from the phone, so `127.0.0.1:<port>` is the
   app listening on the phone, not a service of the server. To reach services on

@@ -39,7 +39,7 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.start).setOnClickListener { start() }
         findViewById<Button>(R.id.stop).setOnClickListener { stop() }
 
-        updateStatus(prefs.getBoolean(Preferences.KEY_AUTOSTART, false))
+        updateStatus(prefs.getBoolean(Preferences.KEY_RUNNING, false))
     }
 
     private fun start() {
@@ -52,12 +52,12 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // Remember the credentials, so that the boot receiver can start again
+        // Remember the fields, so that they are prefilled on the next launch
         prefs.edit()
             .putString(Preferences.KEY_REMOTE, remoteValue)
             .putString(Preferences.KEY_NAME, nameValue)
             .putString(Preferences.KEY_TOKEN, tokenValue)
-            .putBoolean(Preferences.KEY_AUTOSTART, true)
+            .putBoolean(Preferences.KEY_RUNNING, true)
             .apply()
 
         TunnelService.start(this, remoteValue, nameValue, tokenValue)
@@ -65,7 +65,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stop() {
-        prefs.edit().putBoolean(Preferences.KEY_AUTOSTART, false).apply()
+        prefs.edit().putBoolean(Preferences.KEY_RUNNING, false).apply()
         TunnelService.stop(this)
         updateStatus(false)
     }
