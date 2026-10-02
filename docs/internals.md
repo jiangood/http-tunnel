@@ -40,10 +40,14 @@ forwarding is set up. The server also requests a few data channels in advance an
 
 The cached data channels are managed by `DataChannelPool`. It keeps a warm pool
 whose size follows the number of visitors currently being forwarded: at least
-`POOL_MIN`, at most `POOL_MAX`, topped up every 100 ms. A visitor that finds the
-pool empty waits for a warm channel, bounded by `DATA_CHANNEL_WAIT_TIMEOUT`,
-after which it is answered with `504` rather than hanging. The visitors waiting
-for a channel don't block each other: each one is forwarded by its own task.
+`POOL_MIN`, plus one for each active visitor, with no hard upper bound. The pool
+is topped up as soon as a channel is consumed and when a visitor starts being
+forwarded, without waiting for the periodic replenish every 100 ms. A visitor
+that finds the pool empty waits for a warm channel, bounded by
+`DATA_CHANNEL_WAIT_TIMEOUT`, after which it is answered with `504` rather than
+hanging; the requests that never arrived are then forgotten, so a client that
+could not open them doesn't leave the pool stuck. The visitors waiting for a
+channel don't block each other: each one is forwarded by its own task.
 
 On shutdown, after the HTTP listener stops accepting, the server waits for the
 in-flight visitors (up to `DRAIN_TIMEOUT`, 30 seconds) before it tears the

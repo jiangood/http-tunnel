@@ -159,15 +159,16 @@ async fn handle_visitor(
         return Ok(());
     };
 
-    // Ask the client for a data channel to forward this visitor through. The
-    // pool caches warm channels and tops itself up, but a visitor consumes one
-    // and the request keeps the pool from draining. A failed request means that
+    // Make sure the pool has a data channel for this visitor, or is asking for
+    // one. The pool caches warm channels and tops itself up, bounded by its
+    // target, so this doesn't request one per visitor. A closed pool means that
     // the control channel is gone.
-    if !data_pool.request() {
+    if data_pool.is_closed() {
         debug!("No control channel for the host `{}`", host);
         respond_tunnel_unavailable(&mut stream, &state.metrics).await;
         return Ok(());
     }
+    data_pool.replenish();
 
     debug!("Routing visitor {} to the host `{}`", addr, host);
 

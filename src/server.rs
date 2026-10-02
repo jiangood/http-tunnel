@@ -37,7 +37,6 @@ pub(crate) type ClientDigest = protocol::Digest; // SHA256 of a client name
 type Nonce = protocol::Digest; // Also called `session_key`
 
 const POOL_MIN: usize = 8; // Minimum number of warm data channels kept per tunnel
-const POOL_MAX: usize = 32; // Maximum number of warm data channels kept per tunnel
 const POOL_REPLENISH_INTERVAL_MS: u64 = 100; // How often the data channel pool is topped up
 const DATA_CHANNEL_WAIT_TIMEOUT: u64 = 10; // Seconds to wait for a data channel before answering a visitor with 504
 const DRAIN_TIMEOUT: u64 = 30; // Seconds to wait for in-flight visitors on shutdown
@@ -973,12 +972,16 @@ async fn do_data_channel_handshake(
         Some(handle) => {
             SocketOpts::from_server_cfg(&handle.tunnel).apply(&conn);
 
-            // Send the data channel to the corresponding control channel
-            handle
-                .data_ch_tx
-                .send(conn)
-                .await
-                .with_context(|| "Data channel for a stale control channel")?;
+            // Send the data channel to the corresponding control channel. The
+            // pool is told whether it made it, so that a channel that never
+            // arrives doesn't count as outstanding forever.
+            match handle.data_ch_tx.send(conn).await {
+                Ok(()) => handle.data_pool.arrived(),
+                Err(e) => {
+                    handle.data_pool.failed();
+                    return Err(e).with_context(|| "Data channel for a stale control channel");
+                }
+            }
         }
         None => {
             warn!("Data channel has incorrect nonce");
@@ -994,8 +997,10 @@ async fn do_data_channel_handshake(
 pub(crate) struct DataChannelPool {
     // Asks the client to create a data channel
     req_tx: mpsc::UnboundedSender<bool>,
-    // Channels that were requested but not consumed yet
-    outstanding: Arc<AtomicUsize>,
+    // Channels that were requested but did not arrive yet
+    inflight: Arc<AtomicUsize>,
+    // Channels that arrived and are waiting to be consumed
+    warm: Arc<AtomicUsize>,
     // Visitors currently being forwarded
     active: Arc<AtomicUsize>,
     // The server-wide counters, mirrored so that the pool is visible in the API
@@ -1006,7 +1011,8 @@ impl DataChannelPool {
     fn new(req_tx: mpsc::UnboundedSender<bool>, metrics: Arc<ServerMetrics>) -> DataChannelPool {
         DataChannelPool {
             req_tx,
-            outstanding: Arc::new(AtomicUsize::new(0)),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            warm: Arc::new(AtomicUsize::new(0)),
             active: Arc::new(AtomicUsize::new(0)),
             metrics,
         }
@@ -1014,20 +1020,32 @@ impl DataChannelPool {
 
     /// Ask the client for a data channel. Returns `false` when the control
     /// channel is gone, so no data channel will ever come.
-    pub(crate) fn request(&self) -> bool {
-        self.outstanding.fetch_add(1, Ordering::Relaxed);
+    fn request(&self) -> bool {
+        self.inflight.fetch_add(1, Ordering::Relaxed);
         self.metrics.pool_outstanding.fetch_add(1, Ordering::Relaxed);
         if self.req_tx.send(true).is_err() {
-            self.outstanding.fetch_sub(1, Ordering::Relaxed);
+            self.inflight.fetch_sub(1, Ordering::Relaxed);
             self.metrics.pool_outstanding.fetch_sub(1, Ordering::Relaxed);
             return false;
         }
         true
     }
 
-    /// A data channel was taken out of the pool
-    fn consume(&self) {
-        let _ = self.outstanding.try_update(
+    /// A requested data channel arrived and was handed to the pool receiver. It
+    /// stops counting as in flight, but is still outstanding until consumed.
+    fn arrived(&self) {
+        let _ = self.inflight.try_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(1)),
+        );
+        self.warm.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A requested data channel could not be handed over. Nothing will arrive
+    /// for it, so it stops counting as outstanding.
+    fn failed(&self) {
+        let _ = self.inflight.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |v| Some(v.saturating_sub(1)),
@@ -1039,22 +1057,56 @@ impl DataChannelPool {
         );
     }
 
-    /// The number of warm channels to keep: enough for the visitors that are
-    /// being forwarded, plus a small buffer, capped at `POOL_MAX`.
-    fn target(&self) -> usize {
-        (self.active.load(Ordering::Relaxed) + POOL_MIN).min(POOL_MAX)
+    /// A data channel was taken out of the pool. The pool is topped up right
+    /// away instead of waiting for the next replenish tick, which matters when
+    /// the visitors are short-lived connections.
+    fn consume(&self) {
+        let _ = self.warm.try_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(1)),
+        );
+        let _ = self.metrics.pool_outstanding.try_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(1)),
+        );
+        self.replenish();
     }
 
-    /// Top the pool up to the target
-    fn replenish(&self) {
-        while self.outstanding.load(Ordering::Relaxed) < self.target() {
+    /// Forget the requests that never arrived. A visitor that waited for a data
+    /// channel up to its timeout proves that they are lost, so the counter is
+    /// reset and the pool can be replenished again instead of staying stuck.
+    fn forget_inflight(&self) {
+        let lost = self.inflight.swap(0, Ordering::Relaxed);
+        if lost > 0 {
+            let _ = self.metrics.pool_outstanding.try_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |v| Some(v.saturating_sub(lost)),
+            );
+        }
+    }
+
+    /// The number of warm channels to keep: enough for the visitors that are
+    /// being forwarded, plus a small buffer.
+    fn target(&self) -> usize {
+        self.active.load(Ordering::Relaxed) + POOL_MIN
+    }
+
+    /// Top the pool up to the target, counting both the channels that are warm
+    /// and the ones that are already on their way.
+    pub(crate) fn replenish(&self) {
+        while self.warm.load(Ordering::Relaxed) + self.inflight.load(Ordering::Relaxed)
+            < self.target()
+        {
             if !self.request() {
                 break;
             }
         }
     }
 
-    fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         self.req_tx.is_closed()
     }
 
@@ -1062,10 +1114,12 @@ impl DataChannelPool {
         &self.metrics
     }
 
-    /// A guard that counts a visitor as active for as long as it's forwarded
+    /// A guard that counts a visitor as active for as long as it's forwarded.
+    /// Growing `active` also grows the target, so the pool is topped up.
     fn forward_guard(&self) -> ForwardGuard {
         self.active.fetch_add(1, Ordering::Relaxed);
         self.metrics.pool_active.fetch_add(1, Ordering::Relaxed);
+        self.replenish();
         ForwardGuard {
             active: self.active.clone(),
             metrics: self.metrics.clone(),
@@ -1325,6 +1379,9 @@ async fn forward_visitor(
         match received {
             Err(_) => {
                 debug!("Timed out waiting for a data channel");
+                // The requests that were in flight never arrived; forget them
+                // so that the pool can be replenished again.
+                data_pool.forget_inflight();
                 crate::http::respond_gateway_timeout(&mut stream, data_pool.metrics()).await;
                 return Ok(());
             }
@@ -1362,11 +1419,9 @@ async fn forward_visitor(
                     return Ok(());
                 }
 
-                // The current data channel is broken. Ask for a new one and retry
-                if !data_pool.request() {
-                    crate::http::respond_tunnel_unavailable(&mut stream, data_pool.metrics()).await;
-                    return Ok(());
-                }
+                // The current data channel is broken. Top the pool up (bounded
+                // by its target) and wait for a replacement channel.
+                data_pool.replenish();
             }
         }
     }
