@@ -270,11 +270,15 @@ runtime instead.
 
 ### Routing
 
-The server accepts HTTP connections on `http_bind_addr`. For every connection, it reads the HTTP request line and the `Host` header (without touching the body), and forwards the connection to the tunnel whose domain matches that host. Host matching is case-insensitive and the port, if any, is ignored.
+The server accepts HTTP connections on `http_bind_addr`. For every connection, it reads the HTTP request line and the `Host` header (without touching the body), and forwards the connection to the tunnel whose domain matches that host. Host matching is case-insensitive, the port, if any, is ignored, and the trailing dot of a fully qualified name (e.g. `nas.example.com.`) is stripped. An absolute-form request line (`GET http://host/path HTTP/1.1`, as sent by proxy clients) is routed by the authority of the target. A request with several `Host` headers is rejected with `400`.
 
-If no tunnel matches the `Host`, the server responds with `404`. If the matched tunnel is not connected yet, it responds with `503`.
+A tunnel domain may be a wildcard, `*.example.com`, which matches any subdomain
+at any depth but not the apex `example.com`. An exact domain always wins over a
+wildcard, and among the wildcards the longest suffix wins.
 
-Routing is done once per connection, on its first request. A keep-alive connection cannot be re-routed to another tunnel if a later request carries a different `Host`.
+If no tunnel matches the `Host`, the server responds with `404`. If the matched tunnel is not connected yet, it responds with `503`. If the tunnel is connected but the client does not provide a data channel within 10 seconds — for instance because it cannot reach its `local_addr` — the visitor is answered with `504` instead of being left hanging. A malformed request, an oversized header, and a header that is too slow to arrive are answered with `400`, `431`, and `408` respectively.
+
+Routing is done once per connection, on its first request. A keep-alive connection cannot be re-routed to another tunnel if a later request carries a different `Host`. Because of that, the `Host` used for routing is the one of the first request of the connection; a proxy client that reuses a connection across origins will reach the backend of the first request.
 
 ### Logging
 
@@ -288,11 +292,24 @@ will run `http-tunnel` with only error level logging.
 
 If `RUST_LOG` is not present, the default logging level is `info`.
 
+The logs name the reason a visitor could not be served, so that a failure can be
+told apart from a routing miss: a malformed request is logged as a bad header, an
+unknown `Host` as a routing miss, and a missing data channel as a timeout or a
+closed control channel. The count of each outcome is also reported by the
+[administration API](#administration-api) under `metrics`, together with the
+bytes transferred per direction and the state of the data channel pool.
+
 ### Tuning
 
 `http-tunnel` enables TCP_NODELAY by default, which should benefit the latency and interactive applications. However, it slightly decreases the bandwidth.
 
 If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false` for a whole client.
+
+The bytes between a visitor, the tunnel and the local service are piped through
+64 KiB buffers on both the server and the client. Raising the tokio default
+(8 KiB) reduces the number of syscalls on large transfers; the buffers are
+allocated per forwarded connection, so the concurrency of large transfers is
+what trades against memory.
 
 ## Administration API
 
@@ -311,7 +328,7 @@ reverse proxy that terminates TLS, a firewall rule, or a private network such as
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/api/status` | A summary of the running server |
+| `GET` | `/api/status` | A summary of the running server, including the runtime metrics |
 | `GET` | `/api/clients` | List the clients and their tunnels |
 | `POST` | `/api/clients` | Create a client |
 | `GET` | `/api/clients/{client}` | Get a client |
@@ -345,3 +362,14 @@ curl -X PUT http://127.0.0.1:2335/api/clients/home/tunnels/nas.example.com \
 - [x] HTTP APIs for configuration
 
 [Out of Scope](./docs/out-of-scope.md) lists features that are not planned to be implemented and why.
+
+## Benchmarking
+
+The HTTP path has a small harness in [`benches/`](./benches) that starts an echo
+backend, a server and a client, and measures small requests, short-lived
+connections, and concurrent 1 MiB bodies. It uses the same ports as the
+integration tests, so it can't run at the same time as them:
+
+```sh
+RUST_LOG=error cargo bench --bench throughput
+```

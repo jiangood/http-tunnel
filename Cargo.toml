@@ -1,6 +1,6 @@
 [package]
 name = "http-tunnel"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 authors = ["Yujia Qiao <code@rapiz.me>", "jiangood"]
 description = "A secure, stable and high-performance HTTP reverse proxy for NAT traversal"
@@ -27,6 +27,12 @@ name = "http_tunnel_mobile"
 crate-type = ["cdylib"]
 path = "src/mobile_ffi.rs"
 required-features = ["mobile", "client"]
+
+# The benchmarks of the HTTP path. They are plain `harness = false` binaries, so
+# that no benchmarking crate is pulled in (see `benches/`).
+[[bench]]
+name = "throughput"
+harness = false
 
 [features]
 default = [

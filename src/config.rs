@@ -376,7 +376,13 @@ impl ServerConfig {
                     );
                 }
 
-                let domain = t.domain.to_lowercase();
+                let domain = crate::helper::normalize_domain(&t.domain).ok_or_else(|| {
+                    anyhow!(
+                        "The domain `{}` of the client `{}` is invalid",
+                        t.domain,
+                        client_name
+                    )
+                })?;
                 if let Some(prev) = seen_domains.insert(domain.clone(), client_name.clone()) {
                     if prev == *client_name {
                         bail!(

@@ -45,6 +45,22 @@ strip http-tunnel
 upx --best --lzma http-tunnel
 ```
 
+## Benchmarking
+
+The HTTP path has a small benchmark harness in [`benches/`](../benches). It
+starts an echo backend behind the NAT, a server and a client, then measures three
+scenarios: many small keep-alive requests, many short-lived connections (the
+per-connection setup cost, where the data channel pool shows up), and several
+1 MiB bodies in flight at once (the large-transfer throughput).
+
+```sh
+cargo bench --bench throughput
+```
+
+It uses the same ports as the integration tests, so `cargo bench` and
+`cargo test` must not run at the same time. `RUST_LOG=error` keeps the output
+readable.
+
 ## Android
 
 The client runs unchanged on Android, as it only makes outgoing TCP connections.

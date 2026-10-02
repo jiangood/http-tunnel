@@ -17,10 +17,15 @@ use backoff::ExponentialBackoff;
 use rand::RngCore;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context as TaskContext, Poll};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{copy_bidirectional, split, AsyncReadExt, AsyncWriteExt};
+use std::time::{Duration, Instant};
+use tokio::io::{
+    copy_bidirectional_with_sizes, split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+    ReadBuf,
+};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -31,7 +36,15 @@ pub(crate) type TunnelDigest = protocol::Digest; // SHA256 of a tunnel name
 pub(crate) type ClientDigest = protocol::Digest; // SHA256 of a client name
 type Nonce = protocol::Digest; // Also called `session_key`
 
-const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP tunnels
+const POOL_MIN: usize = 8; // Minimum number of warm data channels kept per tunnel
+const POOL_MAX: usize = 32; // Maximum number of warm data channels kept per tunnel
+const POOL_REPLENISH_INTERVAL_MS: u64 = 100; // How often the data channel pool is topped up
+const DATA_CHANNEL_WAIT_TIMEOUT: u64 = 10; // Seconds to wait for a data channel before answering a visitor with 504
+const DRAIN_TIMEOUT: u64 = 30; // Seconds to wait for in-flight visitors on shutdown
+// The size of the buffers that are piped between a visitor, the tunnel and the
+// local service. Larger than the tokio default (8 KiB), which reduces the number
+// of syscalls on large transfers while keeping the per-connection memory modest.
+const COPY_BUF_SIZE: usize = 64 * 1024;
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
@@ -40,6 +53,167 @@ const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 pub(crate) struct HttpVisitor {
     pub stream: TcpStream,
     pub prefetched: Vec<u8>,
+    // Keeps the visitor counted as active until it has been fully served
+    pub activity: ActivityGuard,
+}
+
+/// Tracks the visitor connections that are still being served, so that a
+/// shutdown can drain them instead of cutting them off.
+#[derive(Clone, Default)]
+pub(crate) struct ActivityTracker {
+    active: Arc<AtomicUsize>,
+}
+
+impl ActivityTracker {
+    /// Count one more visitor as active until the returned guard is dropped
+    pub(crate) fn guard(&self) -> ActivityGuard {
+        self.active.fetch_add(1, Ordering::Relaxed);
+        ActivityGuard {
+            active: self.active.clone(),
+        }
+    }
+
+    pub(crate) fn active(&self) -> usize {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    /// Wait until no visitor is being served, up to `timeout`. Returns `false`
+    /// when the timeout is reached with visitors still active.
+    pub(crate) async fn wait_idle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while self.active() > 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            time::sleep(Duration::from_millis(20)).await;
+        }
+        true
+    }
+}
+
+pub(crate) struct ActivityGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Runtime counters of the HTTP entrypoint, exposed through the administration
+/// API.
+#[derive(Default)]
+pub(crate) struct ServerMetrics {
+    pub(crate) visitors_accepted: AtomicU64,
+    pub(crate) responses_400: AtomicU64,
+    pub(crate) responses_404: AtomicU64,
+    pub(crate) responses_408: AtomicU64,
+    pub(crate) responses_431: AtomicU64,
+    pub(crate) responses_503: AtomicU64,
+    pub(crate) responses_504: AtomicU64,
+    pub(crate) bytes_from_visitors: AtomicU64,
+    pub(crate) bytes_to_visitors: AtomicU64,
+    pub(crate) pool_outstanding: AtomicUsize,
+    pub(crate) pool_active: AtomicUsize,
+}
+
+impl ServerMetrics {
+    /// Record a visitor accepted by the HTTP entrypoint
+    pub(crate) fn accept_visitor(&self) {
+        self.visitors_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an HTTP response by its status line
+    pub(crate) fn record_response(&self, status: &str) {
+        let counter = match status {
+            "400 Bad Request" => &self.responses_400,
+            "404 Not Found" => &self.responses_404,
+            "408 Request Timeout" => &self.responses_408,
+            "431 Request Header Fields Too Large" => &self.responses_431,
+            "503 Service Unavailable" => &self.responses_503,
+            "504 Gateway Timeout" => &self.responses_504,
+            _ => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A JSON snapshot of the counters, for the administration API
+    pub(crate) fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "visitors_accepted": self.visitors_accepted.load(Ordering::Relaxed),
+            "responses": {
+                "400": self.responses_400.load(Ordering::Relaxed),
+                "404": self.responses_404.load(Ordering::Relaxed),
+                "408": self.responses_408.load(Ordering::Relaxed),
+                "431": self.responses_431.load(Ordering::Relaxed),
+                "503": self.responses_503.load(Ordering::Relaxed),
+                "504": self.responses_504.load(Ordering::Relaxed),
+            },
+            "bytes_from_visitors": self.bytes_from_visitors.load(Ordering::Relaxed),
+            "bytes_to_visitors": self.bytes_to_visitors.load(Ordering::Relaxed),
+            "pool_outstanding": self.pool_outstanding.load(Ordering::Relaxed),
+            "pool_active": self.pool_active.load(Ordering::Relaxed),
+        })
+    }
+}
+
+/// Wraps a stream and counts the bytes read from and written to it, so that the
+/// server can report the traffic of a visitor per direction.
+struct CountingStream<T> {
+    inner: T,
+    metrics: Arc<ServerMetrics>,
+}
+
+impl<T> CountingStream<T> {
+    fn new(inner: T, metrics: Arc<ServerMetrics>) -> Self {
+        CountingStream { inner, metrics }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for CountingStream<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &res {
+            let n = buf.filled().len() - before;
+            self.metrics
+                .bytes_from_visitors
+                .fetch_add(n as u64, Ordering::Relaxed);
+        }
+        res
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for CountingStream<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let res = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &res {
+            self.metrics
+                .bytes_to_visitors
+                .fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        res
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 // A client of `[clients]`, together with the config that is pushed to it
@@ -92,6 +266,10 @@ pub(crate) struct ServerState {
     // Serialize the configuration changes, so that two concurrent applies can't
     // overwrite each other
     apply_lock: Mutex<()>,
+    // The visitors that are currently being served
+    pub(crate) activity: ActivityTracker,
+    // The runtime counters
+    pub(crate) metrics: Arc<ServerMetrics>,
 }
 
 // The entrypoint of running a server
@@ -157,11 +335,11 @@ fn generate_client_hashmap(server_config: &ServerConfig) -> HashMap<ClientDigest
 
 // Generate a routing table which maps a `Host` domain to a TunnelDigest
 fn generate_routing_table(server_config: &ServerConfig) -> RoutingTable {
-    let mut ret = HashMap::new();
+    let mut ret = RoutingTable::default();
     for client in server_config.clients.values() {
         for (name, s) in &client.tunnels {
             let digest = protocol::digest(name.as_bytes());
-            ret.insert(s.domain.clone(), digest);
+            ret.insert(&s.domain, digest);
         }
     }
     ret
@@ -182,6 +360,8 @@ impl ServerState {
             config_channels: RwLock::new(HashMap::new()),
             next_conn_id: AtomicUsize::new(0),
             apply_lock: Mutex::new(()),
+            activity: ActivityTracker::default(),
+            metrics: Arc::new(ServerMetrics::default()),
         }
     }
 
@@ -498,6 +678,25 @@ impl Server {
         }
 
         let _ = http_task.await;
+
+        // Let the in-flight visitors finish before the tunnel is torn down. The
+        // control channels are still alive here, so the data keeps flowing.
+        let active = self.state.activity.active();
+        if active > 0 {
+            info!("Waiting for {} in-flight visitor(s) to finish...", active);
+            if !self
+                .state
+                .activity
+                .wait_idle(Duration::from_secs(DRAIN_TIMEOUT))
+                .await
+            {
+                warn!(
+                    "{} visitor(s) still in flight after the drain timeout, shutting down anyway",
+                    self.state.activity.active()
+                );
+            }
+        }
+
         if let Some(api_task) = api_task {
             let _ = api_task.await;
         }
@@ -730,8 +929,13 @@ async fn do_control_channel_handshake(
         conn.flush().await?;
 
         info!(tunnel = %tunnel_config.domain, "Control channel established");
-        let (handle, ch_task) =
-            ControlChannelHandle::new(conn, tunnel_config, heartbeat_interval, conn_id);
+        let (handle, ch_task) = ControlChannelHandle::new(
+            conn,
+            tunnel_config,
+            heartbeat_interval,
+            conn_id,
+            state.metrics.clone(),
+        );
 
         // Insert the new handle
         let _ = state
@@ -783,6 +987,104 @@ async fn do_data_channel_handshake(
     Ok(())
 }
 
+/// The data channel pool of one tunnel. It keeps a number of warm data channels
+/// proportional to the number of visitors that are currently being forwarded, so
+/// that a visitor usually gets one without waiting.
+#[derive(Clone)]
+pub(crate) struct DataChannelPool {
+    // Asks the client to create a data channel
+    req_tx: mpsc::UnboundedSender<bool>,
+    // Channels that were requested but not consumed yet
+    outstanding: Arc<AtomicUsize>,
+    // Visitors currently being forwarded
+    active: Arc<AtomicUsize>,
+    // The server-wide counters, mirrored so that the pool is visible in the API
+    metrics: Arc<ServerMetrics>,
+}
+
+impl DataChannelPool {
+    fn new(req_tx: mpsc::UnboundedSender<bool>, metrics: Arc<ServerMetrics>) -> DataChannelPool {
+        DataChannelPool {
+            req_tx,
+            outstanding: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            metrics,
+        }
+    }
+
+    /// Ask the client for a data channel. Returns `false` when the control
+    /// channel is gone, so no data channel will ever come.
+    pub(crate) fn request(&self) -> bool {
+        self.outstanding.fetch_add(1, Ordering::Relaxed);
+        self.metrics.pool_outstanding.fetch_add(1, Ordering::Relaxed);
+        if self.req_tx.send(true).is_err() {
+            self.outstanding.fetch_sub(1, Ordering::Relaxed);
+            self.metrics.pool_outstanding.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// A data channel was taken out of the pool
+    fn consume(&self) {
+        let _ = self.outstanding.try_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(1)),
+        );
+        let _ = self.metrics.pool_outstanding.try_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(1)),
+        );
+    }
+
+    /// The number of warm channels to keep: enough for the visitors that are
+    /// being forwarded, plus a small buffer, capped at `POOL_MAX`.
+    fn target(&self) -> usize {
+        (self.active.load(Ordering::Relaxed) + POOL_MIN).min(POOL_MAX)
+    }
+
+    /// Top the pool up to the target
+    fn replenish(&self) {
+        while self.outstanding.load(Ordering::Relaxed) < self.target() {
+            if !self.request() {
+                break;
+            }
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.req_tx.is_closed()
+    }
+
+    fn metrics(&self) -> &Arc<ServerMetrics> {
+        &self.metrics
+    }
+
+    /// A guard that counts a visitor as active for as long as it's forwarded
+    fn forward_guard(&self) -> ForwardGuard {
+        self.active.fetch_add(1, Ordering::Relaxed);
+        self.metrics.pool_active.fetch_add(1, Ordering::Relaxed);
+        ForwardGuard {
+            active: self.active.clone(),
+            metrics: self.metrics.clone(),
+        }
+    }
+}
+
+struct ForwardGuard {
+    active: Arc<AtomicUsize>,
+    metrics: Arc<ServerMetrics>,
+}
+
+impl Drop for ForwardGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+        self.metrics.pool_active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub(crate) struct ControlChannelHandle {
     // Identifies the connection that owns the handle, so that it only removes its own
     // handle when it goes away
@@ -791,9 +1093,8 @@ pub(crate) struct ControlChannelHandle {
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<TcpStream>,
     pub(crate) visitor_tx: mpsc::Sender<HttpVisitor>,
-    // Asks the client for a new data channel. The HTTP entrypoint requests one for
-    // every visitor, so that the pool is replenished as it's drained.
-    pub(crate) data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    // The data channel pool of the tunnel
+    pub(crate) data_pool: DataChannelPool,
     tunnel: ServerTunnelConfig,
 }
 
@@ -806,6 +1107,7 @@ impl ControlChannelHandle {
         tunnel: ServerTunnelConfig,
         heartbeat_interval: u64,
         id: usize,
+        metrics: Arc<ServerMetrics>,
     ) -> (ControlChannelHandle, JoinHandle<()>) {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -819,19 +1121,13 @@ impl ControlChannelHandle {
         // Visitors handed over by the HTTP entrypoint
         let (visitor_tx, visitor_rx) = mpsc::channel(CHAN_SIZE);
 
-        // Cache some data channels for later use
-        for _i in 0..TCP_POOL_SIZE {
-            if let Err(e) = data_ch_req_tx.send(true) {
-                error!("Failed to request data channel {}", e);
-            };
-        }
+        // The pool that keeps the data channels warm
+        let data_pool = DataChannelPool::new(data_ch_req_tx, metrics);
 
-        // The HTTP entrypoint keeps a sender to request a data channel per visitor
-        let handle_req_tx = data_ch_req_tx.clone();
-
+        let pool_task = data_pool.clone();
         tokio::spawn(
             async move {
-                if let Err(e) = run_tcp_connection_pool(data_ch_rx, visitor_rx, data_ch_req_tx)
+                if let Err(e) = run_tcp_connection_pool(data_ch_rx, visitor_rx, pool_task)
                     .await
                     .with_context(|| "Failed to run TCP connection pool")
                 {
@@ -868,7 +1164,7 @@ impl ControlChannelHandle {
                 _shutdown_tx: shutdown_tx,
                 data_ch_tx,
                 visitor_tx,
-                data_ch_req_tx: handle_req_tx,
+                data_pool,
                 tunnel,
             },
             ch_task,
@@ -959,45 +1255,119 @@ impl ControlChannel {
 
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool(
-    mut data_ch_rx: mpsc::Receiver<TcpStream>,
+    data_ch_rx: mpsc::Receiver<TcpStream>,
     mut visitor_rx: mpsc::Receiver<HttpVisitor>,
-    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    data_pool: DataChannelPool,
 ) -> Result<()> {
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
+    // The receiver is shared, so that every visitor waits for its own data
+    // channel independently. Waiting in a single loop would block the visitors
+    // that arrive later behind the one that is waiting.
+    let data_ch_rx = Arc::new(Mutex::new(data_ch_rx));
 
-    'pool: while let Some(visitor) = visitor_rx.recv().await {
-        let HttpVisitor {
-            mut stream,
-            prefetched,
-        } = visitor;
+    let mut replenish = time::interval(Duration::from_millis(POOL_REPLENISH_INTERVAL_MS));
+    replenish.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    // Warm the pool with the first batch
+    data_pool.replenish();
 
-        loop {
-            if let Some(mut ch) = data_ch_rx.recv().await {
-                let ok = write_and_flush(&mut ch, &cmd).await.is_ok()
-                    && write_and_flush(&mut ch, &prefetched).await.is_ok();
-
-                if ok {
-                    tokio::spawn(async move {
-                        let _ = copy_bidirectional(&mut ch, &mut stream).await;
-                    });
+    loop {
+        tokio::select! {
+            visitor = visitor_rx.recv() => {
+                let Some(visitor) = visitor else {
                     break;
-                } else {
-                    // Current data channel is broken. Request for a new one
-                    if data_ch_req_tx.send(true).is_err() {
-                        // The control channel is gone, so no new data channel will come
-                        crate::http::respond_tunnel_unavailable(&mut stream).await;
-                        break 'pool;
+                };
+                let data_ch_rx = data_ch_rx.clone();
+                let data_pool = data_pool.clone();
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = forward_visitor(visitor, data_ch_rx, data_pool).await {
+                            warn!("Failed to forward a visitor: {:#}", e);
+                        }
                     }
+                    .in_current_span(),
+                );
+            }
+            _ = replenish.tick() => {
+                data_pool.replenish();
+                if data_pool.is_closed() {
+                    break;
                 }
-            } else {
-                // The control channel is gone, so no data channel will ever come.
-                // Answer the visitor with a 503 instead of leaving it hanging.
-                crate::http::respond_tunnel_unavailable(&mut stream).await;
-                break 'pool;
             }
         }
     }
 
     info!("Shutdown");
     Ok(())
+}
+
+/// Forward one visitor through a data channel, waiting for one when the pool is
+/// empty. The wait is bounded, so a visitor is answered with a `504` instead of
+/// hanging forever when the client cannot open a data channel.
+#[instrument(skip_all)]
+async fn forward_visitor(
+    visitor: HttpVisitor,
+    data_ch_rx: Arc<Mutex<mpsc::Receiver<TcpStream>>>,
+    data_pool: DataChannelPool,
+) -> Result<()> {
+    let HttpVisitor {
+        mut stream,
+        prefetched,
+        activity,
+    } = visitor;
+    let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
+
+    loop {
+        let received = time::timeout(Duration::from_secs(DATA_CHANNEL_WAIT_TIMEOUT), async {
+            let mut rx = data_ch_rx.lock().await;
+            rx.recv().await
+        })
+        .await;
+
+        match received {
+            Err(_) => {
+                debug!("Timed out waiting for a data channel");
+                crate::http::respond_gateway_timeout(&mut stream, data_pool.metrics()).await;
+                return Ok(());
+            }
+            Ok(None) => {
+                // The control channel is gone, so no data channel will ever come.
+                // Answer the visitor with a 503 instead of leaving it hanging.
+                crate::http::respond_tunnel_unavailable(&mut stream, data_pool.metrics()).await;
+                return Ok(());
+            }
+            Ok(Some(mut ch)) => {
+                data_pool.consume();
+
+                let ok = write_and_flush(&mut ch, &cmd).await.is_ok()
+                    && write_and_flush(&mut ch, &prefetched).await.is_ok();
+
+                if ok {
+                    let guard = data_pool.forward_guard();
+                    let stream = CountingStream::new(stream, data_pool.metrics().clone());
+                    tokio::spawn(
+                        async move {
+                            // Keep the visitor counted as active until the flow ends
+                            let _guard = guard;
+                            let _activity = activity;
+                            let mut stream = stream;
+                            let _ = copy_bidirectional_with_sizes(
+                                &mut ch,
+                                &mut stream,
+                                COPY_BUF_SIZE,
+                                COPY_BUF_SIZE,
+                            )
+                            .await;
+                        }
+                        .in_current_span(),
+                    );
+                    return Ok(());
+                }
+
+                // The current data channel is broken. Ask for a new one and retry
+                if !data_pool.request() {
+                    crate::http::respond_tunnel_unavailable(&mut stream, data_pool.metrics()).await;
+                    return Ok(());
+                }
+            }
+        }
+    }
 }

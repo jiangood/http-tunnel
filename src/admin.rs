@@ -194,6 +194,10 @@ async fn status(State(state): State<Arc<ServerState>>) -> Json<serde_json::Value
         "tunnels": tunnels,
         "bind_addr": config.bind_addr,
         "http_bind_addr": config.http_bind_addr,
+        "metrics": {
+            "active_visitors": state.activity.active(),
+            "http": state.metrics.snapshot(),
+        },
     }))
 }
 

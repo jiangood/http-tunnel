@@ -13,7 +13,7 @@ use backoff::future::retry_notify;
 use backoff::ExponentialBackoff;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::io::{copy_bidirectional, AsyncWriteExt};
+use tokio::io::{copy_bidirectional_with_sizes, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{self, Duration, Instant};
@@ -21,6 +21,11 @@ use tracing::{debug, error, info, instrument, warn, Instrument, Span};
 
 // The interval between retries to fetch the config, before the client gets one
 const DEFAULT_FETCH_RETRY_INTERVAL_SECS: u64 = 1;
+
+// The size of the buffers that are piped between the data channel and the local
+// service. Larger than the tokio default (8 KiB), which reduces the number of
+// syscalls on large transfers.
+const COPY_BUF_SIZE: usize = 64 * 1024;
 
 // The entrypoint of running a client
 pub async fn run_client(args: ClientArgs, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
@@ -360,7 +365,13 @@ async fn run_data_channel_for_tcp(mut conn: TcpStream, local_addr: &str) -> Resu
     let mut local = TcpStream::connect(local_addr)
         .await
         .with_context(|| format!("Failed to connect to {}", local_addr))?;
-    let _ = copy_bidirectional(&mut conn, &mut local).await;
+    let _ = copy_bidirectional_with_sizes(
+        &mut conn,
+        &mut local,
+        COPY_BUF_SIZE,
+        COPY_BUF_SIZE,
+    )
+    .await;
     Ok(())
 }
 
