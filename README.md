@@ -21,7 +21,6 @@ the server pushes it the tunnels that it should serve.
   - [Features](#features)
   - [Quickstart](#quickstart)
   - [Docker](#docker)
-    - [Docker Compose](#docker-compose)
   - [Configuration](#configuration)
     - [Routing](#routing)
     - [Logging](#logging)
@@ -139,6 +138,9 @@ The mounted folder must be writable: if `server.toml` is missing, the server gen
 starts, and the administration API rewrites it in place. If the folder is read-only, pass an explicit path to a
 writable location instead.
 
+The server [administration API](#administration-api) is off unless `api_port` and `api_token` are set; publish that
+port too (`-p 2335:2335`) when it's enabled.
+
 The client takes no configuration file, so it only needs the server address, its name and its token. Pass them through
 environment variables, which keeps the token out of the container's arguments:
 
@@ -160,56 +162,6 @@ The client [administration API](#client-administration-api) listens on `8610` by
 it. Drop the mapping if you don't need to manage the tunnels remotely. It's exposed on every interface, so protect it
 with a reverse proxy that terminates TLS, a firewall rule, or a loopback-only mapping
 (`-p 127.0.0.1:8610:8610`). Change the port with `HTTP_TUNNEL_API_PORT` (or `--api-port`).
-
-### Docker Compose
-
-The same containers can be managed with Docker Compose. On the server, put this `docker-compose.yml` in the directory
-that holds `server.toml` (or use [`examples/docker-compose/server`](./examples/docker-compose/server)):
-
-```yaml
-# docker-compose.yml
-services:
-  http-tunnel:
-    image: ghcr.io/jiangood/http-tunnel:latest
-    container_name: http-tunnel
-    restart: unless-stopped
-    command: server
-    ports:
-      - "2333:2333" # Clients connect here
-      - "80:80" # Visitors connect here
-      - "2335:2335" # Administration API, exposed on all interfaces, drop unless it's enabled
-    volumes:
-      - ./:/app # Holds server.toml, must be writable
-```
-
-Then start it with:
-
-```bash
-docker compose up -d
-```
-
-On the host behind the NAT (the client), use a second `docker-compose.yml`, or
-[`examples/docker-compose/client`](./examples/docker-compose/client). It takes no configuration file, so the server
-address, name and token are passed as environment variables:
-
-```yaml
-# docker-compose.yml
-services:
-  http-tunnel:
-    image: ghcr.io/jiangood/http-tunnel:latest
-    container_name: http-tunnel
-    restart: unless-stopped
-    command: client
-    ports:
-      - "8610:8610" # Client administration API, drop unless it's needed
-    environment:
-      - HTTP_TUNNEL_REMOTE=myserver.com:2333
-      - HTTP_TUNNEL_NAME=home_nas
-      - HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know
-```
-
-Ready-to-use files are in [`examples/docker-compose`](./examples/docker-compose), with a directory for the
-[server](./examples/docker-compose/server) and one for the [client](./examples/docker-compose/client).
 
 ## Configuration
 
