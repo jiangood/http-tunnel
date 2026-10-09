@@ -11,12 +11,10 @@ pub async fn run_http_tunnel_server(
     config_path: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let cli = http_tunnel::Cli {
-        cmd: http_tunnel::Command::Server(http_tunnel::ServerArgs {
-            config_path: PathBuf::from(config_path),
-        }),
-    };
-    http_tunnel::run(cli, shutdown_rx).await
+    let cmd = http_tunnel::Command::Server(http_tunnel::ServerArgs {
+        config_path: PathBuf::from(config_path),
+    });
+    http_tunnel::run(cmd, shutdown_rx).await
 }
 
 pub async fn run_http_tunnel_client(
@@ -35,15 +33,13 @@ pub async fn run_http_tunnel_client_with_api(
     api_port: Option<u16>,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let cli = http_tunnel::Cli {
-        cmd: http_tunnel::Command::Client(http_tunnel::ClientArgs {
-            name: name.to_string(),
-            remote: remote.to_string(),
-            token: token.to_string(),
-            api_port,
-        }),
-    };
-    http_tunnel::run(cli, shutdown_rx).await
+    let cmd = http_tunnel::Command::Client(http_tunnel::ClientArgs {
+        name: name.to_string(),
+        remote: remote.to_string(),
+        token: token.to_string(),
+        api_port,
+    });
+    http_tunnel::run(cmd, shutdown_rx).await
 }
 
 pub mod tcp {

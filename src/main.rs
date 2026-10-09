@@ -6,8 +6,7 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut args = Cli::parse();
-    args.apply_client_defaults();
+    let cmd = Cli::parse().into_command()?;
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
     tokio::spawn(async move {
@@ -42,5 +41,5 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    run(args, shutdown_rx).await
+    run(cmd, shutdown_rx).await
 }

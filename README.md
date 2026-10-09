@@ -80,16 +80,17 @@ be given explicitly:
 2. On the host which is behind the NAT (your NAS)
 
 The client needs no configuration file. Just tell it where the server is, which name it was given in the configuration
-of the server, and its token:
+of the server, and its token. The client is the default role, so no subcommand is needed (the server is run with
+`./http-tunnel server`):
 
 ```bash
-./http-tunnel client --remote myserver.com:2333 --name home_nas --token use_a_secret_that_only_you_know
+./http-tunnel --remote myserver.com:2333 --name home_nas --token use_a_secret_that_only_you_know
 ```
 
 or pass the token in the environment, so that it doesn't show up in `ps`:
 
 ```bash
-HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know ./http-tunnel client --remote myserver.com:2333 --name home_nas
+HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know ./http-tunnel --remote myserver.com:2333 --name home_nas
 ```
 
 Every option can also be passed through an environment variable (`HTTP_TUNNEL_REMOTE`, `HTTP_TUNNEL_NAME`,
@@ -97,7 +98,7 @@ Every option can also be passed through an environment variable (`HTTP_TUNNEL_RE
 
 ```bash
 HTTP_TUNNEL_REMOTE=myserver.com:2333 HTTP_TUNNEL_NAME=home_nas \
-  HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know ./http-tunnel client
+  HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know ./http-tunnel
 ```
 
 The [client administration API](#client-administration-api), which maintains the client's tunnels at runtime, listens
@@ -109,7 +110,7 @@ on `8610` by default. Set `HTTP_TUNNEL_API_PORT` (or `--api-port`) to change it.
 
 So you can visit `http://nas.example.com` (with `nas.example.com` resolving to your server) to reach the NAS web UI.
 
-To run `http-tunnel` as a background service on Linux, checkout the [systemd examples](./examples/systemd). To run it in a container, see [Docker](#docker).
+To run `http-tunnel` in a container, see [Docker](#docker).
 
 ## Docker
 
@@ -150,7 +151,7 @@ docker run -d --name http-tunnel --restart unless-stopped \
   -e HTTP_TUNNEL_REMOTE=myserver.com:2333 \
   -e HTTP_TUNNEL_NAME=home_nas \
   -e HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know \
-  ghcr.io/jiangood/http-tunnel:latest client
+  ghcr.io/jiangood/http-tunnel:latest
 ```
 
 The default bridge network is enough: the client only dials the server, so it doesn't need the host network. A tunnel
@@ -297,7 +298,7 @@ The client also exposes a REST API to maintain its own tunnels at runtime. It li
 port with `--api-port` or the `HTTP_TUNNEL_API_PORT` environment variable, or set it to `0` to disable the API:
 
 ```bash
-./http-tunnel client --remote myserver.com:2333 --name home_nas \
+./http-tunnel --remote myserver.com:2333 --name home_nas \
   --token use_a_secret_that_only_you_know --api-port 2336
 ```
 

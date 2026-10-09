@@ -86,15 +86,13 @@ impl Harness {
         let (server_shutdown, server_rx) = broadcast::channel(1);
 
         let client = tokio::spawn(async move {
-            let cli = http_tunnel::Cli {
-                cmd: http_tunnel::Command::Client(http_tunnel::ClientArgs {
-                    name: CLIENT_NAME.to_string(),
-                    remote: SERVER_ADDR.to_string(),
-                    token: CLIENT_TOKEN.to_string(),
-                    api_port: None,
-                }),
-            };
-            let _ = http_tunnel::run(cli, client_rx).await;
+            let cmd = http_tunnel::Command::Client(http_tunnel::ClientArgs {
+                name: CLIENT_NAME.to_string(),
+                remote: SERVER_ADDR.to_string(),
+                token: CLIENT_TOKEN.to_string(),
+                api_port: None,
+            });
+            let _ = http_tunnel::run(cmd, client_rx).await;
         });
         // Let the client retry at least once while the server comes up
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -102,10 +100,8 @@ impl Harness {
         let server = {
             let config_path = config_path.clone();
             tokio::spawn(async move {
-                let cli = http_tunnel::Cli {
-                    cmd: http_tunnel::Command::Server(http_tunnel::ServerArgs { config_path }),
-                };
-                let _ = http_tunnel::run(cli, server_rx).await;
+                let cmd = http_tunnel::Command::Server(http_tunnel::ServerArgs { config_path });
+                let _ = http_tunnel::run(cmd, server_rx).await;
             })
         };
 

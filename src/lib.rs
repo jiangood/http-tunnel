@@ -40,12 +40,12 @@ mod server;
 use server::run_server;
 
 #[allow(unused_variables)]
-pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
+pub async fn run(cmd: Command, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
     // Raise `nofile` limit on linux and mac
     #[cfg(any(feature = "server", feature = "client"))]
     fdlimit::raise_fd_limit();
 
-    match args.cmd {
+    match cmd {
         #[allow(unused_variables)]
         Command::Server(args) => {
             #[cfg(not(feature = "server"))]

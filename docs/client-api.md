@@ -4,7 +4,7 @@ The client exposes a small REST API to maintain its own tunnels at runtime. It l
 port with `--api-port` or the `HTTP_TUNNEL_API_PORT` environment variable, or set it to `0` to disable the API:
 
 ```bash
-./http-tunnel client --remote myserver.com:2333 --name home_nas \
+./http-tunnel --remote myserver.com:2333 --name home_nas \
   --token use_a_secret_that_only_you_know --api-port 2336
 ```
 
