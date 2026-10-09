@@ -1,8 +1,8 @@
 //! The administration API of the client, for maintaining its own tunnels.
 //!
-//! It's only started when `--api-port` is given. A build without the `client-api`
-//! feature has no API. Every route requires `Authorization: Bearer <--token>`:
-//! the client token is reused, so there is no second secret to manage.
+//! It listens on `8610` by default (see `--api-port`). A build without the
+//! `client-api` feature has no API. Every route requires `Authorization: Bearer
+//! <--token>`: the client token is reused, so there is no second secret to manage.
 //!
 //! The server remains the source of truth. A change is forwarded to the server
 //! over the config channel, which validates it against the whole configuration,

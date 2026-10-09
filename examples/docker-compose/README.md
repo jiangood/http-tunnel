@@ -15,7 +15,7 @@ it's missing, and the [administration API](../../README.md#administration-api) r
 read-only, pass an explicit path to a writable location with `command: server /path/to/server.toml`.
 
 A client is configured by the server, so it only takes the address of the server, its name and its token, which are
-passed as a command argument and the `HTTP_TUNNEL_TOKEN` environment variable.
+passed through the `HTTP_TUNNEL_REMOTE`, `HTTP_TUNNEL_NAME` and `HTTP_TUNNEL_TOKEN` environment variables.
 
 ## Server
 
@@ -36,12 +36,14 @@ A minimal `server.toml` is provided in [`../minimal/server.toml`](../minimal/ser
 
 ## Client
 
-Edit `client/docker-compose.yml` and change `--remote` to the address of your server, and `--name` to the name of the
-client as configured in `server.toml`. The token is read from `HTTP_TUNNEL_TOKEN`; put it in a `.env` file next to the
-docker-compose file rather than hardcoding it:
+Edit `client/docker-compose.yml` and set `HTTP_TUNNEL_REMOTE` to the address of your server and `HTTP_TUNNEL_NAME` to
+the name of the client as configured in `server.toml`. The token is read from `HTTP_TUNNEL_TOKEN`; put all three in a
+`.env` file next to the docker-compose file rather than hardcoding them:
 
 ```dotenv
 # .env
+HTTP_TUNNEL_REMOTE=myserver.com:2333
+HTTP_TUNNEL_NAME=home_nas
 HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know
 ```
 
@@ -52,21 +54,9 @@ cd client
 docker compose up -d
 ```
 
-`network_mode: host` is the simplest way for the client to reach the services on the host. On Docker Desktop a client
-that has to reach a service on the host uses `host.docker.internal` as the `local_addr` in `server.toml` instead.
+The default bridge network is enough: the client only dials the server. A tunnel that reaches a service on the host
+uses `host.docker.internal` as its `local_addr` in `server.toml` (on Linux, add
+`extra_hosts: ["host.docker.internal:host-gateway"]` to the service), or the name of another container on the same
+network. The client's [administration API](../../README.md#client-administration-api) listens on `8610`, which the
+example publishes; drop the mapping if you don't need it, or change it with `HTTP_TUNNEL_API_PORT`.
 
-## Building the image locally
-
-To build the image instead of pulling it, compile the musl binary and place it under `build-out/<arch>/` first, then
-add a `build` section whose `context` points at the repository root (three levels up from `server/` or `client/`):
-
-```yaml
-services:
-  http-tunnel:
-    build:
-      context: ../../..
-      args:
-        TARGETARCH: amd64
-```
-
-See the [Docker section](../../README.md#docker) of the README for the build commands.

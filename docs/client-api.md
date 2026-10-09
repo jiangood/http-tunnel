@@ -1,7 +1,7 @@
 # Client Administration API
 
-The client can expose a small REST API to maintain its own tunnels at runtime. It is disabled by default and is
-enabled by passing `--api-port`:
+The client exposes a small REST API to maintain its own tunnels at runtime. It listens on `8610` by default; change the
+port with `--api-port` or the `HTTP_TUNNEL_API_PORT` environment variable, or set it to `0` to disable the API:
 
 ```bash
 ./http-tunnel client --remote myserver.com:2333 --name home_nas \
@@ -11,8 +11,7 @@ enabled by passing `--api-port`:
 Every route requires `Authorization: Bearer <token>`, reusing the token that the client already authenticates with, so
 there is no second secret to manage. The API binds to `0.0.0.0`, which makes it reachable from the network, so protect
 it the same way as the [server API](./admin-api.md): a reverse proxy that terminates TLS, a firewall rule, or a private
-network such as WireGuard. A binary built without the `client-api` feature (on by default) has no API and warns at
-startup if `--api-port` is set.
+network such as WireGuard. A binary built without the `client-api` feature (on by default) has no API.
 
 ## Resources
 

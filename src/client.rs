@@ -168,10 +168,11 @@ impl Client {
         };
 
         // Run the administration API when a port is configured. A build without
-        // the `client-api` feature has nothing to serve, so it only warns.
+        // the `client-api` feature has nothing to serve, so it only warns. A port
+        // of `0` disables the API, so that several clients can share a host.
         #[cfg(feature = "client-api")]
         let api_task = match self.args.api_port {
-            Some(port) => {
+            Some(port) if port != 0 => {
                 let state = self.state.clone();
                 let token = self.args.token.clone();
                 let name = self.args.name.clone();
@@ -186,14 +187,14 @@ impl Client {
                     }
                 }))
             }
-            None => None,
+            _ => None,
         };
 
         #[cfg(not(feature = "client-api"))]
-        if self.args.api_port.is_some() {
+        if matches!(self.args.api_port, Some(port) if port != 0) {
             warn!(
-                "`--api-port` is set, but this build has no `client-api` feature. \
-                 The client administration API is disabled"
+                "The client administration API is configured, but this build has \
+                 no `client-api` feature. It is disabled"
             );
         }
 

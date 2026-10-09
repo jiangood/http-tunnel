@@ -62,11 +62,15 @@ pub struct ServerArgs {
 #[derive(Args, Debug, Clone)]
 pub struct ClientArgs {
     /// The address of the server, e.g. `example.com:2333`
-    #[clap(long, short)]
+    ///
+    /// It can also be passed via the `HTTP_TUNNEL_REMOTE` environment variable
+    #[clap(long, short, env = "HTTP_TUNNEL_REMOTE")]
     pub remote: String,
 
     /// The name of the client. It must be defined in the server's configuration
-    #[clap(long, short)]
+    ///
+    /// It can also be passed via the `HTTP_TUNNEL_NAME` environment variable
+    #[clap(long, short, env = "HTTP_TUNNEL_NAME")]
     pub name: String,
 
     /// The token of the client. It must match the one in the server's configuration
@@ -75,11 +79,30 @@ pub struct ClientArgs {
     #[clap(long, short, env = "HTTP_TUNNEL_TOKEN", hide_env_values = true)]
     pub token: String,
 
-    /// The port of the client administration API. The API is disabled unless set.
+    /// The port of the client administration API. Defaults to `8610`.
     ///
     /// It listens on all interfaces (`0.0.0.0`) and requires
     /// `Authorization: Bearer <token>`. It's only compiled in with the
-    /// `client-api` feature (on by default)
-    #[clap(long)]
+    /// `client-api` feature (on by default).
+    ///
+    /// Set it to `0` to disable the API, which is useful when several clients
+    /// run on the same host. It can also be passed via the
+    /// `HTTP_TUNNEL_API_PORT` environment variable, which is convenient to start
+    /// a containerized client
+    #[clap(long, env = "HTTP_TUNNEL_API_PORT")]
     pub api_port: Option<u16>,
+}
+
+/// The default port of the client administration API
+pub const DEFAULT_CLIENT_API_PORT: u16 = 8610;
+
+impl Cli {
+    /// Fill the defaults that clap can't express on an `Option` field. The client
+    /// administration API listens on `DEFAULT_CLIENT_API_PORT` unless a port is
+    /// given on the command line or through `HTTP_TUNNEL_API_PORT`.
+    pub fn apply_client_defaults(&mut self) {
+        if let Command::Client(args) = &mut self.cmd {
+            args.api_port.get_or_insert(DEFAULT_CLIENT_API_PORT);
+        }
+    }
 }

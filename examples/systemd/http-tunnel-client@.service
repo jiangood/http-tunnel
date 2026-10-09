@@ -15,8 +15,11 @@ EnvironmentFile=-/etc/http-tunnel/client.env
 # EnvironmentFile=-%h/.local/etc/http-tunnel/client.env
 
 # The instance name `%i` is the name of the client, which must be defined in
-# the configuration of the server. Change the `--remote` to your server
-ExecStart=/usr/bin/http-tunnel client --remote example.com:2333 --name %i
+# the configuration of the server. Change the `--remote` to your server.
+# `--api-port 0` disables the client administration API, whose default port
+# `8610` can only be bound by one instance. Give each instance its own port
+# (e.g. `--api-port 8610`) if you need the API.
+ExecStart=/usr/bin/http-tunnel client --remote example.com:2333 --name %i --api-port 0
 
 [Install]
 WantedBy=multi-user.target

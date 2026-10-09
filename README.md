@@ -93,8 +93,16 @@ or pass the token in the environment, so that it doesn't show up in `ps`:
 HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know ./http-tunnel client --remote myserver.com:2333 --name home_nas
 ```
 
-Pass `--api-port 2336` to expose the [client administration API](#client-administration-api), which maintains the
-client's tunnels at runtime.
+Every option can also be passed through an environment variable (`HTTP_TUNNEL_REMOTE`, `HTTP_TUNNEL_NAME`,
+`HTTP_TUNNEL_TOKEN` and `HTTP_TUNNEL_API_PORT`), which suits a container:
+
+```bash
+HTTP_TUNNEL_REMOTE=myserver.com:2333 HTTP_TUNNEL_NAME=home_nas \
+  HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know ./http-tunnel client
+```
+
+The [client administration API](#client-administration-api), which maintains the client's tunnels at runtime, listens
+on `8610` by default. Set `HTTP_TUNNEL_API_PORT` (or `--api-port`) to change it.
 
 3. Now the client will try to connect to the server `myserver.com` on port `2333`, and the server pushes it the tunnels
    of `home_nas`, including the tunnel `nas.example.com`. Any HTTP request to the server on port `80` with `Host: nas.example.com` will be
@@ -131,46 +139,27 @@ The mounted folder must be writable: if `server.toml` is missing, the server gen
 starts, and the administration API rewrites it in place. If the folder is read-only, pass an explicit path to a
 writable location instead.
 
-The client takes no configuration file, so it only needs the arguments:
+The client takes no configuration file, so it only needs the server address, its name and its token. Pass them through
+environment variables, which keeps the token out of the container's arguments:
 
 ```bash
-docker run -d --name http-tunnel --restart unless-stopped --network host \
-  ghcr.io/jiangood/http-tunnel:latest client \
-  --remote myserver.com:2333 --name home_nas --token use_a_secret_that_only_you_know
-```
-
-`--network host` is the simplest way for the client to reach the services on the host. On Docker Desktop a client
-that has to reach a service on the host uses `host.docker.internal` as the `local_addr` instead.
-
-If the [administration API](#administration-api) is enabled, publish its port and set `api_port = 2335`, otherwise
-the container doesn't accept the forwarded connections:
-
-```bash
-  -p 2335:2335
-```
-
-This exposes the admin API on every interface of the host. Put it behind a reverse proxy with TLS, restrict the source
-addresses with a firewall, or publish the port on the host loopback only (`-p 127.0.0.1:2335:2335`) when it's only
-managed locally.
-
-The image only contains the binary: it's assembled from the static musl build, so nothing is compiled inside it. To
-build it locally, compile the musl binary and place it under `build-out/<arch>/` first:
-
-```bash
-cargo build --release --target x86_64-unknown-linux-musl
-mkdir -p build-out/amd64
-cp target/x86_64-unknown-linux-musl/release/http-tunnel build-out/amd64/
-docker build --build-arg TARGETARCH=amd64 -t http-tunnel .
-```
-
-The token can also be passed through the `HTTP_TUNNEL_TOKEN` environment variable, which keeps it out of the
-container's arguments:
-
-```bash
-docker run -d --name http-tunnel --network host \
+docker run -d --name http-tunnel --restart unless-stopped \
+  -p 8610:8610 \
+  -e HTTP_TUNNEL_REMOTE=myserver.com:2333 \
+  -e HTTP_TUNNEL_NAME=home_nas \
   -e HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know \
-  ghcr.io/jiangood/http-tunnel:latest client --remote myserver.com:2333 --name home_nas
+  ghcr.io/jiangood/http-tunnel:latest client
 ```
+
+The default bridge network is enough: the client only dials the server, so it doesn't need the host network. A tunnel
+that reaches a service on the host uses `host.docker.internal` as its `local_addr` in `server.toml` (on Linux, add
+`--add-host host.docker.internal:host-gateway` to the client container), or the name of another container on the same
+network.
+
+The client [administration API](#client-administration-api) listens on `8610` by default, so `-p 8610:8610` publishes
+it. Drop the mapping if you don't need to manage the tunnels remotely. It's exposed on every interface, so protect it
+with a reverse proxy that terminates TLS, a firewall rule, or a loopback-only mapping
+(`-p 127.0.0.1:8610:8610`). Change the port with `HTTP_TUNNEL_API_PORT` (or `--api-port`).
 
 ### Docker Compose
 
@@ -201,7 +190,7 @@ docker compose up -d
 
 On the host behind the NAT (the client), use a second `docker-compose.yml`, or
 [`examples/docker-compose/client`](./examples/docker-compose/client). It takes no configuration file, so the server
-address, name and token are passed as arguments and environment variables:
+address, name and token are passed as environment variables:
 
 ```yaml
 # docker-compose.yml
@@ -210,23 +199,13 @@ services:
     image: ghcr.io/jiangood/http-tunnel:latest
     container_name: http-tunnel
     restart: unless-stopped
-    network_mode: host
-    command: client --remote myserver.com:2333 --name home_nas
+    command: client
+    ports:
+      - "8610:8610" # Client administration API, drop unless it's needed
     environment:
+      - HTTP_TUNNEL_REMOTE=myserver.com:2333
+      - HTTP_TUNNEL_NAME=home_nas
       - HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know
-```
-
-To build the image locally instead of pulling it, keep the `build` section and the `build-out/<arch>/` layout
-described above:
-
-```yaml
-services:
-  http-tunnel:
-    build:
-      context: .
-      args:
-        TARGETARCH: amd64
-    # ...
 ```
 
 Ready-to-use files are in [`examples/docker-compose`](./examples/docker-compose), with a directory for the
@@ -362,8 +341,8 @@ curl -X PUT http://127.0.0.1:2335/api/clients/home/tunnels/nas.example.com \
 
 ## Client Administration API
 
-The client can also expose a REST API to maintain its own tunnels at runtime. It is disabled by default and is
-enabled by passing `--api-port`:
+The client also exposes a REST API to maintain its own tunnels at runtime. It listens on `8610` by default; change the
+port with `--api-port` or the `HTTP_TUNNEL_API_PORT` environment variable, or set it to `0` to disable the API:
 
 ```bash
 ./http-tunnel client --remote myserver.com:2333 --name home_nas \
