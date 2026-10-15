@@ -175,7 +175,7 @@ async fn handle_visitor(
             }
             Err(e) => {
                 warn!("Failed to connect server-side proxy {} to {}: {}", host, proxy.local_addr, e);
-                respond(&mut stream, "502 Bad Gateway", "The server-side proxy target is unavailable\\n").await;
+                respond(&mut stream, "502 Bad Gateway", "The server-side proxy target is unavailable\n").await;
             }
         }
         drop(activity);
