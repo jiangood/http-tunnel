@@ -671,6 +671,9 @@ local_addr = "127.0.0.1:80"
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    /// Server-side HTTP reverse proxy rules.
+    #[serde(default)]
+    pub proxies: Vec<ServerProxyEntry>,
     /// Port for client control and data connections.
     #[serde(default = "default_server_port")]
     pub server_port: u16,
@@ -679,6 +682,14 @@ pub struct ServerConfig {
     pub http_port: u16,
     /// Shared secret required by every client.
     pub token: MaskedString,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServerProxyEntry {
+    pub name: String,
+    pub domain: String,
+    pub local_addr: String,
 }
 
 fn default_server_port() -> u16 { 2333 }
@@ -690,6 +701,17 @@ impl ServerConfig {
             Ok(s) => {
                 let config: Self = toml::from_str(&s)
                     .with_context(|| format!("The configuration {:?} is invalid", path))?;
+                let mut domains = BTreeMap::new();
+                for proxy in &config.proxies {
+                    if proxy.name.trim().is_empty() || proxy.local_addr.trim().is_empty() {
+                        bail!("Each [[proxies]] entry needs non-empty name and local_addr");
+                    }
+                    let domain = crate::helper::normalize_domain(&proxy.domain)
+                        .ok_or_else(|| anyhow!("Invalid proxy domain `{}`", proxy.domain))?;
+                    if domains.insert(domain.clone(), ()).is_some() {
+                        bail!("Proxy domain `{}` is configured more than once", domain);
+                    }
+                }
                 if config.token.is_empty()
                     || &*config.token == "replace-with-a-long-random-secret"
                 {
