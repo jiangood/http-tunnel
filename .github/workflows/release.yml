@@ -166,17 +166,31 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # GHCR requires a lowercase image name
-      - name: Compute image name
+      # GHCR requires lowercase image names. Publish separate role-specific images.
+      - name: Compute image names
         id: image
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-      - name: Build and push
-        id: docker_build
+        run: |
+          echo "server=ghcr.io/${GITHUB_REPOSITORY,,}-server" >> "$GITHUB_OUTPUT"
+          echo "client=ghcr.io/${GITHUB_REPOSITORY,,}-client" >> "$GITHUB_OUTPUT"
+      - name: Build and push server image
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile
+          target: server
           push: true
           platforms: linux/amd64, linux/arm64
           tags: |
-            ${{ steps.image.outputs.name }}:latest
-            ${{ steps.image.outputs.name }}:${{ github.ref_name }}
+            ${{ steps.image.outputs.server }}:latest
+            ${{ steps.image.outputs.server }}:${{ github.ref_name }}
+      - name: Build and push client image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: client
+          push: true
+          platforms: linux/amd64, linux/arm64
+          tags: |
+            ${{ steps.image.outputs.client }}:latest
+            ${{ steps.image.outputs.client }}:${{ github.ref_name }}
