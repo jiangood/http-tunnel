@@ -3,5 +3,6 @@ name = "home"
 token = "use_a_secret_that_only_you_know"
 
 [[tunnels]]
+name = "nas"
 domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
