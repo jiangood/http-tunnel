@@ -93,8 +93,7 @@ For `PUT`, send JSON with `domain` and `local_addr` fields. The API binds to `0.
 docker run -d --name http-tunnel --restart unless-stopped \
   -p 2333:2333 -p 80:80 \
   -e HTTP_TUNNEL_TOKEN='replace-with-a-long-random-secret' \
-  ghcr.io/jiangood/http-tunnel:latest server \
-  --server-port 2333 --http-port 80
+  ghcr.io/jiangood/http-tunnel:latest server
 ```
 
 Run the client with its config mounted read-only or read-write as required (the API writes changes back to the file):
