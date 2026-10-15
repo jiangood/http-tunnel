@@ -128,7 +128,7 @@ jobs:
             target/${{ matrix.target }}/release/hts-${{ matrix.name }}.zip
             target/${{ matrix.target }}/release/htc-${{ matrix.name }}.zip
           generate_release_notes: true
-          draft: true
+          draft: false
 
   docker:
     name: Publish to GitHub Container Registry
