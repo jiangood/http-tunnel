@@ -40,6 +40,7 @@ name = "home-nas"
 token = "replace-with-a-long-random-secret"
 
 [[tunnels]]
+name = "nas"
 domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
 ```
@@ -68,7 +69,7 @@ retry_interval = 1       # Seconds between reconnect attempts
 nodelay = true           # TCP_NODELAY; default: true
 
 [[tunnels]]
-name = "app1"             # Optional; defaults to domain
+name = "app1"             # Required; unique within this client
 domain = "app1.example.com"
 local_addr = "127.0.0.1:1081"
 
@@ -77,7 +78,7 @@ domain = "app2.example.com"
 local_addr = "127.0.0.1:1082"
 ```
 
-Each tunnel has a unique client-local `name`, a `domain` to route, and a `local_addr` reachable from the client.
+Each tunnel requires a unique client-local `name`, a `domain` to route, and a `local_addr` reachable from the client.
 
 ## Routing behavior
 
