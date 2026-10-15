@@ -20,50 +20,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            name: x86_64-linux-gnu
-            cross: false
+          # Currently only publish Linux x86_64 (amd64), using musl for static binaries.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             name: x86_64-linux-musl
-            cross: false
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            name: aarch64-linux-musl
-            cross: true
-          - os: ubuntu-latest
-            target: arm-unknown-linux-musleabi
-            name: arm-linux-musleabi
-            cross: true
-          - os: ubuntu-latest
-            target: arm-unknown-linux-musleabihf
-            name: arm-linux-musleabihf
-            cross: true
-          - os: ubuntu-latest
-            target: armv7-unknown-linux-musleabihf
-            name: armv7-linux-musleabihf
-            cross: true
-
-          # The `mips*` targets are Tier 3: they have no prebuilt `std` for the
-          # current stable toolchain, so `cross` fails with `can't find crate for
-          # core`. They were only buildable while the toolchain happened to match
-          # the one bundled in the cross image. Restore them with `build-std` on
-          # nightly if mips releases are needed again.
-
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            name: x86_64-darwin
-            cross: false
-
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            name: aarch64-darwin
-            cross: false
-
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            name: x86_64-windows
             cross: false
     steps:
       - uses: actions/checkout@v4
@@ -148,13 +108,11 @@ jobs:
         with:
           pattern: http-tunnel-*-linux-musl
           path: build-out
-      - name: Lay out the binaries by architecture
+      - name: Lay out the Linux amd64 binaries
         run: |
-          mkdir -p build-out/amd64 build-out/arm64
+          mkdir -p build-out/amd64
           cp build-out/http-tunnel-x86_64-linux-musl/hts build-out/amd64/
           cp build-out/http-tunnel-x86_64-linux-musl/htc build-out/amd64/
-          cp build-out/http-tunnel-aarch64-linux-musl/hts build-out/arm64/
-          cp build-out/http-tunnel-aarch64-linux-musl/htc build-out/arm64/
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -179,7 +137,7 @@ jobs:
           file: Dockerfile
           target: server
           push: true
-          platforms: linux/amd64, linux/arm64
+          platforms: linux/amd64
           tags: |
             ${{ steps.image.outputs.server }}:latest
             ${{ steps.image.outputs.server }}:${{ github.ref_name }}
