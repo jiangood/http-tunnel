@@ -1,6 +1,7 @@
 use crate::helper::normalize_domain;
 use crate::protocol::Digest;
 use crate::server::{HttpVisitor, ServerState};
+use crate::config::ServerProxyEntry;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -68,6 +69,26 @@ impl RoutingTable {
     }
 }
 
+
+fn find_proxy<'a>(proxies: &'a [ServerProxyEntry], host: &str) -> Option<&'a ServerProxyEntry> {
+    let mut wildcard: Option<(&ServerProxyEntry, usize)> = None;
+    for proxy in proxies {
+        let domain = normalize_domain(&proxy.domain)?;
+        if !domain.starts_with("*.") && domain == host {
+            return Some(proxy);
+        }
+        if let Some(suffix) = domain.strip_prefix("*.") {
+            if host.len() > suffix.len()
+                && host.ends_with(&format!(".{}", suffix))
+                && wildcard.map(|(_, len)| suffix.len() > len).unwrap_or(true)
+            {
+                wildcard = Some((proxy, suffix.len()));
+            }
+        }
+    }
+    wildcard.map(|(proxy, _)| proxy)
+}
+
 /// The HTTP entrypoint of the server. It accepts visitors on `http_port`, sniffs the
 /// `Host` header, and hands the visitor over to the corresponding tunnel.
 ///
@@ -76,12 +97,14 @@ pub(crate) async fn serve(
     port: u16,
     state: Arc<ServerState>,
     mut shutdown_rx: broadcast::Receiver<bool>,
+    proxies: Vec<ServerProxyEntry>,
 ) -> Result<()> {
     let addr = crate::helper::to_bind_addr(port);
     let l = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("Failed to listen at `http_port` ({})", port))?;
     info!("HTTP listening at {}", addr);
+    let proxies = Arc::new(proxies);
 
     loop {
         tokio::select! {
@@ -89,8 +112,9 @@ pub(crate) async fn serve(
                 match ret {
                     Ok((stream, addr)) => {
                         let state = state.clone();
+                        let proxies = proxies.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_visitor(stream, addr, state).await {
+                            if let Err(e) = handle_visitor(stream, addr, state, proxies).await {
                                 debug!("Failed to route visitor {}: {:#}", addr, e);
                             }
                         });
@@ -110,6 +134,7 @@ async fn handle_visitor(
     mut stream: TcpStream,
     addr: SocketAddr,
     state: Arc<ServerState>,
+    proxies: Arc<Vec<ServerProxyEntry>>,
 ) -> Result<()> {
     // Count the visitor as active from the moment it's accepted, so that a
     // shutdown can wait for it instead of cutting it off.
@@ -140,6 +165,22 @@ async fn handle_visitor(
         }
         Ok(Ok(header)) => header,
     };
+
+    if let Some(proxy) = find_proxy(&proxies, &host) {
+        debug!("Proxying visitor {} for host {} to {}", addr, host, proxy.local_addr);
+        match TcpStream::connect(&proxy.local_addr).await {
+            Ok(mut upstream) => {
+                upstream.write_all(&prefetched).await?;
+                let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+            }
+            Err(e) => {
+                warn!("Failed to connect server-side proxy {} to {}: {}", host, proxy.local_addr, e);
+                respond(&mut stream, "502 Bad Gateway", "The server-side proxy target is unavailable\\n").await;
+            }
+        }
+        drop(activity);
+        return Ok(());
+    }
 
     let digest = {
         let rt = state.routing_table.read().await;
