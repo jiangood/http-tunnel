@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     let cmd = Command::Server(ServerArgs {
         server_port: config.server_port,
         http_port: config.http_port,
-        token: config.token.to_string(),
+        token: String::from(&*config.token),
     });
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
