@@ -119,7 +119,7 @@ pub(crate) struct ServerState {
 
 // The entrypoint of running a server
 pub async fn run_server(args: ServerArgs, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    let mut server = Server::new(args.server_port, args.http_port, args.token);
+    let mut server = Server::new(args.server_port, args.http_port, args.token, args.proxies);
     server.run(shutdown_rx).await?;
 
     Ok(())
@@ -130,6 +130,7 @@ struct Server {
     state: Arc<ServerState>,
     server_addr: String,
     http_port: u16,
+    proxies: Vec<crate::config::ServerProxyEntry>,
 }
 
 impl ServerState {
@@ -146,7 +147,7 @@ impl ServerState {
 
 impl Server {
     // Create a server from the command line options
-    pub fn new(server_port: u16, http_port: u16, token: String) -> Server {
+    pub fn new(server_port: u16, http_port: u16, token: String, proxies: Vec<crate::config::ServerProxyEntry>) -> Server {
         let server_addr = to_bind_addr(server_port);
         let state = Arc::new(ServerState::new(MaskedString::from(token)));
 
@@ -154,6 +155,7 @@ impl Server {
             state,
             server_addr,
             http_port,
+            proxies,
         }
     }
 
@@ -178,6 +180,7 @@ impl Server {
             self.http_port,
             self.state.clone(),
             shutdown_rx.resubscribe(),
+            self.proxies.clone(),
         ));
 
         // Retry at least every 100ms
