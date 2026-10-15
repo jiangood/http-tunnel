@@ -74,6 +74,7 @@ domain = "app1.example.com"
 local_addr = "127.0.0.1:1081"
 
 [[tunnels]]
+name = "app2"
 domain = "app2.example.com"
 local_addr = "127.0.0.1:1082"
 ```
