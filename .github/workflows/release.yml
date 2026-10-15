@@ -184,8 +184,10 @@ jobs:
       - name: Compute image names
         id: image
         run: |
-          echo "server=ghcr.io/${GITHUB_REPOSITORY%/*}/hts" >> "$GITHUB_OUTPUT"
-          echo "client=ghcr.io/${GITHUB_REPOSITORY%/*}/htc" >> "$GITHUB_OUTPUT"
+          owner="${GITHUB_REPOSITORY%%/*}"
+          owner="${owner,,}"
+          echo "server=ghcr.io/${owner}/hts" >> "$GITHUB_OUTPUT"
+          echo "client=ghcr.io/${owner}/htc" >> "$GITHUB_OUTPUT"
       - name: Build and push server image
         uses: docker/build-push-action@v6
         with:
