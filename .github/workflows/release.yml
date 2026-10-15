@@ -23,32 +23,26 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             name: x86_64-linux-gnu
-            exe: http-tunnel
             cross: false
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             name: x86_64-linux-musl
-            exe: http-tunnel
             cross: false
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             name: aarch64-linux-musl
-            exe: http-tunnel
             cross: true
           - os: ubuntu-latest
             target: arm-unknown-linux-musleabi
             name: arm-linux-musleabi
-            exe: http-tunnel
             cross: true
           - os: ubuntu-latest
             target: arm-unknown-linux-musleabihf
             name: arm-linux-musleabihf
-            exe: http-tunnel
             cross: true
           - os: ubuntu-latest
             target: armv7-unknown-linux-musleabihf
             name: armv7-linux-musleabihf
-            exe: http-tunnel
             cross: true
 
           # The `mips*` targets are Tier 3: they have no prebuilt `std` for the
@@ -60,19 +54,16 @@ jobs:
           - os: macos-latest
             target: x86_64-apple-darwin
             name: x86_64-darwin
-            exe: http-tunnel
             cross: false
 
           - os: macos-latest
             target: aarch64-apple-darwin
             name: aarch64-darwin
-            exe: http-tunnel
             cross: false
 
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             name: x86_64-windows
-            exe: http-tunnel.exe
             cross: false
     steps:
       - uses: actions/checkout@v4
@@ -113,34 +104,27 @@ jobs:
         uses: crazy-max/ghaction-upx@v3
         with:
           version: v4.0.2
-          files: target/${{ matrix.target }}/release/${{ matrix.exe }}
+          files: |
+            target/${{ matrix.target }}/release/hts*
+            target/${{ matrix.target }}/release/htc*
           args: -q --best --lzma
       - uses: actions/upload-artifact@v4
         with:
           name: http-tunnel-${{ matrix.name }}
           path: |
-            target/${{ matrix.target }}/release/http-tunnel*
             target/${{ matrix.target }}/release/hts*
             target/${{ matrix.target }}/release/htc*
-      - name: Zip Release
-        uses: TheDoctor0/zip-release@0.7.6
-        with:
-          type: zip
-          filename: http-tunnel-${{ matrix.name }}.zip
-          directory: target/${{ matrix.target }}/release/
-          path: ${{ matrix.exe }}
       - name: Package hts and htc
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           cd target/${{ matrix.target }}/release
-          zip -j hts-${{ matrix.name }}.zip hts${{ matrix.exe == 'http-tunnel.exe' && '.exe' || '' }}
-          zip -j htc-${{ matrix.name }}.zip htc${{ matrix.exe == 'http-tunnel.exe' && '.exe' || '' }}
+          zip -j hts-${{ matrix.name }}.zip hts${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+          zip -j htc-${{ matrix.name }}.zip htc${{ contains(matrix.target, 'windows') && '.exe' || '' }}
       - name: Publish
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            target/${{ matrix.target }}/release/http-tunnel-${{ matrix.name }}.zip
             target/${{ matrix.target }}/release/hts-${{ matrix.name }}.zip
             target/${{ matrix.target }}/release/htc-${{ matrix.name }}.zip
           generate_release_notes: true
