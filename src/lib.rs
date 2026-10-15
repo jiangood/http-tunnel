@@ -6,7 +6,7 @@ mod multi_map;
 mod protocol;
 mod transport;
 
-pub use cli::{Cli, ClientArgs, Command, ServerArgs};
+pub use cli::{ClientArgs, Command, ServerArgs};
 pub use config::{ClientConfig, ServerConfig};
 
 use anyhow::Result;
