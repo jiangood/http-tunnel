@@ -7,7 +7,7 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cmd = Cli::parse().into_command()?;
-    if !matches!(cmd, Command::Client(_)) {
+    if !matches!(&cmd, Command::Client(_)) {
         bail!("htc only runs the client; use hts for the server");
     }
 
