@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
             .chain(args),
     )?;
     let cmd = cli.into_command()?;
-    if !matches!(cmd, http_tunnel::Command::Server(_)) {
+    if !matches!(&cmd, http_tunnel::Command::Server(_)) {
         bail!("hts only runs the server");
     }
 
