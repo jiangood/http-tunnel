@@ -24,43 +24,24 @@ const COPY_BUF_SIZE: usize = 64 * 1024;
 
 // The entrypoint of running a client
 pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    // Load the configuration file. A missing file is not an error: the identity
-    // can be given on the command line instead, in which case the client simply
-    // has no tunnel.
-    let mut config = ClientConfig::from_file(&args.config_path).await?;
-
-    // The command line wins over the configuration file
-    if let Some(remote) = args.remote {
-        config.remote = Some(remote);
-    }
-    if let Some(name) = args.name {
-        config.name = Some(name);
-    }
-    if let Some(token) = args.token {
-        config.token = Some(token.into());
-    }
-    if let Some(api_port) = args.api_port {
-        config.api_port = Some(api_port);
-    }
+    // The fixed TOML file is the only source of client configuration.
+    let config = ClientConfig::from_file(&args.config_path).await?;
 
     let remote = config.remote.clone().ok_or_else(|| {
         anyhow!(
-            "The address of the server is missing. Pass `--remote`, set \
-             `HTTP_TUNNEL_REMOTE`, or set `remote` in {:?}",
+            "The address of the server is missing. Set `remote` in {:?}",
             args.config_path
         )
     })?;
     let name = config.name.clone().ok_or_else(|| {
         anyhow!(
-            "The name of the client is missing. Pass `--name`, set `HTTP_TUNNEL_NAME`, \
-             or set `name` in {:?}",
+            "The name of the client is missing. Set `name` in {:?}",
             args.config_path
         )
     })?;
     let token = config.token.clone().ok_or_else(|| {
         anyhow!(
-            "The token is missing. Pass `--token`, set `HTTP_TUNNEL_TOKEN`, or set \
-             `token` in {:?}",
+            "The token is missing. Set `token` in {:?}",
             args.config_path
         )
     })?;
