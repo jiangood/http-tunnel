@@ -148,7 +148,7 @@ jobs:
           file: Dockerfile
           target: client
           push: true
-          platforms: linux/amd64, linux/arm64
+          platforms: linux/amd64
           tags: |
             ${{ steps.image.outputs.client }}:latest
             ${{ steps.image.outputs.client }}:${{ github.ref_name }}
