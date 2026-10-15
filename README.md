@@ -10,7 +10,7 @@
 
 - Multiple domains and wildcard routes on one public HTTP port
 - WebSocket and protocol upgrade support
-- No server-side tunnel configuration
+- Optional server-side reverse proxy rules for services running on the server itself
 - Automatic reconnect and pooled data channels
 - Optional runtime client API
 
@@ -28,11 +28,31 @@ Run the server once to generate `hts.toml`:
 ./hts
 ```
 
-Edit `hts.toml` and set a strong shared token. The default ports are TCP `2333` for client connections and TCP `80` for public HTTP traffic. Then start the server again:
+Edit `hts.toml` and set a strong shared token. The default ports are TCP `2333` for client connections and TCP `80` for public HTTP traffic. You can also configure direct reverse-proxy routes to services on the server itself. Then start the server again:
 
 ```sh
 ./hts
 ```
+
+Example server configuration with a direct reverse proxy:
+
+```toml
+server_port = 2333
+http_port = 80
+token = "use-a-long-random-secret"
+
+[[proxies]]
+name = "grafana"
+domain = "grafana.example.com"
+local_addr = "127.0.0.1:3000"
+
+[[proxies]]
+name = "dashboard"
+domain = "dashboard.example.com"
+local_addr = "127.0.0.1:8080"
+```
+
+Each `[[proxies]]` entry routes requests for its `domain` directly to `local_addr` on the server; no `htc` client is needed for these routes. Wildcard domains such as `*.example.com` are supported. Direct proxy routes take precedence over client tunnel routes when domains overlap. The target should normally bind to loopback (for example, `127.0.0.1:3000`) if it should only be reachable through `hts`.
 
 To run it in the background and append output to `hts.log`:
 
@@ -67,7 +87,7 @@ local_addr = "127.0.0.1:80"
 
 ## Configuration
 
-- `hts` reads only `hts.toml` from the current working directory.
+- `hts` reads only `hts.toml` from the current working directory. Server-side direct proxy rules are declared as `[[proxies]]` entries with `name`, `domain`, and `local_addr`.
 - `htc` reads only `htc.toml` from the current working directory.
 - If the file does not exist, the program creates an example configuration and exits. Edit the generated file, then restart the program.
 - `--help` and `--version` remain available. `-b` / `--background` starts the process in the background; output is appended to `hts.log` or `htc.log` in the current directory. Business settings cannot be overridden through command-line flags or environment variables.
