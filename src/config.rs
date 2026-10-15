@@ -65,14 +65,13 @@ pub struct ClientTunnelConfig {
 
 /// A tunnel as declared in the `[[tunnels]]` array of the configuration file.
 ///
-/// The `name` is the identity of the tunnel within the client and is what the
-/// administration API addresses. It is optional and defaults to the `domain`.
+/// The `name` is the required identity of the tunnel within the client and is what the
+/// administration API addresses.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TunnelEntry {
-    /// The identity of the tunnel, unique within the client. Defaults to `domain`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    /// The required identity of the tunnel, unique within the client
+    pub name: String,
     /// The domain (the `Host` header) that is routed to this tunnel
     pub domain: String,
     /// The address of the local service on the client side
@@ -142,7 +141,7 @@ impl ClientConfig {
             .tunnels
             .iter()
             .map(|entry| ClientTunnelConfig {
-                name: entry.name.clone().unwrap_or_else(|| entry.domain.clone()),
+                name: entry.name.clone(),
                 domain: entry.domain.clone(),
                 local_addr: entry.local_addr.clone(),
                 nodelay,
@@ -153,9 +152,9 @@ impl ClientConfig {
         tunnels
     }
 
-    /// The name of a declared tunnel, defaulting to its domain
+    /// The name of a declared tunnel
     fn entry_name(entry: &TunnelEntry) -> &str {
-        entry.name.as_deref().unwrap_or(entry.domain.as_str())
+        &entry.name
     }
 
     /// Replace the tunnel of the given name, or add it
@@ -170,7 +169,7 @@ impl ClientConfig {
                 entry.local_addr = local_addr;
             }
             None => self.tunnels.push(TunnelEntry {
-                name: Some(name),
+                name,
                 domain,
                 local_addr,
             }),
@@ -220,8 +219,8 @@ impl ClientConfig {
     }
 
     /// Validate a configuration and normalize it in place: lowercase the tunnel
-    /// domains, default the names to the domains, and reject the empty,
-    /// malformed or duplicated definitions.
+    /// domains, validate required names, and reject empty, malformed or
+    /// duplicated definitions.
     pub fn validate(config: &mut ClientConfig) -> Result<()> {
         let mut names: BTreeMap<String, ()> = BTreeMap::new();
         let mut domains: BTreeMap<String, ()> = BTreeMap::new();
@@ -235,10 +234,7 @@ impl ClientConfig {
             let domain = crate::helper::normalize_domain(&entry.domain)
                 .ok_or_else(|| anyhow!("The domain `{}` is invalid", entry.domain))?;
 
-            let name = match entry.name {
-                Some(name) => validate_name(&name)?,
-                None => domain.clone(),
-            };
+            let name = validate_name(&entry.name)?;
 
             if domains.insert(domain.clone(), ()).is_some() {
                 bail!("The domain `{}` is defined more than once", domain);
@@ -248,7 +244,7 @@ impl ClientConfig {
             }
 
             entries.push(TunnelEntry {
-                name: Some(name),
+                name,
                 domain,
                 local_addr: entry.local_addr,
             });
@@ -379,6 +375,7 @@ domain = "Foo1.Example.COM"
 local_addr = "127.0.0.1:80"
 
 [[tunnels]]
+name = "foo2"
 domain = "foo2.example.com"
 local_addr = "127.0.0.1:81"
 "#;
@@ -387,7 +384,7 @@ local_addr = "127.0.0.1:81"
         let tunnels = cfg.resolved_tunnels();
         assert_eq!(tunnels.len(), 2);
         // The domains are lowercased and the order is by name
-        assert_eq!(tunnels[0].name, "foo2.example.com"); // defaults to the domain
+        assert_eq!(tunnels[0].name, "foo2");
         assert_eq!(tunnels[0].domain, "foo2.example.com");
         assert_eq!(tunnels[0].local_addr, "127.0.0.1:81");
         assert_eq!(tunnels[1].name, "nas");
@@ -490,6 +487,7 @@ token = "123"
     fn test_rejects_an_empty_local_addr() {
         let s = r#"
 [[tunnels]]
+name = "foo"
 domain = "foo.example.com"
 local_addr = ""
 "#;
@@ -500,6 +498,7 @@ local_addr = ""
     fn test_rejects_an_invalid_domain() {
         let s = r#"
 [[tunnels]]
+name = "foo"
 domain = "foo bar"
 local_addr = "127.0.0.1:80"
 "#;
@@ -510,10 +509,12 @@ local_addr = "127.0.0.1:80"
     fn test_rejects_a_duplicated_domain() {
         let s = r#"
 [[tunnels]]
+name = "foo1"
 domain = "foo.example.com"
 local_addr = "127.0.0.1:80"
 
 [[tunnels]]
+name = "foo2"
 domain = "Foo.Example.com"
 local_addr = "127.0.0.1:81"
 "#;
@@ -618,6 +619,7 @@ name = "home"
 token = "123"
 
 [[tunnels]]
+name = "foo1"
 domain = "foo1.example.com"
 local_addr = "127.0.0.1:80"
 "#;
