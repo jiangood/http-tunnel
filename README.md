@@ -1,239 +1,157 @@
 # http-tunnel
 
-[![GitHub stars](https://img.shields.io/github/stars/jiangood/http-tunnel)](https://github.com/jiangood/http-tunnel/stargazers)
-[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/jiangood/http-tunnel)](https://github.com/jiangood/http-tunnel/releases)
-![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/jiangood/http-tunnel/rust.yml?branch=main)
-[![GitHub all releases](https://img.shields.io/github/downloads/jiangood/http-tunnel/total)](https://github.com/jiangood/http-tunnel/releases)
+[![GitHub release](https://img.shields.io/github/v/release/jiangood/http-tunnel)](https://github.com/jiangood/http-tunnel/releases)
+[![Build](https://img.shields.io/github/actions/workflow/status/jiangood/http-tunnel/rust.yml?branch=main)](https://github.com/jiangood/http-tunnel/actions)
+[![License](https://img.shields.io/github/license/jiangood/http-tunnel)](./LICENSE)
 
-A secure, stable and high-performance HTTP reverse proxy for NAT traversal, written in Rust
+A Rust-based HTTP reverse tunnel for exposing services behind NAT through a server with a public IP. Forked from [rathole](https://github.com/rathole-org/rathole).
 
-`http-tunnel` exposes HTTP services on a device behind the NAT to the Internet, via a server with a public IP. The server listens on a single HTTP port and routes each request to the right tunnel according to the `Host` header. The traffic between the server and the client is carried over a plain TCP tunnel.
-
-The whole configuration lives on the clients. The server takes no configuration file: it's started with its
-two ports and a shared token, and it learns the tunnels from the clients as they connect. A client declares
-the tunnels it serves in its own configuration file, so every client manages its own domains.
-
-> `http-tunnel` is a fork of [rathole](https://github.com/rathole-org/rathole), reworked into an HTTP reverse proxy.
-> It is distributed under the Apache-2.0 license, see [LICENSE](./LICENSE).
-
-
+The server routes incoming HTTP connections by `Host`; clients own their tunnel configuration and register routes when connected. Traffic between the server and client travels over TCP.
 
 ## Features
 
-- **HTTP Reverse Proxy** One public HTTP port serves all the tunnels. Requests are routed to the correct tunnel by the `Host` header. WebSocket and other protocol upgrades work transparently, as the traffic is piped through as it is.
-- **Configuration on the Client** The server takes no configuration file. It's started with its ports and a shared token, and it learns the tunnels from the clients. Each client declares its own tunnels in a `client.toml`.
-- **High Performance** Much higher throughput can be achieved than frp, and more stable when handling a large volume of connections.
-- **Low Resource Consumption** Consumes much less memory than similar tools.
-- **Security** Every client is authenticated with the shared token. A domain is served by a single tunnel at a time.
+- One public HTTP port for multiple domains, including wildcard domains.
+- Transparent WebSocket and other protocol upgrades.
+- Client-managed tunnels; no server configuration file.
+- Reconnects automatically and maintains a pool of data channels.
+- Runtime tunnel management through an optional client administration API.
 
-## Quickstart
+## Quick start
 
-A full-powered `http-tunnel` can be obtained from the [release](https://github.com/jiangood/http-tunnel/releases) page. A [Docker image](https://github.com/jiangood/http-tunnel/pkgs/container/http-tunnel) is also available.
+Download a binary from [Releases](https://github.com/jiangood/http-tunnel/releases), or use the [Docker image](https://github.com/jiangood/http-tunnel/pkgs/container/http-tunnel).
 
+### 1. Start the public server
 
-1. On the server which has a public IP
+Choose a strong shared token and keep it private:
 
-Start the server with the port it listens on for clients, the HTTP entrypoint, and a shared token. The server
-reads no configuration file:
-
-```bash
-./http-tunnel server --server-port 2333 --http-port 80 \
-  --token change_me
+```sh
+./http-tunnel server --server-port 2333 --http-port 80 --token 'replace-with-a-long-random-secret'
 ```
 
-Every option can also be passed through an environment variable (`HTTP_TUNNEL_SERVER_PORT`,
-`HTTP_TUNNEL_HTTP_PORT` and `HTTP_TUNNEL_TOKEN`).
+The server needs TCP port `2333` reachable by clients and port `80` reachable by visitors. The token can also be set with `HTTP_TUNNEL_TOKEN`; the ports support `HTTP_TUNNEL_SERVER_PORT` and `HTTP_TUNNEL_HTTP_PORT`.
 
+### 2. Configure the client
 
-2. On the host which is behind the NAT (your NAS)
-
-Create `client.toml` with the following content and accommodate it to your needs:
+Create `client.toml` on the machine behind NAT:
 
 ```toml
-# client.toml
 remote = "myserver.com:2333"
-name = "home_nas" 
-token = "change_me"
-
-[tunnels]
-"nas.example.com" = "127.0.0.1:80" 
-```
-
-Then run it :
-
-```bash
-./http-tunnel
-```
-
-The configuration file is optional and defaults to `client.toml` in the current directory. A different path can
-also be given explicitly:
-
-```bash
-./http-tunnel --config /path/to/client.toml
-```
-
-The identity (`remote`, `name` and `token`) can also be given on the command line or through the environment
-(`HTTP_TUNNEL_REMOTE`, `HTTP_TUNNEL_NAME`, `HTTP_TUNNEL_TOKEN` and `HTTP_TUNNEL_API_PORT`), in which case the
-command line wins over the file. The tunnels, however, live only in the file:
-
-
-
-The [client administration API](#client-administration-api), which maintains the client's own tunnels at
-runtime, listens on `8610` by default. Set `HTTP_TUNNEL_API_PORT` (or `--api-port`) to change it.
-
-3. Now the client will try to connect to the server `myserver.com` on port `2333`, and register its tunnel
-   `nas.example.com`. Any HTTP request to the server on port `80` with `Host: nas.example.com` will be
-   forwarded to the NAS on port `80`.
-
-So you can visit `http://nas.example.com` (with `nas.example.com` resolving to your server) to reach the NAS web UI.
-
-
-
-## Docker
-
-
-The server takes no configuration file, so it only needs its ports and the token. Pass the token through the
-environment, which keeps it out of the container's arguments:
-
-```bash
-docker run -d --name http-tunnel --restart unless-stopped \
-  -p 2333:2333 -p 80:80 \
-  -e HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know \
-  ghcr.io/jiangood/http-tunnel:latest server 
-```
-
-The client reads its tunnels from `client.toml`, so mount the directory that holds it read-write and publish
-its administration API port. No path has to be passed on the command line:
-
-```bash
-
-docker run -d --name http-tunnel --restart unless-stopped \
-  -p 8610:8610 \
-  -v "$PWD:/app" \
-  ghcr.io/jiangood/http-tunnel:latest
-```
-
-
-## Configuration
-
-
-```toml
-remote = "myserver.com:2333" # Necessary. The address of the server
-name = "home" # Necessary. The name of the client, used for logging
-token = "use_a_secret_that_only_you_know" # Necessary. The shared token of the server
-api_port = 8610 # Optional. The port of the client administration API. 0 disables it. Default: 8610
-heartbeat_timeout = 40 # Optional. The application-layer heartbeat timeout. Set to 0 to disable the test. Default: 40 seconds
-retry_interval = 1 # Optional. The interval between retries to connect to the server. Default: 1 second
-nodelay = true # Optional. Whether to enable TCP_NODELAY for the tunnels. Default: true
-
-[[tunnels]] # Each tunnel is a table with its own name, domain and local_addr
-name = "app1" # Optional. The identity of the tunnel within the client. Default: the domain
-domain = "app1.example.com" # The `Host` the tunnel serves
-local_addr = "127.0.0.1:1081" # The address of the local service
+name = "home-nas"
+token = "replace-with-a-long-random-secret"
 
 [[tunnels]]
-name = "app2"
+domain = "nas.example.com"
+local_addr = "127.0.0.1:80"
+```
+
+Start the client:
+
+```sh
+./http-tunnel --config client.toml
+```
+
+Point `nas.example.com` to the public server's IP. Visiting `http://nas.example.com` will forward traffic to `127.0.0.1:80` on the client machine.
+
+The client configuration path defaults to `client.toml` in the current directory. `remote`, `name`, and `token` can also be supplied through command-line options or the corresponding `HTTP_TUNNEL_REMOTE`, `HTTP_TUNNEL_NAME`, and `HTTP_TUNNEL_TOKEN` environment variables; command-line values take precedence over the file.
+
+## Client configuration
+
+A client can define multiple tunnels:
+
+```toml
+remote = "myserver.com:2333"
+name = "home"
+token = "replace-with-a-long-random-secret"
+api_port = 8610          # Default: 8610; set to 0 to disable the API
+heartbeat_timeout = 40   # Seconds; set to 0 to disable heartbeat timeout
+retry_interval = 1       # Seconds between reconnect attempts
+nodelay = true           # TCP_NODELAY; default: true
+
+[[tunnels]]
+name = "app1"             # Optional; defaults to domain
+domain = "app1.example.com"
+local_addr = "127.0.0.1:1081"
+
+[[tunnels]]
 domain = "app2.example.com"
 local_addr = "127.0.0.1:1082"
-
-
 ```
 
+Each tunnel has a unique client-local `name`, a `domain` to route, and a `local_addr` reachable from the client.
 
-### Routing
+## Routing behavior
 
-The server accepts HTTP connections on `http_port`. For every connection, it reads the HTTP request line and the `Host` header (without touching the body), and forwards the connection to the tunnel whose domain matches that host. Host matching is case-insensitive, the port, if any, is ignored, and the trailing dot of a fully qualified name (e.g. `nas.example.com.`) is stripped. An absolute-form request line (`GET http://host/path HTTP/1.1`, as sent by proxy clients) is routed by the authority of the target. A request with several `Host` headers is rejected with `400`.
+- Exact domains take precedence over wildcards. `*.example.com` matches subdomains at any depth, but not `example.com` itself.
+- Host matching is case-insensitive; an optional port and a trailing dot are ignored. Absolute-form HTTP request targets are supported. Requests with multiple `Host` headers are rejected.
+- Routes exist only while their client control channel is connected. An unknown route returns `404`; if no data channel becomes available within 10 seconds, the visitor receives `504`.
+- Routing happens once per TCP connection, using its first request. A keep-alive connection cannot switch tunnels based on a later request's `Host`.
+- Malformed requests, oversized headers, and slow headers are rejected.
 
-A tunnel domain may be a wildcard, `*.example.com`, which matches any subdomain
-at any depth but not the apex `example.com`. An exact domain always wins over a
-wildcard, and among the wildcards the longest suffix wins.
+## Client administration API
 
-The server has no configuration file, so a domain is known only while the control channel of its tunnel is
-connected. If no tunnel matches the `Host`, the server responds with `404`; a domain whose client is
-disconnected is simply no longer claimed, so it is answered with `404` as well. If the tunnel is connected
-but no data channel is available within 10 seconds, the visitor is answered with `504` instead of being left
-hanging. A `504` is also returned when the client takes the data channel but closes it without sending a
-response — which is how a client that cannot reach its `local_addr` fails — instead of the visitor getting an
-empty reply. A malformed request, an oversized header, and a header that is too slow to arrive are answered
-with `400`, `431`, and `408` respectively.
-
-Routing is done once per connection, on its first request. A keep-alive connection cannot be re-routed to another tunnel if a later request carries a different `Host`. Because of that, the `Host` used for routing is the one of the first request of the connection; a proxy client that reuses a connection across origins will reach the backend of the first request.
-
-### Logging
-
-`http-tunnel`, like many other Rust programs, use environment variables to control the logging level. `info`, `warn`, `error`, `debug`, `trace` are available.
-
-```shell
-RUST_LOG=error ./http-tunnel server --server-port 2333 --http-port 80 --token secret
-```
-
-will run `http-tunnel` with only error level logging.
-
-If `RUST_LOG` is not present, the default logging level is `info`.
-
-The logs name the reason a visitor could not be served, so that a failure can be told apart from a routing miss:
-a malformed request is logged as a bad header, an unknown `Host` as a routing miss, and a missing data channel as
-a timeout or a tunnel that closes the data channel without responding. A failure is logged with the tunnel.
-
-### Tuning
-
-`http-tunnel` enables TCP_NODELAY by default, which should benefit the latency and interactive applications. However, it slightly decreases the bandwidth.
-
-If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false` for a whole client.
-
-The bytes between a visitor, the tunnel and the local service are piped through
-64 KiB buffers on both the server and the client. Raising the tokio default
-(8 KiB) reduces the number of syscalls on large transfers; the buffers are
-allocated per forwarded connection, so the concurrency of large transfers is
-what trades against memory.
-
-## Client Administration API
-
-The client exposes a REST API to maintain its own tunnels at runtime. It listens on `8610` by default; change the
-port with `--api-port` or the `HTTP_TUNNEL_API_PORT` environment variable, or set it to `0` to disable the API:
-
-```bash
-./http-tunnel --config client.toml --api-port 2336
-```
-
-All the routes require `Authorization: Bearer <token>`, reusing the shared token, so there is no second secret. The
-client is the source of truth: a change is validated and written back to the client configuration file, and applied
-to the running tunnels without a restart.
+The client API listens on `8610` by default; use `--api-port` or `HTTP_TUNNEL_API_PORT` to change the port, or set it to `0` to disable the API. All endpoints require `Authorization: Bearer <token>`, using the shared tunnel token.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/api/status` | The client identity, its connection state and its tunnel count |
-| `GET` | `/api/tunnels` | List the tunnels the client is serving |
-| `PUT` | `/api/tunnels/{name}` | Create or replace a tunnel (`{domain, local_addr}`) |
+| `GET` | `/api/status` | Client connection status and tunnel count |
+| `GET` | `/api/tunnels` | List tunnels |
+| `PUT` | `/api/tunnels/{name}` | Create or replace a tunnel; JSON body: `{"domain":"nas.example.com","local_addr":"127.0.0.1:80"}` |
 | `DELETE` | `/api/tunnels/{name}` | Delete a tunnel |
 
-`{name}` is the identity of the tunnel (`{name}`, not its domain). A tunnel that
-was declared without a name is addressed by its domain.
+Example:
 
-```bash
-curl -X PUT http://127.0.0.1:2336/api/tunnels/nas \
-  -H "Authorization: Bearer $CLIENT_TOKEN" -H "Content-Type: application/json" \
+```sh
+curl -X PUT http://127.0.0.1:8610/api/tunnels/nas \
+  -H "Authorization: Bearer $CLIENT_TOKEN" \
+  -H "Content-Type: application/json" \
   -d '{"domain":"nas.example.com","local_addr":"127.0.0.1:80"}'
 ```
 
-The API binds to `0.0.0.0`, so protect it with a reverse proxy that terminates TLS,
-a firewall rule, or a private network such as WireGuard. See
-[`docs/client-api.md`](./docs/client-api.md) for the details and the caveats.
+**Security:** the API binds to `0.0.0.0`. Do not expose it directly to the Internet. Restrict access with a firewall or private network, or place it behind a TLS-terminating reverse proxy. Use a strong token and protect the client configuration file.
 
-## Planning
+## Docker
 
-- [x] Client administration API to maintain a client's own tunnels
-- [x] Configuration on the client, with a configuration-free server
+Run the public server:
 
-[Out of Scope](./docs/out-of-scope.md) lists features that are not planned to be implemented and why.
+```sh
+docker run -d --name http-tunnel --restart unless-stopped \
+  -p 2333:2333 -p 80:80 \
+  -e HTTP_TUNNEL_TOKEN='replace-with-a-long-random-secret' \
+  ghcr.io/jiangood/http-tunnel:latest server \
+  --server-port 2333 --http-port 80
+```
 
-## Benchmarking
+Run a client with `client.toml` in the current directory:
 
-The HTTP path has a small harness in [`benches/`](./benches) that starts an echo
-backend, a server and a client, and measures small requests, short-lived
-connections, and concurrent 1 MiB bodies. It uses the same ports as the
-integration tests, so it can't run at the same time as them:
+```sh
+docker run -d --name http-tunnel-client --restart unless-stopped \
+  -v "$PWD:/app" -w /app \
+  ghcr.io/jiangood/http-tunnel:latest \
+  --config /app/client.toml
+```
+
+If you enable the client API in Docker, publish its port only on a trusted interface and apply the security guidance above.
+
+## Logging and tuning
+
+Set `RUST_LOG` to `error`, `warn`, `info`, `debug`, or `trace`. The default is `info`.
+
+```sh
+RUST_LOG=error ./http-tunnel server --server-port 2333 --http-port 80 --token secret
+```
+
+TCP_NODELAY is enabled by default. Set `nodelay = false` to favor throughput over latency. Forwarding uses 64 KiB copy buffers on both server and client, so memory use increases with concurrent large transfers.
+
+## Development
+
+Run the throughput benchmark (it uses ports shared with integration tests, so don't run both simultaneously):
 
 ```sh
 RUST_LOG=error cargo bench --bench throughput
 ```
+
+See [Out of Scope](./docs/out-of-scope.md) for features this project intentionally does not implement.
+
+## License
+
+[Apache-2.0](./LICENSE)
