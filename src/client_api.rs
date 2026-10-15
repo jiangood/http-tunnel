@@ -10,8 +10,7 @@
 //!
 //! A tunnel has a `name`, its identity within the client, and a `domain`, the
 //! `Host` header it serves. `PUT` and `DELETE` address a tunnel by its name;
-//! `PUT` takes the `domain` and the `local_addr` in its body. A tunnel that is
-//! declared without a name is named after its domain.
+//! `PUT` takes the `domain` and the `local_addr` in its body.
 
 use crate::client::ClientState;
 use crate::config::ClientTunnelConfig;
