@@ -7,7 +7,8 @@ ARG TARGETARCH
 # The binary is installed outside the working directory, so that a client that
 # mounts a directory over `/app` (to hold its `client.toml`) doesn't hide it. The
 # server takes no configuration file and needs no mount, only its ports and token:
-#   docker run -e HTTP_TUNNEL_TOKEN=... -p 2333:2333 -p 80:80 ... server --server-port 2333 --http-port 80
+#   docker run -e HTTP_TUNNEL_TOKEN=... -p 2333:2333 -p 80:80 ... server
+# Server ports default to 2333 (client connections) and 80 (HTTP entrypoint).
 # The mode is set explicitly: the release workflow gets the binaries through
 # upload-artifact/download-artifact, which do not preserve the executable bit.
 # The distroless stage has no shell, so it cannot chmod after the copy.
