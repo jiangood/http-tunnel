@@ -548,6 +548,16 @@ local_addr = "127.0.0.1:81"
     }
 
     #[test]
+    fn test_rejects_a_missing_name() {
+        let s = r#"
+[[tunnels]]
+domain = "foo.example.com"
+local_addr = "127.0.0.1:80"
+"#;
+        assert!(ClientConfig::parse(s).is_err());
+    }
+
+    #[test]
     fn test_rejects_a_missing_domain() {
         let s = r#"
 [[tunnels]]
