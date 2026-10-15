@@ -15,9 +15,8 @@ without the `client-api` feature (on by default) has no API.
 ## Resources
 
 A tunnel has two names: a `name`, its identity within the client, and a `domain`, the `Host` header it serves and
-that the server routes to it. A tunnel is created and deleted by its `name`; the `domain` is part of its body and
-`GET /api/tunnels` returns both. A tunnel that is declared in the configuration file without a `name` is named
-after its `domain`, so the name defaults to something stable.
+that the server routes to it. A tunnel is created and deleted by its required `name`; the `domain` is part of its body and
+`GET /api/tunnels` returns both.
 
 The client is the source of truth: a change is validated locally, written back to the client configuration file,
 and applied to the running control channels without a restart of either side. The handlers answer once the change
