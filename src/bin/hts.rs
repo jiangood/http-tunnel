@@ -1,17 +1,46 @@
 use anyhow::Result;
 use clap::Parser;
 use http_tunnel::{run, Command, ServerArgs, ServerConfig};
-use std::path::Path;
+use std::{fs::OpenOptions, path::Path, process::{Command as ProcessCommand, Stdio}};
 use tokio::{signal, sync::broadcast};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[clap(name = "hts", version, about = "HTTP tunnel server")]
-struct Cli {}
+struct Cli {
+    /// Run in the background and write output to hts.log
+    #[clap(short = 'b', long)]
+    background: bool,
+    /// Internal flag used by the background launcher
+    #[clap(long, hide = true)]
+    background_child: bool,
+}
+
+fn launch_background() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let log = OpenOptions::new().create(true).append(true).open("hts.log")?;
+    let err_log = log.try_clone()?;
+    let mut command = ProcessCommand::new(exe);
+    command.arg("--background-child")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err_log));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command.spawn()?;
+    println!("Started hts in background (pid {}). Log: hts.log", child.id());
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    Cli::parse();
+    let cli = Cli::parse();
+    if cli.background && !cli.background_child {
+        return launch_background();
+    }
     let config = ServerConfig::from_file(Path::new("hts.toml")).await?;
     let cmd = Command::Server(ServerArgs {
         server_port: config.server_port,
