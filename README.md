@@ -16,21 +16,7 @@ the tunnels it serves in its own configuration file, so every client manages its
 > `http-tunnel` is a fork of [rathole](https://github.com/rathole-org/rathole), reworked into an HTTP reverse proxy.
 > It is distributed under the Apache-2.0 license, see [LICENSE](./LICENSE).
 
-<!-- TOC -->
 
-- [http-tunnel](#http-tunnel)
-  - [Features](#features)
-  - [Quickstart](#quickstart)
-  - [Docker](#docker)
-  - [Configuration](#configuration)
-    - [Routing](#routing)
-    - [Logging](#logging)
-    - [Tuning](#tuning)
-  - [Client Administration API](#client-administration-api)
-  - [Planning](#planning)
-  - [Benchmarking](#benchmarking)
-
-<!-- /TOC -->
 
 ## Features
 
@@ -42,11 +28,8 @@ the tunnels it serves in its own configuration file, so every client manages its
 
 ## Quickstart
 
-A full-powered `http-tunnel` can be obtained from the [release](https://github.com/jiangood/http-tunnel/releases) page. Or [build from source](docs/build-guide.md) **for other platforms and minimizing the binary**. A [Docker image](https://github.com/jiangood/http-tunnel/pkgs/container/http-tunnel) is also available.
+A full-powered `http-tunnel` can be obtained from the [release](https://github.com/jiangood/http-tunnel/releases) page. A [Docker image](https://github.com/jiangood/http-tunnel/pkgs/container/http-tunnel) is also available.
 
-To use `http-tunnel`, you need a server with a public IP, and a device behind the NAT with some HTTP services to expose to the Internet.
-
-Assuming you have a NAS at home behind the NAT, and want to expose its web UI at `nas.example.com`:
 
 1. On the server which has a public IP
 
@@ -55,15 +38,12 @@ reads no configuration file:
 
 ```bash
 ./http-tunnel server --server-port 2333 --http-port 80 \
-  --token use_a_secret_that_only_you_know
+  --token change_me
 ```
 
 Every option can also be passed through an environment variable (`HTTP_TUNNEL_SERVER_PORT`,
-`HTTP_TUNNEL_HTTP_PORT` and `HTTP_TUNNEL_TOKEN`), which keeps the token out of `ps` and suits a container:
+`HTTP_TUNNEL_HTTP_PORT` and `HTTP_TUNNEL_TOKEN`).
 
-```bash
-HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know ./http-tunnel server --server-port 2333 --http-port 80
-```
 
 2. On the host which is behind the NAT (your NAS)
 
