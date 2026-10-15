@@ -725,6 +725,12 @@ impl ServerConfig {
 server_port = 2333
 http_port = 80
 token = "replace-with-a-long-random-secret"
+
+# Optional direct reverse-proxy routes to services running on this server.
+# [[proxies]]
+# name = "grafana"
+# domain = "grafana.example.com"
+# local_addr = "127.0.0.1:3000"
 "#;
                 fs::write(path, example).await
                     .with_context(|| format!("Failed to generate default config {:?}", path))?;
