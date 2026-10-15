@@ -185,9 +185,8 @@ impl ClientConfig {
                 if s.contains("server_port") || s.contains("http_port") || s.contains("[clients") {
                     anyhow!(
                         "{}\nNote: `http-tunnel` no longer takes a server configuration file. The \
-                         whole configuration now lives on the client: the server is started with \
-                         `--server-port`, `--http-port` and `--token`, and the tunnels are declared \
-                         in the `[[tunnels]]` array of `client.toml`.",
+                         configure the server in `hts.toml`; client routes belong in \
+                         the `[[tunnels]]` array of `htc.toml`.",
                         e
                     )
                 } else {
@@ -691,8 +690,10 @@ impl ServerConfig {
             Ok(s) => {
                 let config: Self = toml::from_str(&s)
                     .with_context(|| format!("The configuration {:?} is invalid", path))?;
-                if config.token.is_empty() {
-                    bail!("The shared token in {:?} must not be empty", path);
+                if config.token.is_empty()
+                    || &*config.token == "replace-with-a-long-random-secret"
+                {
+                    bail!("Set a strong, non-placeholder shared token in {:?}", path);
                 }
                 Ok(config)
             }
