@@ -2,9 +2,11 @@ name = "home"
 token = "secret"
 
 [[tunnels]]
+name = "nas"
 domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
 
 [[tunnels]]
+name = "nas2"
 domain = "NAS.example.com"
 local_addr = "127.0.0.1:81"
