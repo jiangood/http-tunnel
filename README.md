@@ -97,7 +97,7 @@ Start the server (ports default to TCP `2333` for clients and TCP `80` for HTTP 
 docker run -d --name http-tunnel-server --restart unless-stopped \
   -p 2333:2333 -p 80:80 \
   -e HTTP_TUNNEL_TOKEN='replace-with-a-long-random-secret' \
-  ghcr.io/jiangood/http-tunnel-server:latest
+  ghcr.io/jiangood/hts:latest
 ```
 
 Start the client by mounting its configuration at `/app/client.toml`:
@@ -105,7 +105,7 @@ Start the client by mounting its configuration at `/app/client.toml`:
 ```sh
 docker run -d --name http-tunnel-client --restart unless-stopped \
   -v "$PWD/client.toml:/app/client.toml:ro" \
-  ghcr.io/jiangood/http-tunnel-client:latest
+  ghcr.io/jiangood/htc:latest
 ```
 
 The client API writes configuration changes back to the file, so mount it read-write if you use the API to manage tunnels. The client connects to the server address and port configured in `client.toml`.
