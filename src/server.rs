@@ -355,9 +355,20 @@ async fn do_control_channel_handshake(
     let digest = protocol::digest(domain.as_bytes());
     let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
 
-    // If there's already a control channel for the domain, drop the old one. A
-    // control channel doesn't report back when it's dead, so the handle in the map
-    // could be stale; dropping it lets the client reconnect.
+    info!(tunnel = %domain, client = %name, "Control channel established");
+    let (handle, ch_task) = ControlChannelHandle::new(
+        conn,
+        domain.clone(),
+        name.clone(),
+        nodelay,
+        HEARTBEAT_INTERVAL_SECS,
+        conn_id,
+    );
+
+    // Register the handle and the route. The removal of a previous handle and the
+    // insertion are done under one lock, so that a takeover is atomic: a control
+    // channel that is being replaced can't re-insert itself in between, and the
+    // loser is closed instead of the insertion being silently rejected.
     {
         let mut ccs = state.control_channels.write().await;
         if let Some(prev) = ccs.remove1(&digest) {
@@ -373,31 +384,22 @@ async fn do_control_channel_handshake(
                 );
             }
         }
+        let _ = ccs.insert(digest, session_key, handle);
     }
-
-    info!(tunnel = %domain, client = %name, "Control channel established");
-    let (handle, ch_task) =
-        ControlChannelHandle::new(conn, domain.clone(), name, nodelay, HEARTBEAT_INTERVAL_SECS, conn_id);
-
-    // Register the handle and the route
-    let _ = state
-        .control_channels
-        .write()
-        .await
-        .insert(digest, session_key, handle);
     state.routing_table.write().await.insert(&domain, digest);
 
     // When the control channel is gone (the client crashed, was stopped, or lost its
     // connection), remove its handle and its route, so that the visitor of that host
     // is answered with a 404 instead of being handed over to a tunnel that will
-    // never receive it. Only remove our own, so that a reconnected client isn't
-    // dropped.
+    // never receive it. Only remove our own, and do it while the control-channel
+    // lock is still held: otherwise a control channel that takes the domain over in
+    // the meantime (a reconnect) could have the route it just registered removed by
+    // this stale task, leaving the domain unrouted until the next reconnect.
     tokio::spawn(async move {
         let _ = ch_task.await;
         let mut ccs = state.control_channels.write().await;
         if ccs.get1(&digest).map(|h| h.id) == Some(conn_id) {
             ccs.remove1(&digest);
-            drop(ccs);
             state.routing_table.write().await.remove(&domain);
         }
     });
