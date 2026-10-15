@@ -16,12 +16,12 @@
 
 ## Quick start
 
-Download a [release](https://github.com/jiangood/http-tunnel/releases) or use the [Docker image](https://github.com/jiangood/http-tunnel/pkgs/container/http-tunnel).
+Download the [hts server](https://github.com/jiangood/http-tunnel/releases) and [htc client](https://github.com/jiangood/http-tunnel/releases), or use the Docker images below.
 
 Start the public server with a strong shared token:
 
 ```sh
-./http-tunnel server --server-port 2333 --http-port 80 --token 'replace-with-a-long-random-secret'
+./hts --token 'replace-with-a-long-random-secret'
 ```
 
 Create `client.toml` on the machine running the local service:
@@ -40,7 +40,7 @@ local_addr = "127.0.0.1:80"
 Start the client and point `nas.example.com` to the public server:
 
 ```sh
-./http-tunnel --config client.toml
+./htc --config client.toml
 ```
 
 The server must accept client connections on TCP `2333` and visitor traffic on TCP `80`. The client config defaults to `client.toml`; command-line options override file values. `remote`, `name`, and `token` also support the `HTTP_TUNNEL_REMOTE`, `HTTP_TUNNEL_NAME`, and `HTTP_TUNNEL_TOKEN` environment variables.
@@ -89,7 +89,7 @@ For `PUT`, send JSON with `domain` and `local_addr` fields. The API binds to `0.
 
 ## Docker
 
-The server and client are published as separate multi-architecture images.
+The server and client are published as separate multi-architecture images, each containing only its corresponding binary.
 
 Start the server (ports default to TCP `2333` for clients and TCP `80` for HTTP traffic):
 
