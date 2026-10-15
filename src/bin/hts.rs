@@ -46,6 +46,7 @@ async fn main() -> Result<()> {
         server_port: config.server_port,
         http_port: config.http_port,
         token: String::from(&*config.token),
+        proxies: config.proxies,
     });
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
