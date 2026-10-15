@@ -14,10 +14,6 @@ async fn main() -> Result<()> {
     Cli::parse();
     let cmd = Command::Client(ClientArgs {
         config_path: PathBuf::from("htc.toml"),
-        remote: None,
-        name: None,
-        token: None,
-        api_port: None,
     });
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
