@@ -78,12 +78,7 @@ pub struct TunnelEntry {
     pub local_addr: String,
 }
 
-/// The configuration of a client.
-///
-/// It's the source of truth of `http-tunnel`: the server takes no configuration
-/// file and learns the tunnels of a client from the control channels it opens.
-/// The identity (`remote`, `name` and `token`) can also be given on the command
-/// line or through the environment, in which case the command line wins.
+/// The configuration of a client. The TOML file is the only source of runtime configuration.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
@@ -206,14 +201,36 @@ impl ClientConfig {
         Ok(config)
     }
 
-    /// Read the configuration file. A missing file is not an error: it yields an
-    /// empty configuration, so that a client can also be started with the
-    /// command line only (`--remote`, `--name` and `--token`).
+    /// Read the fixed client config. If it is missing, create a commented
+    /// example and ask the user to edit it before starting.
     pub async fn from_file(path: &Path) -> Result<ClientConfig> {
         match fs::read_to_string(path).await {
             Ok(s) => ClientConfig::parse(&s)
                 .with_context(|| format!("The configuration {:?} is invalid", path)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ClientConfig::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let example = r#"# http-tunnel client configuration
+# Set these values before starting htc.
+remote = "your-server.example.com:2333"
+name = "home"
+token = "replace-with-the-same-secret-as-hts"
+api_port = 8610
+heartbeat_timeout = 40
+retry_interval = 1
+nodelay = true
+
+# Add one [[tunnels]] block per service to expose.
+# [[tunnels]]
+# name = "nas"
+# domain = "nas.example.com"
+# local_addr = "127.0.0.1:80"
+"#;
+                fs::write(path, example).await
+                    .with_context(|| format!("Failed to generate default config {:?}", path))?;
+                bail!(
+                    "Generated {:?}. Edit it with your server address, shared token and tunnel settings, then run htc again.",
+                    path
+                );
+            }
             Err(e) => Err(e).with_context(|| format!("Failed to read the config {:?}", path)),
         }
     }
@@ -647,5 +664,50 @@ local_addr = "127.0.0.1:80"
     fn test_default_config_is_empty() {
         let cfg = ClientConfig::parse("").unwrap();
         assert_eq!(cfg, ClientConfig::default());
+    }
+}
+
+
+/// Server settings loaded exclusively from the fixed hts.toml file.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServerConfig {
+    /// Port for client control and data connections.
+    #[serde(default = "default_server_port")]
+    pub server_port: u16,
+    /// Public HTTP entrypoint.
+    #[serde(default = "default_http_port")]
+    pub http_port: u16,
+    /// Shared secret required by every client.
+    pub token: MaskedString,
+}
+
+fn default_server_port() -> u16 { 2333 }
+fn default_http_port() -> u16 { 80 }
+
+impl ServerConfig {
+    pub async fn from_file(path: &Path) -> Result<Self> {
+        match fs::read_to_string(path).await {
+            Ok(s) => {
+                let config: Self = toml::from_str(&s)
+                    .with_context(|| format!("The configuration {:?} is invalid", path))?;
+                if config.token.is_empty() {
+                    bail!("The shared token in {:?} must not be empty", path);
+                }
+                Ok(config)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let example = r#"# http-tunnel server configuration
+# Use a long random secret and set the same token in htc.toml.
+server_port = 2333
+http_port = 80
+token = "replace-with-a-long-random-secret"
+"#;
+                fs::write(path, example).await
+                    .with_context(|| format!("Failed to generate default config {:?}", path))?;
+                bail!("Generated {:?}. Set a strong shared token, then run hts again.", path);
+            }
+            Err(e) => Err(e).with_context(|| format!("Failed to read the config {:?}", path)),
+        }
     }
 }
