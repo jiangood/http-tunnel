@@ -7,7 +7,7 @@ mod protocol;
 mod transport;
 
 pub use cli::{Cli, ClientArgs, Command, ServerArgs};
-pub use config::ClientConfig;
+pub use config::{ClientConfig, ServerConfig};
 
 use anyhow::Result;
 use tokio::sync::broadcast;
