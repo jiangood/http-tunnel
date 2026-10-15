@@ -18,18 +18,40 @@
 
 Download the [hts server](https://github.com/jiangood/http-tunnel/releases) and [htc client](https://github.com/jiangood/http-tunnel/releases), or use the Docker images below.
 
-Start the public server with a strong shared token:
+Both programs use a single fixed configuration file in the current working directory. They do not accept business configuration from command-line arguments or environment variables.
+
+### Server
+
+Run the server once to generate `hts.toml`:
 
 ```sh
-./hts --token 'replace-with-a-long-random-secret'
+./hts
 ```
 
-Create `client.toml` on the machine running the local service:
+Edit `hts.toml` and set a strong shared token. The default ports are TCP `2333` for client connections and TCP `80` for public HTTP traffic. Then start the server again:
+
+```sh
+./hts
+```
+
+### Client
+
+Run the client once to generate `htc.toml`:
+
+```sh
+./htc
+```
+
+Edit `htc.toml` with the server address, the same shared token, and your forwarding rules, then run `htc` again. For example:
 
 ```toml
 remote = "myserver.com:2333"
 name = "home"
-token = "replace-with-a-long-random-secret"
+token = "replace-with-the-same-secret-as-hts"
+api_port = 8610
+heartbeat_timeout = 40
+retry_interval = 1
+nodelay = true
 
 [[tunnels]]
 name = "nas"
@@ -37,34 +59,26 @@ domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
 ```
 
-Start the client and point `nas.example.com` to the public server:
-
-```sh
-./htc --config client.toml
-```
-
-The server must accept client connections on TCP `2333` and visitor traffic on TCP `80`. The client config defaults to `client.toml`; command-line options override file values. `remote`, `name`, and `token` also support the `HTTP_TUNNEL_REMOTE`, `HTTP_TUNNEL_NAME`, and `HTTP_TUNNEL_TOKEN` environment variables.
-
 ## Configuration
 
-Define one `[[tunnels]]` entry per route:
+- `hts` reads only `hts.toml` from the current working directory.
+- `htc` reads only `htc.toml` from the current working directory.
+- If the file does not exist, the program creates an example configuration and exits. Edit the generated file, then restart the program.
+- `--help` and `--version` remain available. Business settings cannot be overridden through command-line flags or environment variables.
+- Relative paths for any future file-based options are resolved relative to the configuration file.
 
-```toml
-remote = "myserver.com:2333"
-name = "home"
-token = "replace-with-a-long-random-secret"
-api_port = 8610
-heartbeat_timeout = 40
-retry_interval = 1
-nodelay = true
+Client configuration fields:
 
-[[tunnels]]
-name = "app"
-domain = "app.example.com"
-local_addr = "127.0.0.1:8080"
-```
-
-Each tunnel requires a unique client-local `name`, a routing `domain`, and a client-reachable `local_addr`. `api_port = 0` disables the administration API; `heartbeat_timeout = 0` disables heartbeat timeout. `nodelay` defaults to `true`.
+| Field | Meaning | Default |
+| --- | --- | --- |
+| `remote` | Server address, e.g. `myserver.com:2333` | Required |
+| `name` | Client identity used in logs | Required |
+| `token` | Shared secret, must match `hts.toml` | Required |
+| `api_port` | Client administration API port; `0` disables it | `8610` |
+| `heartbeat_timeout` | Heartbeat timeout in seconds; `0` disables it | `40` |
+| `retry_interval` | Retry interval in seconds | `1` |
+| `nodelay` | Enable TCP_NODELAY for tunnels | `true` |
+| `tunnels` | Array of routes, each with `name`, `domain`, and `local_addr` | Empty |
 
 ## Routing
 
@@ -89,30 +103,30 @@ For `PUT`, send JSON with `domain` and `local_addr` fields. The API binds to `0.
 
 ## Docker
 
-The server and client are published as separate multi-architecture images, each containing only its corresponding binary.
+The server and client are published as separate Linux amd64 images, each containing only its corresponding binary.
 
 Start the server (ports default to TCP `2333` for clients and TCP `80` for HTTP traffic):
 
 ```sh
 docker run -d --name http-tunnel-server --restart unless-stopped \
   -p 2333:2333 -p 80:80 \
-  -e HTTP_TUNNEL_TOKEN='replace-with-a-long-random-secret' \
+  -v "$PWD/hts.toml:/app/hts.toml:ro" \
   ghcr.io/jiangood/hts:latest
 ```
 
-Start the client by mounting its configuration at `/app/client.toml`:
+Start the client by mounting its configuration at `/app/htc.toml`:
 
 ```sh
 docker run -d --name http-tunnel-client --restart unless-stopped \
-  -v "$PWD/client.toml:/app/client.toml:ro" \
+  -v "$PWD/htc.toml:/app/htc.toml:ro" \
   ghcr.io/jiangood/htc:latest
 ```
 
-The client API writes configuration changes back to the file, so mount it read-write if you use the API to manage tunnels. The client connects to the server address and port configured in `client.toml`.
+The client API writes configuration changes back to the file, so mount it read-write if you use the API to manage tunnels. The client connects to the server address and port configured in `htc.toml`.
 
 ## Operations
 
-Set `RUST_LOG=error|warn|info|debug|trace` to control logging; the default is `info`. TCP_NODELAY is enabled by default. Forwarding uses 64 KiB copy buffers on both ends.
+Logging defaults to `info`; logging levels are no longer configured through environment variables. TCP_NODELAY is enabled by default. Forwarding uses 64 KiB copy buffers on both ends.
 
 Run the throughput benchmark with `cargo bench --bench throughput`. See [Out of Scope](./docs/out-of-scope.md) for intentional limitations.
 
