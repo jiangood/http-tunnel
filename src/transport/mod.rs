@@ -1,4 +1,3 @@
-use crate::config::{ClientTunnelConfig, ServerTunnelConfig};
 use crate::helper::to_socket_addr;
 use anyhow::{Context, Result};
 use std::fmt::Display;
@@ -62,15 +61,11 @@ impl SocketOpts {
         }
     }
 
-    pub fn from_client_cfg(cfg: &ClientTunnelConfig) -> SocketOpts {
+    /// Socket options for a data channel: the client announces its TCP_NODELAY
+    /// preference for the tunnel, and the server applies the same to its side
+    pub fn data_channel(nodelay: bool) -> SocketOpts {
         SocketOpts {
-            nodelay: cfg.nodelay,
-        }
-    }
-
-    pub fn from_server_cfg(cfg: &ServerTunnelConfig) -> SocketOpts {
-        SocketOpts {
-            nodelay: cfg.nodelay,
+            nodelay: Some(nodelay),
         }
     }
 

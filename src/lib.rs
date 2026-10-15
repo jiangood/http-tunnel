@@ -7,7 +7,7 @@ mod protocol;
 mod transport;
 
 pub use cli::{Cli, ClientArgs, Command, ServerArgs};
-pub use config::ServerConfig;
+pub use config::ClientConfig;
 
 use anyhow::Result;
 use tokio::sync::broadcast;
@@ -45,9 +45,8 @@ pub async fn run(cmd: Command, shutdown_rx: broadcast::Receiver<bool>) -> Result
 
             #[cfg(feature = "server")]
             {
-                let config = crate::config::ServerConfig::from_file(&args.config_path).await?;
-                debug!("{:?}", config);
-                run_server(config, args.config_path.clone(), shutdown_rx).await
+                debug!("{:?}", args);
+                run_server(args, shutdown_rx).await
             }
         }
         #[allow(unused_variables)]

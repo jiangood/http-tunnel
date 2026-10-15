@@ -4,21 +4,19 @@ The client exposes a small REST API to maintain its own tunnels at runtime. It l
 port with `--api-port` or the `HTTP_TUNNEL_API_PORT` environment variable, or set it to `0` to disable the API:
 
 ```bash
-./http-tunnel --remote myserver.com:2333 --name home_nas \
-  --token use_a_secret_that_only_you_know --api-port 2336
+./http-tunnel --config client.toml --api-port 2336
 ```
 
-Every route requires `Authorization: Bearer <token>`, reusing the token that the client already authenticates with, so
+Every route requires `Authorization: Bearer <token>`, reusing the shared token that the client authenticates with, so
 there is no second secret to manage. The API binds to `0.0.0.0`, which makes it reachable from the network, so protect
 it with a reverse proxy that terminates TLS, a firewall rule, or a private network such as WireGuard. A binary built
 without the `client-api` feature (on by default) has no API.
 
 ## Resources
 
-A tunnel belongs to a client: it maps a single `Host` domain to a `local_addr` on the client side. The server remains
-the source of truth. The client API does not keep a configuration of its own: a change is forwarded to the server over
-the config channel, which validates it against the whole configuration, persists it, and pushes the resulting config
-back. The client API answers only once the server has given its verdict.
+A tunnel maps a single `Host` domain to a `local_addr` on the client side. The client is the source of truth: a change
+is validated locally, written back to the client configuration file, and applied to the running control channels
+without a restart of either side. The handlers answer once the change is persisted.
 
 ## Endpoints
 
@@ -29,9 +27,9 @@ back. The client API answers only once the server has given its verdict.
 | `PUT` | `/api/tunnels/{domain}` | `{local_addr}` | Create or replace a tunnel |
 | `DELETE` | `/api/tunnels/{domain}` | | Delete a tunnel |
 
-`{domain}` is lowercased before it is sent to the server. A rejected change is reported with the status that matches
-the reason: `404` when the tunnel does not exist, `409` when the domain is already used, `400` for a malformed request,
-`503` when the client is not connected to the server, and `504` when the server does not answer in time.
+`{domain}` is lowercased before it is applied. A rejected change is reported with the status that matches the reason:
+`404` when the tunnel does not exist, `400` for a malformed domain or an empty `local_addr`, and `500` when the
+configuration file could not be written.
 
 ## Examples
 
@@ -53,17 +51,21 @@ curl -X DELETE "$BASE/api/tunnels/nas.example.com" -H "Authorization: Bearer $TO
 
 ## How a change takes effect
 
-1. The client forwards the change to the server over its config channel.
-2. The server validates it against the whole configuration, so the global rules (unique domains and unique tokens)
-   always hold, and writes the configuration back to its `server.toml` atomically.
-3. The server pushes the new config to the client.
-4. The client starts the new tunnels, stops the removed ones, and restarts the ones whose `local_addr` changed,
-   without a restart of either side. The answer to the API request carries the outcome.
+1. The client validates the change (a lowercased, well-formed domain and a non-empty `local_addr`).
+2. It writes the new configuration back to its `client.toml` atomically.
+3. It starts the new tunnels, stops the removed ones, and restarts the ones whose `local_addr` changed, without a
+   restart of either side. The answer to the API request carries the outcome.
+4. A newly started tunnel opens a control channel, which registers its domain on the server.
 
 ## Caveats
 
-- The server does not restrict *which* free domain a client may claim: any holder of the client token can add a tunnel
-  for any domain that no other client owns, and change or remove the client's own tunnels. The token is already the
-  client's credential, so treat it as a secret.
+- The configuration file must be writable. The API writes back to the path the client was started with (default
+  `client.toml`), so a container has to mount it read-write.
+- Only the tunnels are written back. If the identity (`remote`, `name`, `token`) was given on the command line rather
+  than in the file, it is not persisted: keep passing it on the command line, or put it in the file.
+- The shared token is the client's credential and, since it is shared, the server does not restrict *which* free
+  domain a client may claim. Any holder of the token can add a tunnel for any domain that no other client serves, and
+  change or remove the client's own tunnels. Treat the token as a secret.
 - Changing a `local_addr` restarts the corresponding tunnel, so in-flight visitors on it are cut off.
-- The client must be connected to the server for a change to be accepted; there is no offline queue.
+- A change made through the API only takes effect on the local client. A hand edit of `client.toml` still needs a
+  restart of the client.

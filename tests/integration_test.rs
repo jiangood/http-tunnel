@@ -16,8 +16,9 @@ use crate::common::run_http_tunnel_server;
 mod common;
 const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
 const HTTP_ENTRY_ADDR: &str = "127.0.0.1:2334";
-const SERVER_CONFIG: &str = "tests/for_http/server.toml";
+const HTTP_ENTRY_PORT: u16 = 2334;
 const SERVER_ADDR: &str = "127.0.0.1:2333";
+const SERVER_PORT: u16 = 2333;
 const CLIENT_NAME: &str = "home";
 const CLIENT_TOKEN: &str = "a_secret_token";
 const ECHO_HOST: &str = "echo.test";
@@ -32,6 +33,34 @@ fn init() {
         .try_init();
 }
 
+/// Write a client configuration to a temporary file and return its path. The
+/// identity and the tunnels both live in the client configuration, since the
+/// server takes no configuration file.
+fn write_client_config(
+    file: &str,
+    name: &str,
+    remote: &str,
+    token: &str,
+    api_port: Option<u16>,
+    tunnels: &[(&str, &str)],
+) -> Result<String> {
+    let mut tunnels_toml = String::new();
+    for (domain, local_addr) in tunnels {
+        tunnels_toml.push_str(&format!("\"{}\" = \"{}\"\n", domain, local_addr));
+    }
+    let api = api_port
+        .map(|p| format!("api_port = {}\n", p))
+        .unwrap_or_default();
+    let content = format!(
+        "name = \"{}\"\nremote = \"{}\"\ntoken = \"{}\"\n{}\n[tunnels]\n{}",
+        name, remote, token, api, tunnels_toml
+    );
+
+    let path = std::env::temp_dir().join(file);
+    std::fs::write(&path, content)?;
+    Ok(path.to_str().unwrap().to_string())
+}
+
 #[tokio::test]
 async fn http_routing() -> Result<()> {
     init();
@@ -43,13 +72,22 @@ async fn http_routing() -> Result<()> {
         }
     });
 
+    let client_config = write_client_config(
+        "http_tunnel_routing_client.toml",
+        CLIENT_NAME,
+        SERVER_ADDR,
+        CLIENT_TOKEN,
+        None,
+        &[(ECHO_HOST, ECHO_SERVER_ADDR)],
+    )?;
+
     let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
 
     // Start the client
     info!("start the client");
     let client = tokio::spawn(async move {
-        run_http_tunnel_client(CLIENT_NAME, SERVER_ADDR, CLIENT_TOKEN, client_shutdown_rx)
+        run_http_tunnel_client(&client_config, client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -60,7 +98,7 @@ async fn http_routing() -> Result<()> {
     // Start the server
     info!("start the server");
     let server = tokio::spawn(async move {
-        run_http_tunnel_server(SERVER_CONFIG, server_shutdown_rx)
+        run_http_tunnel_server(SERVER_PORT, HTTP_ENTRY_PORT, CLIENT_TOKEN, server_shutdown_rx)
             .await
             .unwrap();
     });
@@ -79,14 +117,16 @@ async fn http_routing() -> Result<()> {
     client_shutdown_tx.send(true)?;
     let _ = tokio::join!(client);
 
-    // A visitor must not hang when the tunnel is disconnected: it gets a 503
-    info!("a disconnected tunnel is answered with 503");
-    wait_for_503(HTTP_ENTRY_ADDR, ECHO_HOST).await.unwrap();
+    // The domain of a disconnected tunnel is no longer claimed, so a visitor gets
+    // a 404 (the server has no configuration file that would keep it known)
+    info!("a disconnected tunnel is answered with 404");
+    wait_for_404(HTTP_ENTRY_ADDR, ECHO_HOST).await.unwrap();
 
     info!("restart the client");
     let client_shutdown_rx = client_shutdown_tx.subscribe();
+    let client_config = std::env::temp_dir().join("http_tunnel_routing_client.toml");
     let client = tokio::spawn(async move {
-        run_http_tunnel_client(CLIENT_NAME, SERVER_ADDR, CLIENT_TOKEN, client_shutdown_rx)
+        run_http_tunnel_client(client_config.to_str().unwrap(), client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -95,8 +135,8 @@ async fn http_routing() -> Result<()> {
     info!("tunnel by Host");
     http_echo_hitter(HTTP_ENTRY_ADDR, ECHO_HOST).await.unwrap();
 
-    // The data channel pool only caches `TCP_POOL_SIZE` (8) connections and a visitor
-    // consumes one, so more visitors than that only work if the pool is replenished.
+    // The data channel pool only caches a few connections and a visitor consumes
+    // one, so more visitors than that only work if the pool is replenished.
     info!("more visitors than the data channel pool");
     for i in 0..16 {
         let r = time::timeout(
@@ -119,7 +159,7 @@ async fn http_routing() -> Result<()> {
     info!("restart the server");
     let server_shutdown_rx = server_shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
-        run_http_tunnel_server(SERVER_CONFIG, server_shutdown_rx)
+        run_http_tunnel_server(SERVER_PORT, HTTP_ENTRY_PORT, CLIENT_TOKEN, server_shutdown_rx)
             .await
             .unwrap();
     });
@@ -197,10 +237,10 @@ async fn http_404_check(addr: &'static str, host: &'static str) -> Result<()> {
     Ok(())
 }
 
-/// Poll until the host is answered with a `503`, with a timeout. It fails if the request
-/// hangs, which is what happened before the handle of a disconnected control channel was
-/// removed from the map.
-async fn wait_for_503(addr: &'static str, host: &'static str) -> Result<()> {
+/// Poll until the host is answered with a `404`, with a timeout. It fails if the
+/// request hangs, which is what happened before the handle of a disconnected
+/// control channel was removed from the map.
+async fn wait_for_404(addr: &'static str, host: &'static str) -> Result<()> {
     let deadline = time::Instant::now() + Duration::from_secs(10);
     loop {
         let mut conn = TcpStream::connect(addr).await?;
@@ -215,13 +255,13 @@ async fn wait_for_503(addr: &'static str, host: &'static str) -> Result<()> {
             time::timeout(Duration::from_secs(2), conn.read_to_end(&mut response)).await
         {
             let text = String::from_utf8_lossy(&response);
-            if text.starts_with("HTTP/1.1 503") {
+            if text.starts_with("HTTP/1.1 404") {
                 return Ok(());
             }
         }
 
         if time::Instant::now() >= deadline {
-            anyhow::bail!("the tunnel didn't answer `503` in time");
+            anyhow::bail!("the tunnel didn't answer `404` in time");
         }
         time::sleep(Duration::from_millis(250)).await;
     }
@@ -230,31 +270,29 @@ async fn wait_for_503(addr: &'static str, host: &'static str) -> Result<()> {
 // ==== The client administration API test ====
 
 const CLIENT_API_ECHO_SERVER_ADDR: &str = "127.0.0.1:8093";
+const CLIENT_API_HTTP_ENTRY_PORT: u16 = 2464;
 const CLIENT_API_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2464";
 const CLIENT_API_ADDR: &str = "127.0.0.1:2465";
 const CLIENT_API_SERVER_ADDR: &str = "127.0.0.1:2463";
+const CLIENT_API_SERVER_PORT: u16 = 2463;
 const CLIENT_API_TOKEN: &str = "a_secret_token";
 
-// The client starts without any tunnel: they are all created through its API
-const CLIENT_API_CONFIG: &str = r#"
-server_port = 2463
-http_port = 2464
-
-[clients.home]
-token = "a_secret_token"
-"#;
-
 /// A tunnel created, listed and deleted through the client administration API is
-/// validated by the server, which stays the source of truth, and routed without a
-/// restart of either side.
+/// validated locally, written back to the client configuration file, and routed
+/// without a restart of either side.
 #[cfg(feature = "client-api")]
 #[tokio::test]
 async fn client_api_manages_tunnels() -> Result<()> {
     init();
 
-    let config_path = std::env::temp_dir().join("http_tunnel_client_api_test.toml");
-    std::fs::write(&config_path, CLIENT_API_CONFIG)?;
-    let config_path_str = config_path.to_str().unwrap().to_string();
+    let config_path = write_client_config(
+        "http_tunnel_client_api_test.toml",
+        "home",
+        CLIENT_API_SERVER_ADDR,
+        CLIENT_API_TOKEN,
+        Some(2465),
+        &[],
+    )?;
 
     tokio::spawn(async move {
         if let Err(e) = common::tcp::echo_server(CLIENT_API_ECHO_SERVER_ADDR).await {
@@ -266,26 +304,26 @@ async fn client_api_manages_tunnels() -> Result<()> {
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
 
     let server = tokio::spawn(async move {
-        run_http_tunnel_server(&config_path_str, server_shutdown_rx)
-            .await
-            .unwrap();
-    });
-
-    let client = tokio::spawn(async move {
-        common::run_http_tunnel_client_with_api(
-            "home",
-            CLIENT_API_SERVER_ADDR,
+        run_http_tunnel_server(
+            CLIENT_API_SERVER_PORT,
+            CLIENT_API_HTTP_ENTRY_PORT,
             CLIENT_API_TOKEN,
-            Some(2465),
-            client_shutdown_rx,
+            server_shutdown_rx,
         )
         .await
         .unwrap();
     });
 
+    let client_config = config_path.clone();
+    let client = tokio::spawn(async move {
+        run_http_tunnel_client(&client_config, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
     time::sleep(Duration::from_millis(2500)).await;
 
-    info!("the client API reports the connected client");
+    info!("the client API reports the client identity");
     let (status, body) = api_request(
         CLIENT_API_ADDR,
         "GET",
@@ -295,11 +333,6 @@ async fn client_api_manages_tunnels() -> Result<()> {
     )
     .await?;
     assert_eq!(status, 200, "unexpected response: {}", body);
-    assert!(
-        body.contains("\"connected\":true"),
-        "unexpected body: {}",
-        body
-    );
     assert!(body.contains("home"), "unexpected body: {}", body);
 
     info!("the client API has no tunnel yet");
@@ -330,12 +363,28 @@ async fn client_api_manages_tunnels() -> Result<()> {
     assert_eq!(status, 201, "unexpected response: {}", body);
     assert!(body.contains("127.0.0.1:8093"), "unexpected body: {}", body);
 
-    // The server applies the change and the client starts the tunnel
+    // The client starts the tunnel
     time::sleep(Duration::from_millis(1500)).await;
     info!("the added tunnel is routed without a restart");
     http_echo_hitter(CLIENT_API_HTTP_ENTRY_ADDR, "echo.test")
         .await
         .unwrap();
+
+    info!("the client API now reports the client as connected");
+    let (status, body) = api_request(
+        CLIENT_API_ADDR,
+        "GET",
+        "/api/status",
+        Some(CLIENT_API_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(
+        body.contains("\"connected\":true"),
+        "unexpected body: {}",
+        body
+    );
 
     info!("the client API lists the added tunnel");
     let (status, body) = api_request(
@@ -349,7 +398,7 @@ async fn client_api_manages_tunnels() -> Result<()> {
     assert_eq!(status, 200, "unexpected response: {}", body);
     assert!(body.contains("echo.test"), "unexpected body: {}", body);
 
-    info!("the server wrote the change back to its config");
+    info!("the client wrote the change back to its config");
     let written = std::fs::read_to_string(&config_path)?;
     assert!(
         written.contains("echo.test"),
@@ -393,62 +442,46 @@ async fn client_api_manages_tunnels() -> Result<()> {
     Ok(())
 }
 
-// ==== The fatal config error test ====
+// ==== The fatal auth error test ====
 
+const FATAL_SERVER_PORT: u16 = 2453;
 const FATAL_SERVER_ADDR: &str = "127.0.0.1:2453";
 
-const FATAL_CONFIG: &str = r#"
-server_port = 2453
-http_port = 2454
-
-[clients.home]
-token = "a_secret_token"
-
-[clients.home.tunnels]
-"echo.test" = "127.0.0.1:8092"
-"#;
-
-/// A client that the server rejects with a definitive reason must exit with an error
-/// instead of retrying forever: an unknown name gets `TunnelNotExist`, a wrong token
-/// gets `AuthFailed`. The timeout fails the test if the client keeps retrying.
+/// A client whose token is rejected must exit with an error instead of retrying
+/// forever. The timeout fails the test if the client keeps retrying.
 #[tokio::test]
-async fn client_exits_on_fatal_config_error() -> Result<()> {
+async fn client_exits_on_a_wrong_token() -> Result<()> {
     init();
 
-    let config_path = std::env::temp_dir().join("http_tunnel_fatal_test.toml");
-    std::fs::write(&config_path, FATAL_CONFIG)?;
-    let config_path_str = config_path.to_str().unwrap().to_string();
+    let config_path = write_client_config(
+        "http_tunnel_fatal_test.toml",
+        "home",
+        FATAL_SERVER_ADDR,
+        "wrong_token",
+        None,
+        &[("echo.test", "127.0.0.1:8092")],
+    )?;
 
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
     let server = tokio::spawn(async move {
-        run_http_tunnel_server(&config_path_str, server_shutdown_rx)
-            .await
-            .unwrap();
+        run_http_tunnel_server(
+            FATAL_SERVER_PORT,
+            2454,
+            CLIENT_TOKEN,
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
     });
 
     // Wait for the server to listen, so that the client reaches the handshake
     time::sleep(Duration::from_secs(1)).await;
 
-    info!("an unknown name must end the client");
-    let (_tx, rx) = broadcast::channel(1);
-    let err = time::timeout(
-        Duration::from_secs(5),
-        run_http_tunnel_client("unknown", FATAL_SERVER_ADDR, CLIENT_TOKEN, rx),
-    )
-    .await
-    .expect("the client kept retrying on an unknown name")
-    .expect_err("the client must fail on an unknown name");
-    assert!(
-        format!("{:#}", err).contains("unknown"),
-        "unexpected error: {:#}",
-        err
-    );
-
     info!("a wrong token must end the client");
     let (_tx, rx) = broadcast::channel(1);
     let err = time::timeout(
         Duration::from_secs(5),
-        run_http_tunnel_client(CLIENT_NAME, FATAL_SERVER_ADDR, "wrong_token", rx),
+        run_http_tunnel_client(&config_path, rx),
     )
     .await
     .expect("the client kept retrying on a wrong token")

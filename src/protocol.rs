@@ -1,9 +1,7 @@
 pub const HASH_WIDTH_IN_BYTES: usize = 32;
 
-use crate::config::ClientConfig;
 use crate::helper::write_and_flush;
 use anyhow::{bail, Context, Result};
-use lazy_static::lazy_static;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
@@ -11,28 +9,52 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
 
 type ProtocolVersion = u8;
-const PROTO_V2: u8 = 2u8;
+const PROTO_V3: u8 = 3u8;
 
-// V2 makes the config channel bidirectional: the server wraps the pushed config
-// in `ServerConfigPush` and accepts `ClientConfigRequest` from the client. A V1
-// client and a V2 server can't understand each other's config channel, so the
-// version is bumped to reject the pair explicitly instead of failing to
-// deserialize.
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V2;
+// V3 removes the config channel and inverts the source of truth: a client is
+// configured by its own file and declares the domain of each control channel it
+// opens, instead of having its tunnels pushed by the server. The hello messages
+// are length-prefixed payloads now, so a domain of any length fits, and the
+// fixed-size framing (`PACKET_LEN`) is gone.
+pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V3;
 
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 
-/// The variants are named after the kind of channel they establish, so the shared
-/// `ChannelHello` postfix is intended
-#[allow(clippy::enum_variant_names)]
-#[derive(Deserialize, Serialize, Debug)]
-pub enum Hello {
-    /// Sent by a client to represent a tunnel. sha256sum(tunnel name)
-    ControlChannelHello(ProtocolVersion, Digest),
-    /// Sent by a client to establish a data channel. The session key handed out by the control channel
-    DataChannelHello(ProtocolVersion, Digest),
-    /// Sent by a client to ask for its configuration. sha256sum(client name)
-    ConfigChannelHello(ProtocolVersion, Digest),
+/// The first message a client sends on a new connection.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+pub enum ClientHello {
+    /// Opens a control channel that serves `domain`. `name` is the name of the
+    /// client; it's used for logging and to warn when a domain changes hands.
+    /// `nodelay` is the client's TCP_NODELAY preference for the data channels of
+    /// the tunnel, which the server applies to the socket of each data channel.
+    Control {
+        version: ProtocolVersion,
+        domain: String,
+        name: String,
+        nodelay: bool,
+    },
+    /// Opens a data channel. `nonce` is the session key handed out by the
+    /// control channel.
+    Data {
+        version: ProtocolVersion,
+        nonce: Digest,
+    },
+}
+
+impl ClientHello {
+    pub fn version(&self) -> ProtocolVersion {
+        match self {
+            ClientHello::Control { version, .. } | ClientHello::Data { version, .. } => *version,
+        }
+    }
+}
+
+/// The answer of the server to a `ClientHello::Control`, carrying the nonce the
+/// client authenticates against.
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq)]
+pub struct ServerHello {
+    pub version: ProtocolVersion,
+    pub nonce: Digest,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -41,7 +63,6 @@ pub struct Auth(pub Digest);
 #[derive(Deserialize, Serialize, Debug)]
 pub enum Ack {
     Ok,
-    TunnelNotExist,
     AuthFailed,
 }
 
@@ -52,7 +73,6 @@ impl std::fmt::Display for Ack {
             "{}",
             match self {
                 Ack::Ok => "Ok",
-                Ack::TunnelNotExist => "No such a client or tunnel",
                 Ack::AuthFailed => "Incorrect token",
             }
         )
@@ -70,133 +90,22 @@ pub enum DataChannelCmd {
     StartForwardTcp,
 }
 
-/// A change to its own tunnels that a client asks the server to apply, sent over
-/// the config channel.
-///
-/// The server stays authoritative: it validates the change against the whole
-/// configuration, persists it, and pushes the resulting config back (see
-/// `ServerConfigPush`). A domain that is owned by another client, or an empty or
-/// malformed address, is rejected.
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub enum ClientConfigRequest {
-    /// Create or replace the tunnel of `domain`, forwarded to `local_addr`
-    PutTunnel { domain: String, local_addr: String },
-    /// Remove the tunnel of `domain`
-    DeleteTunnel { domain: String },
-}
-
-/// A message pushed by the server over the config channel.
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
-pub enum ServerConfigPush {
-    /// The full configuration of the client, which it reconciles its running
-    /// tunnels with. Sent first and then again whenever the config changes
-    Config(ClientConfig),
-    /// The change requested by the client was applied. Carries the resulting
-    /// config so that the client's view is fresh as soon as the request returns
-    Applied(ClientConfig),
-    /// The change requested by the client was rejected, with the reason
-    Rejected(String),
-}
-
 pub fn digest(data: &[u8]) -> Digest {
     use sha2::{Digest, Sha256};
     let d = Sha256::new().chain_update(data).finalize();
     d.into()
 }
 
-struct PacketLength {
-    hello: usize,
-    ack: usize,
-    auth: usize,
-    c_cmd: usize,
-    d_cmd: usize,
-}
-
-impl PacketLength {
-    pub fn new() -> PacketLength {
-        let username = "default";
-        let d = digest(username.as_bytes());
-        let hello = bincode::serialized_size(&Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d))
-            .unwrap() as usize;
-        let c_cmd =
-            bincode::serialized_size(&ControlChannelCmd::CreateDataChannel).unwrap() as usize;
-        let d_cmd = bincode::serialized_size(&DataChannelCmd::StartForwardTcp).unwrap() as usize;
-        let ack = Ack::Ok;
-        let ack = bincode::serialized_size(&ack).unwrap() as usize;
-
-        let auth = bincode::serialized_size(&Auth(d)).unwrap() as usize;
-        PacketLength {
-            hello,
-            ack,
-            auth,
-            c_cmd,
-            d_cmd,
-        }
-    }
-}
-
-lazy_static! {
-    static ref PACKET_LEN: PacketLength = PacketLength::new();
-}
-
-pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Hello> {
-    let mut buf = vec![0u8; PACKET_LEN.hello];
-    conn.read_exact(&mut buf)
-        .await
-        .with_context(|| "Failed to read hello")?;
-    let hello = bincode::deserialize(&buf).with_context(|| "Failed to deserialize hello")?;
-
-    let v = match hello {
-        Hello::ControlChannelHello(v, _) => v,
-        Hello::DataChannelHello(v, _) => v,
-        Hello::ConfigChannelHello(v, _) => v,
-    };
-
-    if v != CURRENT_PROTO_VERSION {
+/// Reject a peer that speaks another version of the protocol
+pub fn check_version(version: ProtocolVersion) -> Result<()> {
+    if version != CURRENT_PROTO_VERSION {
         bail!(
             "Protocol version mismatched. Expected {}, got {}.",
             CURRENT_PROTO_VERSION,
-            v
+            version
         );
     }
-
-    Ok(hello)
-}
-
-pub async fn read_auth<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Auth> {
-    let mut buf = vec![0u8; PACKET_LEN.auth];
-    conn.read_exact(&mut buf)
-        .await
-        .with_context(|| "Failed to read auth")?;
-    bincode::deserialize(&buf).with_context(|| "Failed to deserialize auth")
-}
-
-pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Ack> {
-    let mut bytes = vec![0u8; PACKET_LEN.ack];
-    conn.read_exact(&mut bytes)
-        .await
-        .with_context(|| "Failed to read ack")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize ack")
-}
-
-pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
-    conn: &mut T,
-) -> Result<ControlChannelCmd> {
-    let mut bytes = vec![0u8; PACKET_LEN.c_cmd];
-    conn.read_exact(&mut bytes)
-        .await
-        .with_context(|| "Failed to read cmd")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize control cmd")
-}
-
-pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
-    conn: &mut T,
-) -> Result<DataChannelCmd> {
-    let mut bytes = vec![0u8; PACKET_LEN.d_cmd];
-    conn.read_exact(&mut bytes)
-        .await
-        .with_context(|| "Failed to read cmd")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize data cmd")
+    Ok(())
 }
 
 /// Write a bincode payload prefixed by its length in bytes (big-endian u32)
@@ -248,56 +157,93 @@ where
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_hello_packet_size() {
-        let d = digest(b"foo");
-        let sizes: Vec<usize> = [
-            Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d),
-            Hello::DataChannelHello(CURRENT_PROTO_VERSION, d),
-            Hello::ConfigChannelHello(CURRENT_PROTO_VERSION, d),
-        ]
-        .iter()
-        .map(|h| bincode::serialized_size(h).unwrap() as usize)
-        .collect();
+    use tokio::io::{duplex, AsyncWriteExt};
 
-        assert!(sizes.iter().all(|s| *s == sizes[0]), "{:?}", sizes);
-        assert_eq!(sizes[0], PACKET_LEN.hello);
+    #[test]
+    fn test_client_hello_roundtrip() {
+        let hellos = [
+            ClientHello::Control {
+                version: CURRENT_PROTO_VERSION,
+                domain: "nas.example.com".to_string(),
+                name: "home".to_string(),
+                nodelay: true,
+            },
+            // A long domain must fit: the frame is length-prefixed
+            ClientHello::Control {
+                version: CURRENT_PROTO_VERSION,
+                domain: "a".repeat(500) + ".example.com",
+                name: "home".to_string(),
+                nodelay: false,
+            },
+            ClientHello::Data {
+                version: CURRENT_PROTO_VERSION,
+                nonce: digest(b"nonce"),
+            },
+        ];
+        for hello in hellos {
+            let bytes = bincode::serialize(&hello).unwrap();
+            let back: ClientHello = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(back, hello);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_payload_framing() -> Result<()> {
+        let (mut a, mut b) = duplex(64 * 1024);
+        let hello = ClientHello::Control {
+            version: CURRENT_PROTO_VERSION,
+            domain: "echo.test".to_string(),
+            name: "home".to_string(),
+            nodelay: true,
+        };
+        write_payload(&mut a, &hello).await?;
+        a.flush().await?;
+        let back: ClientHello = read_payload(&mut b).await?;
+        assert_eq!(back, hello);
+        Ok(())
     }
 
     #[test]
-    fn test_config_channel_messages_roundtrip() {
-        let mut config = ClientConfig::default();
-        config.tunnels.push(crate::config::ClientTunnelConfig {
-            name: "echo.test".to_string(),
-            local_addr: "127.0.0.1:8080".to_string(),
-            nodelay: Some(true),
-            retry_interval: 1,
-        });
+    fn test_check_version() {
+        assert!(check_version(CURRENT_PROTO_VERSION).is_ok());
+        assert!(check_version(CURRENT_PROTO_VERSION.wrapping_add(1)).is_err());
+    }
 
-        let requests = [
-            ClientConfigRequest::PutTunnel {
-                domain: "echo.test".to_string(),
-                local_addr: "127.0.0.1:8080".to_string(),
-            },
-            ClientConfigRequest::DeleteTunnel {
-                domain: "echo.test".to_string(),
-            },
-        ];
-        for req in requests {
-            let bytes = bincode::serialize(&req).unwrap();
-            let back: ClientConfigRequest = bincode::deserialize(&bytes).unwrap();
-            assert_eq!(back, req);
+    #[test]
+    fn test_server_hello_and_auth_roundtrip() {
+        let hello = ServerHello {
+            version: CURRENT_PROTO_VERSION,
+            nonce: digest(b"nonce"),
+        };
+        let bytes = bincode::serialize(&hello).unwrap();
+        let back: ServerHello = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(back, hello);
+
+        let auth = Auth(digest(b"token"));
+        let bytes = bincode::serialize(&auth).unwrap();
+        let Auth(back) = bincode::deserialize::<Auth>(&bytes).unwrap();
+        assert_eq!(back, auth.0);
+    }
+
+    #[test]
+    fn test_acks_and_cmds_roundtrip() {
+        for ack in [Ack::Ok, Ack::AuthFailed] {
+            let bytes = bincode::serialize(&ack).unwrap();
+            let back: Ack = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(format!("{}", back), format!("{}", ack));
         }
 
-        let pushes = [
-            ServerConfigPush::Config(config.clone()),
-            ServerConfigPush::Applied(config),
-            ServerConfigPush::Rejected("The domain is already used".to_string()),
-        ];
-        for push in pushes {
-            let bytes = bincode::serialize(&push).unwrap();
-            let back: ServerConfigPush = bincode::deserialize(&bytes).unwrap();
-            assert_eq!(back, push);
+        for cmd in [
+            ControlChannelCmd::CreateDataChannel,
+            ControlChannelCmd::HeartBeat,
+        ] {
+            let bytes = bincode::serialize(&cmd).unwrap();
+            let back: ControlChannelCmd = bincode::deserialize(&bytes).unwrap();
+            assert_eq!(format!("{:?}", back), format!("{:?}", cmd));
         }
+
+        let bytes = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
+        let back: DataChannelCmd = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(format!("{:?}", back), "StartForwardTcp");
     }
 }

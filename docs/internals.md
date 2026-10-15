@@ -5,20 +5,18 @@
 The entity that maps a domain to the traffic that needs to be forwarded
 
 ### Server
-The host that runs `http-tunnel` in the server mode. It holds the whole configuration
+The host that runs `http-tunnel` in the server mode. It takes no configuration file: it's started with its two
+ports and a shared token, and it learns the tunnels from the clients as they connect.
 
 ### Client
-The host behind the NAT that runs `http-tunnel` in the client mode. It has some local services that need to be exposed, and the *tunnels* that forward them are assigned to it by the *server*
+The host behind the NAT that runs `http-tunnel` in the client mode. It declares its own tunnels in a
+configuration file: each tunnel maps a domain to a local service that needs to be exposed.
 
 ### Visitor
 Who visits a *tunnel*, via the *server*
 
-### Config Channel
-
-A config channel is a TCP connection between the *server* and the *client* that carries the configuration pushed by the *server*. A client has no configuration of its own.
-
 ### Control Channel
-A control channel is a TCP connection between the *server* and the *client* that only carries `http-tunnel` control commands for one *tunnel*.
+A control channel is a TCP connection between the *server* and the *client* that only carries `http-tunnel` control commands for one *tunnel*. It's also where the client announces the domain of the tunnel, so that the configuration-free server learns it.
 
 ### Data Channel
 
@@ -26,11 +24,12 @@ A data channel is a TCP connection between the *server* and the *client* that on
 
 ## The Process
 
-When `http-tunnel` starts in the client mode, it connects to `server_port` and establishes a config channel. It identifies itself by the name given with `--name`, and the server challenges it by a nonce, so that the client is required to authenticate with the token given with `--token`. In this way, the server knows which *client* of its configuration the connection belongs to.
-
-Then the server pushes the *tunnels* of that client over the config channel, and keeps the channel open, so that a change the client requests to its own tunnels through its administration API is applied and pushed back to it as well. Each of the tunnels carries the `local_addr` on the client side, so the client doesn't need any configuration file.
-
-The client then creates one connection to `server_port` for each of the tunnels. These connections act as control channels. When a control channel starts, the server challenges the client by a nonce, the client is required to authenticate as the tunnel it wants to represent, with the token of the client it belongs to. Then that tunnel is set up.
+When `http-tunnel` starts in the client mode, it reads its configuration file: a list of *tunnels*, each an HTTP
+domain mapped to a `local_addr` on the client. It opens one TCP connection to `server_port` per tunnel. These
+connections act as control channels: the client announces the domain in the hello, and the server challenges it by
+a nonce, so that the client is required to authenticate with the shared token given with `--token`. Once the token
+is validated, the server registers the domain in its routing table — this is how the server, which takes no
+configuration file, learns the tunnels of its clients.
 
 The server also listens on `http_port` for HTTP visitors. When a visitor connects, the server reads the HTTP request line and the `Host` header, and looks up
 the tunnel that claims that domain. Then it asks the client for a data channel through the corresponding control
@@ -68,8 +67,14 @@ tunnel fails: the handshake comes before it dials the local service, so it opens
 the data channel, then closes it with the visitor's request still unread, and the
 server sees a reset. `relay` (in `server.rs`) treats a reset like the end of the
 stream and, when not a single byte reached the visitor, answers it with a `504`
-instead of leaving it with an empty reply. The failure is logged with the tunnel
-and its `local_addr`, which are fields of the enclosing span.
+instead of leaving it with an empty reply. The failure is logged with the tunnel.
+
+A domain is claimed while the control channel of its tunnel is connected. When the control channel goes away (the
+client crashed, was stopped, or lost its connection), the server removes the domain from its routing table, so a
+visitor of that host is answered with a `404` instead of being handed over to a tunnel that will never receive it.
+A second control channel for a domain that is already claimed takes it over, which is how a reconnecting client is
+handled; the clients share one token, so they are trusted, and a takeover by a client of another name is logged as
+a warning.
 
 On shutdown, after the HTTP listener stops accepting, the server waits for the
 in-flight visitors (up to `DRAIN_TIMEOUT`, 30 seconds) before it tears the

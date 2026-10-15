@@ -1,14 +1,6 @@
-server_port = 2333
-http_port = 80
+name = "home"
+token = "secret"
 
-[clients.home]
-token = "123"
-
-[clients.home.tunnels]
-"foo1.example.com" = "127.0.0.1:80"
-
-[clients.office]
-token = "456"
-
-[clients.office.tunnels]
-"foo1.example.com" = "127.0.0.1:81"
+[tunnels]
+"nas.example.com" = "127.0.0.1:80"
+"NAS.example.com" = "127.0.0.1:81"

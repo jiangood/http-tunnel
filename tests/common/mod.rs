@@ -8,36 +8,31 @@ use tokio::{
 };
 
 pub async fn run_http_tunnel_server(
-    config_path: &str,
+    server_port: u16,
+    http_port: u16,
+    token: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let cmd = http_tunnel::Command::Server(http_tunnel::ServerArgs {
-        config_path: PathBuf::from(config_path),
+        server_port,
+        http_port,
+        token: token.to_string(),
     });
     http_tunnel::run(cmd, shutdown_rx).await
 }
 
+/// Run a client from its configuration file. The file carries the identity
+/// (`remote`, `name`, `token`) and the tunnels the client serves.
 pub async fn run_http_tunnel_client(
-    name: &str,
-    remote: &str,
-    token: &str,
-    shutdown_rx: broadcast::Receiver<bool>,
-) -> Result<()> {
-    run_http_tunnel_client_with_api(name, remote, token, None, shutdown_rx).await
-}
-
-pub async fn run_http_tunnel_client_with_api(
-    name: &str,
-    remote: &str,
-    token: &str,
-    api_port: Option<u16>,
+    config_path: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let cmd = http_tunnel::Command::Client(http_tunnel::ClientArgs {
-        name: name.to_string(),
-        remote: remote.to_string(),
-        token: token.to_string(),
-        api_port,
+        config_path: PathBuf::from(config_path),
+        remote: None,
+        name: None,
+        token: None,
+        api_port: None,
     });
     http_tunnel::run(cmd, shutdown_rx).await
 }

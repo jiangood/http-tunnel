@@ -1,500 +1,328 @@
-use crate::cli::ClientArgs;
+use crate::cli::{ClientArgs, DEFAULT_CLIENT_API_PORT};
 use crate::config::{ClientConfig, ClientTunnelConfig, MaskedString};
 use crate::constants::run_control_chan_backoff;
-use crate::protocol::Hello::{self, *};
-use crate::protocol::{
-    self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ClientConfigRequest,
-    ControlChannelCmd, DataChannelCmd, ServerConfigPush, CURRENT_PROTO_VERSION,
-    HASH_WIDTH_IN_BYTES,
-};
+use crate::protocol::{self, Ack, Auth, ClientHello, ControlChannelCmd, DataChannelCmd, ServerHello};
 use crate::transport::{connect, AddrMaybeCached, SocketOpts};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::future::retry_notify;
 use backoff::ExponentialBackoff;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::io::{copy_bidirectional_with_sizes, AsyncWriteExt};
+use tokio::io::copy_bidirectional_with_sizes;
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, instrument, warn, Instrument, Span};
-
-// The interval between retries to fetch the config, before the client gets one
-const DEFAULT_FETCH_RETRY_INTERVAL_SECS: u64 = 1;
 
 // The size of the buffers that are piped between the data channel and the local
 // service. Larger than the tokio default (8 KiB), which reduces the number of
 // syscalls on large transfers.
 const COPY_BUF_SIZE: usize = 64 * 1024;
 
-// How long a change submitted through the administration API waits for the
-// server to answer before giving up
-#[cfg_attr(not(feature = "client-api"), allow(dead_code))]
-const CONFIG_REQUEST_TIMEOUT_SECS: u64 = 10;
-
 // The entrypoint of running a client
-pub async fn run_client(args: ClientArgs, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    let mut client = Client::new(args);
-    client.run(shutdown_rx).await
-}
+pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
+    // Load the configuration file. A missing file is not an error: the identity
+    // can be given on the command line instead, in which case the client simply
+    // has no tunnel.
+    let mut config = ClientConfig::from_file(&args.config_path).await?;
 
-// A change to its own tunnels that the administration API asks the config
-// connection to forward to the server. The `reply` carries the server's verdict
-// back to the API handler.
-struct TunnelRequest {
-    msg: ClientConfigRequest,
-    reply: oneshot::Sender<Result<(), String>>,
-}
-
-// The state of a client that is shared between the config connection and the
-// administration API. The server remains the source of truth: `tunnels` is the
-// config it pushed last, and a change is a request that the server validates and
-// pushes back.
-// The request machinery (`requester`, `request_lock` and the API-only methods)
-// is unused when the API is compiled out, so the dead-code lint is relaxed there
-#[cfg_attr(not(feature = "client-api"), allow(dead_code))]
-pub(crate) struct ClientState {
-    // The tunnels of the config that the server pushed last
-    tunnels: RwLock<HashMap<String, ClientTunnelConfig>>,
-    // The sender of the live config connection, if any. A request sent while no
-    // connection is established is refused instead of being queued indefinitely.
-    requester: RwLock<Option<mpsc::Sender<TunnelRequest>>>,
-    // Serializes the requests, so that each reply matches the request sent first
-    request_lock: tokio::sync::Mutex<()>,
-}
-
-#[cfg_attr(not(feature = "client-api"), allow(dead_code))]
-impl ClientState {
-    fn new() -> ClientState {
-        ClientState {
-            tunnels: RwLock::new(HashMap::new()),
-            requester: RwLock::new(None),
-            request_lock: tokio::sync::Mutex::new(()),
-        }
+    // The command line wins over the configuration file
+    if let Some(remote) = args.remote {
+        config.remote = Some(remote);
+    }
+    if let Some(name) = args.name {
+        config.name = Some(name);
+    }
+    if let Some(token) = args.token {
+        config.token = Some(token.into());
+    }
+    if let Some(api_port) = args.api_port {
+        config.api_port = Some(api_port);
     }
 
-    // Replace the cached config with the one that the server pushed last
-    async fn set_tunnels(&self, config: &ClientConfig) {
-        let tunnels = config
-            .tunnels
-            .iter()
-            .map(|t| (t.name.clone(), t.clone()))
-            .collect();
-        *self.tunnels.write().await = tunnels;
-    }
+    let remote = config.remote.clone().ok_or_else(|| {
+        anyhow!(
+            "The address of the server is missing. Pass `--remote`, set \
+             `HTTP_TUNNEL_REMOTE`, or set `remote` in {:?}",
+            args.config_path
+        )
+    })?;
+    let name = config.name.clone().ok_or_else(|| {
+        anyhow!(
+            "The name of the client is missing. Pass `--name`, set `HTTP_TUNNEL_NAME`, \
+             or set `name` in {:?}",
+            args.config_path
+        )
+    })?;
+    let token = config.token.clone().ok_or_else(|| {
+        anyhow!(
+            "The token is missing. Pass `--token`, set `HTTP_TUNNEL_TOKEN`, or set \
+             `token` in {:?}",
+            args.config_path
+        )
+    })?;
 
-    // The tunnels that the client is serving, sorted by name for a stable output
-    pub(crate) async fn tunnels(&self) -> Vec<ClientTunnelConfig> {
-        let mut tunnels: Vec<ClientTunnelConfig> =
-            self.tunnels.read().await.values().cloned().collect();
-        tunnels.sort_by(|a, b| a.name.cmp(&b.name));
-        tunnels
-    }
+    let api_port = config.api_port.unwrap_or(DEFAULT_CLIENT_API_PORT);
+    let identity = Identity { remote, name, token };
 
-    // Register (or clear) the sender of the live config connection
-    async fn set_requester(&self, tx: Option<mpsc::Sender<TunnelRequest>>) {
-        *self.requester.write().await = tx;
-    }
+    // A definitive failure (a wrong token) is reported here so that the client
+    // exits instead of retrying forever
+    let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel::<anyhow::Error>();
+    let state = Arc::new(ClientState::new(
+        config,
+        args.config_path.clone(),
+        identity,
+        fatal_tx,
+    ));
 
-    // Whether a config connection is established, so that the API can report it
-    pub(crate) async fn connected(&self) -> bool {
-        self.requester.read().await.is_some()
-    }
+    // Start the tunnels declared in the configuration
+    state.sync().await;
 
-    // Submit a change to the server over the live config connection and wait for
-    // its verdict. `Err` carries the reason that the server gave, or a message
-    // that the request could not be delivered.
-    pub(crate) async fn submit(&self, msg: ClientConfigRequest) -> Result<(), String> {
-        // One request at a time, so that the reply of a request is never mistaken
-        // for the reply of another one
-        let _guard = self.request_lock.lock().await;
-
-        let Some(tx) = self.requester.read().await.clone() else {
-            return Err("The client is not connected to the server".to_string());
-        };
-
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let request = TunnelRequest {
-            msg,
-            reply: reply_tx,
-        };
-        if tx.send(request).await.is_err() {
-            return Err("The client is not connected to the server".to_string());
-        }
-
-        match time::timeout(Duration::from_secs(CONFIG_REQUEST_TIMEOUT_SECS), reply_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err("The connection to the server was closed".to_string()),
-            Err(_) => Err("The server did not answer the request in time".to_string()),
-        }
-    }
-}
-
-// Holds the state of a client
-struct Client {
-    args: ClientArgs,
-    tunnel_handles: HashMap<String, ControlChannelHandle>,
-    // Shared with the config connection and the administration API
-    state: Arc<ClientState>,
-}
-
-impl Client {
-    fn new(args: ClientArgs) -> Client {
-        Client {
-            args,
-            tunnel_handles: HashMap::new(),
-            state: Arc::new(ClientState::new()),
-        }
-    }
-
-    // The entrypoint of Client
-    async fn run(&mut self, mut shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-        // The client has no config of its own. It's pushed by the server, and the
-        // server keeps the config channel open to push the updates made through the
-        // administration API.
-        let (config_tx, mut config_rx) = mpsc::channel::<ClientConfig>(4);
-
-        // Keep the handle instead of dropping it, so that a definitive failure of the
-        // config session (unknown name, wrong token) makes the client exit non-zero
-        // rather than being retried silently forever
-        let config_session = {
-            let args = self.args.clone();
-            let state = self.state.clone();
+    // Run the administration API when a port is configured. A build without the
+    // `client-api` feature has nothing to serve, so it only warns. A port of `0`
+    // disables the API, so that several clients can share a host.
+    #[cfg(feature = "client-api")]
+    let api_task = match api_port {
+        0 => None,
+        port => {
+            let token = state.token().to_owned();
+            let state = state.clone();
             let shutdown_rx = shutdown_rx.resubscribe();
-            tokio::spawn(
-                async move { run_config_session(args, config_tx, state, shutdown_rx).await },
-            )
-        };
-
-        // Run the administration API when a port is configured. A build without
-        // the `client-api` feature has nothing to serve, so it only warns. A port
-        // of `0` disables the API, so that several clients can share a host.
-        #[cfg(feature = "client-api")]
-        let api_task = match self.args.api_port {
-            Some(port) if port != 0 => {
-                let state = self.state.clone();
-                let token = self.args.token.clone();
-                let name = self.args.name.clone();
-                let remote = self.args.remote.clone();
-                let shutdown_rx = shutdown_rx.resubscribe();
-                Some(tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::client_api::serve(port, token, name, remote, state, shutdown_rx)
-                            .await
-                    {
-                        error!("{:#}", e);
-                    }
-                }))
-            }
-            _ => None,
-        };
-
-        #[cfg(not(feature = "client-api"))]
-        if matches!(self.args.api_port, Some(port) if port != 0) {
-            warn!(
-                "The client administration API is configured, but this build has \
-                 no `client-api` feature. It is disabled"
-            );
-        }
-
-        let mut shutting_down = false;
-        loop {
-            tokio::select! {
-                maybe = config_rx.recv() => {
-                    match maybe {
-                        Some(config) => self.reconcile(config),
-                        // The config session ended and dropped the sender, so its
-                        // result is awaited below
-                        None => break,
-                    }
+            Some(tokio::spawn(async move {
+                if let Err(e) = crate::client_api::serve(port, token, state, shutdown_rx).await {
+                    error!("{:#}", e);
                 }
-                _ = shutdown_rx.recv() => {
-                    shutting_down = true;
-                    break;
-                }
-            }
+            }))
         }
+    };
 
-        // Stop the config session if it is still running. A requested shutdown wins,
-        // otherwise its result is propagated, so that a fatal error exits the client.
-        let result = if shutting_down {
-            config_session.abort();
-            let _ = config_session.await;
-            Ok(())
-        } else {
-            match config_session.await {
-                Ok(result) => result,
-                Err(e) => Err(anyhow!("The config session panicked: {:#}", e)),
-            }
-        };
-
-        // Stop the administration API if it is running
-        #[cfg(feature = "client-api")]
-        if let Some(api_task) = api_task {
-            api_task.abort();
-            let _ = api_task.await;
-        }
-
-        // Shutdown all tunnels
-        for (_, handle) in self.tunnel_handles.drain() {
-            handle.shutdown();
-        }
-
-        result
+    #[cfg(not(feature = "client-api"))]
+    if api_port != 0 {
+        warn!(
+            "The client administration API is configured, but this build has \
+             no `client-api` feature. It is disabled"
+        );
     }
 
-    // Make the pushed config effective: start the new tunnels, stop the removed
-    // ones, and restart the ones whose config changed.
-    fn reconcile(&mut self, config: ClientConfig) {
-        let token = MaskedString::from(self.args.token.as_str());
+    let result = tokio::select! {
+        err = fatal_rx.recv() => match err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        },
+        _ = shutdown_rx.recv() => Ok(()),
+    };
 
-        let names: HashSet<&str> = config.tunnels.iter().map(|s| s.name.as_str()).collect();
+    // Stop every tunnel
+    state.shutdown().await;
 
-        let stale: Vec<String> = self
-            .tunnel_handles
+    // Stop the administration API if it is running
+    #[cfg(feature = "client-api")]
+    if let Some(api_task) = api_task {
+        api_task.abort();
+        let _ = api_task.await;
+    }
+
+    result
+}
+
+/// The identity of a client, resolved from the command line and the configuration
+/// file
+#[derive(Debug, Clone)]
+pub(crate) struct Identity {
+    pub(crate) remote: String,
+    pub(crate) name: String,
+    pub(crate) token: MaskedString,
+}
+
+/// The state of a client, shared between the control channels and the
+/// administration API.
+///
+/// The configuration file is the source of truth: a change made through the API
+/// is written back to it and applied to the running control channels.
+pub(crate) struct ClientState {
+    // The configuration, the source of truth of the tunnels
+    config: RwLock<ClientConfig>,
+    // Where the configuration is written back to
+    config_path: PathBuf,
+    // The resolved identity
+    identity: Identity,
+    // The active control channels, one per tunnel, keyed by domain
+    tunnels: Mutex<HashMap<String, ControlChannelHandle>>,
+    // The number of control channels that are currently established
+    connections: Arc<AtomicUsize>,
+    // Signals a definitive failure to the main loop, so that the client exits
+    fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
+}
+
+impl ClientState {
+    fn new(
+        config: ClientConfig,
+        config_path: PathBuf,
+        identity: Identity,
+        fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
+    ) -> ClientState {
+        ClientState {
+            config: RwLock::new(config),
+            config_path,
+            identity,
+            tunnels: Mutex::new(HashMap::new()),
+            connections: Arc::new(AtomicUsize::new(0)),
+            fatal_tx,
+        }
+    }
+
+    /// The shared token, used by the administration API for authentication
+    #[cfg_attr(not(feature = "client-api"), allow(dead_code))]
+    pub(crate) fn token(&self) -> &str {
+        &self.identity.token
+    }
+
+    /// The name of the client, reported by the administration API
+    #[cfg_attr(not(feature = "client-api"), allow(dead_code))]
+    pub(crate) fn name(&self) -> &str {
+        &self.identity.name
+    }
+
+    /// The address of the server, reported by the administration API
+    #[cfg_attr(not(feature = "client-api"), allow(dead_code))]
+    pub(crate) fn remote(&self) -> &str {
+        &self.identity.remote
+    }
+
+    /// Whether at least one control channel is established, reported by the
+    /// administration API
+    #[cfg_attr(not(feature = "client-api"), allow(dead_code))]
+    pub(crate) fn connected(&self) -> bool {
+        self.connections.load(Ordering::Relaxed) > 0
+    }
+
+    /// The tunnels the client is serving, sorted by domain
+    #[cfg_attr(not(feature = "client-api"), allow(dead_code))]
+    pub(crate) async fn tunnels(&self) -> Vec<ClientTunnelConfig> {
+        self.config.read().await.resolved_tunnels()
+    }
+
+    /// Start, restart and stop the control channels so that they match the
+    /// configuration
+    async fn sync(&self) {
+        let (tunnels, heartbeat_timeout) = {
+            let config = self.config.read().await;
+            (config.resolved_tunnels(), config.heartbeat_timeout())
+        };
+
+        let mut handles = self.tunnels.lock().await;
+
+        // Stop the tunnels that are no longer configured
+        let names: HashSet<&str> = tunnels.iter().map(|t| t.name.as_str()).collect();
+        let stale: Vec<String> = handles
             .keys()
             .filter(|n| !names.contains(n.as_str()))
             .cloned()
             .collect();
         for name in stale {
-            if let Some(handle) = self.tunnel_handles.remove(&name) {
+            if let Some(handle) = handles.remove(&name) {
                 info!("Stopping the tunnel `{}`", name);
                 handle.shutdown();
             }
         }
 
-        for tunnel in &config.tunnels {
-            let restart = match self.tunnel_handles.get(&tunnel.name) {
-                Some(handle) => !handle.matches(tunnel, config.heartbeat_timeout),
+        // Start the new tunnels and restart the ones whose config changed
+        for tunnel in tunnels {
+            let restart = match handles.get(&tunnel.name) {
+                Some(handle) => !handle.matches(&tunnel, heartbeat_timeout),
                 None => true,
             };
             if !restart {
                 continue;
             }
 
-            if let Some(handle) = self.tunnel_handles.remove(&tunnel.name) {
+            if let Some(handle) = handles.remove(&tunnel.name) {
                 handle.shutdown();
             }
 
             let handle = ControlChannelHandle::new(
                 tunnel.clone(),
-                token.clone(),
-                self.args.remote.clone(),
-                config.heartbeat_timeout,
+                self.identity.name.clone(),
+                self.identity.token.clone(),
+                self.identity.remote.clone(),
+                heartbeat_timeout,
+                self.connections.clone(),
+                self.fatal_tx.clone(),
             );
-            self.tunnel_handles.insert(tunnel.name.clone(), handle);
+            handles.insert(tunnel.name.clone(), handle);
+        }
+    }
+
+    /// Create or replace a tunnel, persist the configuration, and apply the change
+    #[cfg_attr(not(feature = "client-api"), allow(dead_code))]
+    pub(crate) async fn put_tunnel(&self, domain: String, local_addr: String) -> Result<()> {
+        if local_addr.is_empty() {
+            bail!("The `local_addr` must not be empty");
+        }
+        let domain = crate::helper::normalize_domain(&domain)
+            .ok_or_else(|| anyhow!("The domain `{}` is invalid", domain))?;
+
+        {
+            let mut config = self.config.write().await;
+            let mut candidate = config.clone();
+            candidate.tunnels.insert(domain, local_addr);
+            // Persist first, so that a failed write leaves the runtime untouched
+            candidate.save(&self.config_path).await?;
+            *config = candidate;
+        }
+
+        self.sync().await;
+        Ok(())
+    }
+
+    /// Delete a tunnel, persist the configuration, and apply the change
+    #[cfg_attr(not(feature = "client-api"), allow(dead_code))]
+    pub(crate) async fn delete_tunnel(&self, domain: &str) -> Result<()> {
+        let domain = crate::helper::normalize_domain(domain)
+            .ok_or_else(|| anyhow!("The domain `{}` is invalid", domain))?;
+
+        {
+            let mut config = self.config.write().await;
+            let mut candidate = config.clone();
+            if candidate.tunnels.remove(&domain).is_none() {
+                bail!("No such a tunnel `{}`", domain);
+            }
+            candidate.save(&self.config_path).await?;
+            *config = candidate;
+        }
+
+        self.sync().await;
+        Ok(())
+    }
+
+    /// Stop every control channel
+    async fn shutdown(&self) {
+        let mut handles = self.tunnels.lock().await;
+        for (_, handle) in handles.drain() {
+            handle.shutdown();
         }
     }
 }
 
-// Check whether the shutdown signal has arrived
-fn is_shutdown(shutdown_rx: &mut broadcast::Receiver<bool>) -> bool {
-    shutdown_rx.try_recv() != Err(broadcast::error::TryRecvError::Empty)
-}
-
-/// A config-session error that the server reported as definitive, e.g. the client
-/// name is unknown or its token is wrong. Retrying cannot fix it, so the error is
-/// marked to make the client exit instead of reconnecting forever.
+/// A config-session error that the server reported as definitive, e.g. the token
+/// is wrong. Retrying cannot fix it, so the error is marked to make the client
+/// exit instead of reconnecting forever.
 #[derive(Debug)]
-struct FatalConfigError(anyhow::Error);
+struct FatalControlError(anyhow::Error);
 
-impl std::fmt::Display for FatalConfigError {
+impl std::fmt::Display for FatalControlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-impl std::error::Error for FatalConfigError {
+impl std::error::Error for FatalControlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.0.as_ref())
     }
-}
-
-// Keep a config channel open, feeding the pushed configs to the reconciliation loop.
-// It reconnects with a backoff when the channel drops, but returns immediately on a
-// definitive rejection from the server.
-async fn run_config_session(
-    args: ClientArgs,
-    tx: mpsc::Sender<ClientConfig>,
-    state: Arc<ClientState>,
-    mut shutdown_rx: broadcast::Receiver<bool>,
-) -> Result<()> {
-    let mut backoff = ExponentialBackoff {
-        max_interval: Duration::from_secs(DEFAULT_FETCH_RETRY_INTERVAL_SECS),
-        max_elapsed_time: None,
-        ..Default::default()
-    };
-
-    loop {
-        if let Err(e) = run_config_connection(&args, &tx, &state, &shutdown_rx).await {
-            if is_shutdown(&mut shutdown_rx) {
-                return Ok(());
-            }
-            // A definitive rejection is not going to succeed on a retry, so give the
-            // error back to the caller and let the client exit
-            if e.downcast_ref::<FatalConfigError>().is_some() {
-                return Err(e);
-            }
-            error!("{:#}", e);
-        }
-
-        if is_shutdown(&mut shutdown_rx) {
-            return Ok(());
-        }
-
-        let duration = backoff
-            .next_backoff()
-            .unwrap_or(Duration::from_secs(DEFAULT_FETCH_RETRY_INTERVAL_SECS));
-        tokio::select! {
-            _ = time::sleep(duration) => {}
-            _ = shutdown_rx.recv() => return Ok(()),
-        }
-    }
-}
-
-// Fetch the config and then keep reading the config updates pushed by the
-// server. It also forwards the changes requested by the administration API and
-// feeds the resulting config to the reconciliation loop.
-async fn run_config_connection(
-    args: &ClientArgs,
-    tx: &mpsc::Sender<ClientConfig>,
-    state: &Arc<ClientState>,
-    shutdown_rx: &broadcast::Receiver<bool>,
-) -> Result<()> {
-    let mut shutdown_rx = shutdown_rx.resubscribe();
-
-    let mut remote_addr = AddrMaybeCached::new(&args.remote);
-    remote_addr.resolve().await.with_context(|| {
-        format!(
-            "Failed to resolve the address of the server {}",
-            args.remote
-        )
-    })?;
-
-    let mut conn = connect(&remote_addr)
-        .await
-        .with_context(|| format!("Failed to connect to {}", remote_addr))?;
-    SocketOpts::for_control_channel().apply(&conn);
-
-    // Send hello. The client identifies itself by its name
-    debug!("Sending hello");
-    let hello_send = Hello::ConfigChannelHello(
-        CURRENT_PROTO_VERSION,
-        protocol::digest(args.name.as_bytes()),
-    );
-    conn.write_all(&bincode::serialize(&hello_send).unwrap())
-        .await?;
-    conn.flush().await?;
-
-    // Read hello
-    debug!("Reading hello");
-    let nonce = match read_hello(&mut conn).await? {
-        ConfigChannelHello(_, d) => d,
-        _ => {
-            bail!("Unexpected type of hello");
-        }
-    };
-
-    // Send auth
-    debug!("Sending auth");
-    let mut concat = Vec::from(args.token.as_bytes());
-    concat.extend_from_slice(&nonce);
-
-    let session_key = protocol::digest(&concat);
-    let auth = Auth(session_key);
-    conn.write_all(&bincode::serialize(&auth).unwrap()).await?;
-    conn.flush().await?;
-
-    // Read ack
-    debug!("Reading ack");
-    match read_ack(&mut conn).await? {
-        Ack::Ok => {}
-        // The server rejected the config channel in a way that a retry cannot fix, so
-        // mark the error fatal and let the client exit instead of retrying forever
-        Ack::TunnelNotExist => {
-            return Err(FatalConfigError(anyhow!(
-                "The client `{}` is not configured on the server",
-                args.name
-            ))
-            .into());
-        }
-        Ack::AuthFailed => {
-            return Err(FatalConfigError(anyhow!(
-                "The token of the client `{}` is incorrect",
-                args.name
-            ))
-            .into());
-        }
-    }
-
-    info!("Config channel established");
-
-    let (mut rd, mut wr) = conn.into_split();
-
-    // Register the requester before reading, so that a request made as soon as the
-    // connection is up is delivered instead of being refused
-    let (req_tx, mut req_rx) = mpsc::channel::<TunnelRequest>(4);
-    state.set_requester(Some(req_tx)).await;
-
-    // The API serializes its requests, so at most one is in flight
-    let mut pending: Option<oneshot::Sender<Result<(), String>>> = None;
-
-    let result = loop {
-        tokio::select! {
-            // A config pushed by the server, or the verdict on a request
-            push = protocol::read_payload::<ServerConfigPush, _>(&mut rd) => {
-                match push {
-                    Ok(ServerConfigPush::Config(config)) => {
-                        state.set_tunnels(&config).await;
-                        info!(
-                            "Got the config from the server. {} tunnel(s)",
-                            config.tunnels.len()
-                        );
-                        if tx.send(config).await.is_err() {
-                            break Err(anyhow!("The client is shutting down"));
-                        }
-                    }
-                    Ok(ServerConfigPush::Applied(config)) => {
-                        state.set_tunnels(&config).await;
-                        if let Some(reply) = pending.take() {
-                            let _ = reply.send(Ok(()));
-                        }
-                    }
-                    Ok(ServerConfigPush::Rejected(reason)) => {
-                        if let Some(reply) = pending.take() {
-                            let _ = reply.send(Err(reason));
-                        }
-                    }
-                    Err(e) => {
-                        break Err(e).with_context(|| "Failed to read the config");
-                    }
-                }
-            }
-            // A change requested through the administration API
-            req = req_rx.recv() => {
-                if let Some(req) = req {
-                    if let Err(e) = protocol::write_payload(&mut wr, &req.msg).await {
-                        let _ = req
-                            .reply
-                            .send(Err("The connection to the server was closed".to_string()));
-                        break Err(e).with_context(|| "Failed to write the config request");
-                    }
-                    pending = Some(req.reply);
-                }
-            }
-            _ = shutdown_rx.recv() => break Ok(()),
-        }
-    };
-
-    // Stop accepting requests and fail the one that is still in flight, so that
-    // the API handler doesn't wait for the whole timeout
-    state.set_requester(None).await;
-    if let Some(reply) = pending.take() {
-        let _ = reply.send(Err("The connection to the server was closed".to_string()));
-    }
-
-    result
 }
 
 struct RunDataChannelArgs {
@@ -530,11 +358,12 @@ async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<TcpS
     // Apply socket options for the data channel
     args.socket_opts.apply(&conn);
 
-    // Send nonce
-    let v: &[u8; HASH_WIDTH_IN_BYTES] = args.session_key[..].try_into().unwrap();
-    let hello = Hello::DataChannelHello(CURRENT_PROTO_VERSION, v.to_owned());
-    conn.write_all(&bincode::serialize(&hello).unwrap()).await?;
-    conn.flush().await?;
+    // Send hello
+    let hello = ClientHello::Data {
+        version: protocol::CURRENT_PROTO_VERSION,
+        nonce: args.session_key,
+    };
+    protocol::write_payload(&mut conn, &hello).await?;
 
     Ok(conn)
 }
@@ -544,7 +373,7 @@ async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
     let mut conn = do_data_channel_handshake(args.clone()).await?;
 
     // Forward
-    match read_data_cmd(&mut conn).await? {
+    match protocol::read_payload::<DataChannelCmd, _>(&mut conn).await? {
         DataChannelCmd::StartForwardTcp => {
             run_data_channel_for_tcp(conn, &args.tunnel.local_addr).await?;
         }
@@ -578,23 +407,22 @@ async fn run_data_channel_for_tcp(mut conn: TcpStream, local_addr: &str) -> Resu
 
 // Control channel
 struct ControlChannel {
-    digest: TunnelDigest,               // SHA256 of the tunnel name
-    tunnel: ClientTunnelConfig,         // Pushed by the server
+    name: String,                       // The client name, announced to the server
+    tunnel: ClientTunnelConfig,         // The domain and its `local_addr`
     token: MaskedString,                // The token given by `--token`
     shutdown_rx: oneshot::Receiver<u8>, // Receives the shutdown signal
     remote_addr: String,                // `--remote`
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
+    connections: Arc<AtomicUsize>,      // The number of established control channels
 }
 
-type TunnelDigest = protocol::Digest;
 type Nonce = protocol::Digest;
-
 // Handle of a control channel
 // Dropping it will also drop the actual control channel
 struct ControlChannelHandle {
     shutdown_tx: oneshot::Sender<u8>,
-    // Keep the config that the channel was created with, so that it can be compared
-    // with the config pushed later
+    // Keep the config that the channel was created with, so that it can be
+    // compared with the one that is configured later
     tunnel: ClientTunnelConfig,
     heartbeat_timeout: u64,
 }
@@ -603,6 +431,25 @@ impl ControlChannelHandle {
     // Whether the channel is already serving the given config
     fn matches(&self, tunnel: &ClientTunnelConfig, heartbeat_timeout: u64) -> bool {
         &self.tunnel == tunnel && self.heartbeat_timeout == heartbeat_timeout
+    }
+}
+
+// Counts an established control channel while it lives, so that the API can
+// report whether the client is connected to the server.
+struct ConnectionsGuard {
+    connections: Arc<AtomicUsize>,
+}
+
+impl ConnectionsGuard {
+    fn new(connections: Arc<AtomicUsize>) -> ConnectionsGuard {
+        connections.fetch_add(1, Ordering::Relaxed);
+        ConnectionsGuard { connections }
+    }
+}
+
+impl Drop for ConnectionsGuard {
+    fn drop(&mut self) {
+        self.connections.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -617,22 +464,21 @@ impl ControlChannel {
             .with_context(|| format!("Failed to connect to {}", self.remote_addr))?;
         SocketOpts::for_control_channel().apply(&conn);
 
-        // Send hello
+        // Send hello. The client announces the domain it serves, which is how the
+        // server learns its tunnels.
         debug!("Sending hello");
-        let hello_send =
-            Hello::ControlChannelHello(CURRENT_PROTO_VERSION, self.digest[..].try_into().unwrap());
-        conn.write_all(&bincode::serialize(&hello_send).unwrap())
-            .await?;
-        conn.flush().await?;
+        let hello = ClientHello::Control {
+            version: protocol::CURRENT_PROTO_VERSION,
+            domain: self.tunnel.name.clone(),
+            name: self.name.clone(),
+            nodelay: self.tunnel.nodelay,
+        };
+        protocol::write_payload(&mut conn, &hello).await?;
 
         // Read hello
         debug!("Reading hello");
-        let nonce = match read_hello(&mut conn).await? {
-            ControlChannelHello(_, d) => d,
-            _ => {
-                bail!("Unexpected type of hello");
-            }
-        };
+        let ServerHello { version, nonce } = protocol::read_payload(&mut conn).await?;
+        protocol::check_version(version)?;
 
         // Send auth
         debug!("Sending auth");
@@ -640,25 +486,29 @@ impl ControlChannel {
         concat.extend_from_slice(&nonce);
 
         let session_key = protocol::digest(&concat);
-        let auth = Auth(session_key);
-        conn.write_all(&bincode::serialize(&auth).unwrap()).await?;
-        conn.flush().await?;
+        protocol::write_payload(&mut conn, &Auth(session_key)).await?;
 
         // Read ack
         debug!("Reading ack");
-        match read_ack(&mut conn).await? {
+        match protocol::read_payload::<Ack, _>(&mut conn).await? {
             Ack::Ok => {}
-            v => {
-                return Err(anyhow!("{}", v))
-                    .with_context(|| format!("Authentication failed: {}", self.tunnel.name));
+            Ack::AuthFailed => {
+                // The token cannot change while the client runs, so retrying is
+                // pointless: mark the error fatal so that the client exits.
+                return Err(FatalControlError(anyhow!(
+                    "The token was rejected by the server for the tunnel `{}`",
+                    self.tunnel.name
+                ))
+                .into());
             }
         }
 
-        // Channel ready
+        // Channel ready. Keep it counted until it goes away
         info!("Control channel established");
+        let _connected = ConnectionsGuard::new(self.connections.clone());
 
         // Socket options for the data channel
-        let socket_opts = SocketOpts::from_client_cfg(&self.tunnel);
+        let socket_opts = SocketOpts::data_channel(self.tunnel.nodelay);
         let data_ch_args = Arc::new(RunDataChannelArgs {
             session_key,
             remote_addr,
@@ -668,7 +518,7 @@ impl ControlChannel {
 
         loop {
             tokio::select! {
-                val = read_control_cmd(&mut conn) => {
+                val = protocol::read_payload::<ControlChannelCmd, _>(&mut conn) => {
                     let val = val?;
                     debug!( "Received {:?}", val);
                     match val {
@@ -701,9 +551,12 @@ impl ControlChannelHandle {
     #[instrument(name="handle", skip_all, fields(tunnel = %tunnel.name, local_addr = %tunnel.local_addr))]
     fn new(
         tunnel: ClientTunnelConfig,
+        name: String,
         token: MaskedString,
         remote_addr: String,
         heartbeat_timeout: u64,
+        connections: Arc<AtomicUsize>,
+        fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
     ) -> ControlChannelHandle {
         let digest = protocol::digest(tunnel.name.as_bytes());
 
@@ -714,12 +567,13 @@ impl ControlChannelHandle {
 
         let handle_tunnel = tunnel.clone();
         let mut s = ControlChannel {
-            digest,
+            name,
             tunnel,
             token,
             shutdown_rx,
             remote_addr,
             heartbeat_timeout,
+            connections,
         };
 
         tokio::spawn(
@@ -732,6 +586,13 @@ impl ControlChannelHandle {
                     .with_context(|| "Failed to run the control channel")
                 {
                     if s.shutdown_rx.try_recv() != Err(oneshot::error::TryRecvError::Empty) {
+                        break;
+                    }
+
+                    // A definitive rejection (a wrong token) is not going to
+                    // succeed on a retry, so report it and stop
+                    if let Some(fatal) = err.downcast_ref::<FatalControlError>() {
+                        let _ = fatal_tx.send(anyhow!("{}", fatal.0));
                         break;
                     }
 

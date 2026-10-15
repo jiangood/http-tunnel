@@ -1,0 +1,13 @@
+# The configuration of a client.
+#
+# The server takes no configuration file: it is started with `--server-port`,
+# `--http-port` and `--token`. The tunnels are declared here, on the client.
+#
+# The identity (`remote`, `name` and `token`) can also be passed on the command
+# line or through the environment, in which case the command line wins.
+remote = "myserver.example.com:2333"
+name = "home_nas"
+token = "use_a_secret_that_only_you_know"
+
+[tunnels]
+"nas.example.com" = "127.0.0.1:80"

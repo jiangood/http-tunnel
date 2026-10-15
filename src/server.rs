@@ -1,12 +1,11 @@
-use crate::config::{ClientConfig, MaskedString, ServerConfig, ServerTunnelConfig};
+use crate::cli::ServerArgs;
+use crate::config::MaskedString;
 use crate::constants::listen_backoff;
 use crate::helper::{retry_notify_with_deadline, to_bind_addr, write_and_flush};
 use crate::http::RoutingTable;
 use crate::multi_map::MultiMap;
-use crate::protocol::Hello::{ConfigChannelHello, ControlChannelHello, DataChannelHello};
 use crate::protocol::{
-    self, read_auth, read_hello, Ack, ClientConfigRequest, ControlChannelCmd, DataChannelCmd,
-    Hello, ServerConfigPush, HASH_WIDTH_IN_BYTES,
+    self, Ack, ClientHello, ControlChannelCmd, DataChannelCmd, ServerHello, HASH_WIDTH_IN_BYTES,
 };
 use crate::transport::SocketOpts;
 use anyhow::{anyhow, bail, Context, Result};
@@ -14,20 +13,18 @@ use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
 
 use rand::RngCore;
-use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
 pub(crate) type TunnelDigest = protocol::Digest; // SHA256 of a tunnel name
-pub(crate) type ClientDigest = protocol::Digest; // SHA256 of a client name
 type Nonce = protocol::Digest; // Also called `session_key`
 
 const POOL_MIN: usize = 8; // Minimum number of warm data channels kept per tunnel
@@ -41,6 +38,10 @@ const DRAIN_TIMEOUT: u64 = 30; // Seconds to wait for in-flight visitors on shut
 const COPY_BUF_SIZE: usize = 64 * 1024;
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
+// The interval between two application-layer heartbeats sent to a client. The
+// server owns it (it is the one sending the heartbeats), so it is a constant now
+// that the server has no configuration file.
+const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 // A visitor accepted by the HTTP entrypoint. `prefetched` holds the bytes that were
 // read while sniffing the `Host` header and must be replayed to the tunnel.
@@ -95,67 +96,30 @@ impl Drop for ActivityGuard {
     }
 }
 
-// A client of `[clients]`, together with the config that is pushed to it
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct ServerClient {
-    name: String,
-    token: MaskedString,
-    config: ClientConfig,
-}
-
-// A tunnel, together with the token of the client that serves it
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct TunnelRuntime {
-    config: ServerTunnelConfig,
-    token: MaskedString,
-    heartbeat_interval: u64,
-}
-
 // A hash map of ControlChannelHandles, indexed by TunnelDigest or Nonce
 // See also MultiMap
 pub(crate) type ControlChannelMap = MultiMap<TunnelDigest, Nonce, ControlChannelHandle>;
 
-// A registered config channel, so that the config updates can be pushed to the client.
-// `id` identifies the connection that owns the handle, so that a connection only
-// removes its own handle when it goes away.
-struct ConfigChannelHandle {
-    id: usize,
-    tx: mpsc::Sender<ClientConfig>,
-}
-
 // ServerState holds all the mutable state of a running server. It's shared by the
-// server tasks.
+// server tasks. The server takes no configuration file: it learns the tunnels of
+// its clients from the control channels they open, so the routing table grows and
+// shrinks with them.
 pub(crate) struct ServerState {
-    // The path of the config file, to write the changes back to
-    pub(crate) config_path: PathBuf,
-    // The authoritative configuration, mutated by the config requests of the clients
-    pub(crate) config: RwLock<ServerConfig>,
-    // The tunnels of all the clients, indexed by TunnelDigest
-    pub(crate) tunnels: RwLock<HashMap<TunnelDigest, TunnelRuntime>>,
-    // `[clients]`, indexed by the digest of the client name
-    pub(crate) clients: RwLock<HashMap<ClientDigest, ServerClient>>,
+    // The shared token every client authenticates with
+    pub(crate) token: MaskedString,
     // Collection of control channels
     pub(crate) control_channels: RwLock<ControlChannelMap>,
     // `Host` -> TunnelDigest
     pub(crate) routing_table: RwLock<RoutingTable>,
-    // The config channels of the connected clients, keyed by the client digest
-    config_channels: RwLock<HashMap<ClientDigest, ConfigChannelHandle>>,
-    // A monotonically increasing id, identifying a config channel connection
+    // A monotonically increasing id, identifying a control channel connection
     next_conn_id: AtomicUsize,
-    // Serialize the configuration changes, so that two concurrent applies can't
-    // overwrite each other
-    apply_lock: Mutex<()>,
     // The visitors that are currently being served
     pub(crate) activity: ActivityTracker,
 }
 
 // The entrypoint of running a server
-pub async fn run_server(
-    config: ServerConfig,
-    config_path: PathBuf,
-    shutdown_rx: broadcast::Receiver<bool>,
-) -> Result<()> {
-    let mut server = Server::from(config, config_path).await?;
+pub async fn run_server(args: ServerArgs, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
+    let mut server = Server::new(args.server_port, args.http_port, args.token);
     server.run(shutdown_rx).await?;
 
     Ok(())
@@ -168,227 +132,29 @@ struct Server {
     http_port: u16,
 }
 
-// Generate the tunnels of all the clients, indexed by TunnelDigest
-fn generate_tunnel_hashmap(server_config: &ServerConfig) -> HashMap<TunnelDigest, TunnelRuntime> {
-    let mut ret = HashMap::new();
-    for client in server_config.clients.values() {
-        let heartbeat_interval = client.heartbeat_interval();
-        for (name, s) in &client.tunnels {
-            ret.insert(
-                protocol::digest(name.as_bytes()),
-                TunnelRuntime {
-                    config: s.clone(),
-                    token: client.token.clone(),
-                    heartbeat_interval,
-                },
-            );
-        }
-    }
-    ret
-}
-
-// Generate the clients, indexed by the digest of their name
-fn generate_client_hashmap(server_config: &ServerConfig) -> HashMap<ClientDigest, ServerClient> {
-    let mut ret = HashMap::new();
-    for (name, client) in &server_config.clients {
-        ret.insert(
-            protocol::digest(name.as_bytes()),
-            ServerClient {
-                name: name.clone(),
-                token: client.token.clone(),
-                config: client.to_client_config(),
-            },
-        );
-    }
-    ret
-}
-
-// Generate a routing table which maps a `Host` domain to a TunnelDigest
-fn generate_routing_table(server_config: &ServerConfig) -> RoutingTable {
-    let mut ret = RoutingTable::default();
-    for client in server_config.clients.values() {
-        for (name, s) in &client.tunnels {
-            let digest = protocol::digest(name.as_bytes());
-            ret.insert(&s.domain, digest);
-        }
-    }
-    ret
-}
-
 impl ServerState {
-    fn new(config: ServerConfig, config_path: PathBuf) -> ServerState {
-        let tunnels = generate_tunnel_hashmap(&config);
-        let clients = generate_client_hashmap(&config);
-        let routing_table = generate_routing_table(&config);
+    fn new(token: MaskedString) -> ServerState {
         ServerState {
-            config_path,
-            config: RwLock::new(config),
-            tunnels: RwLock::new(tunnels),
-            clients: RwLock::new(clients),
+            token,
             control_channels: RwLock::new(ControlChannelMap::new()),
-            routing_table: RwLock::new(routing_table),
-            config_channels: RwLock::new(HashMap::new()),
+            routing_table: RwLock::new(RoutingTable::default()),
             next_conn_id: AtomicUsize::new(0),
-            apply_lock: Mutex::new(()),
             activity: ActivityTracker::default(),
         }
-    }
-
-    /// Apply a change to the configuration and make it effective at runtime.
-    ///
-    /// The candidate is validated and written back to the config file first, so that
-    /// a failed write leaves the runtime untouched. Then the derived maps are rebuilt,
-    /// the tunnels of the removed or changed tunnels are dropped, and the client
-    /// configs are pushed to the affected connected clients.
-    pub(crate) async fn apply<F>(&self, f: F) -> Result<()>
-    where
-        F: FnOnce(&mut ServerConfig) -> Result<()>,
-    {
-        let _guard = self.apply_lock.lock().await;
-
-        let mut config = self.config.read().await.clone();
-        f(&mut config)?;
-        ServerConfig::validate(&mut config)?;
-
-        self.persist(&config)
-            .await
-            .with_context(|| "Failed to write the config back")?;
-
-        let new_tunnels = generate_tunnel_hashmap(&config);
-        let new_clients = generate_client_hashmap(&config);
-        let new_routing_table = generate_routing_table(&config);
-
-        // Diff the clients before the map is replaced
-        let (changed_clients, removed_clients) = {
-            let old = self.clients.read().await;
-            let changed: Vec<ClientDigest> = new_clients
-                .iter()
-                .filter(|(d, c)| old.get(*d) != Some(*c))
-                .map(|(d, _)| *d)
-                .collect();
-            let removed: Vec<ClientDigest> = old
-                .keys()
-                .filter(|d| !new_clients.contains_key(*d))
-                .copied()
-                .collect();
-            (changed, removed)
-        };
-
-        // Drop the control channels of the removed or changed tunnels. Dropping the
-        // handle shuts the control channel down, so the client reconnects and picks up
-        // the change.
-        {
-            let old_tunnels = self.tunnels.read().await;
-            let mut ccs = self.control_channels.write().await;
-            for (digest, old) in old_tunnels.iter() {
-                if new_tunnels.get(digest) != Some(old) {
-                    ccs.remove1(digest);
-                }
-            }
-        }
-
-        // Replace the derived maps
-        *self.tunnels.write().await = new_tunnels;
-        *self.routing_table.write().await = new_routing_table;
-
-        // Drop the config channels of the removed clients
-        {
-            let mut chans = self.config_channels.write().await;
-            for d in &removed_clients {
-                chans.remove(d);
-            }
-        }
-
-        // Push the new config to the connected clients whose config changed
-        {
-            let chans = self.config_channels.read().await;
-            for d in &changed_clients {
-                if let Some(handle) = chans.get(d) {
-                    if let Some(client) = new_clients.get(d) {
-                        let _ = handle.tx.try_send(client.config.clone());
-                    }
-                }
-            }
-        }
-
-        *self.clients.write().await = new_clients;
-        *self.config.write().await = config;
-
-        Ok(())
-    }
-
-    /// Write the configuration back to the config file atomically
-    async fn persist(&self, config: &ServerConfig) -> Result<()> {
-        let s = config.to_toml()?;
-        let tmp = self.config_path.with_extension("toml.tmp");
-        tokio::fs::write(&tmp, s.as_bytes())
-            .await
-            .with_context(|| format!("Failed to write the temporary config {:?}", tmp))?;
-        tokio::fs::rename(&tmp, &self.config_path)
-            .await
-            .with_context(|| format!("Failed to replace the config {:?}", self.config_path))?;
-        Ok(())
-    }
-
-    /// Read the current configuration
-    pub(crate) async fn snapshot(&self) -> ServerConfig {
-        self.config.read().await.clone()
-    }
-
-    /// Create or replace a tunnel of a client
-    pub(crate) async fn put_tunnel(
-        &self,
-        client: &str,
-        domain: String,
-        tunnel_config: ServerTunnelConfig,
-    ) -> Result<()> {
-        if domain.is_empty() {
-            bail!("The domain of the tunnel must not be empty");
-        }
-        let client = client.to_string();
-        self.apply(move |config| {
-            let c = config
-                .clients
-                .get_mut(&client)
-                .ok_or_else(|| anyhow!("No such a client `{}`", client))?;
-            c.tunnels.insert(domain, tunnel_config);
-            Ok(())
-        })
-        .await
-    }
-
-    /// Delete a tunnel of a client
-    pub(crate) async fn delete_tunnel(&self, client: &str, domain: &str) -> Result<()> {
-        let client = client.to_string();
-        let domain = domain.to_string();
-        self.apply(move |config| {
-            let c = config
-                .clients
-                .get_mut(&client)
-                .ok_or_else(|| anyhow!("No such a client `{}`", client))?;
-            if c.tunnels.remove(&domain).is_none() {
-                bail!("No such a tunnel `{}` of the client `{}`", domain, client);
-            }
-            Ok(())
-        })
-        .await
     }
 }
 
 impl Server {
-    // Create a server from the config
-    pub async fn from(mut config: ServerConfig, config_path: PathBuf) -> Result<Server> {
-        ServerConfig::validate(&mut config)?;
+    // Create a server from the command line options
+    pub fn new(server_port: u16, http_port: u16, token: String) -> Server {
+        let server_addr = to_bind_addr(server_port);
+        let state = Arc::new(ServerState::new(MaskedString::from(token)));
 
-        let server_addr = to_bind_addr(config.server_port);
-        let http_port = config.http_port;
-        let state = Arc::new(ServerState::new(config, config_path));
-
-        Ok(Server {
+        Server {
             state,
             server_addr,
             http_port,
-        })
+        }
     }
 
     // The entry point of Server
@@ -492,11 +258,12 @@ impl Server {
             }
         }
 
-        // Drop the tunnels and the config channels, so that the clients reconnect (and
-        // pick up the fresh state) when the server is restarted. Without this, the
-        // in-process tasks of this server would keep the connections alive.
+        // Drop the control channels and the routing table, so that the clients
+        // reconnect (and register their tunnels again) when the server is
+        // restarted. Without this, the in-process tasks of this server would keep
+        // the connections alive.
         *self.state.control_channels.write().await = ControlChannelMap::new();
-        self.state.config_channels.write().await.clear();
+        *self.state.routing_table.write().await = RoutingTable::default();
 
         info!("Shutdown");
 
@@ -512,307 +279,128 @@ async fn handshake(conn: TcpStream) -> Result<TcpStream> {
 // Handle connections to `server_port`
 async fn handle_connection(mut conn: TcpStream, state: Arc<ServerState>) -> Result<()> {
     // Read hello
-    let hello = read_hello(&mut conn).await?;
+    let hello: ClientHello = protocol::read_payload(&mut conn).await?;
+    protocol::check_version(hello.version())?;
+
     match hello {
-        ControlChannelHello(_, tunnel_digest) => {
-            do_control_channel_handshake(conn, state, tunnel_digest).await?;
+        ClientHello::Control {
+            domain,
+            name,
+            nodelay,
+            ..
+        } => {
+            do_control_channel_handshake(conn, state, domain, name, nodelay).await?;
         }
-        ConfigChannelHello(_, client_digest) => {
-            do_config_channel_handshake(conn, state, client_digest).await?;
-        }
-        DataChannelHello(_, nonce) => {
+        ClientHello::Data { nonce, .. } => {
             do_data_channel_handshake(conn, state, nonce).await?;
         }
     }
     Ok(())
 }
 
-// Push the config of a client to it, and keep the config channel open to push the
-// config after a change that the client requests for its own tunnels. The client
-// doesn't have any config of its own.
-async fn do_config_channel_handshake(
-    mut conn: TcpStream,
-    state: Arc<ServerState>,
-    client_digest: ClientDigest,
-) -> Result<()> {
-    info!("Try to handshake a config channel");
-
-    SocketOpts::for_control_channel().apply(&conn);
-
-    // Generate a nonce
-    let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];
-    rand::thread_rng().fill_bytes(&mut nonce);
-
-    // Send hello
-    let hello_send = Hello::ConfigChannelHello(
-        protocol::CURRENT_PROTO_VERSION,
-        nonce.clone().try_into().unwrap(),
-    );
-    conn.write_all(&bincode::serialize(&hello_send).unwrap())
-        .await?;
-    conn.flush().await?;
-
-    // Read auth. It is read before the lookup so that an unknown client is rejected
-    // only once its auth has been drained: closing the connection with unread data
-    // sends a reset instead of the ack, and the client would misread the definitive
-    // rejection as a transient network failure and retry forever
-    let protocol::Auth(d) = read_auth(&mut conn).await?;
-
-    // Lookup the client
-    let client = state.clients.read().await.get(&client_digest).cloned();
-    let Some(client) = client else {
-        conn.write_all(&bincode::serialize(&Ack::TunnelNotExist).unwrap())
-            .await?;
-        conn.flush().await?;
-        bail!("No such a client {}", hex::encode(client_digest));
-    };
-
-    // Calculate the checksum
-    let mut concat = Vec::from(client.token.as_bytes());
-    concat.append(&mut nonce);
-
-    // Validate
-    let session_key = protocol::digest(&concat);
-    if session_key != d {
-        conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
-            .await?;
-        conn.flush().await?;
-        debug!(
-            "Expect {}, but got {}",
-            hex::encode(session_key),
-            hex::encode(d)
-        );
-        bail!("Client {} failed the authentication", client.name);
-    }
-
-    conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
-        .await?;
-    conn.flush().await?;
-
-    // Register the config channel before pushing, so that a change requested in the
-    // meantime isn't missed. Replacing a previous handle drops its sender,
-    // which makes the stale connection exit.
-    let (tx, mut rx) = mpsc::channel::<ClientConfig>(CHAN_SIZE);
-    let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
-    {
-        let mut chans = state.config_channels.write().await;
-        chans.insert(client_digest, ConfigChannelHandle { id: conn_id, tx });
-    }
-
-    // Push the freshest config, then the later updates, until the client goes away
-    let push_result = {
-        let latest = state.clients.read().await.get(&client_digest).cloned();
-        match latest {
-            Some(latest) => run_config_push(conn, &latest, state.clone(), &mut rx).await,
-            None => Ok(()),
-        }
-    };
-
-    // Only remove our own handle, so that a reconnected client isn't dropped
-    {
-        let mut chans = state.config_channels.write().await;
-        if chans.get(&client_digest).map(|h| h.id) == Some(conn_id) {
-            chans.remove(&client_digest);
-        }
-    }
-
-    push_result
-}
-
-// Push the config of a client to it, then the pushed updates, until the channel
-// fails. The client can also request changes to its own tunnels on this channel;
-// they are validated and applied by the server, which then pushes the resulting
-// config back.
-async fn run_config_push(
-    conn: TcpStream,
-    client: &ServerClient,
-    state: Arc<ServerState>,
-    rx: &mut mpsc::Receiver<ClientConfig>,
-) -> Result<()> {
-    let (mut rd, mut wr) = conn.into_split();
-
-    protocol::write_payload(&mut wr, &ServerConfigPush::Config(client.config.clone())).await?;
-    info!(client = %client.name, tunnels = client.config.tunnels.len(), "Config pushed");
-
-    loop {
-        tokio::select! {
-            // A config change pushed by the server (the answer to a request of this
-            // very client)
-            config = rx.recv() => {
-                let Some(config) = config else {
-                    break;
-                };
-                let tunnels = config.tunnels.len();
-                if let Err(e) = protocol::write_payload(&mut wr, &ServerConfigPush::Config(config)).await {
-                    debug!("Failed to push the config to {}: {:#}", client.name, e);
-                    break;
-                }
-                info!(client = %client.name, tunnels, "Config pushed");
-            }
-            // A change to its own tunnels requested by the client
-            req = protocol::read_payload::<ClientConfigRequest, _>(&mut rd) => {
-                let req = match req {
-                    Ok(req) => req,
-                    Err(e) => {
-                        debug!("Failed to read a config request from {}: {:#}", client.name, e);
-                        break;
-                    }
-                };
-                let push = match handle_config_request(&state, &client.name, req).await {
-                    Ok(config) => ServerConfigPush::Applied(config),
-                    Err(e) => ServerConfigPush::Rejected(format!("{:#}", e)),
-                };
-                if let Err(e) = protocol::write_payload(&mut wr, &push).await {
-                    debug!("Failed to answer the config request of {}: {:#}", client.name, e);
-                    break;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-// Apply a change that a client requested to its own tunnels. The whole
-// configuration is validated and persisted by `ServerState`, so the global rules
-// (unique domains and tokens) always hold, and the resulting config is returned
-// to be acknowledged to the client.
-async fn handle_config_request(
-    state: &Arc<ServerState>,
-    client: &str,
-    req: ClientConfigRequest,
-) -> Result<ClientConfig> {
-    match req {
-        ClientConfigRequest::PutTunnel { domain, local_addr } => {
-            let domain = domain.to_lowercase();
-            let tunnel = ServerTunnelConfig {
-                domain: domain.clone(),
-                local_addr,
-                nodelay: None,
-            };
-            state.put_tunnel(client, domain, tunnel).await?;
-        }
-        ClientConfigRequest::DeleteTunnel { domain } => {
-            state.delete_tunnel(client, &domain.to_lowercase()).await?;
-        }
-    }
-
-    let config = state.snapshot().await;
-    let client_config = config
-        .clients
-        .get(client)
-        .ok_or_else(|| anyhow!("No such a client `{}`", client))?
-        .to_client_config();
-    Ok(client_config)
-}
-
+// Establish a control channel for `domain`.
+//
+// The server takes no configuration file: this is where it learns that a client
+// serves `domain`, and where the domain is added to the routing table. The
+// control channel is torn down (and the domain removed) when the client goes
+// away. A second control channel for a domain that is already served takes it
+// over, which is how a reconnecting client is handled; taking a domain from a
+// client of another name is logged as a warning.
 async fn do_control_channel_handshake(
     mut conn: TcpStream,
     state: Arc<ServerState>,
-    tunnel_digest: TunnelDigest,
+    domain: String,
+    name: String,
+    nodelay: bool,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
     SocketOpts::for_control_channel().apply(&conn);
 
+    let domain = crate::helper::normalize_domain(&domain)
+        .ok_or_else(|| anyhow!("The domain `{}` of the client `{}` is invalid", domain, name))?;
+
     // Generate a nonce
     let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];
     rand::thread_rng().fill_bytes(&mut nonce);
+    let nonce: protocol::Digest = nonce.try_into().unwrap();
 
     // Send hello
-    let hello_send = Hello::ControlChannelHello(
-        protocol::CURRENT_PROTO_VERSION,
-        nonce.clone().try_into().unwrap(),
-    );
-    conn.write_all(&bincode::serialize(&hello_send).unwrap())
-        .await?;
-    conn.flush().await?;
-
-    // Lookup the tunnel
-    let tunnel = match state.tunnels.read().await.get(&tunnel_digest) {
-        Some(v) => v,
-        None => {
-            conn.write_all(&bincode::serialize(&Ack::TunnelNotExist).unwrap())
-                .await?;
-            bail!("No such a tunnel {}", hex::encode(tunnel_digest));
-        }
-    }
-    .to_owned();
-
-    let tunnel_config = tunnel.config;
-    let tunnel_name = &tunnel_config.domain;
-    let heartbeat_interval = tunnel.heartbeat_interval;
-
-    // Calculate the checksum with the token of the client that serves the tunnel
-    let mut concat = Vec::from(tunnel.token.as_bytes());
-    concat.append(&mut nonce);
+    let hello_send = ServerHello {
+        version: protocol::CURRENT_PROTO_VERSION,
+        nonce,
+    };
+    protocol::write_payload(&mut conn, &hello_send).await?;
 
     // Read auth
-    let protocol::Auth(d) = read_auth(&mut conn).await?;
+    let protocol::Auth(d) = protocol::read_payload(&mut conn).await?;
 
-    // Validate
+    // Validate against the shared token
+    let mut concat = Vec::from(state.token.as_bytes());
+    concat.extend_from_slice(&nonce);
     let session_key = protocol::digest(&concat);
     if session_key != d {
-        conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
-            .await?;
+        protocol::write_payload(&mut conn, &Ack::AuthFailed).await?;
         debug!(
             "Expect {}, but got {}",
             hex::encode(session_key),
             hex::encode(d)
         );
-        bail!("Tunnel {} failed the authentication", tunnel_name);
-    } else {
-        let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
-
-        // If there's already a control channel for the tunnel, then drop the old one.
-        // Because a control channel doesn't report back when it's dead,
-        // the handle in the map could be stall, dropping the old handle enables
-        // the client to reconnect.
-        if state
-            .control_channels
-            .write()
-            .await
-            .remove1(&tunnel_digest)
-            .is_some()
-        {
-            warn!(
-                "Dropping previous control channel for tunnel {}",
-                tunnel_name
-            );
-        }
-
-        // Send ack
-        conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
-            .await?;
-        conn.flush().await?;
-
-        info!(tunnel = %tunnel_config.domain, "Control channel established");
-        let (handle, ch_task) = ControlChannelHandle::new(
-            conn,
-            tunnel_config,
-            heartbeat_interval,
-            conn_id,
-        );
-
-        // Insert the new handle
-        let _ = state
-            .control_channels
-            .write()
-            .await
-            .insert(tunnel_digest, session_key, handle);
-
-        // When the control channel is gone (the client crashed, was stopped, or lost
-        // its connection), remove its handle so that the visitors are answered with a
-        // 503 instead of being handed over to a tunnel that will never receive them.
-        // Only remove our own handle, so that a reconnected client isn't dropped.
-        tokio::spawn(async move {
-            let _ = ch_task.await;
-            let mut h = state.control_channels.write().await;
-            if h.get1(&tunnel_digest).map(|h| h.id) == Some(conn_id) {
-                h.remove1(&tunnel_digest);
-            }
-        });
+        bail!("The client `{}` failed the authentication", name);
     }
+
+    // Send ack
+    protocol::write_payload(&mut conn, &Ack::Ok).await?;
+
+    let digest = protocol::digest(domain.as_bytes());
+    let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
+
+    // If there's already a control channel for the domain, drop the old one. A
+    // control channel doesn't report back when it's dead, so the handle in the map
+    // could be stale; dropping it lets the client reconnect.
+    {
+        let mut ccs = state.control_channels.write().await;
+        if let Some(prev) = ccs.remove1(&digest) {
+            if prev.name != name {
+                warn!(
+                    "The domain `{}` was served by the client `{}`; taking it over for `{}`",
+                    domain, prev.name, name
+                );
+            } else {
+                debug!(
+                    "Dropping the previous control channel for the domain `{}`",
+                    domain
+                );
+            }
+        }
+    }
+
+    info!(tunnel = %domain, client = %name, "Control channel established");
+    let (handle, ch_task) =
+        ControlChannelHandle::new(conn, domain.clone(), name, nodelay, HEARTBEAT_INTERVAL_SECS, conn_id);
+
+    // Register the handle and the route
+    let _ = state
+        .control_channels
+        .write()
+        .await
+        .insert(digest, session_key, handle);
+    state.routing_table.write().await.insert(&domain, digest);
+
+    // When the control channel is gone (the client crashed, was stopped, or lost its
+    // connection), remove its handle and its route, so that the visitor of that host
+    // is answered with a 404 instead of being handed over to a tunnel that will
+    // never receive it. Only remove our own, so that a reconnected client isn't
+    // dropped.
+    tokio::spawn(async move {
+        let _ = ch_task.await;
+        let mut ccs = state.control_channels.write().await;
+        if ccs.get1(&digest).map(|h| h.id) == Some(conn_id) {
+            ccs.remove1(&digest);
+            drop(ccs);
+            state.routing_table.write().await.remove(&domain);
+        }
+    });
 
     Ok(())
 }
@@ -828,7 +416,7 @@ async fn do_data_channel_handshake(
     let control_channels_guard = state.control_channels.read().await;
     match control_channels_guard.get2(&nonce) {
         Some(handle) => {
-            SocketOpts::from_server_cfg(&handle.tunnel).apply(&conn);
+            SocketOpts::data_channel(handle.nodelay).apply(&conn);
 
             // Send the data channel to the corresponding control channel. The
             // pool is told whether it made it, so that a channel that never
@@ -998,22 +586,27 @@ pub(crate) struct ControlChannelHandle {
     // Identifies the connection that owns the handle, so that it only removes its own
     // handle when it goes away
     id: usize,
+    // The client that owns the channel, to warn when a domain changes hands
+    name: String,
+    // The client's TCP_NODELAY preference for the data channels of the tunnel
+    nodelay: bool,
     // Shutdown the control channel by dropping it
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<TcpStream>,
     pub(crate) visitor_tx: mpsc::Sender<HttpVisitor>,
     // The data channel pool of the tunnel
     pub(crate) data_pool: DataChannelPool,
-    tunnel: ServerTunnelConfig,
 }
 
 impl ControlChannelHandle {
     // Create a control channel handle, where the control channel handling task
     // and the connection pool task are created.
-    #[instrument(name = "handle", skip_all, fields(tunnel = %tunnel.domain, local_addr = %tunnel.local_addr))]
+    #[instrument(name = "handle", skip_all, fields(tunnel = %domain, client = %name))]
     fn new(
         conn: TcpStream,
-        tunnel: ServerTunnelConfig,
+        domain: String,
+        name: String,
+        nodelay: bool,
         heartbeat_interval: u64,
         id: usize,
     ) -> (ControlChannelHandle, JoinHandle<()>) {
@@ -1055,8 +648,8 @@ impl ControlChannelHandle {
 
         // Run the control channel. Its `JoinHandle` is returned so that the caller can
         // remove the handle from the map once the channel is gone, which lets the
-        // visitors be answered with a 503 instead of being handed over to a dead
-        // tunnel.
+        // visitor of the host be answered with a 404 instead of being handed over to a
+        // dead tunnel.
         let ch_task = tokio::spawn(
             async move {
                 if let Err(err) = ch.run().await {
@@ -1069,11 +662,12 @@ impl ControlChannelHandle {
         (
             ControlChannelHandle {
                 id,
+                name,
+                nodelay,
                 _shutdown_tx: shutdown_tx,
                 data_ch_tx,
                 visitor_tx,
                 data_pool,
-                tunnel,
             },
             ch_task,
         )
@@ -1099,9 +693,6 @@ impl ControlChannel {
             heartbeat_interval,
         } = self;
 
-        let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
-        let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
-
         // Split the connection, so that the writes and the read that watches for the
         // client going away don't borrow the same half.
         let (mut rd, mut wr) = split(conn);
@@ -1113,7 +704,7 @@ impl ControlChannel {
                 val = data_ch_req_rx.recv() => {
                     match val {
                         Some(_) => {
-                            if let Err(e) = write_and_flush(&mut wr, &create_ch_cmd).await {
+                            if let Err(e) = protocol::write_payload(&mut wr, &ControlChannelCmd::CreateDataChannel).await {
                                 error!("{:#}", e);
                                 break;
                             }
@@ -1124,15 +715,16 @@ impl ControlChannel {
                     }
                 },
                 _ = time::sleep(Duration::from_secs(heartbeat_interval)), if heartbeat_interval != 0 => {
-                            if let Err(e) = write_and_flush(&mut wr, &heartbeat).await {
+                            if let Err(e) = protocol::write_payload(&mut wr, &ControlChannelCmd::HeartBeat).await {
                                 error!("{:#}", e);
                                 break;
                             }
                 }
                 // The client never writes on the control channel, so any read result
                 // means that it's gone. Breaking the loop removes the handle from the
-                // map (see `do_control_channel_handshake`), so that the visitors get a
-                // 503 instead of being handed over to a tunnel that never forwards.
+                // map (see `do_control_channel_handshake`), so that the visitor of the
+                // host gets a 404 instead of being handed over to a tunnel that never
+                // forwards.
                 ret = rd.read(&mut buf) => {
                     match ret {
                         Ok(0) => {
@@ -1342,7 +934,6 @@ async fn forward_visitor(
         prefetched,
         activity,
     } = visitor;
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
 
     loop {
         let (waiter_tx, waiter_rx) = oneshot::channel();
@@ -1354,7 +945,9 @@ async fn forward_visitor(
 
         match wait_for_channel(&mut stream, waiter_rx).await {
             ChannelWait::Got(mut channel) => {
-                let ok = write_and_flush(&mut channel, &cmd).await.is_ok()
+                let ok = protocol::write_payload(&mut channel, &DataChannelCmd::StartForwardTcp)
+                    .await
+                    .is_ok()
                     && write_and_flush(&mut channel, &prefetched).await.is_ok();
 
                 if ok {

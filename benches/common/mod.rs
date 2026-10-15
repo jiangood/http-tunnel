@@ -70,14 +70,14 @@ impl Harness {
             })
         };
 
-        // Write a server config on the fly, so the benchmark doesn't depend on
+        // Write a client config on the fly, so the benchmark doesn't depend on
         // the test fixtures.
         let config_path = std::env::temp_dir().join(format!(
             "http-tunnel-bench-{}.toml",
             std::process::id()
         ));
         let config = format!(
-            "server_port = {SERVER_PORT}\nhttp_port = {HTTP_ENTRY_PORT}\n\n[clients.{CLIENT_NAME}]\ntoken = \"{CLIENT_TOKEN}\"\n\n[clients.{CLIENT_NAME}.tunnels]\n\"{ECHO_HOST}\" = \"{ECHO_SERVER_ADDR}\"\n"
+            "name = \"{CLIENT_NAME}\"\nremote = \"{SERVER_ADDR}\"\ntoken = \"{CLIENT_TOKEN}\"\n\n[tunnels]\n\"{ECHO_HOST}\" = \"{ECHO_SERVER_ADDR}\"\n"
         );
         std::fs::write(&config_path, config)?;
         let config_guard = TempFile(config_path.clone());
@@ -85,11 +85,13 @@ impl Harness {
         let (client_shutdown, client_rx) = broadcast::channel(1);
         let (server_shutdown, server_rx) = broadcast::channel(1);
 
+        let client_config_path = config_path.clone();
         let client = tokio::spawn(async move {
             let cmd = http_tunnel::Command::Client(http_tunnel::ClientArgs {
-                name: CLIENT_NAME.to_string(),
-                remote: SERVER_ADDR.to_string(),
-                token: CLIENT_TOKEN.to_string(),
+                config_path: client_config_path,
+                remote: None,
+                name: None,
+                token: None,
                 api_port: None,
             });
             let _ = http_tunnel::run(cmd, client_rx).await;
@@ -98,9 +100,12 @@ impl Harness {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let server = {
-            let config_path = config_path.clone();
             tokio::spawn(async move {
-                let cmd = http_tunnel::Command::Server(http_tunnel::ServerArgs { config_path });
+                let cmd = http_tunnel::Command::Server(http_tunnel::ServerArgs {
+                    server_port: SERVER_PORT,
+                    http_port: HTTP_ENTRY_PORT,
+                    token: CLIENT_TOKEN.to_string(),
+                });
                 let _ = http_tunnel::run(cmd, server_rx).await;
             })
         };

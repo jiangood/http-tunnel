@@ -43,9 +43,7 @@ cargo Features:      {}
     setting(AppSettings::DeriveDisplayOrder)
 )]
 pub struct Cli {
-    // The client options, used when no `server` subcommand is given. They are
-    // all optional here because clap can't express "required unless a
-    // subcommand is given"; `into_command` enforces them for the default role.
+    // The client options, used when no `server` subcommand is given.
     #[clap(flatten)]
     client: ClientOptions,
 
@@ -57,21 +55,36 @@ pub struct Cli {
 // subcommand of its own.
 #[derive(Subcommand, Debug, Clone)]
 enum ServerCommand {
-    /// Run as a server. The configuration file defines all the clients and their tunnels
+    /// Run as a server. It takes no configuration file: the tunnels are declared
+    /// by the clients in their own configuration files
     Server(ServerArgs),
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct ServerArgs {
-    /// The path to the configuration file (defaults to `server.toml` in the current directory)
-    #[clap(parse(from_os_str), name = "CONFIG", default_value = "server.toml")]
-    pub config_path: PathBuf,
+    /// The port that the server listens on for clients (control and data channels)
+    ///
+    /// It can also be passed via the `HTTP_TUNNEL_SERVER_PORT` environment variable
+    #[clap(long, env = "HTTP_TUNNEL_SERVER_PORT", default_value_t = 2333)]
+    pub server_port: u16,
+
+    /// The HTTP entrypoint. Visitors are routed by the `Host` header
+    ///
+    /// It can also be passed via the `HTTP_TUNNEL_HTTP_PORT` environment variable
+    #[clap(long, env = "HTTP_TUNNEL_HTTP_PORT", default_value_t = 80)]
+    pub http_port: u16,
+
+    /// The shared token every client must authenticate with
+    ///
+    /// It can also be passed via the `HTTP_TUNNEL_TOKEN` environment variable,
+    /// which keeps it out of `ps`
+    #[clap(long, env = "HTTP_TUNNEL_TOKEN", hide_env_values = true)]
+    pub token: String,
 }
 
-// The client options as parsed from the top level. They mirror `ClientArgs`, but
-// every field is optional: the values are only required when the client is the
-// role actually selected (i.e. no `server` subcommand), which `into_command`
-// checks.
+// The client options as parsed from the top level. The identity values are
+// optional here: they can also come from the configuration file, and
+// `run_client` merges the two.
 #[derive(Args, Debug, Clone)]
 struct ClientOptions {
     /// The address of the server, e.g. `example.com:2333`
@@ -80,19 +93,20 @@ struct ClientOptions {
     #[clap(long, short, env = "HTTP_TUNNEL_REMOTE")]
     remote: Option<String>,
 
-    /// The name of the client. It must be defined in the server's configuration
+    /// The name of the client, used for logging
     ///
     /// It can also be passed via the `HTTP_TUNNEL_NAME` environment variable
     #[clap(long, short, env = "HTTP_TUNNEL_NAME")]
     name: Option<String>,
 
-    /// The token of the client. It must match the one in the server's configuration
+    /// The shared token of the server
     ///
     /// It can also be passed via the `HTTP_TUNNEL_TOKEN` environment variable
     #[clap(long, short, env = "HTTP_TUNNEL_TOKEN", hide_env_values = true)]
     token: Option<String>,
 
-    /// The port of the client administration API. Defaults to `8610`.
+    /// The port of the client administration API. Overrides the configuration
+    /// file and defaults to `8610`.
     ///
     /// It listens on all interfaces (`0.0.0.0`) and requires
     /// `Authorization: Bearer <token>`. It's only compiled in with the
@@ -100,19 +114,24 @@ struct ClientOptions {
     ///
     /// Set it to `0` to disable the API, which is useful when several clients
     /// run on the same host. It can also be passed via the
-    /// `HTTP_TUNNEL_API_PORT` environment variable, which is convenient to start
-    /// a containerized client
+    /// `HTTP_TUNNEL_API_PORT` environment variable
     #[clap(long, env = "HTTP_TUNNEL_API_PORT")]
     api_port: Option<u16>,
+
+    /// The path to the configuration file (defaults to `client.toml` in the
+    /// current directory)
+    #[clap(long = "config", short = 'c', parse(from_os_str), default_value = "client.toml")]
+    config_path: PathBuf,
 }
 
-// The client options once the client is known to be the selected role: every
-// value is present. This is what `run_client` consumes.
+// The client options once the command line is parsed. The identity values stay
+// optional: they are resolved against the configuration file in `run_client`.
 #[derive(Debug, Clone)]
 pub struct ClientArgs {
-    pub remote: String,
-    pub name: String,
-    pub token: String,
+    pub config_path: PathBuf,
+    pub remote: Option<String>,
+    pub name: Option<String>,
+    pub token: Option<String>,
     pub api_port: Option<u16>,
 }
 
@@ -129,8 +148,8 @@ pub enum Command {
 impl Cli {
     /// Resolve the command line into the role to run. The client is the default
     /// role: when no `server` subcommand is given, the top-level options
-    /// configure a client, and the client administration API listens on
-    /// `DEFAULT_CLIENT_API_PORT` unless a port is given.
+    /// configure a client, whose identity is merged with its configuration file
+    /// in `run_client`.
     pub fn into_command(self) -> Result<Command> {
         match self.cmd {
             Some(ServerCommand::Server(args)) => Ok(Command::Server(args)),
@@ -139,35 +158,14 @@ impl Cli {
                     remote,
                     name,
                     token,
-                    mut api_port,
+                    api_port,
+                    config_path,
                 } = self.client;
-
-                let mut missing = Vec::new();
-                if remote.is_none() {
-                    missing.push("--remote");
-                }
-                if name.is_none() {
-                    missing.push("--name");
-                }
-                if token.is_none() {
-                    missing.push("--token");
-                }
-                if !missing.is_empty() {
-                    anyhow::bail!(
-                        "the client is the default role and the following required \
-                         arguments were not provided: {}\n\n\
-                         They can also be passed through the `HTTP_TUNNEL_REMOTE`, \
-                         `HTTP_TUNNEL_NAME` and `HTTP_TUNNEL_TOKEN` environment \
-                         variables, or run a server with the `server` subcommand",
-                        missing.join(", ")
-                    );
-                }
-
-                api_port.get_or_insert(DEFAULT_CLIENT_API_PORT);
                 Ok(Command::Client(ClientArgs {
-                    remote: remote.expect("checked above"),
-                    name: name.expect("checked above"),
-                    token: token.expect("checked above"),
+                    config_path,
+                    remote,
+                    name,
+                    token,
                     api_port,
                 }))
             }
@@ -179,85 +177,8 @@ impl Cli {
 mod tests {
     use super::*;
 
-    fn client_options(
-        remote: Option<&str>,
-        name: Option<&str>,
-        token: Option<&str>,
-        api_port: Option<u16>,
-    ) -> ClientOptions {
-        ClientOptions {
-            remote: remote.map(str::to_owned),
-            name: name.map(str::to_owned),
-            token: token.map(str::to_owned),
-            api_port,
-        }
-    }
-
     #[test]
     fn no_subcommand_is_a_client() {
-        let cli = Cli {
-            client: client_options(Some("example.com:2333"), Some("home"), Some("secret"), None),
-            cmd: None,
-        };
-
-        match cli.into_command().unwrap() {
-            Command::Client(args) => {
-                assert_eq!(args.remote, "example.com:2333");
-                assert_eq!(args.name, "home");
-                assert_eq!(args.token, "secret");
-                // The administration API defaults to `DEFAULT_CLIENT_API_PORT`
-                assert_eq!(args.api_port, Some(DEFAULT_CLIENT_API_PORT));
-            }
-            Command::Server(_) => panic!("expected the default role to be a client"),
-        }
-    }
-
-    #[test]
-    fn an_explicit_port_is_kept() {
-        let cli = Cli {
-            client: client_options(
-                Some("example.com:2333"),
-                Some("home"),
-                Some("secret"),
-                Some(0),
-            ),
-            cmd: None,
-        };
-
-        match cli.into_command().unwrap() {
-            Command::Client(args) => assert_eq!(args.api_port, Some(0)),
-            Command::Server(_) => panic!("expected the default role to be a client"),
-        }
-    }
-
-    #[test]
-    fn the_server_subcommand_wins_over_the_client_options() {
-        let cli = Cli {
-            client: client_options(None, None, None, None),
-            cmd: Some(ServerCommand::Server(ServerArgs {
-                config_path: PathBuf::from("server.toml"),
-            })),
-        };
-
-        match cli.into_command().unwrap() {
-            Command::Server(args) => assert_eq!(args.config_path, PathBuf::from("server.toml")),
-            Command::Client(_) => panic!("expected a server"),
-        }
-    }
-
-    #[test]
-    fn the_default_client_requires_the_address_the_name_and_the_token() {
-        let cli = Cli {
-            client: client_options(Some("example.com:2333"), Some("home"), None, None),
-            cmd: None,
-        };
-
-        let err = cli.into_command().unwrap_err();
-        assert!(err.to_string().contains("--token"));
-    }
-
-    #[test]
-    fn the_parsed_flags_become_the_default_client() {
         let cli = Cli::try_parse_from([
             "http-tunnel",
             "--remote",
@@ -266,28 +187,83 @@ mod tests {
             "home",
             "--token",
             "secret",
-            "--api-port",
-            "8611",
         ])
         .unwrap();
 
         match cli.into_command().unwrap() {
             Command::Client(args) => {
-                assert_eq!(args.remote, "example.com:2333");
-                assert_eq!(args.name, "home");
-                assert_eq!(args.token, "secret");
-                assert_eq!(args.api_port, Some(8611));
+                assert_eq!(args.remote.as_deref(), Some("example.com:2333"));
+                assert_eq!(args.name.as_deref(), Some("home"));
+                assert_eq!(args.token.as_deref(), Some("secret"));
+                // The administration API port is left to the configuration file
+                assert_eq!(args.api_port, None);
+                // The configuration defaults to `client.toml`
+                assert_eq!(args.config_path, PathBuf::from("client.toml"));
             }
-            Command::Server(_) => panic!("expected a client"),
+            Command::Server(_) => panic!("expected the default role to be a client"),
         }
     }
 
     #[test]
-    fn parsing_the_server_subcommand() {
-        let cli = Cli::try_parse_from(["http-tunnel", "server", "custom.toml"]).unwrap();
+    fn the_client_config_path_can_be_changed() {
+        let cli = Cli::try_parse_from([
+            "http-tunnel",
+            "--remote",
+            "example.com:2333",
+            "--name",
+            "home",
+            "--token",
+            "secret",
+            "--config",
+            "custom.toml",
+        ])
+        .unwrap();
 
         match cli.into_command().unwrap() {
-            Command::Server(args) => assert_eq!(args.config_path, PathBuf::from("custom.toml")),
+            Command::Client(args) => assert_eq!(args.config_path, PathBuf::from("custom.toml")),
+            Command::Server(_) => panic!("expected the default role to be a client"),
+        }
+    }
+
+    #[test]
+    fn the_client_can_be_started_without_identity_flags() {
+        // The identity may come from the configuration file, so the command line
+        // doesn't enforce it
+        let cli = Cli::try_parse_from(["http-tunnel"]).unwrap();
+        match cli.into_command().unwrap() {
+            Command::Client(args) => {
+                assert_eq!(args.remote, None);
+                assert_eq!(args.name, None);
+                assert_eq!(args.token, None);
+            }
+            Command::Server(_) => panic!("expected the default role to be a client"),
+        }
+    }
+
+    #[test]
+    fn the_server_subcommand_wins_over_the_client_options() {
+        let cli =
+            Cli::try_parse_from(["http-tunnel", "server", "--server-port", "3000", "--token", "s"])
+                .unwrap();
+
+        match cli.into_command().unwrap() {
+            Command::Server(args) => {
+                assert_eq!(args.server_port, 3000);
+                assert_eq!(args.http_port, 80);
+                assert_eq!(args.token, "s");
+            }
+            Command::Client(_) => panic!("expected a server"),
+        }
+    }
+
+    #[test]
+    fn parsing_the_server_subcommand_defaults() {
+        let cli = Cli::try_parse_from(["http-tunnel", "server", "--token", "s"]).unwrap();
+        match cli.into_command().unwrap() {
+            Command::Server(args) => {
+                assert_eq!(args.server_port, 2333);
+                assert_eq!(args.http_port, 80);
+            }
             Command::Client(_) => panic!("expected a server"),
         }
     }

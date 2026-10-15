@@ -1,21 +1,12 @@
-server_port = 2333 # Necessary. The port that the server listens for clients
-http_port = 80 # Necessary. The HTTP entrypoint, routed by the `Host` header
+remote = "example.com:2333" # The address of the server
+name = "home" # The name of the client
+token = "use_a_secret_that_only_you_know" # The shared token of the server
+api_port = 8610 # The port of the client administration API
+heartbeat_timeout = 40 # The application-layer heartbeat timeout. Set to 0 to disable the test
+retry_interval = 1 # The interval between retries to connect to the server
+nodelay = true # Whether to enable TCP_NODELAY for the tunnels
 
-[clients.home] # The name must be identical to the `--name` of the client
-token = "use_a_secret_that_only_you_know" # Necessary. The token of the client
-heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeats. Default: 30 seconds
-heartbeat_timeout = 40 # Optional. The application-layer heartbeat timeout. Default: 40 seconds
-retry_interval = 1 # Optional. The interval between retries to connect to the server. Default: 1 second
-nodelay = true # Optional. The default TCP_NODELAY of the tunnels of this client. Default: true
-
-[clients.home.tunnels] # The tunnels of `home`, keyed by domain
-"tunnel1.example.com" = "127.0.0.1:1081" # Requests with this `Host` are forwarded to this address
-"tunnel2.example.com" = "127.0.0.1:1082"
-"www.tunnel2.example.com" = "127.0.0.1:1082" # The same address can serve several domains
-
-[clients.office] # Multiple clients can be defined
-token = "another_secret"
-nodelay = false # Applied to all the tunnels of `office`
-
-[clients.office.tunnels]
-"office.example.com" = "127.0.0.1:1083"
+[tunnels] # Each tunnel is a domain keyed to the `local_addr` of the local service
+"nas.example.com" = "127.0.0.1:80" # Requests with this `Host` are forwarded to this address
+"git.example.com" = "127.0.0.1:3000"
+"www.example.com" = "127.0.0.1:80" # The same address can serve several domains

@@ -38,6 +38,18 @@ impl RoutingTable {
         }
     }
 
+    /// Remove the route of a domain, whether it was an exact or a wildcard one.
+    /// It's called when the control channel that registered the domain goes away.
+    pub fn remove(&mut self, domain: &str) {
+        if let Some(suffix) = domain.strip_prefix("*.") {
+            if !suffix.is_empty() {
+                self.wildcard.remove(&format!(".{}", suffix));
+            }
+        } else {
+            self.exact.remove(domain);
+        }
+    }
+
     pub fn get(&self, host: &str) -> Option<Digest> {
         if let Some(digest) = self.exact.get(host) {
             return Some(*digest);
