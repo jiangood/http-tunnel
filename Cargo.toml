@@ -15,10 +15,6 @@ name = "http_tunnel"
 path = "src/lib.rs"
 
 [[bin]]
-name = "http-tunnel"
-path = "src/main.rs"
-
-[[bin]]
 name = "hts"
 path = "src/bin/hts.rs"
 required-features = ["server"]
