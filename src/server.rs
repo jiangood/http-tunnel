@@ -16,15 +16,10 @@ use backoff::ExponentialBackoff;
 use rand::RngCore;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{
-    copy_bidirectional_with_sizes, split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
-    ReadBuf,
-};
+use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -1260,104 +1255,76 @@ fn serve_waiters(
     }
 }
 
-/// The visitor side of a connection that is being forwarded. It tracks whether
-/// the tunnel ever sent it a byte, so that a tunnel that closes its data channel
-/// without answering can be told apart from a normal close.
+/// Relay a visitor and a data channel until both directions are done.
 ///
-/// A client that cannot reach the `local_addr` of its tunnel opens the data
-/// channel first and only then discovers the failure, so the channel is handed
-/// over and closed without a single byte. `copy_bidirectional_with_sizes` calls
-/// `poll_shutdown` on this wrapper when the tunnel closes; when nothing was ever
-/// sent, the visitor is answered with a `504` there instead of being left with an
-/// empty reply.
-struct VisitorStream {
-    inner: TcpStream,
-    // Whether the tunnel sent anything to the visitor
-    responded: bool,
-    // The `504` that is written at shutdown, and how much of it was sent
-    answer: Vec<u8>,
-    sent: usize,
-}
+/// If the tunnel closes without sending a single byte back, the visitor is
+/// answered with a `504` instead of being left with an empty reply. That is what
+/// happens when a client cannot reach the `local_addr` of its tunnel: it opens
+/// the data channel first (the handshake comes before it dials anything) and
+/// then closes it with the visitor's request still unread, so the server sees a
+/// reset. A reset is treated as the end of the tunnel, exactly like an end of
+/// stream, so that the failure is answered instead of silently dropping the
+/// visitor. `copy_bidirectional_with_sizes` cannot be used here: it returns on
+/// the first IO error before it can answer the visitor.
+#[instrument(skip_all)]
+async fn relay(channel: TcpStream, stream: TcpStream) {
+    let (mut ch_rd, mut ch_wr) = channel.into_split();
+    let (mut v_rd, mut v_wr) = stream.into_split();
 
-impl VisitorStream {
-    fn new(inner: TcpStream) -> VisitorStream {
-        VisitorStream {
-            inner,
-            responded: false,
-            answer: crate::http::response(
-                "504 Gateway Timeout",
-                "The tunnel closed without responding\n",
-            ),
-            sent: 0,
-        }
-    }
-}
-
-impl AsyncRead for VisitorStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for VisitorStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let res = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = &res {
-            if *n > 0 {
-                self.responded = true;
-            }
-        }
-        res
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        // The tunnel closed without answering: write the `504`. It's only logged
-        // once the whole response is out, so a visitor that went away first (the
-        // write fails) doesn't produce a misleading line.
-        let this = self.as_mut().get_mut();
-        if !this.responded && this.sent < this.answer.len() {
-            loop {
-                let start = this.sent;
-                let res = {
-                    let inner = &mut this.inner;
-                    let answer = &this.answer[start..];
-                    Pin::new(inner).poll_write(cx, answer)
-                };
-                match res {
-                    Poll::Ready(Ok(0)) => break,
-                    Poll::Ready(Ok(n)) => {
-                        this.sent += n;
-                        if this.sent >= this.answer.len() {
-                            warn!(
-                                "The tunnel closed its data channel without sending a \
-                                 response; answered the visitor with 504"
-                            );
-                            break;
-                        }
+    // Visitor -> tunnel, until either side is done
+    let upstream = async {
+        let mut buf = vec![0u8; COPY_BUF_SIZE];
+        loop {
+            match v_rd.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if ch_wr.write_all(&buf[..n]).await.is_err() {
+                        break;
                     }
-                    // The visitor is gone, so there is nothing to answer
-                    Poll::Ready(Err(_)) => break,
-                    Poll::Pending => return Poll::Pending,
                 }
+                Err(_) => break,
             }
         }
-        Pin::new(&mut this.inner).poll_shutdown(cx)
-    }
+        let _ = ch_wr.shutdown().await;
+    };
+
+    // Tunnel -> visitor. A `504` is written when the tunnel closes without ever
+    // answering; it's only logged once the response is out, so a visitor that
+    // went away first (the write fails) doesn't produce a misleading line.
+    let downstream = async {
+        let mut buf = vec![0u8; COPY_BUF_SIZE];
+        let mut sent = 0u64;
+        loop {
+            match ch_rd.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if v_wr.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                    sent += n as u64;
+                }
+                // A reset means the tunnel is gone, same as an end of stream
+                Err(_) => break,
+            }
+        }
+        if sent == 0
+            && v_wr
+                .write_all(&crate::http::response(
+                    "504 Gateway Timeout",
+                    "The tunnel closed without responding\n",
+                ))
+                .await
+                .is_ok()
+        {
+            warn!(
+                "The tunnel closed its data channel without sending a response; \
+                 answered the visitor with 504"
+            );
+        }
+        let _ = v_wr.shutdown().await;
+    };
+
+    tokio::join!(upstream, downstream);
 }
 
 /// Forward one visitor through a data channel, waiting for one when the pool is
@@ -1395,16 +1362,7 @@ async fn forward_visitor(
                         async move {
                             // Keep the visitor counted as active until the flow ends
                             let _activity = activity;
-                            // Wrap the visitor, so that a tunnel that closes
-                            // without answering is answered with a `504`
-                            let mut stream = VisitorStream::new(stream);
-                            let _ = copy_bidirectional_with_sizes(
-                                &mut channel,
-                                &mut stream,
-                                COPY_BUF_SIZE,
-                                COPY_BUF_SIZE,
-                            )
-                            .await;
+                            relay(channel, stream).await;
                         }
                         .in_current_span(),
                     );

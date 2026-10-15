@@ -206,7 +206,7 @@ A tunnel domain may be a wildcard, `*.example.com`, which matches any subdomain
 at any depth but not the apex `example.com`. An exact domain always wins over a
 wildcard, and among the wildcards the longest suffix wins.
 
-If no tunnel matches the `Host`, the server responds with `404`. If the matched tunnel is not connected yet, it responds with `503`. If the tunnel is connected but the client does not provide a data channel within 10 seconds — for instance because it cannot reach its `local_addr` — the visitor is answered with `504` instead of being left hanging. A malformed request, an oversized header, and a header that is too slow to arrive are answered with `400`, `431`, and `408` respectively.
+If no tunnel matches the `Host`, the server responds with `404`. If the matched tunnel is not connected yet, it responds with `503`. If the tunnel is connected but no data channel is available within 10 seconds, the visitor is answered with `504` instead of being left hanging. A `504` is also returned when the client takes the data channel but closes it without sending a response — which is how a client that cannot reach its `local_addr` fails — instead of the visitor getting an empty reply. A malformed request, an oversized header, and a header that is too slow to arrive are answered with `400`, `431`, and `408` respectively.
 
 Routing is done once per connection, on its first request. A keep-alive connection cannot be re-routed to another tunnel if a later request carries a different `Host`. Because of that, the `Host` used for routing is the one of the first request of the connection; a proxy client that reuses a connection across origins will reach the backend of the first request.
 
@@ -224,8 +224,9 @@ If `RUST_LOG` is not present, the default logging level is `info`.
 
 The logs name the reason a visitor could not be served, so that a failure can be
 told apart from a routing miss: a malformed request is logged as a bad header, an
-unknown `Host` as a routing miss, and a missing data channel as a timeout or a
-closed control channel.
+unknown `Host` as a routing miss, and a missing data channel as a timeout, a
+tunnel that closes the data channel without responding, or a closed control
+channel. A failure is logged with the tunnel and its `local_addr`.
 
 ### Tuning
 

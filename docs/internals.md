@@ -62,6 +62,15 @@ a lock; a visitor that closes its connection while it waits is noticed through a
 `peek` and gives up, and the channel that was reserved for it is dropped instead
 of being spent on a dead visitor.
 
+A data channel that is handed to a visitor can still die before the tunnel sends
+anything back, which is how a client that cannot reach the `local_addr` of its
+tunnel fails: the handshake comes before it dials the local service, so it opens
+the data channel, then closes it with the visitor's request still unread, and the
+server sees a reset. `relay` (in `server.rs`) treats a reset like the end of the
+stream and, when not a single byte reached the visitor, answers it with a `504`
+instead of leaving it with an empty reply. The failure is logged with the tunnel
+and its `local_addr`, which are fields of the enclosing span.
+
 On shutdown, after the HTTP listener stops accepting, the server waits for the
 in-flight visitors (up to `DRAIN_TIMEOUT`, 30 seconds) before it tears the
 control channels down, so a graceful restart doesn't cut the flows off. The

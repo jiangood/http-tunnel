@@ -557,9 +557,15 @@ async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
 async fn run_data_channel_for_tcp(mut conn: TcpStream, local_addr: &str) -> Result<()> {
     debug!("New data channel starts forwarding");
 
-    let mut local = TcpStream::connect(local_addr)
-        .await
-        .with_context(|| format!("Failed to connect to {}", local_addr))?;
+    // The `111` (`ECONNREFUSED`) most often seen on a client is this line: the
+    // tunnel points at a `local_addr` where nothing is listening. Name it as the
+    // local service, so that it isn't mistaken for the connection to the server.
+    let mut local = TcpStream::connect(local_addr).await.with_context(|| {
+        format!(
+            "Failed to connect to the local service `{}`. Is it running on this host?",
+            local_addr
+        )
+    })?;
     let _ = copy_bidirectional_with_sizes(
         &mut conn,
         &mut local,
@@ -692,7 +698,7 @@ impl ControlChannel {
 }
 
 impl ControlChannelHandle {
-    #[instrument(name="handle", skip_all, fields(tunnel = %tunnel.name))]
+    #[instrument(name="handle", skip_all, fields(tunnel = %tunnel.name, local_addr = %tunnel.local_addr))]
     fn new(
         tunnel: ClientTunnelConfig,
         token: MaskedString,
