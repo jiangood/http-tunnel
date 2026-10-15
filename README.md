@@ -89,20 +89,26 @@ For `PUT`, send JSON with `domain` and `local_addr` fields. The API binds to `0.
 
 ## Docker
 
+The server and client are published as separate multi-architecture images.
+
+Start the server (ports default to TCP `2333` for clients and TCP `80` for HTTP traffic):
+
 ```sh
-docker run -d --name http-tunnel --restart unless-stopped \
+docker run -d --name http-tunnel-server --restart unless-stopped \
   -p 2333:2333 -p 80:80 \
   -e HTTP_TUNNEL_TOKEN='replace-with-a-long-random-secret' \
-  ghcr.io/jiangood/http-tunnel:latest server
+  ghcr.io/jiangood/http-tunnel-server:latest
 ```
 
-Run the client with its config mounted read-only or read-write as required (the API writes changes back to the file):
+Start the client by mounting its configuration at `/app/client.toml`:
 
 ```sh
 docker run -d --name http-tunnel-client --restart unless-stopped \
-  -v "$PWD:/app" -w /app \
-  ghcr.io/jiangood/http-tunnel:latest --config /app/client.toml
+  -v "$PWD/client.toml:/app/client.toml:ro" \
+  ghcr.io/jiangood/http-tunnel-client:latest
 ```
+
+The client API writes configuration changes back to the file, so mount it read-write if you use the API to manage tunnels. The client connects to the server address and port configured in `client.toml`.
 
 ## Operations
 
