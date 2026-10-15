@@ -118,19 +118,31 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: http-tunnel-${{ matrix.name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.exe }}
+          path: |
+            target/${{ matrix.target }}/release/http-tunnel*
+            target/${{ matrix.target }}/release/hts*
+            target/${{ matrix.target }}/release/htc*
       - name: Zip Release
         uses: TheDoctor0/zip-release@0.7.6
         with:
           type: zip
           filename: http-tunnel-${{ matrix.name }}.zip
           directory: target/${{ matrix.target }}/release/
-          path: ${{ matrix.exe }}
+          path: http-tunnel
+      - name: Package hts and htc
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          cd target/${{ matrix.target }}/release
+          zip -j hts-${{ matrix.name }}.zip hts${{ matrix.exe == 'http-tunnel.exe' && '.exe' || '' }}
+          zip -j htc-${{ matrix.name }}.zip htc${{ matrix.exe == 'http-tunnel.exe' && '.exe' || '' }}
       - name: Publish
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: target/${{ matrix.target }}/release/http-tunnel-${{ matrix.name }}.zip
+          files: |
+            target/${{ matrix.target }}/release/http-tunnel-${{ matrix.name }}.zip
+            target/${{ matrix.target }}/release/hts-${{ matrix.name }}.zip
+            target/${{ matrix.target }}/release/htc-${{ matrix.name }}.zip
           generate_release_notes: true
           draft: true
 
@@ -155,8 +167,10 @@ jobs:
       - name: Lay out the binaries by architecture
         run: |
           mkdir -p build-out/amd64 build-out/arm64
-          cp build-out/http-tunnel-x86_64-linux-musl/http-tunnel build-out/amd64/
-          cp build-out/http-tunnel-aarch64-linux-musl/http-tunnel build-out/arm64/
+          cp build-out/http-tunnel-x86_64-linux-musl/hts build-out/amd64/
+          cp build-out/http-tunnel-x86_64-linux-musl/htc build-out/amd64/
+          cp build-out/http-tunnel-aarch64-linux-musl/hts build-out/arm64/
+          cp build-out/http-tunnel-aarch64-linux-musl/htc build-out/arm64/
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
