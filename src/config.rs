@@ -44,19 +44,39 @@ impl From<String> for MaskedString {
 
 /// A tunnel as it runs on the client.
 ///
-/// The client derives it from the `[tunnels]` table of its configuration file.
-/// The name is the domain (the `Host` header) that the tunnel serves, which is
-/// also the identity the client announces on the control channel.
+/// The client derives it from the `[[tunnels]]` array of its configuration file.
+/// A tunnel has two names: the `name`, its identity within the client, which the
+/// administration API uses to address it; and the `domain`, the `Host` header it
+/// serves, which the client announces on the control channel so that the server
+/// can route to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientTunnelConfig {
-    /// The domain (the `Host` header) that is routed to this tunnel
+    /// The identity of the tunnel, unique within the client
     pub name: String,
+    /// The domain (the `Host` header) that is routed to this tunnel
+    pub domain: String,
     /// The address of the local service on the client side
     pub local_addr: String,
     /// Whether to enable TCP_NODELAY
     pub nodelay: bool,
     /// The interval between retries to connect to the server
     pub retry_interval: u64,
+}
+
+/// A tunnel as declared in the `[[tunnels]]` array of the configuration file.
+///
+/// The `name` is the identity of the tunnel within the client and is what the
+/// administration API addresses. It is optional and defaults to the `domain`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelEntry {
+    /// The identity of the tunnel, unique within the client. Defaults to `domain`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The domain (the `Host` header) that is routed to this tunnel
+    pub domain: String,
+    /// The address of the local service on the client side
+    pub local_addr: String,
 }
 
 /// The configuration of a client.
@@ -90,9 +110,9 @@ pub struct ClientConfig {
     /// Whether to enable TCP_NODELAY for the tunnels of this client
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodelay: Option<bool>,
-    /// The tunnels, each a domain keyed to the `local_addr` of the local service
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub tunnels: BTreeMap<String, String>,
+    /// The tunnels declared by the client
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tunnels: Vec<TunnelEntry>,
 }
 
 impl ClientConfig {
@@ -114,22 +134,54 @@ impl ClientConfig {
         self.nodelay.unwrap_or(true)
     }
 
-    /// The resolved tunnels, sorted by domain for a stable order
+    /// The resolved tunnels, sorted by name for a stable order
     pub fn resolved_tunnels(&self) -> Vec<ClientTunnelConfig> {
         let retry_interval = self.retry_interval();
         let nodelay = self.nodelay();
         let mut tunnels: Vec<ClientTunnelConfig> = self
             .tunnels
             .iter()
-            .map(|(domain, local_addr)| ClientTunnelConfig {
-                name: domain.clone(),
-                local_addr: local_addr.clone(),
+            .map(|entry| ClientTunnelConfig {
+                name: entry.name.clone().unwrap_or_else(|| entry.domain.clone()),
+                domain: entry.domain.clone(),
+                local_addr: entry.local_addr.clone(),
                 nodelay,
                 retry_interval,
             })
             .collect();
         tunnels.sort_by(|a, b| a.name.cmp(&b.name));
         tunnels
+    }
+
+    /// The name of a declared tunnel, defaulting to its domain
+    fn entry_name(entry: &TunnelEntry) -> &str {
+        entry.name.as_deref().unwrap_or(entry.domain.as_str())
+    }
+
+    /// Replace the tunnel of the given name, or add it
+    pub fn set_tunnel(&mut self, name: String, domain: String, local_addr: String) {
+        match self
+            .tunnels
+            .iter_mut()
+            .find(|e| Self::entry_name(e) == name.as_str())
+        {
+            Some(entry) => {
+                entry.domain = domain;
+                entry.local_addr = local_addr;
+            }
+            None => self.tunnels.push(TunnelEntry {
+                name: Some(name),
+                domain,
+                local_addr,
+            }),
+        }
+    }
+
+    /// Remove the tunnel of the given name. Returns whether one was removed.
+    pub fn remove_tunnel(&mut self, name: &str) -> bool {
+        let before = self.tunnels.len();
+        self.tunnels.retain(|e| Self::entry_name(e) != name);
+        self.tunnels.len() != before
     }
 
     /// Parse a configuration and normalize it
@@ -141,7 +193,7 @@ impl ClientConfig {
                         "{}\nNote: `http-tunnel` no longer takes a server configuration file. The \
                          whole configuration now lives on the client: the server is started with \
                          `--server-port`, `--http-port` and `--token`, and the tunnels are declared \
-                         in the `[tunnels]` table of `client.toml`.",
+                         in the `[[tunnels]]` array of `client.toml`.",
                         e
                     )
                 } else {
@@ -168,22 +220,41 @@ impl ClientConfig {
     }
 
     /// Validate a configuration and normalize it in place: lowercase the tunnel
-    /// domains and reject the empty or duplicated definitions.
+    /// domains, default the names to the domains, and reject the empty,
+    /// malformed or duplicated definitions.
     pub fn validate(config: &mut ClientConfig) -> Result<()> {
-        let mut tunnels: BTreeMap<String, String> = BTreeMap::new();
-        for (domain, local_addr) in std::mem::take(&mut config.tunnels) {
-            if local_addr.is_empty() {
-                bail!("The `local_addr` of the tunnel `{}` is empty", domain);
+        let mut names: BTreeMap<String, ()> = BTreeMap::new();
+        let mut domains: BTreeMap<String, ()> = BTreeMap::new();
+        let mut entries: Vec<TunnelEntry> = Vec::new();
+
+        for entry in std::mem::take(&mut config.tunnels) {
+            if entry.local_addr.is_empty() {
+                bail!("The `local_addr` of the tunnel `{}` is empty", entry.domain);
             }
 
-            let domain = crate::helper::normalize_domain(&domain)
-                .ok_or_else(|| anyhow!("The domain `{}` is invalid", domain))?;
+            let domain = crate::helper::normalize_domain(&entry.domain)
+                .ok_or_else(|| anyhow!("The domain `{}` is invalid", entry.domain))?;
 
-            if tunnels.insert(domain.clone(), local_addr).is_some() {
+            let name = match entry.name {
+                Some(name) => validate_name(&name)?,
+                None => domain.clone(),
+            };
+
+            if domains.insert(domain.clone(), ()).is_some() {
                 bail!("The domain `{}` is defined more than once", domain);
             }
+            if names.insert(name.clone(), ()).is_some() {
+                bail!("The tunnel name `{}` is defined more than once", name);
+            }
+
+            entries.push(TunnelEntry {
+                name: Some(name),
+                domain,
+                local_addr: entry.local_addr,
+            });
         }
-        config.tunnels = tunnels;
+
+        config.tunnels = entries;
 
         Ok(())
     }
@@ -206,6 +277,29 @@ impl ClientConfig {
             .with_context(|| format!("Failed to replace the config {:?}", path))?;
         Ok(())
     }
+}
+
+/// Validate a tunnel name and return it trimmed.
+///
+/// A name is used in the path of the administration API, so it is restricted to
+/// a URL-safe alphabet. The domains and the names share no namespace: a name may
+/// look like a domain.
+fn validate_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("A tunnel `name` must not be empty");
+    }
+    let valid = name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !valid {
+        bail!(
+            "The tunnel name `{}` is invalid: only letters, digits, dot, \
+             underscore and hyphen are allowed",
+            name
+        );
+    }
+    Ok(name.to_string())
 }
 
 #[cfg(test)]
@@ -279,24 +373,106 @@ heartbeat_timeout = 20
 retry_interval = 7
 nodelay = false
 
-[tunnels]
-"Foo1.Example.COM" = "127.0.0.1:80"
-"foo2.example.com" = "127.0.0.1:81"
+[[tunnels]]
+name = "nas"
+domain = "Foo1.Example.COM"
+local_addr = "127.0.0.1:80"
+
+[[tunnels]]
+domain = "foo2.example.com"
+local_addr = "127.0.0.1:81"
 "#;
-        let mut cfg = ClientConfig::parse(s)?;
-        ClientConfig::validate(&mut cfg)?;
+        let cfg = ClientConfig::parse(s)?;
 
         let tunnels = cfg.resolved_tunnels();
         assert_eq!(tunnels.len(), 2);
-        // The domains are lowercased and sorted
-        assert_eq!(tunnels[0].name, "foo1.example.com");
-        assert_eq!(tunnels[0].local_addr, "127.0.0.1:80");
-        assert_eq!(tunnels[1].name, "foo2.example.com");
+        // The domains are lowercased and the order is by name
+        assert_eq!(tunnels[0].name, "foo2.example.com"); // defaults to the domain
+        assert_eq!(tunnels[0].domain, "foo2.example.com");
+        assert_eq!(tunnels[0].local_addr, "127.0.0.1:81");
+        assert_eq!(tunnels[1].name, "nas");
+        assert_eq!(tunnels[1].domain, "foo1.example.com");
+        assert_eq!(tunnels[1].local_addr, "127.0.0.1:80");
 
         // The client-level options are inherited by every tunnel
         assert!(tunnels.iter().all(|t| t.nodelay == false));
         assert!(tunnels.iter().all(|t| t.retry_interval == 7));
         assert_eq!(cfg.heartbeat_timeout(), 20);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rejects_the_legacy_tunnels_table() {
+        // The old `[tunnels]` table (domain -> local_addr) is no longer accepted
+        let s = r#"
+name = "home"
+token = "123"
+
+[tunnels]
+"nas.example.com" = "127.0.0.1:80"
+"#;
+        assert!(ClientConfig::parse(s).is_err());
+    }
+
+    #[test]
+    fn test_set_and_remove_tunnel() -> Result<()> {
+        let mut cfg = ClientConfig::parse("name = \"home\"\ntoken = \"123\"\n")?;
+
+        cfg.set_tunnel(
+            "nas".to_string(),
+            "nas.example.com".to_string(),
+            "127.0.0.1:80".to_string(),
+        );
+        ClientConfig::validate(&mut cfg)?;
+        assert_eq!(cfg.resolved_tunnels().len(), 1);
+
+        // Replacing by name changes the domain without adding a tunnel
+        cfg.set_tunnel(
+            "nas".to_string(),
+            "nas2.example.com".to_string(),
+            "127.0.0.1:81".to_string(),
+        );
+        ClientConfig::validate(&mut cfg)?;
+        let tunnels = cfg.resolved_tunnels();
+        assert_eq!(tunnels.len(), 1);
+        assert_eq!(tunnels[0].domain, "nas2.example.com");
+        assert_eq!(tunnels[0].local_addr, "127.0.0.1:81");
+
+        // Removing by name
+        assert!(cfg.remove_tunnel("nas"));
+        assert!(!cfg.remove_tunnel("nas"));
+        assert!(cfg.tunnels.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_set_tunnel_adds_and_keeps_names_distinct() -> Result<()> {
+        let mut cfg = ClientConfig::parse("name = \"home\"\ntoken = \"123\"\n")?;
+
+        cfg.set_tunnel(
+            "app-1".to_string(),
+            "nas.example.com".to_string(),
+            "127.0.0.1:80".to_string(),
+        );
+        // A different name serving the same domain is not adopted: it clashes
+        cfg.set_tunnel(
+            "app-2".to_string(),
+            "nas.example.com".to_string(),
+            "127.0.0.1:80".to_string(),
+        );
+        assert!(ClientConfig::validate(&mut cfg).is_err());
+
+        // Replacing by name is fine
+        cfg.set_tunnel(
+            "app-1".to_string(),
+            "nas.example.com".to_string(),
+            "127.0.0.1:81".to_string(),
+        );
+        ClientConfig::validate(&mut cfg)?;
+        let tunnels = cfg.resolved_tunnels();
+        assert_eq!(tunnels.len(), 1);
+        assert_eq!(tunnels[0].name, "app-1");
+        assert_eq!(tunnels[0].local_addr, "127.0.0.1:81");
         Ok(())
     }
 
@@ -313,8 +489,9 @@ nodelay = false
     #[test]
     fn test_rejects_an_empty_local_addr() {
         let s = r#"
-[tunnels]
-"foo.example.com" = ""
+[[tunnels]]
+domain = "foo.example.com"
+local_addr = ""
 "#;
         assert!(ClientConfig::parse(s).is_err());
     }
@@ -322,8 +499,9 @@ nodelay = false
     #[test]
     fn test_rejects_an_invalid_domain() {
         let s = r#"
-[tunnels]
-"foo bar" = "127.0.0.1:80"
+[[tunnels]]
+domain = "foo bar"
+local_addr = "127.0.0.1:80"
 "#;
         assert!(ClientConfig::parse(s).is_err());
     }
@@ -331,9 +509,13 @@ nodelay = false
     #[test]
     fn test_rejects_a_duplicated_domain() {
         let s = r#"
-[tunnels]
-"foo.example.com" = "127.0.0.1:80"
-"Foo.Example.com" = "127.0.0.1:81"
+[[tunnels]]
+domain = "foo.example.com"
+local_addr = "127.0.0.1:80"
+
+[[tunnels]]
+domain = "Foo.Example.com"
+local_addr = "127.0.0.1:81"
 "#;
         assert!(ClientConfig::parse(s).is_err());
     }
@@ -344,6 +526,43 @@ nodelay = false
 name = "home"
 token = "123"
 tokenz = "oops"
+"#;
+        assert!(ClientConfig::parse(s).is_err());
+    }
+
+    #[test]
+    fn test_rejects_a_duplicated_name() {
+        let s = r#"
+[[tunnels]]
+name = "nas"
+domain = "nas.example.com"
+local_addr = "127.0.0.1:80"
+
+[[tunnels]]
+name = "nas"
+domain = "git.example.com"
+local_addr = "127.0.0.1:81"
+"#;
+        assert!(ClientConfig::parse(s).is_err());
+    }
+
+    #[test]
+    fn test_rejects_a_missing_domain() {
+        let s = r#"
+[[tunnels]]
+name = "nas"
+local_addr = "127.0.0.1:80"
+"#;
+        assert!(ClientConfig::parse(s).is_err());
+    }
+
+    #[test]
+    fn test_rejects_an_invalid_name() {
+        let s = r#"
+[[tunnels]]
+name = "nas/../etc"
+domain = "nas.example.com"
+local_addr = "127.0.0.1:80"
 "#;
         assert!(ClientConfig::parse(s).is_err());
     }
@@ -372,16 +591,23 @@ heartbeat_timeout = 20
 retry_interval = 2
 nodelay = false
 
-[tunnels]
-"foo1.example.com" = "127.0.0.1:80"
-"foo2.example.com" = "127.0.0.1:81"
+[[tunnels]]
+name = "nas"
+domain = "foo1.example.com"
+local_addr = "127.0.0.1:80"
+
+[[tunnels]]
+name = "git"
+domain = "foo2.example.com"
+local_addr = "127.0.0.1:81"
 "#;
         let cfg = ClientConfig::parse(s)?;
         let dumped = cfg.to_toml()?;
         let reparsed = ClientConfig::parse(&dumped)?;
         assert_eq!(cfg, reparsed);
-        assert!(dumped.contains("[tunnels]"));
-        assert!(dumped.contains("\"foo1.example.com\" = \"127.0.0.1:80\""));
+        assert!(dumped.contains("[[tunnels]]"), "{}", dumped);
+        assert!(dumped.contains("domain = \"foo1.example.com\""), "{}", dumped);
+        assert!(dumped.contains("local_addr = \"127.0.0.1:80\""), "{}", dumped);
         Ok(())
     }
 
@@ -391,8 +617,9 @@ nodelay = false
 name = "home"
 token = "123"
 
-[tunnels]
-"foo1.example.com" = "127.0.0.1:80"
+[[tunnels]]
+domain = "foo1.example.com"
+local_addr = "127.0.0.1:80"
 "#;
         let cfg = ClientConfig::parse(s)?;
         let dumped = cfg.to_toml()?;

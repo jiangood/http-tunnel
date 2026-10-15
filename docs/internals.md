@@ -25,7 +25,8 @@ A data channel is a TCP connection between the *server* and the *client* that on
 ## The Process
 
 When `http-tunnel` starts in the client mode, it reads its configuration file: a list of *tunnels*, each an HTTP
-domain mapped to a `local_addr` on the client. It opens one TCP connection to `server_port` per tunnel. These
+domain mapped to a `local_addr` on the client (a tunnel also carries a `name`, its identity within the client, which
+defaults to the domain). It opens one TCP connection to `server_port` per tunnel. These
 connections act as control channels: the client announces the domain in the hello, and the server challenges it by
 a nonce, so that the client is required to authenticate with the shared token given with `--token`. Once the token
 is validated, the server registers the domain in its routing table — this is how the server, which takes no

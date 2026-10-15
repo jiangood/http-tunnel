@@ -256,9 +256,15 @@ impl ClientState {
         }
     }
 
-    /// Create or replace a tunnel, persist the configuration, and apply the change
+    /// Create or replace the tunnel of the given name, persist the
+    /// configuration, and apply the change
     #[cfg_attr(not(feature = "client-api"), allow(dead_code))]
-    pub(crate) async fn put_tunnel(&self, domain: String, local_addr: String) -> Result<()> {
+    pub(crate) async fn put_tunnel(
+        &self,
+        name: String,
+        domain: String,
+        local_addr: String,
+    ) -> Result<()> {
         if local_addr.is_empty() {
             bail!("The `local_addr` must not be empty");
         }
@@ -268,7 +274,10 @@ impl ClientState {
         {
             let mut config = self.config.write().await;
             let mut candidate = config.clone();
-            candidate.tunnels.insert(domain, local_addr);
+            candidate.set_tunnel(name, domain, local_addr);
+            // Validate after the change, so that a name or domain clash is
+            // rejected before anything is written
+            ClientConfig::validate(&mut candidate)?;
             // Persist first, so that a failed write leaves the runtime untouched
             candidate.save(&self.config_path).await?;
             *config = candidate;
@@ -278,17 +287,15 @@ impl ClientState {
         Ok(())
     }
 
-    /// Delete a tunnel, persist the configuration, and apply the change
+    /// Delete the tunnel of the given name, persist the configuration, and
+    /// apply the change
     #[cfg_attr(not(feature = "client-api"), allow(dead_code))]
-    pub(crate) async fn delete_tunnel(&self, domain: &str) -> Result<()> {
-        let domain = crate::helper::normalize_domain(domain)
-            .ok_or_else(|| anyhow!("The domain `{}` is invalid", domain))?;
-
+    pub(crate) async fn delete_tunnel(&self, name: &str) -> Result<()> {
         {
             let mut config = self.config.write().await;
             let mut candidate = config.clone();
-            if candidate.tunnels.remove(&domain).is_none() {
-                bail!("No such a tunnel `{}`", domain);
+            if !candidate.remove_tunnel(name.trim()) {
+                bail!("No such a tunnel `{}`", name);
             }
             candidate.save(&self.config_path).await?;
             *config = candidate;
@@ -408,7 +415,7 @@ async fn run_data_channel_for_tcp(mut conn: TcpStream, local_addr: &str) -> Resu
 // Control channel
 struct ControlChannel {
     name: String,                       // The client name, announced to the server
-    tunnel: ClientTunnelConfig,         // The domain and its `local_addr`
+    tunnel: ClientTunnelConfig,         // The tunnel: its name, domain and `local_addr`
     token: MaskedString,                // The token given by `--token`
     shutdown_rx: oneshot::Receiver<u8>, // Receives the shutdown signal
     remote_addr: String,                // `--remote`
@@ -469,7 +476,7 @@ impl ControlChannel {
         debug!("Sending hello");
         let hello = ClientHello::Control {
             version: protocol::CURRENT_PROTO_VERSION,
-            domain: self.tunnel.name.clone(),
+            domain: self.tunnel.domain.clone(),
             name: self.name.clone(),
             nodelay: self.tunnel.nodelay,
         };
@@ -497,7 +504,7 @@ impl ControlChannel {
                 // pointless: mark the error fatal so that the client exits.
                 return Err(FatalControlError(anyhow!(
                     "The token was rejected by the server for the tunnel `{}`",
-                    self.tunnel.name
+                    self.tunnel.domain
                 ))
                 .into());
             }
@@ -548,7 +555,7 @@ impl ControlChannel {
 }
 
 impl ControlChannelHandle {
-    #[instrument(name="handle", skip_all, fields(tunnel = %tunnel.name, local_addr = %tunnel.local_addr))]
+    #[instrument(name="handle", skip_all, fields(name = %tunnel.name, domain = %tunnel.domain, local_addr = %tunnel.local_addr))]
     fn new(
         tunnel: ClientTunnelConfig,
         name: String,

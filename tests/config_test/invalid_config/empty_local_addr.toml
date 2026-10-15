@@ -1,5 +1,6 @@
 name = "home"
 token = "secret"
 
-[tunnels]
-"nas.example.com" = ""
+[[tunnels]]
+domain = "nas.example.com"
+local_addr = ""

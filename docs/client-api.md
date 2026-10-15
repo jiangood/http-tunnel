@@ -14,9 +14,14 @@ without the `client-api` feature (on by default) has no API.
 
 ## Resources
 
-A tunnel maps a single `Host` domain to a `local_addr` on the client side. The client is the source of truth: a change
-is validated locally, written back to the client configuration file, and applied to the running control channels
-without a restart of either side. The handlers answer once the change is persisted.
+A tunnel has two names: a `name`, its identity within the client, and a `domain`, the `Host` header it serves and
+that the server routes to it. A tunnel is created and deleted by its `name`; the `domain` is part of its body and
+`GET /api/tunnels` returns both. A tunnel that is declared in the configuration file without a `name` is named
+after its `domain`, so the name defaults to something stable.
+
+The client is the source of truth: a change is validated locally, written back to the client configuration file,
+and applied to the running control channels without a restart of either side. The handlers answer once the change
+is persisted.
 
 ## Endpoints
 
@@ -24,12 +29,12 @@ without a restart of either side. The handlers answer once the change is persist
 | --- | --- | --- | --- |
 | `GET` | `/api/status` | | The name and address of the client, whether it is connected, and its tunnel count |
 | `GET` | `/api/tunnels` | | List the tunnels the client is serving |
-| `PUT` | `/api/tunnels/{domain}` | `{local_addr}` | Create or replace a tunnel |
-| `DELETE` | `/api/tunnels/{domain}` | | Delete a tunnel |
+| `PUT` | `/api/tunnels/{name}` | `{domain, local_addr}` | Create or replace a tunnel |
+| `DELETE` | `/api/tunnels/{name}` | | Delete a tunnel |
 
-`{domain}` is lowercased before it is applied. A rejected change is reported with the status that matches the reason:
-`404` when the tunnel does not exist, `400` for a malformed domain or an empty `local_addr`, and `500` when the
-configuration file could not be written.
+A rejected change is reported with the status that matches the reason: `404` when the tunnel does not exist,
+`400` for a malformed name or domain, an empty `local_addr`, or a name or domain that is already taken, and `500`
+when the configuration file could not be written.
 
 ## Examples
 
@@ -37,25 +42,26 @@ configuration file could not be written.
 TOKEN=use_a_secret_that_only_you_know
 BASE=http://127.0.0.1:2336
 
-# Add a tunnel
-curl -X PUT "$BASE/api/tunnels/nas.example.com" \
+# Add a tunnel (its name is `nas`, it serves `nas.example.com`)
+curl -X PUT "$BASE/api/tunnels/nas" \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"local_addr":"127.0.0.1:80"}'
+  -d '{"domain":"nas.example.com","local_addr":"127.0.0.1:80"}'
 
 # List the tunnels
 curl "$BASE/api/tunnels" -H "Authorization: Bearer $TOKEN"
 
-# Delete the tunnel
-curl -X DELETE "$BASE/api/tunnels/nas.example.com" -H "Authorization: Bearer $TOKEN"
+# Delete the tunnel by its name
+curl -X DELETE "$BASE/api/tunnels/nas" -H "Authorization: Bearer $TOKEN"
 ```
 
 ## How a change takes effect
 
-1. The client validates the change (a lowercased, well-formed domain and a non-empty `local_addr`).
+1. The client validates the change (a URL-safe name, a lowercased, well-formed domain, a non-empty `local_addr`,
+   and no name or domain clash).
 2. It writes the new configuration back to its `client.toml` atomically.
-3. It starts the new tunnels, stops the removed ones, and restarts the ones whose `local_addr` changed, without a
-   restart of either side. The answer to the API request carries the outcome.
-4. A newly started tunnel opens a control channel, which registers its domain on the server.
+3. It starts the new tunnels, stops the removed ones, and restarts the ones whose `domain` or `local_addr` changed,
+   without a restart of either side. The answer to the API request carries the outcome.
+4. A newly started tunnel opens a control channel, which registers its `domain` on the server.
 
 ## Caveats
 

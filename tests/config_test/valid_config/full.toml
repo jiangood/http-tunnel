@@ -6,7 +6,17 @@ heartbeat_timeout = 40 # The application-layer heartbeat timeout. Set to 0 to di
 retry_interval = 1 # The interval between retries to connect to the server
 nodelay = true # Whether to enable TCP_NODELAY for the tunnels
 
-[tunnels] # Each tunnel is a domain keyed to the `local_addr` of the local service
-"nas.example.com" = "127.0.0.1:80" # Requests with this `Host` are forwarded to this address
-"git.example.com" = "127.0.0.1:3000"
-"www.example.com" = "127.0.0.1:80" # The same address can serve several domains
+[[tunnels]] # Each tunnel is a table with its own name, domain and local_addr
+name = "nas"
+domain = "nas.example.com" # Requests with this `Host` are forwarded to `local_addr`
+local_addr = "127.0.0.1:80"
+
+[[tunnels]]
+name = "git"
+domain = "git.example.com"
+local_addr = "127.0.0.1:3000"
+
+[[tunnels]]
+name = "www"
+domain = "www.example.com" # The same address can serve several domains
+local_addr = "127.0.0.1:80"

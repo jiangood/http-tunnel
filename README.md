@@ -171,6 +171,12 @@ Before heading to the full configuration specification, it's recommended to skim
 
 Here is the full configuration specification:
 
+The `tunnels` section is an array of tables: each tunnel carries its own `name`,
+`domain` and `local_addr`. The `name` is the identity of the tunnel within the
+client and is what the administration API addresses; the `domain` is the `Host`
+the tunnel serves, unique among the client's tunnels. The `name` is optional and
+defaults to the `domain`.
+
 ```toml
 remote = "myserver.com:2333" # Necessary. The address of the server
 name = "home" # Necessary. The name of the client, used for logging
@@ -180,10 +186,19 @@ heartbeat_timeout = 40 # Optional. The application-layer heartbeat timeout. Set 
 retry_interval = 1 # Optional. The interval between retries to connect to the server. Default: 1 second
 nodelay = true # Optional. Whether to enable TCP_NODELAY for the tunnels. Default: true
 
-[tunnels] # Each tunnel is a domain keyed to the `local_addr` of the local service
-"app1.example.com" = "127.0.0.1:1081"
-"app2.example.com" = "127.0.0.1:1082"
-"www.app2.example.com" = "127.0.0.1:1082" # The same address can serve several domains
+[[tunnels]] # Each tunnel is a table with its own name, domain and local_addr
+name = "app1" # Optional. The identity of the tunnel within the client. Default: the domain
+domain = "app1.example.com" # The `Host` the tunnel serves
+local_addr = "127.0.0.1:1081" # The address of the local service
+
+[[tunnels]]
+name = "app2"
+domain = "app2.example.com"
+local_addr = "127.0.0.1:1082"
+
+[[tunnels]]
+domain = "www.app2.example.com" # The same address can serve several domains
+local_addr = "127.0.0.1:1082"
 ```
 
 The client names are global. A `Host` domain can only be claimed by one tunnel: a domain is registered on the
@@ -256,13 +271,16 @@ to the running tunnels without a restart.
 | --- | --- | --- |
 | `GET` | `/api/status` | The client identity, its connection state and its tunnel count |
 | `GET` | `/api/tunnels` | List the tunnels the client is serving |
-| `PUT` | `/api/tunnels/{domain}` | Create or replace a tunnel (`{local_addr}`) |
-| `DELETE` | `/api/tunnels/{domain}` | Delete a tunnel |
+| `PUT` | `/api/tunnels/{name}` | Create or replace a tunnel (`{domain, local_addr}`) |
+| `DELETE` | `/api/tunnels/{name}` | Delete a tunnel |
+
+`{name}` is the identity of the tunnel (`{name}`, not its domain). A tunnel that
+was declared without a name is addressed by its domain.
 
 ```bash
-curl -X PUT http://127.0.0.1:2336/api/tunnels/nas.example.com \
+curl -X PUT http://127.0.0.1:2336/api/tunnels/nas \
   -H "Authorization: Bearer $CLIENT_TOKEN" -H "Content-Type: application/json" \
-  -d '{"local_addr":"127.0.0.1:80"}'
+  -d '{"domain":"nas.example.com","local_addr":"127.0.0.1:80"}'
 ```
 
 The API binds to `0.0.0.0`, so protect it with a reverse proxy that terminates TLS,

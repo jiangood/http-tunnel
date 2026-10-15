@@ -7,6 +7,11 @@
 //! The client is the source of truth. A change is validated locally, written back
 //! to the client configuration file, and applied to the running control channels
 //! without a restart. The handlers answer once the change is persisted.
+//!
+//! A tunnel has a `name`, its identity within the client, and a `domain`, the
+//! `Host` header it serves. `PUT` and `DELETE` address a tunnel by its name;
+//! `PUT` takes the `domain` and the `local_addr` in its body. A tunnel that is
+//! declared without a name is named after its domain.
 
 use crate::client::ClientState;
 use crate::config::ClientTunnelConfig;
@@ -44,7 +49,7 @@ pub(crate) async fn serve(
     let api = Router::new()
         .route("/status", get(status))
         .route("/tunnels", get(list_tunnels))
-        .route("/tunnels/:domain", put(put_tunnel).delete(delete_tunnel))
+        .route("/tunnels/:name", put(put_tunnel).delete(delete_tunnel))
         .route_layer(middleware::from_fn_with_state(token, auth));
 
     let app = Router::new().nest("/api", api).with_state(state);
@@ -90,6 +95,7 @@ async fn auth<B>(
 #[derive(Serialize)]
 struct TunnelView {
     name: String,
+    domain: String,
     local_addr: String,
     nodelay: bool,
     retry_interval: u64,
@@ -98,6 +104,7 @@ struct TunnelView {
 fn tunnel_view(t: &ClientTunnelConfig) -> TunnelView {
     TunnelView {
         name: t.name.clone(),
+        domain: t.domain.clone(),
         local_addr: t.local_addr.clone(),
         nodelay: t.nodelay,
         retry_interval: t.retry_interval,
@@ -117,6 +124,7 @@ struct StatusView {
 
 #[derive(Deserialize)]
 struct PutTunnel {
+    domain: String,
     local_addr: String,
 }
 
@@ -173,13 +181,13 @@ async fn list_tunnels(State(state): State<Arc<ApiState>>) -> Json<Vec<TunnelView
 
 async fn put_tunnel(
     State(state): State<Arc<ApiState>>,
-    Path(domain): Path<String>,
+    Path(name): Path<String>,
     Json(body): Json<PutTunnel>,
 ) -> Result<Response, ApiError> {
-    let domain = domain.to_lowercase();
+    let name = name.trim().to_string();
     state
         .client
-        .put_tunnel(domain.clone(), body.local_addr)
+        .put_tunnel(name.clone(), body.domain, body.local_addr)
         .await
         .map_err(|e| ApiError::from_reason(format!("{:#}", e)))?;
 
@@ -188,7 +196,7 @@ async fn put_tunnel(
         .tunnels()
         .await
         .into_iter()
-        .find(|t| t.name == domain)
+        .find(|t| t.name == name)
     {
         Some(t) => Ok((StatusCode::CREATED, Json(tunnel_view(&t))).into_response()),
         None => Ok(StatusCode::CREATED.into_response()),
@@ -197,11 +205,11 @@ async fn put_tunnel(
 
 async fn delete_tunnel(
     State(state): State<Arc<ApiState>>,
-    Path(domain): Path<String>,
+    Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     state
         .client
-        .delete_tunnel(&domain.to_lowercase())
+        .delete_tunnel(name.trim())
         .await
         .map_err(|e| ApiError::from_reason(format!("{:#}", e)))?;
     Ok(StatusCode::NO_CONTENT)

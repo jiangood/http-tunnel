@@ -46,13 +46,16 @@ fn write_client_config(
 ) -> Result<String> {
     let mut tunnels_toml = String::new();
     for (domain, local_addr) in tunnels {
-        tunnels_toml.push_str(&format!("\"{}\" = \"{}\"\n", domain, local_addr));
+        tunnels_toml.push_str(&format!(
+            "\n[[tunnels]]\ndomain = \"{}\"\nlocal_addr = \"{}\"\n",
+            domain, local_addr
+        ));
     }
     let api = api_port
         .map(|p| format!("api_port = {}\n", p))
         .unwrap_or_default();
     let content = format!(
-        "name = \"{}\"\nremote = \"{}\"\ntoken = \"{}\"\n{}\n[tunnels]\n{}",
+        "name = \"{}\"\nremote = \"{}\"\ntoken = \"{}\"\n{}\n{}",
         name, remote, token, api, tunnels_toml
     );
 
@@ -355,13 +358,15 @@ async fn client_api_manages_tunnels() -> Result<()> {
     let (status, body) = api_request(
         CLIENT_API_ADDR,
         "PUT",
-        "/api/tunnels/echo.test",
+        "/api/tunnels/echo",
         Some(CLIENT_API_TOKEN),
-        Some(r#"{"local_addr":"127.0.0.1:8093"}"#),
+        Some(r#"{"domain":"echo.test","local_addr":"127.0.0.1:8093"}"#),
     )
     .await?;
     assert_eq!(status, 201, "unexpected response: {}", body);
     assert!(body.contains("127.0.0.1:8093"), "unexpected body: {}", body);
+    assert!(body.contains("\"name\":\"echo\""), "unexpected body: {}", body);
+    assert!(body.contains("\"domain\":\"echo.test\""), "unexpected body: {}", body);
 
     // The client starts the tunnel
     time::sleep(Duration::from_millis(1500)).await;
@@ -410,7 +415,7 @@ async fn client_api_manages_tunnels() -> Result<()> {
     let (status, body) = api_request(
         CLIENT_API_ADDR,
         "DELETE",
-        "/api/tunnels/echo.test",
+        "/api/tunnels/echo",
         Some(CLIENT_API_TOKEN),
         None,
     )
