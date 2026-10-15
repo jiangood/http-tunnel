@@ -11,22 +11,8 @@ build = "build.rs"
 include = ["src/**/*", "LICENSE", "README.md", "build.rs"]
 
 [lib]
-# A plain `lib`. The JNI shared library of the Android client is a separate
-# `cdylib` example (see `[[example]]` below).
 name = "http_tunnel"
 path = "src/lib.rs"
-
-# The shared library embedded by the Android client. Reusing the crate, it only
-# re-exports the C API of `src/mobile.rs`, but as its own `cdylib` target: a
-# `cdylib` that is named after the package makes cargo emit an `http_tunnel.dll`
-# in `deps/` that collides with the artifacts of the integration tests on
-# Windows, which breaks the link of `cargo test`. It is built with the `mobile`
-# feature by `android/build.sh`.
-[[example]]
-name = "http_tunnel_mobile"
-crate-type = ["cdylib"]
-path = "src/mobile_ffi.rs"
-required-features = ["mobile", "client"]
 
 # The benchmarks of the HTTP path. They are plain `harness = false` binaries, so
 # that no benchmarking crate is pulled in (see `benches/`).
@@ -46,12 +32,8 @@ server = ["dep:axum", "dep:serde_json"]
 # Run as a client
 client = []
 # The administration API of the client. Kept out of `client` so that a minimal
-# client build (e.g. the Android cdylib) doesn't pull in an HTTP server
+# client build doesn't pull in an HTTP server
 client-api = ["dep:axum"]
-
-# The mobile client. It embeds the client and exposes a small C API that the
-# Android UI calls through JNI
-mobile = ["dep:tracing-android"]
 
 # Feature to enable tokio-console. Disabled by default.
 # Don't enable it unless for debugging purposes.
@@ -97,11 +79,6 @@ console-subscriber = { version = "0.1", optional = true, features = [
     "parking_lot",
 ] }
 atty = "0.2"
-# The mobile client logs through `tracing`, and logcat is fed by this layer. It
-# only builds for Android, so it is declared for that target (see
-# `src/mobile.rs`).
-[target.'cfg(target_os = "android")'.dependencies]
-tracing-android = { version = "0.2", optional = true }
 
 [build-dependencies]
 # The `git` feature is deliberately left out: it pulls in libgit2, whose build

@@ -4,7 +4,6 @@
 /target/
 /examples/
 /docs/
-/android/
 
 # Files
 .gitignore

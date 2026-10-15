@@ -1,2 +1,0 @@
--dontwarn me.rapiz.httptunnel.**
--keep class me.rapiz.httptunnel.MobileClient { *; }

@@ -3,15 +3,6 @@ perf.data
 perf.data.old
 # The binaries that the release workflow lays out for the Docker image
 /build-out
-# The APK that the release workflow builds
-/android-apk
 
 # Environment files, which hold the client token
 .env
-
-# The Gradle and Android projects of the mobile client
-/android/.gradle
-/android/build
-/android/local.properties
-/android/app/build
-/android/app/src/main/jniLibs

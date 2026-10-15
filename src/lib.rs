@@ -24,12 +24,6 @@ use client::run_client;
 #[cfg(all(feature = "client", feature = "client-api"))]
 mod client_api;
 
-// The C API embedded by the Android client (see `android/`). It reuses the
-// client, so it can only be compiled together with it, and it is exposed for the
-// `http_tunnel_mobile` cdylib (`src/mobile_ffi.rs`) to re-export.
-#[cfg(all(feature = "mobile", feature = "client"))]
-pub mod mobile;
-
 #[cfg(feature = "server")]
 mod admin;
 #[cfg(feature = "server")]

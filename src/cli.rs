@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 // `build.rs` emits the `VERGEN_*` variables as `cargo:rustc-env`, so they are
 // available to every target of the crate. They are read with `option_env!` and
-// fall back to `unknown` so that the mobile `cdylib` (and any other consumer of
-// the library) still builds if a variable is ever missing. The git-derived
+// fall back to `unknown` so that a consumer of the library still builds if a
+// variable is ever missing. The git-derived
 // variables are not reported because `build.rs` leaves the `git` feature of
 // `vergen` disabled (see `build.rs`).
 macro_rules! build_env {
