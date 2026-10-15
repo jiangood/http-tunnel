@@ -6,6 +6,7 @@ pub struct ServerArgs {
     pub server_port: u16,
     pub http_port: u16,
     pub token: String,
+    pub proxies: Vec<crate::config::ServerProxyEntry>,
 }
 
 /// Client runtime settings. The configuration path is fixed to htc.toml.
