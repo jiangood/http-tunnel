@@ -10,6 +10,7 @@ domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
 
 [[tunnels]]
-# The name is optional: a tunnel declared without one is named after its domain
+# Every tunnel must have an explicit name.
+name = "git"
 domain = "git.example.com"
 local_addr = "127.0.0.1:3000"
