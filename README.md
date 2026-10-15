@@ -51,16 +51,15 @@ Create `client.toml` with the following content and accommodate it to your needs
 
 ```toml
 # client.toml
-remote = "myserver.com:2333" # The address of the server
-name = "home_nas" # The name of the client, used for logging
-token = "use_a_secret_that_only_you_know" # The shared token of the server
+remote = "myserver.com:2333"
+name = "home_nas" 
+token = "change_me"
 
 [tunnels]
-"nas.example.com" = "127.0.0.1:80" # Requests with this `Host` are forwarded to the NAS web UI, as seen from the NAS
+"nas.example.com" = "127.0.0.1:80" 
 ```
 
-Then run it from the directory that contains `client.toml`. The client is the default role, so no subcommand is
-needed (the server is run with `./http-tunnel server`):
+Then run it :
 
 ```bash
 ./http-tunnel
@@ -77,10 +76,7 @@ The identity (`remote`, `name` and `token`) can also be given on the command lin
 (`HTTP_TUNNEL_REMOTE`, `HTTP_TUNNEL_NAME`, `HTTP_TUNNEL_TOKEN` and `HTTP_TUNNEL_API_PORT`), in which case the
 command line wins over the file. The tunnels, however, live only in the file:
 
-```bash
-HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know ./http-tunnel \
-  --remote myserver.com:2333 --name home_nas
-```
+
 
 The [client administration API](#client-administration-api), which maintains the client's own tunnels at
 runtime, listens on `8610` by default. Set `HTTP_TUNNEL_API_PORT` (or `--api-port`) to change it.
@@ -91,13 +87,10 @@ runtime, listens on `8610` by default. Set `HTTP_TUNNEL_API_PORT` (or `--api-por
 
 So you can visit `http://nas.example.com` (with `nas.example.com` resolving to your server) to reach the NAS web UI.
 
-To run `http-tunnel` in a container, see [Docker](#docker).
+
 
 ## Docker
 
-A [Docker image](https://github.com/jiangood/http-tunnel/pkgs/container/http-tunnel) is published to the GitHub
-Container Registry for `linux/amd64` and `linux/arm64`. It's a [distroless](https://github.com/GoogleContainerTools/distroless)
-image, so it only contains `http-tunnel` and has no shell. The binary is installed at `/usr/local/bin/http-tunnel`.
 
 The server takes no configuration file, so it only needs its ports and the token. Pass the token through the
 environment, which keeps it out of the container's arguments:
@@ -106,20 +99,13 @@ environment, which keeps it out of the container's arguments:
 docker run -d --name http-tunnel --restart unless-stopped \
   -p 2333:2333 -p 80:80 \
   -e HTTP_TUNNEL_TOKEN=use_a_secret_that_only_you_know \
-  ghcr.io/jiangood/http-tunnel:latest server --server-port 2333 --http-port 80
+  ghcr.io/jiangood/http-tunnel:latest server 
 ```
 
 The client reads its tunnels from `client.toml`, so mount the directory that holds it read-write and publish
 its administration API port. No path has to be passed on the command line:
 
 ```bash
-# client.toml
-# remote = "myserver.com:2333"
-# name = "home_nas"
-# token = "use_a_secret_that_only_you_know"
-#
-# [tunnels]
-# "nas.example.com" = "127.0.0.1:80"
 
 docker run -d --name http-tunnel --restart unless-stopped \
   -p 8610:8610 \
@@ -127,35 +113,9 @@ docker run -d --name http-tunnel --restart unless-stopped \
   ghcr.io/jiangood/http-tunnel:latest
 ```
 
-The default bridge network is enough: the client only dials the server, so it doesn't need the host network. A tunnel
-that reaches a service on the host uses `host.docker.internal` as its `local_addr` in `client.toml` (on Linux, add
-`--add-host host.docker.internal:host-gateway` to the client container), or the name of another container on the same
-network.
-
-The mounted folder must be writable: a change made through the client [administration
-API](#client-administration-api) rewrites `client.toml` in place. If the folder is read-only, pass an explicit path
-to a writable location instead, or start the client with `--api-port 0`.
-
-The client [administration API](#client-administration-api) listens on `8610` by default, so `-p 8610:8610` publishes
-it. Drop the mapping if you don't need to manage the tunnels remotely. It's exposed on every interface, so protect it
-with a reverse proxy that terminates TLS, a firewall rule, or a loopback-only mapping
-(`-p 127.0.0.1:8610:8610`). Change the port with `HTTP_TUNNEL_API_PORT` (or `--api-port`).
 
 ## Configuration
 
-All the configuration lives on the clients. The server takes no configuration file: it's started with its ports
-and a shared token, and it learns the tunnels of a client from the control channels the client opens. A client
-declares its own tunnels in its configuration file.
-
-Before heading to the full configuration specification, it's recommended to skim [the configuration examples](./examples) to get a feeling of the configuration format.
-
-Here is the full configuration specification:
-
-The `tunnels` section is an array of tables: each tunnel carries its own `name`,
-`domain` and `local_addr`. The `name` is the identity of the tunnel within the
-client and is what the administration API addresses; the `domain` is the `Host`
-the tunnel serves, unique among the client's tunnels. The `name` is optional and
-defaults to the `domain`.
 
 ```toml
 remote = "myserver.com:2333" # Necessary. The address of the server
@@ -176,16 +136,9 @@ name = "app2"
 domain = "app2.example.com"
 local_addr = "127.0.0.1:1082"
 
-[[tunnels]]
-domain = "www.app2.example.com" # The same address can serve several domains
-local_addr = "127.0.0.1:1082"
+
 ```
 
-The client names are global. A `Host` domain can only be claimed by one tunnel: a domain is registered on the
-server while the control channel of its tunnel is connected, and a second client that connects a control channel
-for the same domain takes it over (they share one token, so they are trusted). A change of the configuration
-file still needs a restart of the client, but a change made through the
-[client administration API](#client-administration-api) applies at runtime instead.
 
 ### Routing
 
