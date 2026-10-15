@@ -18,7 +18,7 @@
 
 Download the [hts server](https://github.com/jiangood/http-tunnel/releases) and [htc client](https://github.com/jiangood/http-tunnel/releases), or use the Docker images below.
 
-Both programs use a single fixed configuration file in the current working directory. They do not accept business configuration from command-line arguments or environment variables.
+Both programs use a single fixed configuration file in the current working directory. They do not accept business configuration from command-line arguments or environment variables. The `-b` / `--background` option only controls how the process is launched.
 
 ### Server
 
@@ -34,6 +34,12 @@ Edit `hts.toml` and set a strong shared token. The default ports are TCP `2333` 
 ./hts
 ```
 
+To run it in the background and append output to `hts.log`:
+
+```sh
+./hts -b
+```
+
 ### Client
 
 Run the client once to generate `htc.toml`:
@@ -42,7 +48,7 @@ Run the client once to generate `htc.toml`:
 ./htc
 ```
 
-Edit `htc.toml` with the server address, the same shared token, and your forwarding rules, then run `htc` again. For example:
+Edit `htc.toml` with the server address, the same shared token, and your forwarding rules, then run `htc` again. To run it in the background and append output to `htc.log`, use `./htc -b`. For example:
 
 ```toml
 remote = "myserver.com:2333"
@@ -64,7 +70,7 @@ local_addr = "127.0.0.1:80"
 - `hts` reads only `hts.toml` from the current working directory.
 - `htc` reads only `htc.toml` from the current working directory.
 - If the file does not exist, the program creates an example configuration and exits. Edit the generated file, then restart the program.
-- `--help` and `--version` remain available. Business settings cannot be overridden through command-line flags or environment variables.
+- `--help` and `--version` remain available. `-b` / `--background` starts the process in the background; output is appended to `hts.log` or `htc.log` in the current directory. Business settings cannot be overridden through command-line flags or environment variables.
 - Relative paths for any future file-based options are resolved relative to the configuration file.
 
 Client configuration fields:
