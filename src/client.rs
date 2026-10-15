@@ -45,6 +45,9 @@ pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<b
             args.config_path
         )
     })?;
+    if &*token == "replace-with-the-same-secret-as-hts" {
+        bail!("Replace the placeholder token in {:?}", args.config_path);
+    }
 
     let api_port = config.api_port.unwrap_or(DEFAULT_CLIENT_API_PORT);
     let identity = Identity { remote, name, token };
