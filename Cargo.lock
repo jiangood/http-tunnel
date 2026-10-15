@@ -582,7 +582,6 @@ dependencies = [
  "lazy_static",
  "rand",
  "serde",
- "serde_json",
  "sha2",
  "tokio",
  "toml",

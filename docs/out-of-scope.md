@@ -6,7 +6,7 @@
 
 - *HTTP Request Logging*
 
-  `http-tunnel` doesn't interfere with the application layer traffic beyond reading the first request's `Host` header to route the connection. A right place for this kind of stuff is the web server, and a network capture tool. Runtime counters (visitors, responses by status, bytes, pool levels) are exposed by the administration API instead of access logs.
+  `http-tunnel` doesn't interfere with the application layer traffic beyond reading the first request's `Host` header to route the connection. A right place for this kind of stuff is the web server, and a network capture tool.
 
 - *Per-request HTTP features*
 

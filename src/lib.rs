@@ -25,8 +25,6 @@ use client::run_client;
 mod client_api;
 
 #[cfg(feature = "server")]
-mod admin;
-#[cfg(feature = "server")]
 mod http;
 #[cfg(feature = "server")]
 mod server;

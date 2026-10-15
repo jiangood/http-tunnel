@@ -147,8 +147,7 @@ impl IntoResponse for ApiError {
 }
 
 impl ApiError {
-    // Map a message from the client or the server to a status code, mirroring the
-    // mapping of the server's administration API
+    // Map a message from the client or the server to a status code
     fn from_reason(reason: String) -> ApiError {
         let status = if reason.contains("No such") {
             StatusCode::NOT_FOUND

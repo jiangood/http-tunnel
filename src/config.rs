@@ -246,15 +246,6 @@ pub struct ServerConfig {
     /// The port that the server listens for HTTP visitors, routed by the `Host` header.
     /// It listens on all interfaces (`0.0.0.0`).
     pub http_port: u16,
-    /// The port that the administration API and the minimal web UI listen at, on all
-    /// interfaces (`0.0.0.0`). The API is only started when both this and `api_token`
-    /// are set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_port: Option<u16>,
-    /// The token required by the administration API (`Authorization: Bearer <token>`).
-    /// The API is only started when both this and `api_port` are set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_token: Option<MaskedString>,
     /// The clients that are allowed to connect, indexed by the name of the client
     #[serde(default)]
     pub clients: HashMap<String, ServerClientConfig>,
@@ -307,8 +298,8 @@ impl ServerConfig {
     }
 
     /// A minimal template that is written when the config file doesn't exist.
-    /// It only sets the three ports, so that a fresh server can start and be
-    /// configured through the administration API.
+    /// It only sets the ports, so that a fresh server can start and be configured
+    /// by editing the file.
     pub fn template() -> String {
         const TEMPLATE: &str = "\
              # http-tunnel server configuration.\n\
@@ -317,8 +308,6 @@ impl ServerConfig {
              \n\
              server_port = 2333 # The port that the server listens for clients\n\
              http_port = 80 # The HTTP entrypoint, routed by the `Host` header\n\
-             api_port = 2335 # The administration API and the web UI, on all interfaces\n\
-             api_token = \"change_me\" # Required by the administration API\n\
              \n\
              # [clients.home]\n\
              # token = \"use_a_secret_that_only_you_know\"\n\
@@ -331,10 +320,11 @@ impl ServerConfig {
     /// Validate a configuration and normalize it in place: fill the names from the
     /// map keys, lowercase the domains, and reject the ambiguous definitions.
     ///
-    /// A client without any tunnel is allowed, so that a configuration can be built
-    /// incrementally through the administration API. The rules that are enforced:
-    /// a client must have a token, a domain belongs to a single tunnel, and the tokens
-    /// are unique (a duplicated token would let a client impersonate another one).
+    /// A client without any tunnel is allowed, so that it can start with none and
+    /// add them at runtime through its own administration API. The rules that are
+    /// enforced: a client must have a token, a domain belongs to a single tunnel,
+    /// and the tokens are unique (a duplicated token would let a client impersonate
+    /// another one).
     pub fn validate(config: &mut ServerConfig) -> Result<()> {
         // domain -> client name
         let mut seen_domains: HashMap<String, String> = HashMap::new();
@@ -420,7 +410,7 @@ impl ServerConfig {
     }
 
     /// Serialize the configuration back to TOML, so that it can be written back to
-    /// the file after a change made through the administration API.
+    /// the file after a change was requested by a client.
     pub fn to_toml(&self) -> Result<String> {
         toml::to_string(self).with_context(|| "Failed to serialize the config")
     }
@@ -710,8 +700,6 @@ tokenz = "oops"
         let s = r#"
 server_port = 2333
 http_port = 80
-api_port = 2335
-api_token = "admin_secret"
 
 [clients.home]
 token = "123"
@@ -729,7 +717,6 @@ nodelay = false
         // The dump must be parseable again and preserve the structure
         let reparsed = ServerConfig::from_str(&dumped)?;
         assert_eq!(cfg, reparsed);
-        assert!(dumped.contains("api_token = \"admin_secret\""));
         assert!(dumped.contains("[clients.home]"));
         assert!(dumped.contains("[clients.home.tunnels]"));
         assert!(dumped.contains("\"foo1.example.com\" = \"127.0.0.1:80\""));
@@ -742,8 +729,6 @@ nodelay = false
         let cfg = ServerConfig::from_str(&s)?;
         assert_eq!(cfg.server_port, 2333);
         assert_eq!(cfg.http_port, 80);
-        assert_eq!(cfg.api_port, Some(2335));
-        assert!(cfg.api_token.is_some());
         // The sample client is commented out
         assert!(cfg.clients.is_empty());
         Ok(())
@@ -764,7 +749,6 @@ token = "123"
         let cfg = ServerConfig::from_str(s)?;
         let dumped = cfg.to_toml()?;
         // `None` options must be omitted rather than serialized as an error
-        assert!(!dumped.contains("api_port"));
         assert!(!dumped.contains("nodelay"));
         let reparsed = ServerConfig::from_str(&dumped)?;
         assert_eq!(cfg, reparsed);

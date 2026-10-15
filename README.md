@@ -25,7 +25,6 @@ the server pushes it the tunnels that it should serve.
     - [Routing](#routing)
     - [Logging](#logging)
     - [Tuning](#tuning)
-  - [Administration API](#administration-api)
   - [Client Administration API](#client-administration-api)
   - [Planning](#planning)
 
@@ -121,8 +120,9 @@ outside the working directory, so mounting a directory over the working director
 as root, so it can write the bind-mounted `server.toml` whatever the owner of the host directory is.
 
 The server reads `server.toml` from its working directory (`/app` in the image), which it also writes back to when
-it's changed through the [administration API](#administration-api). Mount the directory that holds `server.toml`
-read-write, and publish the ports of the config you use. No path has to be passed on the command line:
+a client changes its tunnels through the [client administration API](#client-administration-api). Mount the directory
+that holds `server.toml` read-write, and publish the ports of the config you use. No path has to be passed on the
+command line:
 
 ```bash
 # server.toml
@@ -136,11 +136,8 @@ docker run -d --name http-tunnel --restart unless-stopped \
 ```
 
 The mounted folder must be writable: if `server.toml` is missing, the server generates a minimal template there and
-starts, and the administration API rewrites it in place. If the folder is read-only, pass an explicit path to a
-writable location instead.
-
-The server [administration API](#administration-api) is off unless `api_port` and `api_token` are set; publish that
-port too (`-p 2335:2335`) when it's enabled.
+starts, and a change made through the client administration API rewrites it in place. If the folder is read-only, pass
+an explicit path to a writable location instead.
 
 The client takes no configuration file, so it only needs the server address, its name and its token. Pass them through
 environment variables, which keeps the token out of the container's arguments:
@@ -176,8 +173,6 @@ Here is the full configuration specification:
 ```toml
 server_port = 2333 # Necessary. The port that the server listens for clients, on all interfaces
 http_port = 80 # Necessary. The HTTP entrypoint. Visitors are routed by the `Host` header
-api_port = 2335 # Optional. The administration API and the web UI, on all interfaces
-api_token = "a_secret_for_the_admin_api" # Optional. The token required by the administration API. Required if `api_port` is set
 
 [clients.home] # A client. The name `home` must be identical to the `--name` of the client
 token = "use_a_secret_that_only_you_know" # Necessary. The token of the client. It can also be given by the `HTTP_TUNNEL_TOKEN` environment variable
@@ -200,8 +195,8 @@ nodelay = false # Applied to all the tunnels of `office`
 ```
 
 The client names are global, and a `Host` domain can only be claimed by one tunnel. A change of the config file still
-needs a restart of the server and the clients, but the [administration API](#administration-api) applies the changes at
-runtime instead.
+needs a restart of the server and the clients, but a change made through the
+[client administration API](#client-administration-api) applies at runtime instead.
 
 ### Routing
 
@@ -230,9 +225,7 @@ If `RUST_LOG` is not present, the default logging level is `info`.
 The logs name the reason a visitor could not be served, so that a failure can be
 told apart from a routing miss: a malformed request is logged as a bad header, an
 unknown `Host` as a routing miss, and a missing data channel as a timeout or a
-closed control channel. The count of each outcome is also reported by the
-[administration API](#administration-api) under `metrics`, together with the
-bytes transferred per direction and the state of the data channel pool.
+closed control channel.
 
 ### Tuning
 
@@ -246,55 +239,9 @@ The bytes between a visitor, the tunnel and the local service are piped through
 allocated per forwarded connection, so the concurrency of large transfers is
 what trades against memory.
 
-## Administration API
-
-The server can expose a small REST API and a web UI to manage the clients and their tunnels at runtime, without a
-restart. It's disabled by default and is enabled by setting `api_port` and `api_token` in `server.toml`:
-
-```toml
-api_port = 2335
-api_token = "a_secret_for_the_admin_api"
-```
-
-All the API routes require the header `Authorization: Bearer <api_token>`. Open `http://127.0.0.1:2335/` for a
-minimal web UI. The API binds to `0.0.0.0`, which makes it reachable from the network, so protect it with a
-reverse proxy that terminates TLS, a firewall rule, or a private network such as WireGuard; publish the port on the
-host loopback only (e.g. `-p 127.0.0.1:2335:2335` in Docker) for local-only access.
-
-| Method | Path | Description |
-| --- | --- | --- |
-| `GET` | `/api/status` | A summary of the running server, including the runtime metrics |
-| `GET` | `/api/clients` | List the clients and their tunnels |
-| `POST` | `/api/clients` | Create a client |
-| `GET` | `/api/clients/{client}` | Get a client |
-| `PATCH` | `/api/clients/{client}` | Update a client (token, heartbeat interval, heartbeat timeout, retry interval, nodelay) |
-| `DELETE` | `/api/clients/{client}` | Delete a client and its tunnels |
-| `GET` | `/api/clients/{client}/tunnels` | List the tunnels of a client |
-| `PUT` | `/api/clients/{client}/tunnels/{domain}` | Create or replace a tunnel (`{local_addr}`) |
-| `DELETE` | `/api/clients/{client}/tunnels/{domain}` | Delete a tunnel |
-
-Every change is written back to the `server.toml` atomically, and is pushed to the connected clients, which start,
-update or stop the corresponding tunnels without a restart. Because the file is rewritten, the comments of a
-`server.toml` that is managed through the API are not preserved.
-
-Two caveats: changing the `token` of a client only affects the server, so the client must be restarted with the new
-`--token`; and the config channel of a client is authenticated by the token, so a client that reconnects with an old
-token is rejected.
-
-```bash
-# Create a client, then add a tunnel to it
-curl -X POST http://127.0.0.1:2335/api/clients \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"name":"home","token":"a_secret_token"}'
-
-curl -X PUT http://127.0.0.1:2335/api/clients/home/tunnels/nas.example.com \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"local_addr":"127.0.0.1:80"}'
-```
-
 ## Client Administration API
 
-The client also exposes a REST API to maintain its own tunnels at runtime. It listens on `8610` by default; change the
+The client exposes a REST API to maintain its own tunnels at runtime. It listens on `8610` by default; change the
 port with `--api-port` or the `HTTP_TUNNEL_API_PORT` environment variable, or set it to `0` to disable the API:
 
 ```bash
@@ -319,12 +266,12 @@ curl -X PUT http://127.0.0.1:2336/api/tunnels/nas.example.com \
   -d '{"local_addr":"127.0.0.1:80"}'
 ```
 
-The API binds to `0.0.0.0`, so protect it the same way as the server API. See
+The API binds to `0.0.0.0`, so protect it with a reverse proxy that terminates TLS,
+a firewall rule, or a private network such as WireGuard. See
 [`docs/client-api.md`](./docs/client-api.md) for the details and the caveats.
 
 ## Planning
 
-- [x] HTTP APIs for configuration
 - [x] Client administration API to maintain a client's own tunnels
 
 [Out of Scope](./docs/out-of-scope.md) lists features that are not planned to be implemented and why.

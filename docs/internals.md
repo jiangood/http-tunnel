@@ -28,7 +28,7 @@ A data channel is a TCP connection between the *server* and the *client* that on
 
 When `http-tunnel` starts in the client mode, it connects to `server_port` and establishes a config channel. It identifies itself by the name given with `--name`, and the server challenges it by a nonce, so that the client is required to authenticate with the token given with `--token`. In this way, the server knows which *client* of its configuration the connection belongs to.
 
-Then the server pushes the *tunnels* of that client over the config channel, and keeps the channel open, so that the later changes made through the administration API are pushed to the client as well. Each of the tunnels carries the `local_addr` on the client side, so the client doesn't need any configuration file.
+Then the server pushes the *tunnels* of that client over the config channel, and keeps the channel open, so that a change the client requests to its own tunnels through its administration API is applied and pushed back to it as well. Each of the tunnels carries the `local_addr` on the client side, so the client doesn't need any configuration file.
 
 The client then creates one connection to `server_port` for each of the tunnels. These connections act as control channels. When a control channel starts, the server challenges the client by a nonce, the client is required to authenticate as the tunnel it wants to represent, with the token of the client it belongs to. Then that tunnel is set up.
 
@@ -66,7 +66,3 @@ On shutdown, after the HTTP listener stops accepting, the server waits for the
 in-flight visitors (up to `DRAIN_TIMEOUT`, 30 seconds) before it tears the
 control channels down, so a graceful restart doesn't cut the flows off. The
 `ActivityTracker` counts the visitors that are still being served for that.
-
-The counters of the HTTP entrypoint (visitors accepted, responses by status,
-bytes per direction, pool levels) live in `ServerMetrics` and are exposed by the
-administration API at `/api/status`.

@@ -1,6 +1,6 @@
 use crate::helper::normalize_domain;
 use crate::protocol::Digest;
-use crate::server::{HttpVisitor, ServerMetrics, ServerState};
+use crate::server::{HttpVisitor, ServerState};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -102,7 +102,6 @@ async fn handle_visitor(
     // Count the visitor as active from the moment it's accepted, so that a
     // shutdown can wait for it instead of cutting it off.
     let activity = state.activity.guard();
-    state.metrics.accept_visitor();
 
     let (prefetched, host) = match time::timeout(
         Duration::from_secs(HEADER_READ_TIMEOUT),
@@ -117,7 +116,6 @@ async fn handle_visitor(
                 &mut stream,
                 "408 Request Timeout",
                 "Timed out reading the HTTP header\n",
-                &state.metrics,
             )
             .await;
             return Ok(());
@@ -125,7 +123,7 @@ async fn handle_visitor(
         Ok(Err(e)) => {
             // E3: the error carries the reason, log it as-is
             debug!("Bad HTTP header from {}: {}", addr, e.message);
-            respond(&mut stream, e.status, &format!("{}\n", e.message), &state.metrics).await;
+            respond(&mut stream, e.status, &format!("{}\n", e.message)).await;
             return Ok(());
         }
         Ok(Ok(header)) => header,
@@ -142,7 +140,6 @@ async fn handle_visitor(
             &mut stream,
             "404 Not Found",
             "No tunnel for this host\n",
-            &state.metrics,
         )
         .await;
         return Ok(());
@@ -156,7 +153,7 @@ async fn handle_visitor(
 
     let Some((visitor_tx, data_pool)) = handle else {
         debug!("No control channel for the host `{}`", host);
-        respond_tunnel_unavailable(&mut stream, &state.metrics).await;
+        respond_tunnel_unavailable(&mut stream).await;
         return Ok(());
     };
 
@@ -168,7 +165,7 @@ async fn handle_visitor(
     // request means that the control channel is gone.
     if !data_pool.request_for_visitor() {
         debug!("No control channel for the host `{}`", host);
-        respond_tunnel_unavailable(&mut stream, &state.metrics).await;
+        respond_tunnel_unavailable(&mut stream).await;
         return Ok(());
     }
 
@@ -347,41 +344,41 @@ fn normalize_domain_bytes(raw: &[u8]) -> Option<String> {
 /// Answer a visitor with a `503`, either because no tunnel is connected for its
 /// `Host`, or because the control channel of the tunnel went away after the visitor
 /// was already handed over.
-pub(crate) async fn respond_tunnel_unavailable(
-    stream: &mut TcpStream,
-    metrics: &ServerMetrics,
-) {
+pub(crate) async fn respond_tunnel_unavailable(stream: &mut TcpStream) {
     respond(
         stream,
         "503 Service Unavailable",
         "The tunnel is not connected\n",
-        metrics,
     )
     .await;
 }
 
 /// Answer a visitor with a `504`, when the tunnel is connected but no data
-/// channel is available in time, e.g. because the client cannot reach its local
-/// service.
-pub(crate) async fn respond_gateway_timeout(stream: &mut TcpStream, metrics: &ServerMetrics) {
+/// channel arrives within the timeout.
+pub(crate) async fn respond_gateway_timeout(stream: &mut TcpStream) {
     respond(
         stream,
         "504 Gateway Timeout",
         "The tunnel did not provide a data channel in time\n",
-        metrics,
     )
     .await;
 }
 
-async fn respond(stream: &mut TcpStream, status: &str, body: &str, metrics: &ServerMetrics) {
-    metrics.record_response(status);
-    let response = format!(
+/// Build a plain-text HTTP response that closes the connection. It's shared with
+/// the server, which writes a `504` from a stream wrapper when a tunnel closes
+/// without sending anything back.
+pub(crate) fn response(status: &str, body: &str) -> Vec<u8> {
+    format!(
         "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{}",
         status,
         body.len(),
         body
-    );
-    let _ = stream.write_all(response.as_bytes()).await;
+    )
+    .into_bytes()
+}
+
+async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
+    let _ = stream.write_all(&response(status, body)).await;
     let _ = stream.flush().await;
 }
 

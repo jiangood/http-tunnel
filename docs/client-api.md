@@ -10,8 +10,8 @@ port with `--api-port` or the `HTTP_TUNNEL_API_PORT` environment variable, or se
 
 Every route requires `Authorization: Bearer <token>`, reusing the token that the client already authenticates with, so
 there is no second secret to manage. The API binds to `0.0.0.0`, which makes it reachable from the network, so protect
-it the same way as the [server API](./admin-api.md): a reverse proxy that terminates TLS, a firewall rule, or a private
-network such as WireGuard. A binary built without the `client-api` feature (on by default) has no API.
+it with a reverse proxy that terminates TLS, a firewall rule, or a private network such as WireGuard. A binary built
+without the `client-api` feature (on by default) has no API.
 
 ## Resources
 
