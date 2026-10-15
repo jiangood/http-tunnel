@@ -1,4 +1,5 @@
 [package]
+autobins = false
 name = "http-tunnel"
 version = "0.13.0"
 edition = "2021"
