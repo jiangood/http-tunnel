@@ -14,3 +14,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-features
       - run: cargo test --all-features
+      - run: cargo build --all-features --bins
+      - name: Run process-level client/server E2E test
+        run: python3 tests/process_e2e.py
