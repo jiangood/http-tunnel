@@ -1,7 +1,7 @@
 remote = "example.com:2333" # The address of the server
 name = "home" # The name of the client
 token = "use_a_secret_that_only_you_know" # The shared token of the server
-api_port = 8610 # The port of the client administration API
+web_port = 8610 # The port of the client web management interface
 heartbeat_timeout = 40 # The application-layer heartbeat timeout. Set to 0 to disable the test
 retry_interval = 1 # The interval between retries to connect to the server
 nodelay = true # Whether to enable TCP_NODELAY for the tunnels
