@@ -5,8 +5,8 @@ Starts real hts/htc processes and two local HTTP backends, then checks both
 server-side proxies and client tunnels, including Authorization replacement.
 Only Python's standard library is required.
 """
+import base64
 import json
-import os
 import socket
 import subprocess
 import tempfile
@@ -58,6 +58,32 @@ def wait_for_port(port, process, label, timeout=15):
     raise TimeoutError(f"{label} did not listen on port {port} in {timeout}s")
 
 
+def check_web_management(port):
+    base = f"http://127.0.0.1:{port}/"
+    try:
+        urllib.request.urlopen(base, timeout=3)
+        raise AssertionError("web UI should require authentication")
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 401, f"expected 401 without credentials, got {exc.code}"
+
+    credentials = base64.b64encode(f"htc:{TOKEN}".encode()).decode()
+    req = urllib.request.Request(base, headers={"Authorization": f"Basic {credentials}"})
+    with urllib.request.urlopen(req, timeout=3) as response:
+        page = response.read().decode()
+        assert response.status == 200
+        assert "http-tunnel 客户端管理" in page
+        assert "<form" in page
+        assert "<script" not in page.lower()
+        assert "<style" not in page.lower()
+
+    api_req = urllib.request.Request(
+        base + "api/status", headers={"Authorization": f"Bearer {TOKEN}"}
+    )
+    with urllib.request.urlopen(api_req, timeout=3) as response:
+        assert response.status == 200
+    print("PASS web management: Basic auth, plain HTML page, and existing Bearer API")
+
+
 def request(port, host):
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/e2e",
@@ -78,9 +104,9 @@ def main():
     for server in (server_backend, client_backend):
         threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    control_port, http_port = free_port(), free_port()
-    while http_port == control_port:
-        http_port = free_port()
+    control_port, http_port, web_port = free_port(), free_port(), free_port()
+    while http_port in (control_port, web_port) or web_port == control_port:
+        http_port, web_port = free_port(), free_port()
 
     processes = []
     try:
@@ -99,7 +125,7 @@ auth_header = "{SERVER_AUTH}"
             (work / "htc.toml").write_text(f"""remote = "127.0.0.1:{control_port}"
 name = "e2e-client"
 token = "{TOKEN}"
-web_port = 0
+web_port = {web_port}
 retry_interval = 1
 
 [[tunnels]]
@@ -122,6 +148,8 @@ auth_header = "{CLIENT_AUTH}"
                 text=True,
             )
             processes.append(client)
+            wait_for_port(web_port, client, "htc web management listener")
+            check_web_management(web_port)
             deadline = time.monotonic() + 20
             last_error = None
             while time.monotonic() < deadline:
