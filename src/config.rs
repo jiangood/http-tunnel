@@ -217,7 +217,7 @@ impl ClientConfig {
                 fs::write(path, example).await
                     .with_context(|| format!("Failed to generate default config {:?}", path))?;
                 bail!(
-                    "Generated {:?}. Edit it with your server address, shared token and tunnel settings, then run htc again.",
+                    "Generated {:?}. Edit it with your server address, shared token and tunnel settings, then restart htc.",
                     path
                 );
             }

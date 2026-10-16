@@ -8,7 +8,7 @@ use backoff::backoff::Backoff;
 use backoff::future::retry_notify;
 use backoff::ExponentialBackoff;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{copy_bidirectional_with_sizes, AsyncReadExt, AsyncWriteExt};
@@ -24,33 +24,22 @@ const COPY_BUF_SIZE: usize = 64 * 1024;
 
 // The entrypoint of running a client
 pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    // The fixed TOML file is the only source of client configuration.
-    let config = ClientConfig::from_file(&args.config_path).await?;
+    // The fixed TOML file is the only source of client configuration. A missing
+    // or unusable configuration is not fatal: it is reported and the process
+    // then waits for a shutdown signal. A client running in a container thus
+    // stays up while its configuration is being fixed, instead of exiting and
+    // making the container restart-loop.
+    let config = match ClientConfig::from_file(&args.config_path).await {
+        Ok(config) => config,
+        Err(e) => return wait_after_error(e, &mut shutdown_rx).await,
+    };
 
-    let remote = config.remote.clone().ok_or_else(|| {
-        anyhow!(
-            "The address of the server is missing. Set `remote` in {:?}",
-            args.config_path
-        )
-    })?;
-    let name = config.name.clone().ok_or_else(|| {
-        anyhow!(
-            "The name of the client is missing. Set `name` in {:?}",
-            args.config_path
-        )
-    })?;
-    let token = config.token.clone().ok_or_else(|| {
-        anyhow!(
-            "The token is missing. Set `token` in {:?}",
-            args.config_path
-        )
-    })?;
-    if &*token == "replace-with-the-same-secret-as-hts" {
-        bail!("Replace the placeholder token in {:?}", args.config_path);
-    }
+    let identity = match resolve_identity(&config, &args.config_path) {
+        Ok(identity) => identity,
+        Err(e) => return wait_after_error(e, &mut shutdown_rx).await,
+    };
 
     let web_port = config.web_port.unwrap_or(DEFAULT_CLIENT_WEB_PORT);
-    let identity = Identity { remote, name, token };
 
     // A definitive failure (a wrong token) is reported here so that the client
     // exits instead of retrying forever
@@ -110,6 +99,44 @@ pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<b
     }
 
     result
+}
+
+/// Resolve the identity of a client from its configuration, rejecting a missing
+/// or placeholder value.
+fn resolve_identity(config: &ClientConfig, config_path: &Path) -> Result<Identity> {
+    let remote = config.remote.clone().ok_or_else(|| {
+        anyhow!(
+            "The address of the server is missing. Set `remote` in {:?}",
+            config_path
+        )
+    })?;
+    let name = config.name.clone().ok_or_else(|| {
+        anyhow!(
+            "The name of the client is missing. Set `name` in {:?}",
+            config_path
+        )
+    })?;
+    let token = config.token.clone().ok_or_else(|| {
+        anyhow!("The token is missing. Set `token` in {:?}", config_path)
+    })?;
+    if &*token == "replace-with-the-same-secret-as-hts" {
+        bail!("Replace the placeholder token in {:?}", config_path);
+    }
+    Ok(Identity { remote, name, token })
+}
+
+/// Report a startup error and then wait for a shutdown signal instead of
+/// returning it.
+///
+/// A client in a container should stay up while its configuration is prepared,
+/// rather than exiting and being restarted in a loop.
+async fn wait_after_error(
+    e: anyhow::Error,
+    shutdown_rx: &mut broadcast::Receiver<bool>,
+) -> Result<()> {
+    error!("{:#}", e);
+    let _ = shutdown_rx.recv().await;
+    Ok(())
 }
 
 /// The identity of a client, resolved from the command line and the configuration
