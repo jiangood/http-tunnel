@@ -99,7 +99,7 @@ auth_header = "{SERVER_AUTH}"
             (work / "htc.toml").write_text(f"""remote = "127.0.0.1:{control_port}"
 name = "e2e-client"
 token = "{TOKEN}"
-api_port = 0
+web_port = 0
 retry_interval = 1
 
 [[tunnels]]
