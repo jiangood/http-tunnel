@@ -56,7 +56,7 @@ local_addr = "127.0.0.1:3000"
 remote = "your-server.example.com:2333"
 name = "home"
 token = "与服务端相同的密钥"
-api_port = 8610
+web_port = 8610
 
 [[tunnels]]
 name = "nas"
@@ -95,9 +95,11 @@ auth_header = "请替换为后端要求的密钥"
 
 **安全提示：** `auth_header` 用于认证后端服务，并不验证访问隧道的用户身份。请妥善保管密钥，并限制公网入口的访问权限。
 
-## 客户端管理 API
+## 客户端 Web 管理
 
-客户端管理 API 默认监听 `8610` 端口，可通过配置 `api_port = 0` 关闭。请求需携带 `Authorization: Bearer <token>`。
+客户端管理页面和原有 API 共用 `web_port` 端口，默认 `8610`；设置 `web_port = 0` 可关闭。浏览器打开 `http://客户端地址:8610/`，登录时用户名填写 `htc`，密码填写客户端配置中的 `token`。页面使用原生 HTML 表单，不包含 CSS 或 JavaScript。
+
+原有 API 路径和 Bearer Token 认证保持不变：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -106,7 +108,7 @@ auth_header = "请替换为后端要求的密钥"
 | PUT | `/api/tunnels/{name}` | 新增或更新隧道 |
 | DELETE | `/api/tunnels/{name}` | 删除隧道 |
 
-管理 API 绑定到 `0.0.0.0`，请勿直接暴露在公网；建议通过防火墙或私有网络限制访问。
+管理端口绑定到 `0.0.0.0`，请勿直接暴露在公网；建议通过防火墙或私有网络限制访问。
 
 ## Docker
 
