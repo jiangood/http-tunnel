@@ -41,7 +41,7 @@ fn write_client_config(
     name: &str,
     remote: &str,
     token: &str,
-    api_port: Option<u16>,
+    web_port: Option<u16>,
     tunnels: &[(&str, &str)],
 ) -> Result<String> {
     let mut tunnels_toml = String::new();
@@ -54,8 +54,8 @@ fn write_client_config(
             name, domain, local_addr
         ));
     }
-    let api = api_port
-        .map(|p| format!("api_port = {}\n", p))
+    let api = web_port
+        .map(|p| format!("web_port = {}\n", p))
         .unwrap_or_default();
     let content = format!(
         "name = \"{}\"\nremote = \"{}\"\ntoken = \"{}\"\n{}\n{}",
