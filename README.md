@@ -1,83 +1,62 @@
 # http-tunnel
 
 [![Release](https://img.shields.io/github/v/release/jiangood/http-tunnel)](https://github.com/jiangood/http-tunnel/releases)
-[![Build](https://img.shields.io/github/actions/workflow/status/jiangood/http-tunnel/rust.yml?branch=main)](https://github.com/jiangood/http-tunnel/actions)
+[![Build](https://img.shields.io/github/actions/workflow/status/jiangood/http-tunnel/rust-checks.yml?branch=main)](https://github.com/jiangood/http-tunnel/actions)
 [![License](https://img.shields.io/github/license/jiangood/http-tunnel)](./LICENSE)
 
-**http-tunnel** is a Rust-based HTTP reverse tunnel for exposing services behind NAT through a public server. Forked from [rathole](https://github.com/rathole-org/rathole), it routes HTTP traffic by `Host` and lets clients manage their own routes.
+**http-tunnel** 是一个基于 Rust 的 HTTP 反向隧道工具，可将内网服务通过公网服务器对外提供访问。服务端根据 HTTP `Host` 头路由请求，客户端负责声明转发规则。
 
-## Features
+## 功能
 
-- Multiple domains and wildcard routes on one public HTTP port
-- WebSocket and protocol upgrade support
-- Optional server-side reverse proxy rules for services running on the server itself
-- Automatic reconnect and pooled data channels
-- Optional runtime client API
+- 多域名和泛域名路由
+- 支持 WebSocket 和 HTTP 协议升级
+- 支持服务端直连代理和客户端隧道
+- 支持 TCP 地址和 Unix Socket
+- 可为转发请求注入 `Authorization: Bearer` 认证头
 
-## Quick start
+## 快速开始
 
-Download the [hts server](https://github.com/jiangood/http-tunnel/releases) and [htc client](https://github.com/jiangood/http-tunnel/releases), or use the Docker images below.
+从 [Releases](https://github.com/jiangood/http-tunnel/releases) 下载 `hts`（服务端）和 `htc`（客户端）。
 
-Both programs use a single fixed configuration file in the current working directory. They do not accept business configuration from command-line arguments or environment variables. The `-b` / `--background` option only controls how the process is launched.
+### 1. 配置服务端
 
-### Server
-
-Run the server once to generate `hts.toml`:
+首次运行会生成 `hts.toml`：
 
 ```sh
 ./hts
 ```
 
-Edit `hts.toml` and set a strong shared token. The default ports are TCP `2333` for client connections and TCP `80` for public HTTP traffic. You can also configure direct reverse-proxy routes to services on the server itself. Then start the server again:
-
-```sh
-./hts
-```
-
-Example server configuration with a direct reverse proxy:
+编辑配置，设置共享密钥：
 
 ```toml
 server_port = 2333
 http_port = 80
-token = "use-a-long-random-secret"
+token = "请替换为随机强密钥"
 
+# 可选：将指定域名转发到服务端本机的服务
 [[proxies]]
 name = "grafana"
 domain = "grafana.example.com"
 local_addr = "127.0.0.1:3000"
-
-[[proxies]]
-name = "dashboard"
-domain = "dashboard.example.com"
-local_addr = "127.0.0.1:8080"
 ```
 
-Each `[[proxies]]` entry routes requests for its `domain` directly to `local_addr` on the server; no `htc` client is needed for these routes. Wildcard domains such as `*.example.com` are supported. Direct proxy routes take precedence over client tunnel routes when domains overlap. The target should normally bind to loopback (for example, `127.0.0.1:3000`) if it should only be reachable through `hts`.
+再次运行 `./hts` 启动服务端。客户端连接端口默认为 `2333`，HTTP 访问端口默认为 `80`。
 
-To run it in the background and append output to `hts.log`:
+### 2. 配置客户端
 
-```sh
-./hts -b
-```
-
-### Client
-
-Run the client once to generate `htc.toml`:
+首次运行会生成 `htc.toml`：
 
 ```sh
 ./htc
 ```
 
-Edit `htc.toml` with the server address, the same shared token, and your forwarding rules, then run `htc` again. To run it in the background and append output to `htc.log`, use `./htc -b`. For example:
+编辑配置，填写服务端地址、相同的共享密钥和转发规则：
 
 ```toml
-remote = "myserver.com:2333"
+remote = "your-server.example.com:2333"
 name = "home"
-token = "replace-with-the-same-secret-as-hts"
+token = "与服务端相同的密钥"
 api_port = 8610
-heartbeat_timeout = 40
-retry_interval = 1
-nodelay = true
 
 [[tunnels]]
 name = "nas"
@@ -85,53 +64,55 @@ domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
 ```
 
-## Configuration
+再次运行 `./htc` 启动客户端。之后访问 `http://nas.example.com`，请求会转发到客户端的本地服务。
 
-- `hts` reads only `hts.toml` from the current working directory. Server-side direct proxy rules are declared as `[[proxies]]` entries with `name`, `domain`, and `local_addr`.
-- `htc` reads only `htc.toml` from the current working directory.
-- If the file does not exist, the program creates an example configuration and exits. Edit the generated file, then restart the program.
-- `--help` and `--version` remain available. `-b` / `--background` starts the process in the background; output is appended to `hts.log` or `htc.log` in the current directory. Business settings cannot be overridden through command-line flags or environment variables.
-- Relative paths for any future file-based options are resolved relative to the configuration file.
+## 转发配置
 
-Client configuration fields:
+客户端使用 `[[tunnels]]`，服务端直连代理使用 `[[proxies]]`。两者均支持以下字段：
 
-| Field | Meaning | Default |
+| 字段 | 说明 |
+| --- | --- |
+| `name` | 规则名称 |
+| `domain` | 要匹配的域名，支持如 `*.example.com` 的泛域名 |
+| `local_addr` | 本地目标地址，可使用 TCP 地址或 Unix Socket |
+| `auth_header` | 可选的认证密钥；自动设置为 `Authorization: Bearer <密钥>` |
+
+TCP 地址示例：`127.0.0.1:3000`
+
+Unix Socket 示例：`unix:///var/run/docker.sock`
+
+例如，将 Docker Socket 通过客户端隧道转发，并为后端请求添加认证头：
+
+```toml
+[[tunnels]]
+name = "docker-api"
+domain = "docker.example.com"
+local_addr = "unix:///var/run/docker.sock"
+auth_header = "请替换为后端要求的密钥"
+```
+
+服务端的 `[[proxies]]` 也可以使用相同的 `local_addr` 和 `auth_header` 配置。设置 `auth_header` 后，转发请求中原有的 `Authorization` 会被覆盖。
+
+**安全提示：** `auth_header` 用于认证后端服务，并不验证访问隧道的用户身份。请妥善保管密钥，并限制公网入口的访问权限。
+
+## 客户端管理 API
+
+客户端管理 API 默认监听 `8610` 端口，可通过配置 `api_port = 0` 关闭。请求需携带 `Authorization: Bearer <token>`。
+
+| 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `remote` | Server address, e.g. `myserver.com:2333` | Required |
-| `name` | Client identity used in logs | Required |
-| `token` | Shared secret, must match `hts.toml` | Required |
-| `api_port` | Client administration API port; `0` disables it | `8610` |
-| `heartbeat_timeout` | Heartbeat timeout in seconds; `0` disables it | `40` |
-| `retry_interval` | Retry interval in seconds | `1` |
-| `nodelay` | Enable TCP_NODELAY for tunnels | `true` |
-| `tunnels` | Array of routes, each with `name`, `domain`, and `local_addr` | Empty |
+| GET | `/api/status` | 查看客户端状态 |
+| GET | `/api/tunnels` | 列出隧道 |
+| PUT | `/api/tunnels/{name}` | 新增或更新隧道 |
+| DELETE | `/api/tunnels/{name}` | 删除隧道 |
 
-## Routing
-
-- Exact domains take precedence over wildcards. `*.example.com` matches subdomains, not the apex domain.
-- Host matching is case-insensitive; ports and trailing dots are ignored.
-- Routing is selected from the first request on each TCP connection; keep-alive connections cannot switch routes.
-- Unknown routes return `404`; failure to obtain a data channel within 10 seconds returns `504`.
-- Multiple `Host` headers and malformed, oversized, or slow headers are rejected.
-
-## Client API
-
-The optional administration API listens on port `8610` by default. Requests require `Authorization: Bearer <token>`.
-
-| Method | Endpoint | Purpose |
-| --- | --- | --- |
-| GET | `/api/status` | Client status |
-| GET | `/api/tunnels` | List routes |
-| PUT | `/api/tunnels/{name}` | Create or replace a route |
-| DELETE | `/api/tunnels/{name}` | Delete a route |
-
-For `PUT`, send JSON with `domain` and `local_addr` fields. The API binds to `0.0.0.0`; do not expose it directly to the Internet. Restrict access with a firewall or private network, or use a TLS-terminating reverse proxy.
+管理 API 绑定到 `0.0.0.0`，请勿直接暴露在公网；建议通过防火墙或私有网络限制访问。
 
 ## Docker
 
-The server and client are published as separate Linux amd64 images, each containing only its corresponding binary.
+服务端和客户端使用独立镜像。请先在宿主机准备好 `hts.toml` 和 `htc.toml`。
 
-Start the server (ports default to TCP `2333` for clients and TCP `80` for HTTP traffic):
+启动服务端：
 
 ```sh
 docker run -d --name http-tunnel-server --restart unless-stopped \
@@ -140,7 +121,7 @@ docker run -d --name http-tunnel-server --restart unless-stopped \
   ghcr.io/jiangood/hts:latest
 ```
 
-Start the client by mounting its configuration at `/app/htc.toml`:
+启动客户端：
 
 ```sh
 docker run -d --name http-tunnel-client --restart unless-stopped \
@@ -148,39 +129,6 @@ docker run -d --name http-tunnel-client --restart unless-stopped \
   ghcr.io/jiangood/htc:latest
 ```
 
-The client API writes configuration changes back to the file, so mount it read-write if you use the API to manage tunnels. The client connects to the server address and port configured in `htc.toml`.
-
-## Operations
-
-Logging defaults to `info`; logging levels are no longer configured through environment variables. TCP_NODELAY is enabled by default. Forwarding uses 64 KiB copy buffers on both ends.
-
-Run the throughput benchmark with `cargo bench --bench throughput`. See [Out of Scope](./docs/out-of-scope.md) for intentional limitations.
-
-## License
+## 许可证
 
 [Apache-2.0](./LICENSE)
-
-
-### Unix sockets and Authorization injection
-
-Both client `[[tunnels]]` and server `[[proxies]]` accept TCP `local_addr` values or Unix socket paths such as `unix:///var/run/docker.sock`. The optional `auth_header` field contains only the secret value; the proxy injects `Authorization: Bearer <value>` into the first HTTP request sent to the local service, replacing any incoming Authorization header. Example:
-
-```toml
-[[tunnels]]
-name = "docker-api"
-domain = "docker.example.com"
-local_addr = "unix:///var/run/docker.sock"
-auth_header = "replace-with-a-long-secret"
-```
-
-Treat this secret as a credential and restrict access to the public tunnel endpoint. This backend Authorization header does not authenticate callers at the tunnel entrypoint.
-
-The same option is available on a server-side `[[proxies]]` entry:
-
-```toml
-[[proxies]]
-name = "docker-api"
-domain = "docker.example.com"
-local_addr = "unix:///var/run/docker.sock"
-auth_header = "replace-with-a-long-secret"
-```
