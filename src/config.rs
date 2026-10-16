@@ -343,7 +343,8 @@ nodelay = true
 # name = "docker-api"
 # domain = "docker.example.com"
 # local_addr = "unix:///var/run/docker.sock"
-# auth_header is optional; it injects `Authorization: Bearer <secret>`
+# auth_header is optional; when set, a request must carry
+# `X-HTTP-TUNNEL-TOKEN: <secret>` or it is answered with 401
 # auth_header = "replace-with-a-long-secret"
 "#
     .to_string()
@@ -372,7 +373,8 @@ token = "{token}"
 # name = "docker-api"
 # domain = "docker.example.com"
 # local_addr = "unix:///var/run/docker.sock"
-# auth_header is optional; it injects `Authorization: Bearer <secret>`
+# auth_header is optional; when set, a request must carry
+# `X-HTTP-TUNNEL-TOKEN: <secret>` or it is answered with 401
 # auth_header = "replace-with-a-long-secret"
 "#
     )

@@ -167,10 +167,21 @@ async fn handle_visitor(
     };
 
     if let Some(proxy) = find_proxy(&proxies, &host) {
+        let request = match crate::helper::gate_auth_header(
+            &prefetched,
+            proxy.auth_header.as_ref().map(|v| &**v),
+        ) {
+            crate::helper::AuthOutcome::Allowed(request) => request,
+            crate::helper::AuthOutcome::Unauthorized(failure) => {
+                debug!("Rejected an unauthenticated visitor {} for host {}: {:?}", addr, host, failure);
+                respond_unauthorized(&mut stream, failure).await;
+                drop(activity);
+                return Ok(());
+            }
+        };
         debug!("Proxying visitor {} for host {} to {}", addr, host, proxy.local_addr);
         match crate::helper::connect_local(&proxy.local_addr).await {
             Ok(mut upstream) => {
-                let request = crate::helper::inject_auth_header(&prefetched, proxy.auth_header.as_ref().map(|v| &**v));
                 upstream.write_all(&request).await?;
                 let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
             }
@@ -416,6 +427,22 @@ pub(crate) async fn respond_gateway_timeout(stream: &mut TcpStream) {
         "The tunnel did not provide a data channel in time\n",
     )
     .await;
+}
+
+/// The `401` sent when a tunnel sets `auth_header` and the visitor does not
+/// present the expected `X-HTTP-TUNNEL-TOKEN`. It carries no `WWW-Authenticate`:
+/// that header describes an `Authorization` scheme, which this is not.
+pub(crate) fn unauthorized_response(failure: crate::helper::AuthFailure) -> Vec<u8> {
+    response("401 Unauthorized", failure.message())
+}
+
+/// Answer a visitor with a `401`, see [`unauthorized_response`].
+pub(crate) async fn respond_unauthorized(
+    stream: &mut TcpStream,
+    failure: crate::helper::AuthFailure,
+) {
+    let _ = stream.write_all(&unauthorized_response(failure)).await;
+    let _ = stream.flush().await;
 }
 
 /// Build a plain-text HTTP response that closes the connection. It's shared with

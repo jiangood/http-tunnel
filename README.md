@@ -12,7 +12,7 @@
 - 支持 WebSocket 和 HTTP 协议升级
 - 支持服务端直连代理和客户端隧道
 - 支持 TCP 地址和 Unix Socket
-- 可为转发请求注入 `Authorization: Bearer` 认证头
+- 可为转发规则开启入口校验，要求访客携带 `X-HTTP-TUNNEL-TOKEN`
 
 ## 快速开始
 
@@ -75,25 +75,29 @@ local_addr = "127.0.0.1:80"
 | `name` | 规则名称 |
 | `domain` | 要匹配的域名，支持如 `*.example.com` 的泛域名 |
 | `local_addr` | 本地目标地址，可使用 TCP 地址或 Unix Socket |
-| `auth_header` | 可选的认证密钥；自动设置为 `Authorization: Bearer <密钥>` |
+| `auth_header` | 可选的访问密钥；设置后访客必须携带 `X-HTTP-TUNNEL-TOKEN: <密钥>`，否则返回 `401` |
 
 TCP 地址示例：`127.0.0.1:3000`
 
 Unix Socket 示例：`unix:///var/run/docker.sock`
 
-例如，将 Docker Socket 通过客户端隧道转发，并为后端请求添加认证头：
+例如，为 Docker Socket 隧道开启访问校验，只有携带正确密钥的请求才会被转发：
 
 ```toml
 [[tunnels]]
 name = "docker-api"
 domain = "docker.example.com"
 local_addr = "unix:///var/run/docker.sock"
-auth_header = "请替换为后端要求的密钥"
+auth_header = "请替换为一个足够长的随机密钥"
 ```
 
-服务端的 `[[proxies]]` 也可以使用相同的 `local_addr` 和 `auth_header` 配置。`auth_header` 为可选字段，仅在需要时设置；设置后，转发请求中原有的 `Authorization` 会被覆盖。
+此时访客必须发送 `X-HTTP-TUNNEL-TOKEN: 请替换为一个足够长的随机密钥`，否则会得到 `401 Unauthorized`，响应体分别为 `Missing X-HTTP-TUNNEL-TOKEN header` 或 `Invalid X-HTTP-TUNNEL-TOKEN header`，说明是没带还是值不对。校验通过后，该头会在转发给后端之前被移除，后端看不到密钥；请求里的 `Authorization` 等其他头不受影响，仍原样传给后端。
 
-**安全提示：** `auth_header` 用于认证后端服务，并不验证访问隧道的用户身份。请妥善保管密钥，并限制公网入口的访问权限。
+服务端的 `[[proxies]]` 也支持相同的 `local_addr` 和 `auth_header` 配置。`auth_header` 为可选字段，不设置时不校验，任何请求都会被转发。
+
+校验用的是自定义头 `X-HTTP-TUNNEL-TOKEN`，而不是 `Authorization`，因此不会和你后端的登录鉴权冲突。
+
+**安全提示：** `auth_header` 是隧道的入口校验，密钥一旦泄露即可绕过。请使用足够长的随机值，并尽量配合 HTTPS 使用；浏览器和 `curl` 都能直接发送这个头。
 
 ## 客户端 Web 管理
 

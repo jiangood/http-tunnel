@@ -27,12 +27,63 @@ pub async fn connect_local(addr: &str) -> Result<BoxLocalIo> {
         .with_context(|| format!("Failed to connect to local TCP service {}", addr))?))
 }
 
-pub fn inject_auth_header(header: &[u8], auth: Option<&str>) -> Vec<u8> {
-    let Some(auth) = auth else { return header.to_vec(); };
-    let Some(end) = header.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return header.to_vec();
+/// The request header a visitor must present when a tunnel sets `auth_header`.
+///
+/// It's a custom header on purpose: applications routinely use `Authorization`
+/// for their own authentication, so checking that header would conflict with
+/// them. The name is matched case-insensitively, as HTTP requires.
+pub const AUTH_HEADER_NAME: &str = "X-HTTP-TUNNEL-TOKEN";
+
+/// The result of checking a request against the `auth_header` of a tunnel.
+#[derive(Debug)]
+pub enum AuthOutcome {
+    /// The request may be forwarded. Its head has the auth header removed.
+    Allowed(Vec<u8>),
+    /// The request does not carry the expected auth header, and why.
+    Unauthorized(AuthFailure),
+}
+
+/// Why a request was rejected, so that the `401` can say what is wrong.
+///
+/// Telling a missing header apart from a wrong one is safe here: it only ever
+/// reveals whether the header was present, never the secret itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailure {
+    /// The request carried no `X-HTTP-TUNNEL-TOKEN` at all.
+    Missing,
+    /// The request carried an `X-HTTP-TUNNEL-TOKEN` that did not match.
+    Invalid,
+}
+
+impl AuthFailure {
+    /// The plain-text body of the `401` that is sent to the visitor.
+    pub fn message(self) -> &'static str {
+        match self {
+            AuthFailure::Missing => "Missing X-HTTP-TUNNEL-TOKEN header\n",
+            AuthFailure::Invalid => "Invalid X-HTTP-TUNNEL-TOKEN header\n",
+        }
+    }
+}
+
+/// Check `X-HTTP-TUNNEL-TOKEN` of a request head against the optional secret of
+/// a tunnel, and strip the header before the request is forwarded.
+///
+/// With no secret configured the request passes through untouched. Otherwise the
+/// request must send `X-HTTP-TUNNEL-TOKEN: <secret>`; the header is always
+/// removed from the forwarded head, so the secret never reaches the backend.
+/// The `Authorization` header is left alone, whatever the application makes of it.
+pub fn gate_auth_header(header: &[u8], auth: Option<&str>) -> AuthOutcome {
+    let Some(auth) = auth else {
+        return AuthOutcome::Allowed(header.to_vec());
     };
-    let mut out = Vec::with_capacity(header.len() + auth.len() + 32);
+    let Some(end) = header.windows(4).position(|w| w == b"\r\n\r\n") else {
+        // A head that cannot be parsed has no usable header in it
+        return AuthOutcome::Unauthorized(AuthFailure::Missing);
+    };
+
+    let mut present = false;
+    let mut authorized = false;
+    let mut out = Vec::with_capacity(header.len());
     let mut lines = header[..end].split(|b| *b == b'\n');
     if let Some(first) = lines.next() {
         out.extend_from_slice(first.strip_suffix(b"\r").unwrap_or(first));
@@ -41,17 +92,56 @@ pub fn inject_auth_header(header: &[u8], auth: Option<&str>) -> Vec<u8> {
     for raw in lines {
         let line = raw.strip_suffix(b"\r").unwrap_or(raw);
         if line.is_empty() { continue; }
-        let is_auth = line.iter().position(|b| *b == b':')
-            .map(|i| line[..i].eq_ignore_ascii_case(b"authorization"))
-            .unwrap_or(false);
-        if !is_auth {
-            out.extend_from_slice(line);
-            out.extend_from_slice(b"\r\n");
+        match line.iter().position(|b| *b == b':') {
+            Some(colon) if line[..colon].eq_ignore_ascii_case(AUTH_HEADER_NAME.as_bytes()) => {
+                present = true;
+                let value = trim_ascii(&line[colon + 1..]);
+                if constant_time_eq(value, auth.as_bytes()) {
+                    authorized = true;
+                }
+                // The header is never forwarded, whether it matched or not.
+            }
+            _ => {
+                out.extend_from_slice(line);
+                out.extend_from_slice(b"\r\n");
+            }
         }
     }
-    out.extend_from_slice(format!("Authorization: Bearer {}\r\n\r\n", auth).as_bytes());
+
+    if !authorized {
+        return AuthOutcome::Unauthorized(if present {
+            AuthFailure::Invalid
+        } else {
+            AuthFailure::Missing
+        });
+    }
+    out.extend_from_slice(b"\r\n");
     out.extend_from_slice(&header[end + 4..]);
-    out
+    AuthOutcome::Allowed(out)
+}
+
+/// Trim ASCII whitespace (spaces and tabs) from both ends of a byte slice
+fn trim_ascii(mut s: &[u8]) -> &[u8] {
+    while let Some((first, rest)) = s.split_first() {
+        if first.is_ascii_whitespace() { s = rest; } else { break; }
+    }
+    while let Some((last, rest)) = s.split_last() {
+        if last.is_ascii_whitespace() { s = rest; } else { break; }
+    }
+    s
+}
+
+/// Compare two byte strings without an early exit, so that the comparison time
+/// does not reveal how many leading bytes of the secret matched.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 use tokio::sync::broadcast;
 
@@ -170,4 +260,86 @@ where
         .with_context(|| "Failed to write data")?;
     conn.flush().await.with_context(|| "Failed to flush data")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allowed(outcome: AuthOutcome) -> Vec<u8> {
+        match outcome {
+            AuthOutcome::Allowed(out) => out,
+            AuthOutcome::Unauthorized(reason) => {
+                panic!("the request should have been allowed, got {:?}", reason)
+            }
+        }
+    }
+
+    fn rejected(outcome: AuthOutcome) -> AuthFailure {
+        match outcome {
+            AuthOutcome::Allowed(_) => panic!("the request should have been rejected"),
+            AuthOutcome::Unauthorized(reason) => reason,
+        }
+    }
+
+    #[test]
+    fn test_gate_auth_header_passes_through_when_disabled() {
+        // Without a secret the request is forwarded byte for byte, even an
+        // `Authorization` that another application would use.
+        let head = b"GET / HTTP/1.1\r\nHost: a.test\r\nAuthorization: Bearer app\r\n\r\n";
+        assert_eq!(allowed(gate_auth_header(head, None)), head);
+    }
+
+    #[test]
+    fn test_gate_auth_header_accepts_and_strips_the_token() {
+        let head = b"GET / HTTP/1.1\r\nHost: a.test\r\nX-HTTP-TUNNEL-TOKEN: s3cret\r\nAccept: */*\r\n\r\n";
+        let out = String::from_utf8(allowed(gate_auth_header(head, Some("s3cret")))).unwrap();
+        assert!(out.contains("Host: a.test\r\n"));
+        assert!(out.contains("Accept: */*\r\n"));
+        assert!(!out.to_lowercase().contains("x-http-tunnel-token"));
+        assert!(out.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_gate_auth_header_name_is_case_insensitive() {
+        let head = b"GET / HTTP/1.1\r\nhost: a.test\r\nx-http-tunnel-token: abc\r\n\r\n";
+        assert!(matches!(gate_auth_header(head, Some("abc")), AuthOutcome::Allowed(_)));
+    }
+
+    #[test]
+    fn test_gate_auth_header_tolerates_value_whitespace() {
+        let head = b"GET / HTTP/1.1\r\nHost: a.test\r\nX-HTTP-TUNNEL-TOKEN:   abc \r\n\r\n";
+        assert!(matches!(gate_auth_header(head, Some("abc")), AuthOutcome::Allowed(_)));
+    }
+
+    #[test]
+    fn test_gate_auth_header_reports_the_reason() {
+        // No header at all: the visitor is told it is missing
+        let missing = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        assert_eq!(rejected(gate_auth_header(missing, Some("s3cret"))), AuthFailure::Missing);
+
+        // A header that does not match: the visitor is told it is invalid
+        let wrong = b"GET / HTTP/1.1\r\nHost: a.test\r\nX-HTTP-TUNNEL-TOKEN: nope\r\n\r\n";
+        assert_eq!(rejected(gate_auth_header(wrong, Some("s3cret"))), AuthFailure::Invalid);
+
+        // An incomplete head cannot be inspected, so it is reported as missing
+        let partial = b"GET / HTTP/1.1\r\nHost: a.test\r\n";
+        assert_eq!(rejected(gate_auth_header(partial, Some("s3cret"))), AuthFailure::Missing);
+    }
+
+    #[test]
+    fn test_auth_failure_messages_name_the_header() {
+        assert!(AuthFailure::Missing.message().contains("X-HTTP-TUNNEL-TOKEN"));
+        assert!(AuthFailure::Invalid.message().contains("X-HTTP-TUNNEL-TOKEN"));
+        assert!(AuthFailure::Missing.message().ends_with('\n'));
+        assert!(AuthFailure::Invalid.message().ends_with('\n'));
+    }
+
+    #[test]
+    fn test_gate_auth_header_keeps_the_body_and_the_authorization() {
+        let head = b"POST / HTTP/1.1\r\nHost: a.test\r\nAuthorization: Bearer app\r\nX-HTTP-TUNNEL-TOKEN: s\r\n\r\nhello";
+        let out = String::from_utf8(allowed(gate_auth_header(head, Some("s")))).unwrap();
+        assert!(out.contains("Authorization: Bearer app\r\n"));
+        assert!(out.ends_with("\r\n\r\nhello"));
+    }
 }

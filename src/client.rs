@@ -412,9 +412,16 @@ async fn run_data_channel_for_tcp(mut conn: TcpStream, local_addr: &str, auth: O
         if n == 0 { bail!("Tunnel closed before the HTTP request header was complete"); }
         header.extend_from_slice(&chunk[..n]);
     }
+    let request = match crate::helper::gate_auth_header(&header, auth) {
+        crate::helper::AuthOutcome::Allowed(request) => request,
+        crate::helper::AuthOutcome::Unauthorized(failure) => {
+            debug!("Rejected an unauthenticated request for {}: {:?}", local_addr, failure);
+            crate::http::respond_unauthorized(&mut conn, failure).await;
+            return Ok(());
+        }
+    };
     let mut local = crate::helper::connect_local(local_addr)
         .await.with_context(|| format!("Failed to connect to local service {}", local_addr))?;
-    let request = crate::helper::inject_auth_header(&header, auth);
     local.write_all(&request).await.context("Failed to write HTTP request to local service")?;
     let _ = copy_bidirectional_with_sizes(&mut conn, &mut local, COPY_BUF_SIZE, COPY_BUF_SIZE).await;
     Ok(())

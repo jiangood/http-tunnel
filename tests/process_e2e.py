@@ -2,7 +2,7 @@
 """Process-level E2E smoke test for the hts and htc executables.
 
 Starts real hts/htc processes and two local HTTP backends, then checks both
-server-side proxies and client tunnels, including Authorization replacement.
+server-side proxies and client tunnels, including the X-HTTP-TUNNEL-TOKEN gate.
 Only Python's standard library is required.
 """
 import base64
@@ -29,6 +29,7 @@ class BackendHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         payload = json.dumps({
             "authorization": self.headers.get("Authorization"),
+            "tunnel_token": self.headers.get("X-HTTP-TUNNEL-TOKEN"),
             "path": self.path,
         }).encode()
         self.send_response(200)
@@ -86,10 +87,13 @@ def check_web_management(port):
     print("PASS web management: Basic auth, plain HTML page, and existing Bearer API")
 
 
-def request(port, host):
+def request(port, host, token=None):
+    headers = {"Host": host}
+    if token is not None:
+        headers["X-HTTP-TUNNEL-TOKEN"] = token
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/e2e",
-        headers={"Host": host, "Authorization": "Bearer incoming-wrong-value"},
+        headers=headers,
     )
     with urllib.request.urlopen(req, timeout=5) as response:
         return response.status, json.loads(response.read())
@@ -168,7 +172,7 @@ auth_header = "{CLIENT_AUTH}"
             if client.poll() is not None:
                 raise RuntimeError(f"htc exited early with code {client.returncode}")
             try:
-                status, body = request(http_port, "client.e2e.test")
+                status, body = request(http_port, "client.e2e.test", CLIENT_AUTH)
                 if status == 200:
                     break
             except (OSError, urllib.error.URLError, TimeoutError) as exc:
@@ -177,17 +181,42 @@ auth_header = "{CLIENT_AUTH}"
         else:
             raise TimeoutError(f"client tunnel did not become ready: {last_error}")
 
-        for host, expected in (
-            ("server.e2e.test", f"Bearer {SERVER_AUTH}"),
-            ("client.e2e.test", f"Bearer {CLIENT_AUTH}"),
+        for host, secret in (
+            ("server.e2e.test", SERVER_AUTH),
+            ("client.e2e.test", CLIENT_AUTH),
         ):
-            status, body = request(http_port, host)
+            status, body = request(http_port, host, secret)
             assert status == 200, f"{host}: unexpected HTTP status {status}"
-            assert body["authorization"] == expected, (
-                f"{host}: expected Authorization {expected!r}, "
-                f"got {body['authorization']!r}"
+            assert body["tunnel_token"] is None, (
+                f"{host}: the token must be stripped before the backend, "
+                f"got {body['tunnel_token']!r}"
             )
-            print(f"PASS {host}: real hts/htc process forwarded request and replaced Authorization")
+            print(f"PASS {host}: real hts/htc process gated the request by X-HTTP-TUNNEL-TOKEN")
+
+        for host in ("server.e2e.test", "client.e2e.test"):
+            try:
+                request(http_port, host)
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 401, f"{host}: expected 401 without the token, got {exc.code}"
+                body = exc.read().decode()
+                assert "Missing X-HTTP-TUNNEL-TOKEN header" in body, (
+                    f"{host}: unexpected 401 body {body!r}"
+                )
+            else:
+                raise AssertionError(f"{host}: a request without the token must get 401")
+            print(f"PASS {host}: a request without the token is answered with 401 (missing)")
+
+            try:
+                request(http_port, host, "wrong-secret")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 401, f"{host}: expected 401 for a wrong token, got {exc.code}"
+                body = exc.read().decode()
+                assert "Invalid X-HTTP-TUNNEL-TOKEN header" in body, (
+                    f"{host}: unexpected 401 body {body!r}"
+                )
+            else:
+                raise AssertionError(f"{host}: a wrong token must get 401")
+            print(f"PASS {host}: a wrong token is answered with 401 (invalid)")
 
     finally:
         for process in reversed(processes):
