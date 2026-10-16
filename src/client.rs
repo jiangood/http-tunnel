@@ -49,7 +49,7 @@ pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<b
         bail!("Replace the placeholder token in {:?}", args.config_path);
     }
 
-    let api_port = config.api_port.unwrap_or(DEFAULT_CLIENT_API_PORT);
+    let web_port = config.web_port.unwrap_or(DEFAULT_CLIENT_WEB_PORT);
     let identity = Identity { remote, name, token };
 
     // A definitive failure (a wrong token) is reported here so that the client
