@@ -268,6 +268,7 @@ nodelay = true
                 name,
                 domain,
                 local_addr: entry.local_addr,
+                auth_header: entry.auth_header,
             });
         }
 
