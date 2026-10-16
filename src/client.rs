@@ -67,9 +67,9 @@ pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<b
 
     // Run the web management interface and administration API when a port is configured. A build without the
     // `client-api` feature has nothing to serve, so it only warns. A port of `0`
-    // disables the API, so that several clients can share a host.
+    // disables the web management service, so that several clients can share a host.
     #[cfg(feature = "client-api")]
-    let api_task = match web_port {
+    let web_task = match web_port {
         0 => None,
         port => {
             let token = state.token().to_owned();
@@ -102,11 +102,11 @@ pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<b
     // Stop every tunnel
     state.shutdown().await;
 
-    // Stop the administration API if it is running
+    // Stop the web management service if it is running
     #[cfg(feature = "client-api")]
-    if let Some(api_task) = api_task {
-        api_task.abort();
-        let _ = api_task.await;
+    if let Some(web_task) = web_task {
+        web_task.abort();
+        let _ = web_task.await;
     }
 
     result
