@@ -1,4 +1,4 @@
-use crate::cli::{ClientArgs, DEFAULT_CLIENT_API_PORT};
+use crate::cli::{ClientArgs, DEFAULT_CLIENT_WEB_PORT};
 use crate::config::{ClientConfig, ClientTunnelConfig, MaskedString};
 use crate::constants::run_control_chan_backoff;
 use crate::protocol::{self, Ack, Auth, ClientHello, ControlChannelCmd, DataChannelCmd, ServerHello};
@@ -65,11 +65,11 @@ pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<b
     // Start the tunnels declared in the configuration
     state.sync().await;
 
-    // Run the administration API when a port is configured. A build without the
+    // Run the web management interface and administration API when a port is configured. A build without the
     // `client-api` feature has nothing to serve, so it only warns. A port of `0`
     // disables the API, so that several clients can share a host.
     #[cfg(feature = "client-api")]
-    let api_task = match api_port {
+    let api_task = match web_port {
         0 => None,
         port => {
             let token = state.token().to_owned();
@@ -84,9 +84,9 @@ pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<b
     };
 
     #[cfg(not(feature = "client-api"))]
-    if api_port != 0 {
+    if web_port != 0 {
         warn!(
-            "The client administration API is configured, but this build has \
+            "The client web management interface is configured, but this build has \
              no `client-api` feature. It is disabled"
         );
     }
