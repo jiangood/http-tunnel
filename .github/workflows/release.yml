@@ -56,18 +56,6 @@ jobs:
         if: matrix.cross
         run: cross build --release --target ${{ matrix.target }} --no-default-features --features server,client,client-api
 
-      - name: Run UPX
-        # Upx may not support some platforms. Ignore the errors
-        continue-on-error: true
-        # Disable upx for mips. See https://github.com/upx/upx/issues/387
-        if: matrix.os == 'ubuntu-latest' && !contains(matrix.target, 'mips')
-        uses: crazy-max/ghaction-upx@v3
-        with:
-          version: v4.0.2
-          files: |
-            target/${{ matrix.target }}/release/hts*
-            target/${{ matrix.target }}/release/htc*
-          args: -q --best --lzma
       - uses: actions/upload-artifact@v4
         with:
           name: http-tunnel-${{ matrix.name }}
