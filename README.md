@@ -117,7 +117,7 @@ auth_header = "请替换为后端要求的密钥"
 启动服务端：
 
 ```sh
-docker run -d --name http-tunnel-server --restart unless-stopped \
+docker run -d --name hts --restart unless-stopped \
   -p 2333:2333 -p 80:80 \
   -v "$PWD/hts.toml:/app/hts.toml:ro" \
   ghcr.io/jiangood/hts:latest
@@ -126,7 +126,7 @@ docker run -d --name http-tunnel-server --restart unless-stopped \
 启动客户端：
 
 ```sh
-docker run -d --name http-tunnel-client --restart unless-stopped \
+docker run -d --name htc --restart unless-stopped \
   -v "$PWD/htc.toml:/app/htc.toml:ro" \
   ghcr.io/jiangood/htc:latest
 ```
