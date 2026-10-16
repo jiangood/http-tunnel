@@ -117,13 +117,13 @@ auth_header = "请替换为后端要求的密钥"
 启动服务端：
 
 ```sh
-docker run -d --name hts --restart unless-stopped   -p 2333:2333 -p 80:80   -v "/opt/hts.toml:/app/hts.toml"   ghcr.io/jiangood/hts:latest
+docker run -d --name hts --restart unless-stopped   -p 2333:2333 -p 80:80   -v "/opt/hts:/app/"   ghcr.io/jiangood/hts:latest
 ```
 
 启动客户端：
 
 ```sh
-docker run -d --name htc --restart unless-stopped   -v "/opt/htc.toml:/app/htc.toml"   ghcr.io/jiangood/htc:latest
+docker run -d --name htc --restart unless-stopped   -v "/opt/htc:/app/"   ghcr.io/jiangood/htc:latest
 ```
 
 ## 许可证
