@@ -227,6 +227,8 @@ nodelay = true
 # name = "nas"
 # domain = "nas.example.com"
 # local_addr = "127.0.0.1:80"
+# local_addr can also be "unix:///var/run/docker.sock"
+# auth_header = "replace-with-a-long-secret"
 "#;
                 fs::write(path, example).await
                     .with_context(|| format!("Failed to generate default config {:?}", path))?;
@@ -250,6 +252,9 @@ nodelay = true
         for entry in std::mem::take(&mut config.tunnels) {
             if entry.local_addr.is_empty() {
                 bail!("The `local_addr` of the tunnel `{}` is empty", entry.domain);
+            }
+            if entry.auth_header.as_ref().is_some_and(|v| v.contains('\r') || v.contains('\n')) {
+                bail!("The `auth_header` of the tunnel `{}` must not contain line breaks", entry.name);
             }
 
             let domain = crate::helper::normalize_domain(&entry.domain)
@@ -714,6 +719,9 @@ impl ServerConfig {
                     if proxy.name.trim().is_empty() || proxy.local_addr.trim().is_empty() {
                         bail!("Each [[proxies]] entry needs non-empty name and local_addr");
                     }
+                    if proxy.auth_header.as_ref().is_some_and(|v| v.contains('\r') || v.contains('\n')) {
+                        bail!("The `auth_header` of proxy `{}` must not contain line breaks", proxy.name);
+                    }
                     let domain = crate::helper::normalize_domain(&proxy.domain)
                         .ok_or_else(|| anyhow!("Invalid proxy domain `{}`", proxy.domain))?;
                     if domains.insert(domain.clone(), ()).is_some() {
@@ -739,6 +747,8 @@ token = "replace-with-a-long-random-secret"
 # name = "grafana"
 # domain = "grafana.example.com"
 # local_addr = "127.0.0.1:3000"
+# local_addr can also be "unix:///var/run/docker.sock"
+# auth_header = "replace-with-a-long-secret"
 "#;
                 fs::write(path, example).await
                     .with_context(|| format!("Failed to generate default config {:?}", path))?;
