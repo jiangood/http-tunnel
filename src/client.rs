@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::io::copy_bidirectional_with_sizes;
+use tokio::io::{copy_bidirectional_with_sizes, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio::time::{self, Duration, Instant};
@@ -366,7 +366,7 @@ async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
     // Forward
     match protocol::read_payload::<DataChannelCmd, _>(&mut conn).await? {
         DataChannelCmd::StartForwardTcp => {
-            run_data_channel_for_tcp(conn, &args.tunnel.local_addr).await?;
+            run_data_channel_for_tcp(conn, &args.tunnel.local_addr, args.tunnel.auth_header.as_ref().map(|v| &**v)).await?;
         }
     }
     Ok(())
@@ -374,25 +374,22 @@ async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
 
 // Simply copying back and forth for TCP
 #[instrument(skip(conn))]
-async fn run_data_channel_for_tcp(mut conn: TcpStream, local_addr: &str) -> Result<()> {
+async fn run_data_channel_for_tcp(mut conn: TcpStream, local_addr: &str, auth: Option<&str>) -> Result<()> {
     debug!("New data channel starts forwarding");
-
-    // The `111` (`ECONNREFUSED`) most often seen on a client is this line: the
-    // tunnel points at a `local_addr` where nothing is listening. Name it as the
-    // local service, so that it isn't mistaken for the connection to the server.
-    let mut local = TcpStream::connect(local_addr).await.with_context(|| {
-        format!(
-            "Failed to connect to the local service `{}`. Is it running on this host?",
-            local_addr
-        )
-    })?;
-    let _ = copy_bidirectional_with_sizes(
-        &mut conn,
-        &mut local,
-        COPY_BUF_SIZE,
-        COPY_BUF_SIZE,
-    )
-    .await;
+    let mut header = Vec::with_capacity(1024);
+    loop {
+        if header.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+        if header.len() >= 8 * 1024 { bail!("HTTP request header is too large"); }
+        let mut chunk = [0u8; 1024];
+        let n = conn.read(&mut chunk).await.context("Failed to read HTTP request header from tunnel")?;
+        if n == 0 { bail!("Tunnel closed before the HTTP request header was complete"); }
+        header.extend_from_slice(&chunk[..n]);
+    }
+    let mut local = crate::helper::connect_local(local_addr)
+        .await.with_context(|| format!("Failed to connect to local service {}", local_addr))?;
+    let request = crate::helper::inject_auth_header(&header, auth);
+    local.write_all(&request).await.context("Failed to write HTTP request to local service")?;
+    let _ = copy_bidirectional_with_sizes(&mut conn, &mut local, COPY_BUF_SIZE, COPY_BUF_SIZE).await;
     Ok(())
 }
 
