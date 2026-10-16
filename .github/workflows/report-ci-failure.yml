@@ -1,0 +1,71 @@
+name: Report CI failures
+
+on:
+  workflow_run:
+    workflows: ["Rust checks"]
+    types: [completed]
+
+permissions:
+  actions: read
+  issues: write
+
+jobs:
+  report:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open an issue for the failed run
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const { owner, repo } = context.repo;
+
+            const jobsResponse = await github.rest.actions.listJobsForWorkflowRun({
+              owner,
+              repo,
+              run_id: run.id,
+              per_page: 100,
+            });
+
+            const failedJobs = jobsResponse.data.jobs.filter(
+              job => job.conclusion === 'failure'
+            );
+
+            const details = failedJobs.length
+              ? failedJobs.map(job => {
+                  const failedSteps = job.steps
+                    .filter(step => step.conclusion === 'failure')
+                    .map(step => `- Step **${step.name}** failed`);
+                  return [
+                    `### Job: ${job.name}`,
+                    `- [View job logs](${job.html_url})`,
+                    ...failedSteps,
+                  ].join('\n');
+                }).join('\n\n')
+              : 'GitHub Actions reported a failed run, but no failed job was listed in the API response.';
+
+            const body = [
+              'A GitHub Actions workflow run failed automatically.',
+              '',
+              '## Run details',
+              `- **Workflow:** ${run.name}`,
+              `- **Branch:** ${run.head_branch}`,
+              `- **Commit:** \`${run.head_sha}\``,
+              `- **Event:** ${run.event}`,
+              `- **Run:** [#${run.run_number}](${run.html_url})`,
+              '',
+              '## Failed jobs',
+              details,
+              '',
+              'Please inspect the logs, fix the cause, and close this issue once resolved.',
+            ].join('\n');
+
+            const issue = await github.rest.issues.create({
+              owner,
+              repo,
+              title: `[CI failure] ${run.name} — ${run.head_branch} (#${run.run_number})`,
+              body,
+            });
+
+            core.info(`Created issue ${issue.data.html_url}`);
