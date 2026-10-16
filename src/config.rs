@@ -95,9 +95,9 @@ pub struct ClientConfig {
     /// The token of the client. It must match the shared token of the server
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<MaskedString>,
-    /// The port of the client administration API. Defaults to 8610, `0` disables it
+    /// The port of the client web management page and API. Defaults to 8610, `0` disables it
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_port: Option<u16>,
+    pub web_port: Option<u16>,
     /// Application-layer heartbeat timeout in secs. 0 disables the test
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat_timeout: Option<u64>,
@@ -217,7 +217,7 @@ impl ClientConfig {
 remote = "your-server.example.com:2333"
 name = "home"
 token = "replace-with-the-same-secret-as-hts"
-api_port = 8610
+web_port = 8610
 heartbeat_timeout = 40
 retry_interval = 1
 nodelay = true
@@ -624,7 +624,7 @@ token = "123"
 remote = "example.com:2333"
 name = "home"
 token = "123"
-api_port = 8611
+web_port = 8611
 heartbeat_timeout = 20
 retry_interval = 2
 nodelay = false
