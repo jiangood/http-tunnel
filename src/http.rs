@@ -168,9 +168,10 @@ async fn handle_visitor(
 
     if let Some(proxy) = find_proxy(&proxies, &host) {
         debug!("Proxying visitor {} for host {} to {}", addr, host, proxy.local_addr);
-        match TcpStream::connect(&proxy.local_addr).await {
+        match crate::helper::connect_local(&proxy.local_addr).await {
             Ok(mut upstream) => {
-                upstream.write_all(&prefetched).await?;
+                let request = crate::helper::inject_auth_header(&prefetched, proxy.auth_header.as_ref().map(|v| &**v));
+                upstream.write_all(&request).await?;
                 let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
             }
             Err(e) => {
