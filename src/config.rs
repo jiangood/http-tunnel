@@ -57,6 +57,7 @@ pub struct ClientTunnelConfig {
     pub domain: String,
     /// The address of the local service on the client side
     pub local_addr: String,
+    pub auth_header: Option<MaskedString>,
     /// Whether to enable TCP_NODELAY
     pub nodelay: bool,
     /// The interval between retries to connect to the server
@@ -76,6 +77,8 @@ pub struct TunnelEntry {
     pub domain: String,
     /// The address of the local service on the client side
     pub local_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<MaskedString>,
 }
 
 /// The configuration of a client. The TOML file is the only source of runtime configuration.
@@ -139,6 +142,7 @@ impl ClientConfig {
                 name: entry.name.clone(),
                 domain: entry.domain.clone(),
                 local_addr: entry.local_addr.clone(),
+                auth_header: entry.auth_header.clone(),
                 nodelay,
                 retry_interval,
             })
@@ -167,6 +171,7 @@ impl ClientConfig {
                 name,
                 domain,
                 local_addr,
+                auth_header: None,
             }),
         }
     }
@@ -690,6 +695,8 @@ pub struct ServerProxyEntry {
     pub name: String,
     pub domain: String,
     pub local_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<MaskedString>,
 }
 
 fn default_server_port() -> u16 { 2333 }
