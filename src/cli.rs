@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+/// Default port for the client administration API.
+pub const DEFAULT_CLIENT_API_PORT: u16 = 8610;
+
 /// Server runtime settings loaded from hts.toml.
 #[derive(Debug, Clone)]
 pub struct ServerArgs {
