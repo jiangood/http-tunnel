@@ -130,7 +130,7 @@ docker run -d --name hts --restart unless-stopped   -p 2333:2333 -p 80:80   -v "
 docker run -d --name htc --restart unless-stopped   -v "/opt/htc:/app/"   ghcr.io/jiangood/htc:latest
 ```
 
-客户端在配置缺失或无效（例如 `token` 仍为占位符）时不会退出，而是记录错误并保持运行，修正配置后重启容器即可。
+如果需要代理 unix sock，例如docker api，还需要 参数 `-v /var/run/docker.sock:/var/run/docker.sock`
 
 ## 许可证
 
