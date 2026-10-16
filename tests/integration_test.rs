@@ -46,9 +46,12 @@ fn write_client_config(
 ) -> Result<String> {
     let mut tunnels_toml = String::new();
     for (domain, local_addr) in tunnels {
+        // Tunnel names are required by the current client config schema.
+        // Use the first domain label as a stable name for these integration tests.
+        let name = domain.split('.').next().unwrap_or(domain);
         tunnels_toml.push_str(&format!(
-            "\n[[tunnels]]\ndomain = \"{}\"\nlocal_addr = \"{}\"\n",
-            domain, local_addr
+            "\n[[tunnels]]\nname = \"{}\"\ndomain = \"{}\"\nlocal_addr = \"{}\"\n",
+            name, domain, local_addr
         ));
     }
     let api = api_port
