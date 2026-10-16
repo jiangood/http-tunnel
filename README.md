@@ -159,3 +159,18 @@ Run the throughput benchmark with `cargo bench --bench throughput`. See [Out of 
 ## License
 
 [Apache-2.0](./LICENSE)
+
+
+### Unix sockets and Authorization injection
+
+Both client `[[tunnels]]` and server `[[proxies]]` accept TCP `local_addr` values or Unix socket paths such as `unix:///var/run/docker.sock`. The optional `auth_header` field contains only the secret value; the proxy injects `Authorization: Bearer <value>` into the first HTTP request sent to the local service, replacing any incoming Authorization header. Example:
+
+```toml
+[[tunnels]]
+name = "docker-api"
+domain = "docker.example.com"
+local_addr = "unix:///var/run/docker.sock"
+auth_header = "replace-with-a-long-secret"
+```
+
+Treat this secret as a credential and restrict access to the public tunnel endpoint. This backend Authorization header does not authenticate callers at the tunnel entrypoint.
