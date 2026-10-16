@@ -7,6 +7,8 @@ Only Python's standard library is required.
 """
 import base64
 import json
+import os
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -93,9 +95,20 @@ def request(port, host):
         return response.status, json.loads(response.read())
 
 
+def cleanup(work):
+    # Windows may keep a just-terminated process's working directory locked for a
+    # short while. Retry, ignoring errors, so a failed cleanup never masks a pass.
+    for _ in range(10):
+        if not work.exists():
+            return
+        shutil.rmtree(work, ignore_errors=True)
+        time.sleep(0.2)
+
+
 def main():
-    hts = ROOT / "target" / "debug" / "hts"
-    htc = ROOT / "target" / "debug" / "htc"
+    suffix = ".exe" if os.name == "nt" else ""
+    hts = ROOT / "target" / "debug" / f"hts{suffix}"
+    htc = ROOT / "target" / "debug" / f"htc{suffix}"
     if not hts.is_file() or not htc.is_file():
         raise SystemExit("Missing target/debug/hts or htc; run cargo build --all-features first")
 
@@ -109,10 +122,9 @@ def main():
         http_port, web_port = free_port(), free_port()
 
     processes = []
+    work = Path(tempfile.mkdtemp(prefix="http-tunnel-e2e-"))
     try:
-        with tempfile.TemporaryDirectory(prefix="http-tunnel-e2e-") as tmp:
-            work = Path(tmp)
-            (work / "hts.toml").write_text(f"""server_port = {control_port}
+        (work / "hts.toml").write_text(f"""server_port = {control_port}
 http_port = {http_port}
 token = "{TOKEN}"
 
@@ -122,7 +134,7 @@ domain = "server.e2e.test"
 local_addr = "127.0.0.1:{server_backend.server_port}"
 auth_header = "{SERVER_AUTH}"
 """)
-            (work / "htc.toml").write_text(f"""remote = "127.0.0.1:{control_port}"
+        (work / "htc.toml").write_text(f"""remote = "127.0.0.1:{control_port}"
 name = "e2e-client"
 token = "{TOKEN}"
 web_port = {web_port}
@@ -135,47 +147,47 @@ local_addr = "127.0.0.1:{client_backend.server_port}"
 auth_header = "{CLIENT_AUTH}"
 """)
 
-            server = subprocess.Popen(
-                [str(hts)], cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True,
-            )
-            processes.append(server)
-            wait_for_port(control_port, server, "hts control listener")
-            wait_for_port(http_port, server, "hts HTTP listener")
+        server = subprocess.Popen(
+            [str(hts)], cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True,
+        )
+        processes.append(server)
+        wait_for_port(control_port, server, "hts control listener")
+        wait_for_port(http_port, server, "hts HTTP listener")
 
-            client = subprocess.Popen(
-                [str(htc)], cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True,
-            )
-            processes.append(client)
-            wait_for_port(web_port, client, "htc web management listener")
-            check_web_management(web_port)
-            deadline = time.monotonic() + 20
-            last_error = None
-            while time.monotonic() < deadline:
-                if client.poll() is not None:
-                    raise RuntimeError(f"htc exited early with code {client.returncode}")
-                try:
-                    status, body = request(http_port, "client.e2e.test")
-                    if status == 200:
-                        break
-                except (OSError, urllib.error.URLError, TimeoutError) as exc:
-                    last_error = exc
-                    time.sleep(0.2)
-            else:
-                raise TimeoutError(f"client tunnel did not become ready: {last_error}")
+        client = subprocess.Popen(
+            [str(htc)], cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True,
+        )
+        processes.append(client)
+        wait_for_port(web_port, client, "htc web management listener")
+        check_web_management(web_port)
+        deadline = time.monotonic() + 20
+        last_error = None
+        while time.monotonic() < deadline:
+            if client.poll() is not None:
+                raise RuntimeError(f"htc exited early with code {client.returncode}")
+            try:
+                status, body = request(http_port, "client.e2e.test")
+                if status == 200:
+                    break
+            except (OSError, urllib.error.URLError, TimeoutError) as exc:
+                last_error = exc
+                time.sleep(0.2)
+        else:
+            raise TimeoutError(f"client tunnel did not become ready: {last_error}")
 
-            for host, expected in (
-                ("server.e2e.test", f"Bearer {SERVER_AUTH}"),
-                ("client.e2e.test", f"Bearer {CLIENT_AUTH}"),
-            ):
-                status, body = request(http_port, host)
-                assert status == 200, f"{host}: unexpected HTTP status {status}"
-                assert body["authorization"] == expected, (
-                    f"{host}: expected Authorization {expected!r}, "
-                    f"got {body['authorization']!r}"
-                )
-                print(f"PASS {host}: real hts/htc process forwarded request and replaced Authorization")
+        for host, expected in (
+            ("server.e2e.test", f"Bearer {SERVER_AUTH}"),
+            ("client.e2e.test", f"Bearer {CLIENT_AUTH}"),
+        ):
+            status, body = request(http_port, host)
+            assert status == 200, f"{host}: unexpected HTTP status {status}"
+            assert body["authorization"] == expected, (
+                f"{host}: expected Authorization {expected!r}, "
+                f"got {body['authorization']!r}"
+            )
+            print(f"PASS {host}: real hts/htc process forwarded request and replaced Authorization")
 
     finally:
         for process in reversed(processes):
@@ -192,6 +204,7 @@ auth_header = "{CLIENT_AUTH}"
         client_backend.shutdown()
         server_backend.server_close()
         client_backend.server_close()
+        cleanup(work)
 
 
 if __name__ == "__main__":
