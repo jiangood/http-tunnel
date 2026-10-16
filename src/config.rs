@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
@@ -212,24 +213,7 @@ impl ClientConfig {
             Ok(s) => ClientConfig::parse(&s)
                 .with_context(|| format!("The configuration {:?} is invalid", path)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let example = r#"# http-tunnel client configuration
-# Set these values before starting htc.
-remote = "your-server.example.com:2333"
-name = "home"
-token = "replace-with-the-same-secret-as-hts"
-web_port = 8610
-heartbeat_timeout = 40
-retry_interval = 1
-nodelay = true
-
-# Add one [[tunnels]] block per service to expose.
-# [[tunnels]]
-# name = "nas"
-# domain = "nas.example.com"
-# local_addr = "127.0.0.1:80"
-# local_addr can also be "unix:///var/run/docker.sock"
-# auth_header = "replace-with-a-long-secret"
-"#;
+                let example = client_config_example();
                 fs::write(path, example).await
                     .with_context(|| format!("Failed to generate default config {:?}", path))?;
                 bail!(
@@ -323,6 +307,75 @@ fn validate_name(name: &str) -> Result<String> {
         );
     }
     Ok(name.to_string())
+}
+
+/// Generate a strong random shared token: 128 bits, lowercase hex encoded
+fn generate_token() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// The commented example written when htc.toml is missing.
+///
+/// It shows two tunnels: a plain TCP one and a Docker socket one. The token is
+/// left as a placeholder because it must match the one of the server.
+fn client_config_example() -> String {
+    r#"# http-tunnel client configuration
+# Set these values before starting htc.
+remote = "your-server.example.com:2333"
+name = "home"
+token = "replace-with-the-same-secret-as-hts"
+web_port = 8610
+heartbeat_timeout = 40
+retry_interval = 1
+nodelay = true
+
+# Add one [[tunnels]] block per service to expose.
+# A plain TCP service:
+# [[tunnels]]
+# name = "nas"
+# domain = "nas.example.com"
+# local_addr = "127.0.0.1:80"
+
+# A service reachable over a Unix socket:
+# [[tunnels]]
+# name = "docker-api"
+# domain = "docker.example.com"
+# local_addr = "unix:///var/run/docker.sock"
+# auth_header is optional; it injects `Authorization: Bearer <secret>`
+# auth_header = "replace-with-a-long-secret"
+"#
+    .to_string()
+}
+
+/// The commented example written when hts.toml is missing.
+///
+/// The shared token is generated when the file is first created.
+fn server_config_example(token: &str) -> String {
+    format!(
+        r#"# http-tunnel server configuration
+# The shared token is generated for you. Set the same token in htc.toml.
+server_port = 2333
+http_port = 80
+token = "{token}"
+
+# Optional direct reverse-proxy routes to services running on this server.
+# A plain TCP service:
+# [[proxies]]
+# name = "grafana"
+# domain = "grafana.example.com"
+# local_addr = "127.0.0.1:3000"
+
+# A service reachable over a Unix socket:
+# [[proxies]]
+# name = "docker-api"
+# domain = "docker.example.com"
+# local_addr = "unix:///var/run/docker.sock"
+# auth_header is optional; it injects `Authorization: Bearer <secret>`
+# auth_header = "replace-with-a-long-secret"
+"#
+    )
 }
 
 #[cfg(test)]
@@ -675,6 +728,48 @@ local_addr = "127.0.0.1:80"
         let cfg = ClientConfig::parse("").unwrap();
         assert_eq!(cfg, ClientConfig::default());
     }
+
+    #[test]
+    fn test_generate_token_is_strong_and_random() {
+        let a = generate_token();
+        let b = generate_token();
+        assert_eq!(a.len(), 32);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+        assert_ne!(a, "replace-with-a-long-random-secret");
+    }
+
+    #[test]
+    fn test_server_config_example_is_valid() -> Result<()> {
+        let token = generate_token();
+        let example = server_config_example(&token);
+        // The generated example must be a valid server configuration
+        let cfg: ServerConfig = toml::from_str(&example)?;
+        assert_eq!(String::from(&*cfg.token), token);
+        assert!(cfg.proxies.is_empty());
+        // A plain and a Docker socket proxy example are both present
+        assert_eq!(example.matches("# [[proxies]]").count(), 2);
+        assert!(example.contains("unix:///var/run/docker.sock"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_client_config_example_is_valid() -> Result<()> {
+        let example = client_config_example();
+        // The commented tunnels are inactive, so the example parses as-is
+        let cfg = ClientConfig::parse(&example)?;
+        assert!(cfg.tunnels.is_empty());
+        // A plain and a Docker socket tunnel example are both present
+        assert_eq!(example.matches("# [[tunnels]]").count(), 2);
+        assert!(example.contains("unix:///var/run/docker.sock"));
+        // Only the Docker tunnel documents the optional `auth_header`
+        let (plain, docker) = example
+            .split_once("# A service reachable over a Unix socket:")
+            .expect("the Docker tunnel example is present");
+        assert!(!plain.contains("auth_header"), "{}", plain);
+        assert!(docker.contains("auth_header"), "{}", docker);
+        Ok(())
+    }
 }
 
 
@@ -736,23 +831,14 @@ impl ServerConfig {
                 Ok(config)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let example = r#"# http-tunnel server configuration
-# Use a long random secret and set the same token in htc.toml.
-server_port = 2333
-http_port = 80
-token = "replace-with-a-long-random-secret"
-
-# Optional direct reverse-proxy routes to services running on this server.
-# [[proxies]]
-# name = "grafana"
-# domain = "grafana.example.com"
-# local_addr = "127.0.0.1:3000"
-# local_addr can also be "unix:///var/run/docker.sock"
-# auth_header = "replace-with-a-long-secret"
-"#;
+                let token = generate_token();
+                let example = server_config_example(&token);
                 fs::write(path, example).await
                     .with_context(|| format!("Failed to generate default config {:?}", path))?;
-                bail!("Generated {:?}. Set a strong shared token, then run hts again.", path);
+                bail!(
+                    "Generated {:?} with the shared token {:?}. Set the same token in htc.toml, then run hts again.",
+                    path, token
+                );
             }
             Err(e) => Err(e).with_context(|| format!("Failed to read the config {:?}", path)),
         }

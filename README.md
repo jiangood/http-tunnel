@@ -20,18 +20,18 @@
 
 ### 1. 配置服务端
 
-首次运行会生成 `hts.toml`：
+首次运行会生成 `hts.toml`，其中 `token` 是自动生成的随机强密钥：
 
 ```sh
 ./hts
 ```
 
-编辑配置，设置共享密钥：
+把生成的 `token` 填到 `htc.toml`，其余字段可按需调整：
 
 ```toml
 server_port = 2333
 http_port = 80
-token = "请替换为随机强密钥"
+token = "自动生成的随机强密钥"
 
 # 可选：将指定域名转发到服务端本机的服务
 [[proxies]]
@@ -50,7 +50,7 @@ local_addr = "127.0.0.1:3000"
 ./htc
 ```
 
-编辑配置，填写服务端地址、相同的共享密钥和转发规则：
+编辑配置，填写服务端地址、与服务端相同的 `token` 和转发规则：
 
 ```toml
 remote = "your-server.example.com:2333"
@@ -91,7 +91,7 @@ local_addr = "unix:///var/run/docker.sock"
 auth_header = "请替换为后端要求的密钥"
 ```
 
-服务端的 `[[proxies]]` 也可以使用相同的 `local_addr` 和 `auth_header` 配置。设置 `auth_header` 后，转发请求中原有的 `Authorization` 会被覆盖。
+服务端的 `[[proxies]]` 也可以使用相同的 `local_addr` 和 `auth_header` 配置。`auth_header` 为可选字段，仅在需要时设置；设置后，转发请求中原有的 `Authorization` 会被覆盖。
 
 **安全提示：** `auth_header` 用于认证后端服务，并不验证访问隧道的用户身份。请妥善保管密钥，并限制公网入口的访问权限。
 
