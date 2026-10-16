@@ -17,6 +17,7 @@ pub async fn run_http_tunnel_server(
         server_port,
         http_port,
         token: token.to_string(),
+        proxies: Vec::new(),
     });
     http_tunnel::run(cmd, shutdown_rx).await
 }
@@ -29,10 +30,6 @@ pub async fn run_http_tunnel_client(
 ) -> Result<()> {
     let cmd = http_tunnel::Command::Client(http_tunnel::ClientArgs {
         config_path: PathBuf::from(config_path),
-        remote: None,
-        name: None,
-        token: None,
-        api_port: None,
     });
     http_tunnel::run(cmd, shutdown_rx).await
 }
