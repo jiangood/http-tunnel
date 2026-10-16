@@ -174,3 +174,13 @@ auth_header = "replace-with-a-long-secret"
 ```
 
 Treat this secret as a credential and restrict access to the public tunnel endpoint. This backend Authorization header does not authenticate callers at the tunnel entrypoint.
+
+The same option is available on a server-side `[[proxies]]` entry:
+
+```toml
+[[proxies]]
+name = "docker-api"
+domain = "docker.example.com"
+local_addr = "unix:///var/run/docker.sock"
+auth_header = "replace-with-a-long-secret"
+```
