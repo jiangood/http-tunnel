@@ -1,76 +1,49 @@
-# Client Administration API
+# 客户端 Web 管理与 API
 
-The client exposes a small REST API to maintain its own tunnels at runtime. It listens on `8610` by default; change the
-port with `--api-port` or the `HTTP_TUNNEL_API_PORT` environment variable, or set it to `0` to disable the API:
+客户端的 Web 管理页面和 REST API 共用一个端口，默认监听 `8610`。在 `htc.toml` 中设置 `web_port = 0` 可关闭整个管理服务。
 
-```bash
-./http-tunnel --config client.toml --api-port 2336
+浏览器访问 `http://客户端地址:8610/`。浏览器弹出 HTTP Basic 认证时，用户名填写 `htc`，密码填写客户端配置中的 `token`。管理页面只使用原生 HTML 表单，不包含 CSS 或 JavaScript。
+
+管理服务绑定到 `0.0.0.0`，可从网络访问。请使用防火墙、私有网络或带 TLS 的反向代理限制访问，不要直接暴露在公网。
+
+## 页面功能
+
+- 查看客户端名称、服务端地址、连接状态和隧道数量
+- 列出已有隧道
+- 新增隧道；使用已有名称可更新其域名和本地地址
+- 删除隧道
+
+通过页面进行的修改会校验配置、写入 `htc.toml`，并立即应用，无需重启客户端。配置文件必须可写。
+
+## REST API
+
+原有 API 路径与 Bearer Token 认证保持不变。每个请求都需要：
+
+```http
+Authorization: Bearer <token>
 ```
 
-Every route requires `Authorization: Bearer <token>`, reusing the shared token that the client authenticates with, so
-there is no second secret to manage. The API binds to `0.0.0.0`, which makes it reachable from the network, so protect
-it with a reverse proxy that terminates TLS, a firewall rule, or a private network such as WireGuard. A binary built
-without the `client-api` feature (on by default) has no API.
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/status` | 客户端名称、服务端地址、连接状态和隧道数量 |
+| `GET` | `/api/tunnels` | 列出隧道 |
+| `PUT` | `/api/tunnels/{name}` | 新增或更新隧道，请求体为 `{ "domain": "...", "local_addr": "..." }` |
+| `DELETE` | `/api/tunnels/{name}` | 删除隧道 |
 
-## Resources
-
-A tunnel has two names: a `name`, its identity within the client, and a `domain`, the `Host` header it serves and
-that the server routes to it. A tunnel is created and deleted by its required `name`; the `domain` is part of its body and
-`GET /api/tunnels` returns both.
-
-The client is the source of truth: a change is validated locally, written back to the client configuration file,
-and applied to the running control channels without a restart of either side. The handlers answer once the change
-is persisted.
-
-## Endpoints
-
-| Method | Path | Body | Description |
-| --- | --- | --- | --- |
-| `GET` | `/api/status` | | The name and address of the client, whether it is connected, and its tunnel count |
-| `GET` | `/api/tunnels` | | List the tunnels the client is serving |
-| `PUT` | `/api/tunnels/{name}` | `{domain, local_addr}` | Create or replace a tunnel |
-| `DELETE` | `/api/tunnels/{name}` | | Delete a tunnel |
-
-A rejected change is reported with the status that matches the reason: `404` when the tunnel does not exist,
-`400` for a malformed name or domain, an empty `local_addr`, or a name or domain that is already taken, and `500`
-when the configuration file could not be written.
-
-## Examples
+例如：
 
 ```bash
-TOKEN=use_a_secret_that_only_you_know
-BASE=http://127.0.0.1:2336
+TOKEN=replace-with-your-client-token
+BASE=http://127.0.0.1:8610
 
-# Add a tunnel (its name is `nas`, it serves `nas.example.com`)
+curl "$BASE/api/status" -H "Authorization: Bearer $TOKEN"
+curl "$BASE/api/tunnels" -H "Authorization: Bearer $TOKEN"
 curl -X PUT "$BASE/api/tunnels/nas" \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"domain":"nas.example.com","local_addr":"127.0.0.1:80"}'
-
-# List the tunnels
-curl "$BASE/api/tunnels" -H "Authorization: Bearer $TOKEN"
-
-# Delete the tunnel by its name
 curl -X DELETE "$BASE/api/tunnels/nas" -H "Authorization: Bearer $TOKEN"
 ```
 
-## How a change takes effect
+## 安全注意事项
 
-1. The client validates the change (a URL-safe name, a lowercased, well-formed domain, a non-empty `local_addr`,
-   and no name or domain clash).
-2. It writes the new configuration back to its `client.toml` atomically.
-3. It starts the new tunnels, stops the removed ones, and restarts the ones whose `domain` or `local_addr` changed,
-   without a restart of either side. The answer to the API request carries the outcome.
-4. A newly started tunnel opens a control channel, which registers its `domain` on the server.
-
-## Caveats
-
-- The configuration file must be writable. The API writes back to the path the client was started with (default
-  `client.toml`), so a container has to mount it read-write.
-- Only the tunnels are written back. If the identity (`remote`, `name`, `token`) was given on the command line rather
-  than in the file, it is not persisted: keep passing it on the command line, or put it in the file.
-- The shared token is the client's credential and, since it is shared, the server does not restrict *which* free
-  domain a client may claim. Any holder of the token can add a tunnel for any domain that no other client serves, and
-  change or remove the client's own tunnels. Treat the token as a secret.
-- Changing a `local_addr` restarts the corresponding tunnel, so in-flight visitors on it are cut off.
-- A change made through the API only takes effect on the local client. A hand edit of `client.toml` still needs a
-  restart of the client.
+客户端共享令牌同时用于连接服务端和管理 API；任何持有该令牌的人都能修改客户端隧道。妥善保管令牌，并限制管理端口的网络访问。
