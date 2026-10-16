@@ -117,10 +117,7 @@ auth_header = "请替换为后端要求的密钥"
 启动服务端：
 
 ```sh
-docker run -d --name hts --restart unless-stopped \
-  -p 2333:2333 -p 80:80 \
-  -v "$PWD/hts.toml:/app/hts.toml:ro" \
-  ghcr.io/jiangood/hts:latest
+docker run -d --name hts --restart unless-stopped   -p 2333:2333 -p 80:80   -v "opt/hts.toml:/app/hts.toml"   ghcr.io/jiangood/hts:latest
 ```
 
 启动客户端：
