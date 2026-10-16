@@ -1,8 +1,58 @@
 use anyhow::{anyhow, Context, Result};
 use backoff::{backoff::Backoff, Notify};
 use std::{future::Future, net::SocketAddr};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::net::{lookup_host, ToSocketAddrs};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::{lookup_host, TcpStream, ToSocketAddrs};
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
+pub trait LocalIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> LocalIo for T {}
+pub type BoxLocalIo = Box<dyn LocalIo>;
+
+pub async fn connect_local(addr: &str) -> Result<BoxLocalIo> {
+    if let Some(path) = addr.strip_prefix("unix://") {
+        #[cfg(unix)]
+        {
+            return Ok(Box::new(UnixStream::connect(path).await
+                .with_context(|| format!("Failed to connect to Unix socket {}", path))?));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            anyhow::bail!("Unix sockets are not supported on this platform");
+        }
+    }
+    Ok(Box::new(TcpStream::connect(addr).await
+        .with_context(|| format!("Failed to connect to local TCP service {}", addr))?))
+}
+
+pub fn inject_auth_header(header: &[u8], auth: Option<&str>) -> Vec<u8> {
+    let Some(auth) = auth else { return header.to_vec(); };
+    let Some(end) = header.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return header.to_vec();
+    };
+    let mut out = Vec::with_capacity(header.len() + auth.len() + 32);
+    let mut lines = header[..end].split(|b| *b == b'\n');
+    if let Some(first) = lines.next() {
+        out.extend_from_slice(first.strip_suffix(b"\r").unwrap_or(first));
+        out.extend_from_slice(b"\r\n");
+    }
+    for raw in lines {
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.is_empty() { continue; }
+        let is_auth = line.iter().position(|b| *b == b':')
+            .map(|i| line[..i].eq_ignore_ascii_case(b"authorization"))
+            .unwrap_or(false);
+        if !is_auth {
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    out.extend_from_slice(format!("Authorization: Bearer {}\r\n\r\n", auth).as_bytes());
+    out.extend_from_slice(&header[end + 4..]);
+    out
+}
 use tokio::sync::broadcast;
 
 #[allow(dead_code)]
