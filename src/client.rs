@@ -357,42 +357,37 @@ struct RunDataChannelArgs {
 }
 
 async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<BoxedIo> {
-    // Retry at least every 100ms, at most for 10 seconds
+    // Retry at least every 100ms, at most for 10 seconds.
     let backoff = ExponentialBackoff {
         max_interval: Duration::from_millis(100),
         max_elapsed_time: Some(Duration::from_secs(10)),
         ..Default::default()
     };
 
-    // Connect to remote_addr
-    let mut conn: TcpStream = retry_notify(
+    retry_notify(
         backoff,
         || async {
-            connect(&args.remote_addr)
-                .await
+            let result: Result<BoxedIo> = if args.transport == "websocket" {
+                connect_websocket(&args.remote_addr.addr).await
+            } else {
+                connect(&args.remote_addr)
+                    .await
+                    .map(|tcp| {
+                        args.socket_opts.apply(&tcp);
+                        Box::new(tcp) as BoxedIo
+                    })
+                    .map_err(Into::into)
+            };
+            result
                 .with_context(|| format!("Failed to connect to {}", args.remote_addr))
                 .map_err(backoff::Error::transient)
         },
         |e, duration| {
-            warn!("{:#}. Retry in {:?}", e, duration);
+            warn!("{:#}. Retry in {:?}...", e, duration);
         },
     )
-    .await?;
-
-    // Apply socket options for the data channel
-    args.socket_opts.apply(&conn);
-
-    // Send hello
-    let hello = ClientHello::Data {
-        version: protocol::CURRENT_PROTO_VERSION,
-        nonce: args.session_key,
-    };
-    protocol::write_payload(&mut conn, &hello).await?;
-
-    Ok(conn)
-}
-
-async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
+    .await
+}async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
     // Do the handshake
     let mut conn = do_data_channel_handshake(args.clone()).await?;
 
@@ -441,6 +436,7 @@ struct ControlChannel {
     token: MaskedString,                // The token given by `--token`
     shutdown_rx: oneshot::Receiver<u8>, // Receives the shutdown signal
     remote_addr: String,                // `--remote`
+    transport: String,                  // TCP or WebSocket byte-stream transport
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
     connections: Arc<AtomicUsize>,      // The number of established control channels
 }
