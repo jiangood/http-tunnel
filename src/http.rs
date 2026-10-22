@@ -95,6 +95,8 @@ fn find_proxy<'a>(proxies: &'a [ServerProxyEntry], host: &str) -> Option<&'a Ser
 /// Only the first request of a connection is inspected, so routing is connection-level.
 pub(crate) async fn serve(
     port: u16,
+    server_port: u16,
+    control_host: Option<String>,
     state: Arc<ServerState>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     proxies: Vec<ServerProxyEntry>,
@@ -113,8 +115,16 @@ pub(crate) async fn serve(
                     Ok((stream, addr)) => {
                         let state = state.clone();
                         let proxies = proxies.clone();
+                        let control_host = control_host.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_visitor(stream, addr, state, proxies).await {
+                            if let Err(e) = handle_visitor(
+                                stream,
+                                addr,
+                                server_port,
+                                control_host,
+                                state,
+                                proxies,
+                            ).await {
                                 debug!("Failed to route visitor {}: {:#}", addr, e);
                             }
                         });
@@ -133,6 +143,8 @@ pub(crate) async fn serve(
 async fn handle_visitor(
     mut stream: TcpStream,
     addr: SocketAddr,
+    server_port: u16,
+    control_host: Option<String>,
     state: Arc<ServerState>,
     proxies: Arc<Vec<ServerProxyEntry>>,
 ) -> Result<()> {
@@ -165,6 +177,23 @@ async fn handle_visitor(
         }
         Ok(Ok(header)) => header,
     };
+
+    // Reserve the configured control Host for the internal WebSocket transport.
+    // Host is a routing key only; the existing token handshake still authenticates clients.
+    if control_host.as_deref() == Some(host.as_str()) {
+        let path = parse_request_path(&prefetched).unwrap_or("");
+        if path != "/_http-tunnel/v1/connect" {
+            respond(&mut stream, "404 Not Found", "Unknown control endpoint\n").await;
+            return Ok(());
+        }
+        if !is_websocket_upgrade(&prefetched) {
+            respond(&mut stream, "426 Upgrade Required", "WebSocket upgrade required\n").await;
+            return Ok(());
+        }
+        drop(activity);
+        crate::transport::websocket::accept_and_bridge(prefetched, stream, server_port).await?;
+        return Ok(());
+    }
 
     if let Some(proxy) = find_proxy(&proxies, &host) {
         let request = match crate::helper::gate_auth_header(
