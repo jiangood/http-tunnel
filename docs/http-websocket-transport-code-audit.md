@@ -58,7 +58,15 @@
 - 已在 HTTP 入口按 control_host + 专用路径分流，并在 README 中记录配置方式和明文传输风险。
 - 已在 GitHub Actions 中通过编译、单元/集成测试、二进制构建及进程级 E2E；仍属于实验性原型，尚未覆盖所有阶段 2 的异常、背压与恢复场景。
 
-## 6. 下一阶段任务
+## 6. 阶段 2 追加的资源与生命周期保护
+
+- WebSocket 帧和消息最大 1 MiB，避免单条消息无界分配。
+- WebSocket 握手超时 10 秒，本地 TCP 上游连接超时 5 秒。
+- HTTP 入口最多允许 256 条活动 WebSocket 连接；达到上限时返回 503。
+- WebSocket 活动期间保留服务端 activity guard，纳入现有关闭/活动计数。
+- 拒绝把保留的 control_host 注册为业务隧道，避免控制域名被业务路由覆盖。
+
+## 7. 下一阶段任务
 
 1. 增加可选配置字段并保证旧配置默认仍使用 TCP。
 2. 增加 WebSocket byte-stream adapter 和依赖。
