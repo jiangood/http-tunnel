@@ -15,6 +15,8 @@ use tokio_tungstenite::{
     WebSocketStream,
 };
 
+use super::SocketOpts;
+
 /// Keep individual WebSocket messages bounded; the byte-stream protocol does
 /// not need large WS messages because the bridge chunks writes into 16 KiB pieces.
 const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024;
@@ -41,7 +43,9 @@ pub(crate) async fn connect_websocket(remote: &str) -> Result<BoxedIo> {
     let url = format!("ws://{}/_http-tunnel/v1/connect", remote);
     let (ws, _) = timeout(
         WS_HANDSHAKE_TIMEOUT,
-        connect_async_with_config(&url, Some(websocket_config()), false),
+        // The tunnel carries small interactive frames; keep the same
+        // TCP_NODELAY behaviour as the legacy TCP transport.
+        connect_async_with_config(&url, Some(websocket_config()), true),
     )
     .await
     .context("Timed out connecting to WebSocket endpoint")?
@@ -179,6 +183,9 @@ pub(crate) async fn accept_and_bridge(
     stream: TcpStream,
     server_port: u16,
 ) -> Result<()> {
+    // This socket carries the whole tunnel for the rest of its life, so it has
+    // the same latency requirements as a control channel.
+    SocketOpts::for_control_channel().apply(&stream);
     let prefixed = PrefixedIo::new(prefix, stream);
     let ws = timeout(
         WS_HANDSHAKE_TIMEOUT,
@@ -194,6 +201,7 @@ pub(crate) async fn accept_and_bridge(
     .await
     .context("Timed out connecting WebSocket bridge to local TCP listener")?
     .with_context(|| format!("Connecting WebSocket bridge to local TCP port {}", server_port))?;
+    SocketOpts::for_control_channel().apply(&upstream);
     bridge_websocket_to_io(ws, upstream).await
 }
 
