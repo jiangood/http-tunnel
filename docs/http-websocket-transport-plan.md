@@ -1,6 +1,6 @@
 # HTTP/WebSocket 隧道传输实施计划
 
-> 状态：实施中。阶段 0 代码路径审查已完成；运行时代码尚未修改。详见 [代码路径审查](./http-websocket-transport-code-audit.md)。  
+> 状态：实施中。阶段 0 已完成；阶段 1 的配置字段、WebSocket 字节流适配器和 HTTP 入口分流已开始实现。详见 [代码路径审查](./http-websocket-transport-code-audit.md)。  
 > 目标仓库：`jiangood/http-tunnel`
 
 ## 1. 背景与目标
@@ -128,9 +128,9 @@ http_port = 80
 
 ### 阶段 1：最小端到端原型
 
-- [ ] 增加服务端控制 Host + 专用路径的 WebSocket 握手入口。
-- [ ] 增加客户端主动连接该入口的可选传输模式。
-- [ ] 复用现有 token 认证语义。
+- [x] 增加服务端控制 Host + 专用路径的 WebSocket 握手入口（首版原型）。
+- [x] 增加客户端主动连接该入口的可选传输模式（首版原型）。
+- [x] 复用现有 token 认证语义（通过桥接继续使用原协议握手）。
 - [ ] 验证一个客户端与一个简单 HTTP 目标之间的基本请求/响应。
 - [ ] 保留 TCP 模式作为默认模式及回退路径。
 
