@@ -1,7 +1,7 @@
 # WebSocket 传输代码路径审查
 
 > 分支：`feat/websocket-transport`  
-> 状态：阶段 0 审查完成；阶段 1 原型已实现，GitHub Actions 的 check、test、build 和进程级 E2E 均通过。
+> 状态：阶段 0/1 已完成；阶段 2 的首轮资源限制和生命周期保护已实现，GitHub Actions 最新运行通过。后续仍需专项异常流量、重连和长稳测试。
 
 ## 1. 现有连接流程
 
@@ -66,10 +66,10 @@
 - WebSocket 传输连接不计入业务 visitor 的 drain 计数，避免服务端优雅关闭时等待长连接超时；真正的业务 visitor 仍由原 activity guard 统计。
 - 拒绝把保留的 control_host 注册为业务隧道，避免控制域名被业务路由覆盖。
 
-## 7. 下一阶段任务
+## 8. 下一阶段任务
 
-1. 增加可选配置字段并保证旧配置默认仍使用 TCP。
-2. 增加 WebSocket byte-stream adapter 和依赖。
-3. 在 HTTP 入口按 Host + path 接入 WebSocket，并桥接至本机 TCP listener。
-4. 在客户端统一连接类型，支持 TCP / WebSocket 两种方式。
-5. 补配置解析、Host/path 拒绝、连接桥接及端到端测试。
+1. 增加超大消息和连接数耗尽的集成测试，验证拒绝行为及资源回收。
+2. 增加服务端重启、网络断开、客户端重连和重复注册的专项测试。
+3. 增加长时间运行与多隧道并发测试，观察内存、任务数和连接泄漏。
+4. 验证错误 Host、错误路径、错误 Token 和业务 WebSocket Upgrade 的回归行为。
+5. 根据真实代理环境决定是否需要 WSS 支持或长轮询兼容模式。
