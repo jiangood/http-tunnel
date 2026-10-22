@@ -234,7 +234,7 @@ impl ClientConfig {
     pub fn validate(config: &mut ClientConfig) -> Result<()> {
         if let Some(transport) = config.transport.as_mut() {
             *transport = transport.trim().to_ascii_lowercase();
-            if transport != "tcp" && transport != "websocket" {
+            if transport.as_str() != "tcp" && transport.as_str() != "websocket" {
                 bail!("Unsupported transport; expected tcp or websocket");
             }
         }
@@ -333,7 +333,8 @@ fn client_config_example() -> String {
     r#"# http-tunnel client configuration
 # Set these values before starting htc.
 remote = "your-server.example.com:2333"
-# Optional: "tcp" (default) or "websocket". For WebSocket, remote points to the control Host on http_port.
+# Optional: "tcp" (default) or "websocket". For WebSocket, set remote to "control.example.com:80"
+# and configure the same control_host in hts.toml.
 # transport = "websocket"
 name = "home"
 token = "replace-with-the-same-secret-as-hts"
