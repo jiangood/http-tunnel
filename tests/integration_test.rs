@@ -11,7 +11,7 @@ use tokio::{
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
-use crate::common::run_http_tunnel_server;
+use crate::common::{run_http_tunnel_server, run_http_tunnel_server_with_control_host};
 
 mod common;
 const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
