@@ -424,9 +424,9 @@ mod tests {
 
     #[test]
     fn test_transport_validation() -> Result<()> {
-        let config = ClientConfig::parse("transport = \"WebSocket\"\\n")?;
+        let config = ClientConfig::parse("transport = \"WebSocket\"\n")?;
         assert_eq!(config.transport.as_deref(), Some("websocket"));
-        assert!(ClientConfig::parse("transport = \"udp\"\\n").is_err());
+        assert!(ClientConfig::parse("transport = \"udp\"\n").is_err());
         Ok(())
     }
 
