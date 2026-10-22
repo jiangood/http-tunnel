@@ -142,9 +142,10 @@ struct Server {
 }
 
 impl ServerState {
-    fn new(token: MaskedString) -> ServerState {
+    fn new(token: MaskedString, control_host: Option<String>) -> ServerState {
         ServerState {
             token,
+            control_host,
             control_channels: RwLock::new(ControlChannelMap::new()),
             routing_table: RwLock::new(RoutingTable::default()),
             next_conn_id: AtomicUsize::new(0),
@@ -163,7 +164,7 @@ impl Server {
         proxies: Vec<crate::config::ServerProxyEntry>,
     ) -> Server {
         let server_addr = to_bind_addr(server_port);
-        let state = Arc::new(ServerState::new(MaskedString::from(token)));
+        let state = Arc::new(ServerState::new(MaskedString::from(token), control_host.clone()));
 
         Server {
             state,
@@ -340,6 +341,9 @@ async fn do_control_channel_handshake(
 
     let domain = crate::helper::normalize_domain(&domain)
         .ok_or_else(|| anyhow!("The domain `{}` of the client `{}` is invalid", domain, name))?;
+    if state.control_host.as_deref() == Some(domain.as_str()) {
+        bail!("The domain `{}` is reserved for the WebSocket control endpoint", domain);
+    }
 
     // Generate a nonce
     let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];
