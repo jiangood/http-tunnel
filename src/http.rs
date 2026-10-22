@@ -199,7 +199,7 @@ async fn handle_visitor(
         let _websocket_permit = match websocket_connections.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                respond(&mut stream, "503 Service Unavailable", "WebSocket connection limit reached\\n").await;
+                respond(&mut stream, "503 Service Unavailable", "WebSocket connection limit reached\n").await;
                 return Ok(());
             }
         };
