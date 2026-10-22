@@ -3,11 +3,31 @@ use futures_util::{SinkExt, StreamExt};
 use std::io::{self, Cursor};
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
+use std::time::Duration;
 use tokio::io::{
     duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf,
 };
 use tokio::net::TcpStream;
-use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message, WebSocketStream};
+use tokio::time::timeout;
+use tokio_tungstenite::{
+    accept_async_with_config, connect_async_with_config,
+    tungstenite::{protocol::WebSocketConfig, Message},
+    WebSocketStream,
+};
+
+/// Keep individual WebSocket messages bounded; the byte-stream protocol does
+/// not need large WS messages because the bridge chunks writes into 16 KiB pieces.
+const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024;
+const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(MAX_WS_MESSAGE_SIZE),
+        max_frame_size: Some(MAX_WS_MESSAGE_SIZE),
+        ..WebSocketConfig::default()
+    }
+}
 
 /// Object-safe async byte stream used by the client transport implementations.
 pub(crate) trait AsyncReadWrite: AsyncRead + AsyncWrite {}
@@ -19,9 +39,13 @@ pub(crate) type BoxedIo = Box<dyn AsyncReadWrite + Unpin + Send>;
 /// The existing length-prefixed protocol therefore does not need to know about WS frames.
 pub(crate) async fn connect_websocket(remote: &str) -> Result<BoxedIo> {
     let url = format!("ws://{}/_http-tunnel/v1/connect", remote);
-    let (ws, _) = connect_async(&url)
-        .await
-        .with_context(|| format!("Failed to connect to WebSocket endpoint {}", url))?;
+    let (ws, _) = timeout(
+        WS_HANDSHAKE_TIMEOUT,
+        connect_async_with_config(&url, Some(websocket_config()), false),
+    )
+    .await
+    .context("Timed out connecting to WebSocket endpoint")?
+    .with_context(|| format!("Failed to connect to WebSocket endpoint {}", url))?;
 
     let (client, bridge) = duplex(64 * 1024);
     tokio::spawn(async move {
@@ -156,11 +180,19 @@ pub(crate) async fn accept_and_bridge(
     server_port: u16,
 ) -> Result<()> {
     let prefixed = PrefixedIo::new(prefix, stream);
-    let ws = accept_async(prefixed)
-        .await
-        .context("Accepting tunnel WebSocket handshake")?;
-    let upstream = TcpStream::connect(("127.0.0.1", server_port))
-        .await
-        .with_context(|| format!("Connecting WebSocket bridge to local TCP port {}", server_port))?;
+    let ws = timeout(
+        WS_HANDSHAKE_TIMEOUT,
+        accept_async_with_config(prefixed, Some(websocket_config())),
+    )
+    .await
+    .context("Timed out accepting tunnel WebSocket handshake")?
+    .context("Accepting tunnel WebSocket handshake")?;
+    let upstream = timeout(
+        UPSTREAM_CONNECT_TIMEOUT,
+        TcpStream::connect(("127.0.0.1", server_port)),
+    )
+    .await
+    .context("Timed out connecting WebSocket bridge to local TCP listener")?
+    .with_context(|| format!("Connecting WebSocket bridge to local TCP port {}", server_port))?;
     bridge_websocket_to_io(ws, upstream).await
 }
