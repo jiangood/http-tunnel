@@ -203,8 +203,10 @@ async fn handle_visitor(
                 return Ok(());
             }
         };
-        // Keep the activity guard alive for the full WebSocket lifetime so shutdown
-        // accounting includes the bridged connection, not just the HTTP handshake.
+        // This is a transport/control connection, not an in-flight visitor request.
+        // Do not include its lifetime in the visitor drain counter: shutdown drops
+        // the control channels after draining actual visitor traffic.
+        drop(activity);
         crate::transport::websocket::accept_and_bridge(prefetched, stream, server_port).await?;
         return Ok(());
     }
