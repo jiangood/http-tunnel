@@ -342,9 +342,30 @@ async fn websocket_transport_routes_http() -> Result<()> {
 
     http_echo_hitter(WS_HTTP_ENTRY_ADDR, "echo-ws.test").await?;
 
-    client_shutdown_tx.send(true)?;
+    // Restart the server while the client remains alive. The WebSocket control
+    // channel should close and the existing retry loop should register the tunnel again.
     server_shutdown_tx.send(true)?;
-    let _ = tokio::join!(client, server);
+    server.await?;
+    time::sleep(Duration::from_millis(500)).await;
+
+    let (server2_shutdown_tx, server2_shutdown_rx) = broadcast::channel(1);
+    let server2 = tokio::spawn(async move {
+        common::run_http_tunnel_server_with_control_host(
+            WS_SERVER_PORT,
+            WS_HTTP_ENTRY_PORT,
+            Some("127.0.0.1"),
+            CLIENT_TOKEN,
+            server2_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    time::sleep(Duration::from_secs(3)).await;
+    http_echo_hitter(WS_HTTP_ENTRY_ADDR, "echo-ws.test").await?;
+
+    client_shutdown_tx.send(true)?;
+    server2_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server2);
     Ok(())
 }
 
