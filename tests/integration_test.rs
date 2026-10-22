@@ -766,9 +766,14 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
     }
 
     let url = format!("ws://{}/_http-tunnel/v1/connect", WS_LIMIT_HTTP_ADDR);
+    // Open the full set concurrently so the protocol's five-second ClientHello
+    // timeout cannot expire the earliest idle connections during a slow CI run.
+    let attempts = futures_util::future::join_all((0..256).map(|_| async {
+        time::timeout(Duration::from_secs(8), connect_async(&url)).await
+    }))
+    .await;
     let mut sockets = Vec::with_capacity(256);
-    for index in 0..256 {
-        let result = time::timeout(Duration::from_secs(3), connect_async(&url)).await;
+    for (index, result) in attempts.into_iter().enumerate() {
         match result {
             std::result::Result::Ok(std::result::Result::Ok((socket, _))) => sockets.push(socket),
             std::result::Result::Ok(Err(error)) => anyhow::bail!("WebSocket connection {} failed before the limit: {}", index + 1, error),
