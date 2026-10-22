@@ -627,3 +627,78 @@ async fn api_request(
         .to_string();
     Ok((status, body))
 }
+
+
+// ==== WebSocket resource-limit integration test ====
+
+const WS_LIMIT_SERVER_PORT: u16 = 2535;
+const WS_LIMIT_HTTP_PORT: u16 = 2536;
+const WS_LIMIT_HTTP_ADDR: &str = "127.0.0.1:2536";
+
+/// Exercise the real HTTP upgrade path at the configured WebSocket connection
+/// limit, verify excess connections receive 503, and ensure closed connections
+/// release their slots for subsequent clients.
+#[cfg(feature = "client-api")]
+#[tokio::test]
+async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
+    use tokio_tungstenite::connect_async;
+
+    init();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let server = tokio::spawn(async move {
+        run_http_tunnel_server_with_control_host(
+            WS_LIMIT_SERVER_PORT,
+            WS_LIMIT_HTTP_PORT,
+            Some("127.0.0.1"),
+            CLIENT_TOKEN,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    // Wait until both listeners are bound before creating the connection burst.
+    time::sleep(Duration::from_millis(300)).await;
+
+    let url = format!("ws://{}/_http-tunnel/v1/connect", WS_LIMIT_HTTP_ADDR);
+    let mut sockets = Vec::with_capacity(256);
+    for index in 0..256 {
+        let result = time::timeout(Duration::from_secs(3), connect_async(&url)).await;
+        match result {
+            Ok(Ok((socket, _))) => sockets.push(socket),
+            Ok(Err(error)) => anyhow::bail!("WebSocket connection {} failed before the limit: {}", index + 1, error),
+            Err(_) => anyhow::bail!("WebSocket connection {} timed out before the limit", index + 1),
+        }
+    }
+
+    let excess = time::timeout(Duration::from_secs(3), connect_async(&url)).await;
+    match excess {
+        Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response))) => {
+            assert_eq!(
+                response.status().as_u16(),
+                503,
+                "expected HTTP 503 after the connection limit, got {}",
+                response.status()
+            );
+        }
+        Ok(Ok((socket, _))) => {
+            drop(socket);
+            anyhow::bail!("the 257th WebSocket connection unexpectedly succeeded");
+        }
+        Ok(Err(error)) => anyhow::bail!("unexpected error for the 257th connection: {}", error),
+        Err(_) => anyhow::bail!("the 257th WebSocket handshake timed out"),
+    }
+
+    // Closing held connections must release permits; a new upgrade should work.
+    drop(sockets);
+    time::sleep(Duration::from_millis(300)).await;
+    let recovered = time::timeout(Duration::from_secs(3), connect_async(&url)).await;
+    match recovered {
+        Ok(Ok((socket, _))) => drop(socket),
+        Ok(Err(error)) => anyhow::bail!("connection slot did not recover after close: {}", error),
+        Err(_) => anyhow::bail!("recovery WebSocket handshake timed out"),
+    }
+
+    shutdown_tx.send(true)?;
+    server.await?;
+    Ok(())
+}
