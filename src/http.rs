@@ -99,7 +99,6 @@ pub(crate) async fn serve(
     port: u16,
     server_port: u16,
     control_host: Option<String>,
-    websocket_connections: Arc<tokio::sync::Semaphore>,
     state: Arc<ServerState>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     proxies: Vec<ServerProxyEntry>,
@@ -151,6 +150,7 @@ async fn handle_visitor(
     addr: SocketAddr,
     server_port: u16,
     control_host: Option<String>,
+    websocket_connections: Arc<tokio::sync::Semaphore>,
     state: Arc<ServerState>,
     proxies: Arc<Vec<ServerProxyEntry>>,
 ) -> Result<()> {
