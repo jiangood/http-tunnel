@@ -1,7 +1,7 @@
 use anyhow::{Ok, Result};
 use common::run_http_tunnel_client;
 use rand::Rng;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -11,12 +11,16 @@ use tokio::{
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
-use crate::common::run_http_tunnel_server;
+use crate::common::{run_http_tunnel_server, run_http_tunnel_server_with_control_host};
 
 mod common;
 const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
 const HTTP_ENTRY_ADDR: &str = "127.0.0.1:2334";
 const HTTP_ENTRY_PORT: u16 = 2334;
+const WS_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2336";
+const WS_HTTP_ENTRY_PORT: u16 = 2336;
+const WS_SERVER_PORT: u16 = 2335;
+const WS_ECHO_SERVER_ADDR: &str = "127.0.0.1:8081";
 const SERVER_ADDR: &str = "127.0.0.1:2333";
 const SERVER_PORT: u16 = 2333;
 const CLIENT_NAME: &str = "home";
@@ -223,6 +227,46 @@ async fn http_echo_hitter(addr: &'static str, host: &'static str) -> Result<()> 
     Ok(())
 }
 
+/// Poll `addr` until it accepts TCP connections. Tests use this instead of a
+/// fixed sleep so a slow or busy machine does not turn a startup delay into a
+/// spurious connection-refused failure.
+async fn wait_for_tcp(addr: &'static str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if TcpStream::connect(addr).await.is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("nothing accepted connections at {} within {:?}", addr, timeout);
+        }
+        time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Retry an echo request until the tunnel is registered and healthy again. A
+/// tunnel that is not registered yet answers with an error page or closes the
+/// connection, both of which `http_echo_hitter` reports as an error.
+async fn wait_for_echo(addr: &'static str, host: &'static str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    loop {
+        match time::timeout(Duration::from_secs(5), http_echo_hitter(addr, host)).await {
+            std::result::Result::Ok(std::result::Result::Ok(())) => return Ok(()),
+            std::result::Result::Ok(Err(e)) => last_error = Some(format!("{:#}", e)),
+            std::result::Result::Err(_) => last_error = Some("the request timed out".to_string()),
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "the tunnel did not serve {} within {:?}: {}",
+                host,
+                timeout,
+                last_error.unwrap_or_default()
+            );
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn http_404_check(addr: &'static str, host: &'static str) -> Result<()> {
     let mut conn = TcpStream::connect(addr).await?;
 
@@ -282,6 +326,156 @@ const CLIENT_API_ADDR: &str = "127.0.0.1:2465";
 const CLIENT_API_SERVER_ADDR: &str = "127.0.0.1:2463";
 const CLIENT_API_SERVER_PORT: u16 = 2463;
 const CLIENT_API_TOKEN: &str = "a_secret_token";
+
+/// A WebSocket transport carries the control channel and every data channel
+/// over the HTTP entrypoint, and reconnects after a server restart.
+#[tokio::test]
+async fn websocket_transport_routes_http() -> Result<()> {
+    init();
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(WS_ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the WebSocket echo server: {:?}", e);
+        }
+    });
+
+    let client_config = write_client_config(
+        "http_tunnel_websocket_client.toml",
+        CLIENT_NAME,
+        WS_HTTP_ENTRY_ADDR,
+        CLIENT_TOKEN,
+        Some(0),
+        &[("echo-ws.test", WS_ECHO_SERVER_ADDR)],
+    )?;
+    let config = std::fs::read_to_string(&client_config)?;
+    let config = config.replacen(
+        "\n[[tunnels]]",
+        "\ntransport = \"websocket\"\n\n[[tunnels]]",
+        1,
+    );
+    std::fs::write(&client_config, config)?;
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    let server = tokio::spawn(async move {
+        common::run_http_tunnel_server_with_control_host(
+            WS_SERVER_PORT,
+            WS_HTTP_ENTRY_PORT,
+            Some("127.0.0.1"),
+            CLIENT_TOKEN,
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_tcp(WS_HTTP_ENTRY_ADDR, Duration::from_secs(10)).await?;
+
+    let client = tokio::spawn(async move {
+        run_http_tunnel_client(&client_config, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_echo(WS_HTTP_ENTRY_ADDR, "echo-ws.test", Duration::from_secs(20)).await?;
+
+    // Restart the server while the client remains alive. The WebSocket control
+    // channel should close and the existing retry loop should register the tunnel again.
+    server_shutdown_tx.send(true)?;
+    server.await?;
+
+    let (server2_shutdown_tx, server2_shutdown_rx) = broadcast::channel(1);
+    let server2 = tokio::spawn(async move {
+        common::run_http_tunnel_server_with_control_host(
+            WS_SERVER_PORT,
+            WS_HTTP_ENTRY_PORT,
+            Some("127.0.0.1"),
+            CLIENT_TOKEN,
+            server2_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_tcp(WS_HTTP_ENTRY_ADDR, Duration::from_secs(10)).await?;
+    wait_for_echo(WS_HTTP_ENTRY_ADDR, "echo-ws.test", Duration::from_secs(20)).await?;
+
+    client_shutdown_tx.send(true)?;
+    server2_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server2);
+    Ok(())
+}
+
+// ==== WebSocket transport with an unavailable client-side target ====
+
+const WS_FAILURE_SERVER_PORT: u16 = 2545;
+const WS_FAILURE_HTTP_PORT: u16 = 2546;
+const WS_FAILURE_HTTP_ADDR: &str = "127.0.0.1:2546";
+const WS_FAILURE_TARGET_ADDR: &str = "127.0.0.1:2547";
+
+/// A WebSocket tunnel whose local target refuses connections must not hang
+/// visitors forever; the server eventually returns its existing 504 timeout.
+#[tokio::test]
+async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
+    init();
+    let client_config = write_client_config(
+        "http_tunnel_websocket_unavailable_target.toml",
+        CLIENT_NAME,
+        WS_FAILURE_HTTP_ADDR,
+        CLIENT_TOKEN,
+        Some(0),
+        &[("unavailable-ws.test", WS_FAILURE_TARGET_ADDR)],
+    )?;
+    let config = std::fs::read_to_string(&client_config)?;
+    let config = config.replacen(
+        "\n[[tunnels]]",
+        "\ntransport = \"websocket\"\n\n[[tunnels]]",
+        1,
+    );
+    std::fs::write(&client_config, config)?;
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let server = tokio::spawn(async move {
+        run_http_tunnel_server_with_control_host(
+            WS_FAILURE_SERVER_PORT,
+            WS_FAILURE_HTTP_PORT,
+            Some("127.0.0.1"),
+            CLIENT_TOKEN,
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_tcp(WS_FAILURE_HTTP_ADDR, Duration::from_secs(10)).await?;
+    let client = tokio::spawn(async move {
+        run_http_tunnel_client(&client_config, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    // Give the client time to register the tunnel before the visitor arrives;
+    // this test is about the 504, not about the unregistered-tunnel path.
+    time::sleep(Duration::from_secs(2)).await;
+
+    let mut visitor = TcpStream::connect(WS_FAILURE_HTTP_ADDR).await?;
+    visitor
+        .write_all(
+            b"GET / HTTP/1.1\r\nHost: unavailable-ws.test\r\nConnection: close\r\n\r\n",
+        )
+        .await?;
+    let mut response = Vec::new();
+    time::timeout(Duration::from_secs(18), visitor.read_to_end(&mut response))
+        .await??;
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 504"),
+        "expected 504 for an unavailable local target, got {}",
+        response
+    );
+
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server);
+    Ok(())
+}
 
 /// A tunnel created, listed and deleted through the client administration API is
 /// validated locally, written back to the client configuration file, and routed
@@ -544,4 +738,146 @@ async fn api_request(
         .unwrap_or("")
         .to_string();
     Ok((status, body))
+}
+
+
+// ==== WebSocket resource-limit integration test ====
+
+const WS_LIMIT_SERVER_PORT: u16 = 2535;
+const WS_LIMIT_HTTP_PORT: u16 = 2536;
+const WS_LIMIT_HTTP_ADDR: &str = "127.0.0.1:2536";
+
+/// Exercise the real HTTP upgrade path at the configured WebSocket connection
+/// limit, verify excess connections receive 503, and ensure closed connections
+/// release their slots for subsequent clients.
+#[tokio::test]
+async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
+    use tokio_tungstenite::connect_async;
+
+    init();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let server = tokio::spawn(async move {
+        run_http_tunnel_server_with_control_host(
+            WS_LIMIT_SERVER_PORT,
+            WS_LIMIT_HTTP_PORT,
+            Some("127.0.0.1"),
+            CLIENT_TOKEN,
+            shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    // Wait until both listeners are bound before creating the connection burst.
+    wait_for_tcp(WS_LIMIT_HTTP_ADDR, Duration::from_secs(10)).await?;
+
+    // Check control endpoint routing before consuming the connection budget.
+    for (request, expected_status) in [
+        (
+            "GET /wrong HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 404",
+        ),
+        (
+            "GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: other.test\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 404",
+        ),
+        (
+            "GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 426",
+        ),
+        (
+            "GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 426",
+        ),
+    ] {
+        let mut conn = TcpStream::connect(WS_LIMIT_HTTP_ADDR).await?;
+        conn.write_all(request.as_bytes()).await?;
+        let mut response = Vec::new();
+        time::timeout(Duration::from_secs(2), conn.read_to_end(&mut response))
+            .await??;
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with(expected_status),
+            "expected {} for request {:?}, got {}",
+            expected_status,
+            request,
+            response
+        );
+    }
+
+    let url = format!("ws://{}/_http-tunnel/v1/connect", WS_LIMIT_HTTP_ADDR);
+    // The server reclaims a bridged WebSocket that has not sent the tunnel
+    // protocol ClientHello after five seconds. Opening the burst is therefore
+    // only meaningful while the earliest connections are still inside that
+    // window; otherwise their slots have legitimately been released again.
+    // Retry the burst instead of reporting a false regression on a slow runner.
+    const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+    const BURST_BUDGET: Duration = Duration::from_secs(4);
+    let mut held = None;
+    for attempt in 1..=3 {
+        let started = Instant::now();
+        let attempts = futures_util::future::join_all((0..256).map(|_| async {
+            time::timeout(Duration::from_secs(8), connect_async(&url)).await
+        }))
+        .await;
+        let mut sockets = Vec::with_capacity(256);
+        for (index, result) in attempts.into_iter().enumerate() {
+            match result {
+                std::result::Result::Ok(std::result::Result::Ok((socket, _))) => sockets.push(socket),
+                std::result::Result::Ok(Err(error)) => anyhow::bail!("WebSocket connection {} failed before the limit: {}", index + 1, error),
+                Err(_) => anyhow::bail!("WebSocket connection {} timed out before the limit", index + 1),
+            }
+        }
+        let burst = started.elapsed();
+        if burst >= BURST_BUDGET {
+            debug!("opening 256 WebSockets took {:?} on attempt {}; retrying", burst, attempt);
+            drop(sockets);
+            continue;
+        }
+
+        let excess = time::timeout(Duration::from_secs(3), connect_async(&url)).await;
+        match excess {
+            std::result::Result::Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response)))
+                if response.status().as_u16() == 503 =>
+            {
+                held = Some(sockets);
+                break;
+            }
+            std::result::Result::Ok(std::result::Result::Ok((socket, _))) => {
+                drop(socket);
+                // The burst finished inside the hello window, so all 256 slots
+                // were still held: accepting the 257th connection is a regression.
+                anyhow::bail!("the 257th WebSocket connection unexpectedly succeeded");
+            }
+            std::result::Result::Ok(Err(error)) => anyhow::bail!("unexpected error for the 257th connection: {}", error),
+            Err(_) => anyhow::bail!("the 257th WebSocket handshake timed out"),
+        }
+    }
+    let sockets = held.ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not open 256 WebSocket connections within the {:?} hello window",
+            HELLO_TIMEOUT
+        )
+    })?;
+
+    // Closing held connections must release permits; a new upgrade should work.
+    drop(sockets);
+    let mut recovered = false;
+    for _ in 0..50 {
+        match connect_async(&url).await {
+            std::result::Result::Ok((socket, _)) => {
+                drop(socket);
+                recovered = true;
+                break;
+            }
+            std::result::Result::Err(_) => time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    assert!(
+        recovered,
+        "connection slot did not recover within five seconds of closing"
+    );
+
+    shutdown_tx.send(true)?;
+    server.await?;
+    std::result::Result::Ok(())
 }

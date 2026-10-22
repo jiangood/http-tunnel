@@ -107,6 +107,8 @@ pub(crate) type ControlChannelMap = MultiMap<TunnelDigest, Nonce, ControlChannel
 pub(crate) struct ServerState {
     // The shared token every client authenticates with
     pub(crate) token: MaskedString,
+    // Reserved HTTP Host for the WebSocket transport; never a business tunnel.
+    control_host: Option<String>,
     // Collection of control channels
     pub(crate) control_channels: RwLock<ControlChannelMap>,
     // `Host` -> TunnelDigest
@@ -119,7 +121,13 @@ pub(crate) struct ServerState {
 
 // The entrypoint of running a server
 pub async fn run_server(args: ServerArgs, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    let mut server = Server::new(args.server_port, args.http_port, args.token, args.proxies);
+    let mut server = Server::new(
+        args.server_port,
+        args.http_port,
+        args.control_host,
+        args.token,
+        args.proxies,
+    );
     server.run(shutdown_rx).await?;
 
     Ok(())
@@ -129,14 +137,17 @@ pub async fn run_server(args: ServerArgs, shutdown_rx: broadcast::Receiver<bool>
 struct Server {
     state: Arc<ServerState>,
     server_addr: String,
+    server_port: u16,
     http_port: u16,
+    control_host: Option<String>,
     proxies: Vec<crate::config::ServerProxyEntry>,
 }
 
 impl ServerState {
-    fn new(token: MaskedString) -> ServerState {
+    fn new(token: MaskedString, control_host: Option<String>) -> ServerState {
         ServerState {
             token,
+            control_host,
             control_channels: RwLock::new(ControlChannelMap::new()),
             routing_table: RwLock::new(RoutingTable::default()),
             next_conn_id: AtomicUsize::new(0),
@@ -147,14 +158,22 @@ impl ServerState {
 
 impl Server {
     // Create a server from the command line options
-    pub fn new(server_port: u16, http_port: u16, token: String, proxies: Vec<crate::config::ServerProxyEntry>) -> Server {
+    pub fn new(
+        server_port: u16,
+        http_port: u16,
+        control_host: Option<String>,
+        token: String,
+        proxies: Vec<crate::config::ServerProxyEntry>,
+    ) -> Server {
         let server_addr = to_bind_addr(server_port);
-        let state = Arc::new(ServerState::new(MaskedString::from(token)));
+        let state = Arc::new(ServerState::new(MaskedString::from(token), control_host.clone()));
 
         Server {
             state,
             server_addr,
+            server_port,
             http_port,
+            control_host,
             proxies,
         }
     }
@@ -178,6 +197,8 @@ impl Server {
         // Run the HTTP entrypoint which routes visitors by the `Host` header
         let http_task = tokio::spawn(crate::http::serve(
             self.http_port,
+            self.server_port,
+            self.control_host.clone(),
             self.state.clone(),
             shutdown_rx.resubscribe(),
             self.proxies.clone(),
@@ -281,8 +302,14 @@ async fn handshake(conn: TcpStream) -> Result<TcpStream> {
 
 // Handle connections to `server_port`
 async fn handle_connection(mut conn: TcpStream, state: Arc<ServerState>) -> Result<()> {
-    // Read hello
-    let hello: ClientHello = protocol::read_payload(&mut conn).await?;
+    // Bound the complete length-prefixed hello read, including slow/partial messages.
+    // This is important for WebSocket clients too: a completed WS upgrade alone is not authentication.
+    let hello: ClientHello = time::timeout(
+        Duration::from_secs(HANDSHAKE_TIMEOUT),
+        protocol::read_payload(&mut conn),
+    )
+    .await
+    .context("Timed out waiting for client hello")??;
     protocol::check_version(hello.version())?;
 
     match hello {
@@ -322,6 +349,9 @@ async fn do_control_channel_handshake(
 
     let domain = crate::helper::normalize_domain(&domain)
         .ok_or_else(|| anyhow!("The domain `{}` of the client `{}` is invalid", domain, name))?;
+    if state.control_host.as_deref() == Some(domain.as_str()) {
+        bail!("The domain `{}` is reserved for the WebSocket control endpoint", domain);
+    }
 
     // Generate a nonce
     let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];

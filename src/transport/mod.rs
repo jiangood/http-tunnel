@@ -1,3 +1,5 @@
+pub(crate) mod websocket;
+
 use crate::helper::to_socket_addr;
 use anyhow::{Context, Result};
 use std::fmt::Display;

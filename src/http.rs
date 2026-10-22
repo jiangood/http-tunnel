@@ -17,6 +17,14 @@ use tracing::{debug, error, info, warn};
 const MAX_HEADER_SIZE: usize = 8 * 1024;
 /// Timeout for reading the HTTP header from a visitor
 const HEADER_READ_TIMEOUT: u64 = 5;
+/// Bound persistent control/data WebSocket connections to avoid unbounded task and socket growth.
+const MAX_WEBSOCKET_CONNECTIONS: usize = 256;
+
+fn try_acquire_websocket_permit(
+    semaphore: Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+    semaphore.try_acquire_owned()
+}
 
 /// Maps a `Host` to the digest of the tunnel that serves it. An exact match takes
 /// precedence over a wildcard domain (`*.example.com`), and among the wildcards
@@ -95,6 +103,8 @@ fn find_proxy<'a>(proxies: &'a [ServerProxyEntry], host: &str) -> Option<&'a Ser
 /// Only the first request of a connection is inspected, so routing is connection-level.
 pub(crate) async fn serve(
     port: u16,
+    server_port: u16,
+    control_host: Option<String>,
     state: Arc<ServerState>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     proxies: Vec<ServerProxyEntry>,
@@ -105,6 +115,7 @@ pub(crate) async fn serve(
         .with_context(|| format!("Failed to listen at `http_port` ({})", port))?;
     info!("HTTP listening at {}", addr);
     let proxies = Arc::new(proxies);
+    let websocket_connections = Arc::new(tokio::sync::Semaphore::new(MAX_WEBSOCKET_CONNECTIONS));
 
     loop {
         tokio::select! {
@@ -113,8 +124,18 @@ pub(crate) async fn serve(
                     Ok((stream, addr)) => {
                         let state = state.clone();
                         let proxies = proxies.clone();
+                        let control_host = control_host.clone();
+                        let websocket_connections = websocket_connections.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_visitor(stream, addr, state, proxies).await {
+                            if let Err(e) = handle_visitor(
+                                stream,
+                                addr,
+                                server_port,
+                                control_host,
+                                websocket_connections,
+                                state,
+                                proxies,
+                            ).await {
                                 debug!("Failed to route visitor {}: {:#}", addr, e);
                             }
                         });
@@ -133,6 +154,9 @@ pub(crate) async fn serve(
 async fn handle_visitor(
     mut stream: TcpStream,
     addr: SocketAddr,
+    server_port: u16,
+    control_host: Option<String>,
+    websocket_connections: Arc<tokio::sync::Semaphore>,
     state: Arc<ServerState>,
     proxies: Arc<Vec<ServerProxyEntry>>,
 ) -> Result<()> {
@@ -165,6 +189,33 @@ async fn handle_visitor(
         }
         Ok(Ok(header)) => header,
     };
+
+    // Reserve the configured control Host for the internal WebSocket transport.
+    // Host is a routing key only; the existing token handshake still authenticates clients.
+    if control_host.as_deref() == Some(host.as_str()) {
+        let path = parse_request_path(&prefetched).unwrap_or_default();
+        if path != "/_http-tunnel/v1/connect" {
+            respond(&mut stream, "404 Not Found", "Unknown control endpoint\n").await;
+            return Ok(());
+        }
+        if !is_websocket_upgrade(&prefetched) {
+            respond(&mut stream, "426 Upgrade Required", "WebSocket upgrade required\n").await;
+            return Ok(());
+        }
+        let _websocket_permit = match try_acquire_websocket_permit(websocket_connections.clone()) {
+            Ok(permit) => permit,
+            Err(_) => {
+                respond(&mut stream, "503 Service Unavailable", "WebSocket connection limit reached\n").await;
+                return Ok(());
+            }
+        };
+        // This is a transport/control connection, not an in-flight visitor request.
+        // Do not include its lifetime in the visitor drain counter: shutdown drops
+        // the control channels after draining actual visitor traffic.
+        drop(activity);
+        crate::transport::websocket::accept_and_bridge(prefetched, stream, server_port).await?;
+        return Ok(());
+    }
 
     if let Some(proxy) = find_proxy(&proxies, &host) {
         let request = match crate::helper::gate_auth_header(
@@ -305,6 +356,44 @@ async fn read_header(stream: &mut TcpStream) -> Result<(Vec<u8>, String), Header
         }
         buf.extend_from_slice(&chunk[..n]);
     }
+}
+
+fn parse_request_path(head: &[u8]) -> Option<String> {
+    let line = head.split(|&b| b == b'\n').next().map(strip_cr)?;
+    let line = std::str::from_utf8(line).ok()?;
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "GET" {
+        return None;
+    }
+    let target = parts.next()?;
+    if !target.starts_with('/') {
+        return None;
+    }
+    Some(target.split('?').next()?.to_string())
+}
+
+fn is_websocket_upgrade(head: &[u8]) -> bool {
+    let mut upgrade = false;
+    let mut connection_upgrade = false;
+    for raw in head.split(|&b| b == b'\n').skip(1) {
+        let line = strip_cr(raw);
+        if line.is_empty() {
+            break;
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let name = trim_ascii(&line[..colon]);
+        let value = trim_ascii(&line[colon + 1..]);
+        if name.eq_ignore_ascii_case(b"upgrade") {
+            upgrade = value.eq_ignore_ascii_case(b"websocket");
+        } else if name.eq_ignore_ascii_case(b"connection") {
+            connection_upgrade = value
+                .split(|&b| b == b',')
+                .any(|v| trim_ascii(v).eq_ignore_ascii_case(b"upgrade"));
+        }
+    }
+    upgrade && connection_upgrade
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -466,6 +555,41 @@ async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_connection_permit_is_released_after_close() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = try_acquire_websocket_permit(semaphore.clone()).unwrap();
+        assert!(try_acquire_websocket_permit(semaphore.clone()).is_err());
+        drop(permit);
+        assert!(try_acquire_websocket_permit(semaphore).is_ok());
+    }
+
+    #[test]
+    fn test_parse_request_path() {
+        assert_eq!(
+            parse_request_path(b"GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\n\r\n"),
+            Some("/_http-tunnel/v1/connect".to_string())
+        );
+        assert_eq!(
+            parse_request_path(b"GET /_http-tunnel/v1/connect?x=1 HTTP/1.1\r\nHost: control.test\r\n\r\n"),
+            Some("/_http-tunnel/v1/connect".to_string())
+        );
+        assert_eq!(
+            parse_request_path(b"POST /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\n\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_is_websocket_upgrade() {
+        assert!(is_websocket_upgrade(
+            b"GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\r\n"
+        ));
+        assert!(!is_websocket_upgrade(
+            b"GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\nConnection: keep-alive\r\n\r\n"
+        ));
+    }
 
     #[test]
     fn test_parse_host() {

@@ -8,6 +8,7 @@ pub const DEFAULT_CLIENT_WEB_PORT: u16 = 8610;
 pub struct ServerArgs {
     pub server_port: u16,
     pub http_port: u16,
+    pub control_host: Option<String>,
     pub token: String,
     pub proxies: Vec<crate::config::ServerProxyEntry>,
 }

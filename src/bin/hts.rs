@@ -45,6 +45,7 @@ async fn main() -> Result<()> {
     let cmd = Command::Server(ServerArgs {
         server_port: config.server_port,
         http_port: config.http_port,
+        control_host: config.control_host,
         token: String::from(&*config.token),
         proxies: config.proxies,
     });

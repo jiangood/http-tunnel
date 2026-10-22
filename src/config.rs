@@ -89,6 +89,9 @@ pub struct ClientConfig {
     /// The address of the server, e.g. `example.com:2333`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
+    /// Optional transport mode. Missing means the legacy TCP transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
     /// The name of the client. It's used for logging and to warn when a domain
     /// changes hands
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,6 +232,12 @@ impl ClientConfig {
     /// domains, validate required names, and reject empty, malformed or
     /// duplicated definitions.
     pub fn validate(config: &mut ClientConfig) -> Result<()> {
+        if let Some(transport) = config.transport.as_mut() {
+            *transport = transport.trim().to_ascii_lowercase();
+            if transport.as_str() != "tcp" && transport.as_str() != "websocket" {
+                bail!("Unsupported transport; expected tcp or websocket");
+            }
+        }
         let mut names: BTreeMap<String, ()> = BTreeMap::new();
         let mut domains: BTreeMap<String, ()> = BTreeMap::new();
         let mut entries: Vec<TunnelEntry> = Vec::new();
@@ -324,6 +333,9 @@ fn client_config_example() -> String {
     r#"# http-tunnel client configuration
 # Set these values before starting htc.
 remote = "your-server.example.com:2333"
+# Optional: "tcp" (default) or "websocket". For WebSocket, set remote to "control.example.com:80"
+# and configure the same control_host in hts.toml.
+# transport = "websocket"
 name = "home"
 token = "replace-with-the-same-secret-as-hts"
 web_port = 8610
@@ -360,6 +372,8 @@ fn server_config_example(token: &str) -> String {
 server_port = 2333
 http_port = 80
 token = "{token}"
+# Optional: reserve this exact Host for WebSocket transport. It must resolve to this server.
+# control_host = "control.example.com"
 
 # Optional direct reverse-proxy routes to services running on this server.
 # A plain TCP service:
@@ -406,6 +420,14 @@ mod tests {
             .into_iter()
             .filter(|x| x.extension().map(|e| e == "toml").unwrap_or(false))
             .collect())
+    }
+
+    #[test]
+    fn test_transport_validation() -> Result<()> {
+        let config = ClientConfig::parse("transport = \"WebSocket\"\n")?;
+        assert_eq!(config.transport.as_deref(), Some("websocket"));
+        assert!(ClientConfig::parse("transport = \"udp\"\n").is_err());
+        Ok(())
     }
 
     #[test]
@@ -742,6 +764,14 @@ local_addr = "127.0.0.1:80"
     }
 
     #[test]
+    fn test_proxy_domain_cannot_overlap_control_host() {
+        assert!(proxy_domain_overlaps_control_host("control.example.com", "control.example.com"));
+        assert!(proxy_domain_overlaps_control_host("*.example.com", "control.example.com"));
+        assert!(!proxy_domain_overlaps_control_host("*.example.com", "example.com"));
+        assert!(!proxy_domain_overlaps_control_host("*.other.test", "control.example.com"));
+    }
+
+    #[test]
     fn test_server_config_example_is_valid() -> Result<()> {
         let token = generate_token();
         let example = server_config_example(&token);
@@ -775,6 +805,14 @@ local_addr = "127.0.0.1:80"
 }
 
 
+fn proxy_domain_overlaps_control_host(domain: &str, control_host: &str) -> bool {
+    domain == control_host
+        || domain.strip_prefix("*.").is_some_and(|suffix| {
+            control_host.len() > suffix.len()
+                && control_host.ends_with(&format!(".{}", suffix))
+        })
+}
+
 /// Server settings loaded exclusively from the fixed hts.toml file.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -790,6 +828,9 @@ pub struct ServerConfig {
     pub http_port: u16,
     /// Shared secret required by every client.
     pub token: MaskedString,
+    /// Optional exact Host reserved for WebSocket control/data connections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_host: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -809,8 +850,16 @@ impl ServerConfig {
     pub async fn from_file(path: &Path) -> Result<Self> {
         match fs::read_to_string(path).await {
             Ok(s) => {
-                let config: Self = toml::from_str(&s)
+                let mut config: Self = toml::from_str(&s)
                     .with_context(|| format!("The configuration {:?} is invalid", path))?;
+                if let Some(host) = config.control_host.as_deref() {
+                    let normalized = crate::helper::normalize_domain(host)
+                        .ok_or_else(|| anyhow!("Invalid control_host"))?;
+                    if normalized.starts_with("*.") {
+                        bail!("control_host must be an exact hostname, not a wildcard");
+                    }
+                    config.control_host = Some(normalized);
+                }
                 let mut domains = BTreeMap::new();
                 for proxy in &config.proxies {
                     if proxy.name.trim().is_empty() || proxy.local_addr.trim().is_empty() {
@@ -821,6 +870,16 @@ impl ServerConfig {
                     }
                     let domain = crate::helper::normalize_domain(&proxy.domain)
                         .ok_or_else(|| anyhow!("Invalid proxy domain `{}`", proxy.domain))?;
+                    if let Some(control_host) = config.control_host.as_deref() {
+                        let conflicts = proxy_domain_overlaps_control_host(&domain, control_host);
+                        if conflicts {
+                            bail!(
+                                "Proxy domain `{}` overlaps the reserved control_host `{}`",
+                                domain,
+                                control_host
+                            );
+                        }
+                    }
                     if domains.insert(domain.clone(), ()).is_some() {
                         bail!("Proxy domain `{}` is configured more than once", domain);
                     }
