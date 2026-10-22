@@ -107,6 +107,8 @@ pub(crate) type ControlChannelMap = MultiMap<TunnelDigest, Nonce, ControlChannel
 pub(crate) struct ServerState {
     // The shared token every client authenticates with
     pub(crate) token: MaskedString,
+    // Reserved HTTP Host for the WebSocket transport; never a business tunnel.
+    control_host: Option<String>,
     // Collection of control channels
     pub(crate) control_channels: RwLock<ControlChannelMap>,
     // `Host` -> TunnelDigest
