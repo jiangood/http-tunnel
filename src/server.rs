@@ -119,7 +119,13 @@ pub(crate) struct ServerState {
 
 // The entrypoint of running a server
 pub async fn run_server(args: ServerArgs, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    let mut server = Server::new(args.server_port, args.http_port, args.token, args.proxies);
+    let mut server = Server::new(
+        args.server_port,
+        args.http_port,
+        args.control_host,
+        args.token,
+        args.proxies,
+    );
     server.run(shutdown_rx).await?;
 
     Ok(())
@@ -130,6 +136,7 @@ struct Server {
     state: Arc<ServerState>,
     server_addr: String,
     http_port: u16,
+    control_host: Option<String>,
     proxies: Vec<crate::config::ServerProxyEntry>,
 }
 
@@ -147,7 +154,13 @@ impl ServerState {
 
 impl Server {
     // Create a server from the command line options
-    pub fn new(server_port: u16, http_port: u16, token: String, proxies: Vec<crate::config::ServerProxyEntry>) -> Server {
+    pub fn new(
+        server_port: u16,
+        http_port: u16,
+        control_host: Option<String>,
+        token: String,
+        proxies: Vec<crate::config::ServerProxyEntry>,
+    ) -> Server {
         let server_addr = to_bind_addr(server_port);
         let state = Arc::new(ServerState::new(MaskedString::from(token)));
 
@@ -155,6 +168,7 @@ impl Server {
             state,
             server_addr,
             http_port,
+            control_host,
             proxies,
         }
     }
@@ -178,6 +192,12 @@ impl Server {
         // Run the HTTP entrypoint which routes visitors by the `Host` header
         let http_task = tokio::spawn(crate::http::serve(
             self.http_port,
+            self.server_addr
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(2333),
+            self.control_host.clone(),
             self.state.clone(),
             shutdown_rx.resubscribe(),
             self.proxies.clone(),
