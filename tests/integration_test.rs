@@ -392,8 +392,8 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
     )?;
     let config = std::fs::read_to_string(&client_config)?;
     let config = config.replacen(
-        "\\n[[tunnels]]",
-        "\\ntransport = \\"websocket\\"\\n\\n[[tunnels]]",
+        "\n[[tunnels]]",
+        "\ntransport = \"websocket\"\n\n[[tunnels]]",
         1,
     );
     std::fs::write(&client_config, config)?;
@@ -422,7 +422,7 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
     let mut visitor = TcpStream::connect(WS_FAILURE_HTTP_ADDR).await?;
     visitor
         .write_all(
-            b"GET / HTTP/1.1\\r\\nHost: unavailable-ws.test\\r\\nConnection: close\\r\\n\\r\\n",
+            b"GET / HTTP/1.1\r\nHost: unavailable-ws.test\r\nConnection: close\r\n\r\n",
         )
         .await?;
     let mut response = Vec::new();
@@ -734,19 +734,19 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
     // Check control endpoint routing before consuming the connection budget.
     for (request, expected_status) in [
         (
-            "GET /wrong HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n",
+            "GET /wrong HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
             "HTTP/1.1 404",
         ),
         (
-            "GET /_http-tunnel/v1/connect HTTP/1.1\\r\\nHost: other.test\\r\\nConnection: close\\r\\n\\r\\n",
+            "GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: other.test\r\nConnection: close\r\n\r\n",
             "HTTP/1.1 404",
         ),
         (
-            "GET /_http-tunnel/v1/connect HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n",
+            "GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
             "HTTP/1.1 426",
         ),
         (
-            "GET /_http-tunnel/v1/connect HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nUpgrade: websocket\\r\\nConnection: keep-alive\\r\\nConnection: close\\r\\n\\r\\n",
+            "GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n",
             "HTTP/1.1 426",
         ),
     ] {
