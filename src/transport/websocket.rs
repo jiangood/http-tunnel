@@ -12,7 +12,6 @@ use tokio::time::timeout;
 use tokio_tungstenite::{
     accept_async_with_config, connect_async_with_config,
     tungstenite::{protocol::WebSocketConfig, Message},
-    client_async_with_config,
     WebSocketStream,
 };
 
@@ -202,6 +201,7 @@ pub(crate) async fn accept_and_bridge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_tungstenite::client_async_with_config;
 
     #[test]
     fn websocket_config_bounds_incoming_messages_and_frames() {
@@ -229,7 +229,6 @@ mod tests {
             "ws://localhost/_http-tunnel/v1/connect",
             client_io,
             Some(client_config),
-            false,
         )
         .await
         .expect("client handshake should succeed");
