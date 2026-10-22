@@ -61,7 +61,7 @@
 ## 6. 阶段 2 追加的资源与生命周期保护
 
 - WebSocket 帧和消息最大 1 MiB，避免单条消息无界分配。
-- WebSocket 握手超时 10 秒，本地 TCP 上游连接超时 5 秒。
+- HTTP WebSocket 握手超时 10 秒；服务端完整读取隧道协议 ClientHello 超时 5 秒；本地 TCP 上游连接超时 5 秒。
 - HTTP 入口最多允许 256 条活动 WebSocket 连接；达到上限时返回 503。
 - WebSocket 传输连接不计入业务 visitor 的 drain 计数，避免服务端优雅关闭时等待长连接超时；真正的业务 visitor 仍由原 activity guard 统计。
 - 拒绝把保留的 control_host 注册为业务隧道，避免控制域名被业务路由覆盖。
