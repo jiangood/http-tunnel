@@ -423,6 +423,14 @@ mod tests {
     }
 
     #[test]
+    fn test_transport_validation() -> Result<()> {
+        let config = ClientConfig::parse("transport = \"WebSocket\"\\n")?;
+        assert_eq!(config.transport.as_deref(), Some("websocket"));
+        assert!(ClientConfig::parse("transport = \"udp\"\\n").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn test_example_config() -> Result<()> {
         let paths = get_all_example_config()?;
         assert!(!paths.is_empty());
