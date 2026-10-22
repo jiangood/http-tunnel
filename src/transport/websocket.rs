@@ -4,7 +4,7 @@ use std::io::{self, Cursor};
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{
-    duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
+    duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf,
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message, WebSocketStream};
@@ -72,7 +72,7 @@ where
                         .context("Writing WebSocket data to tunnel byte stream")?;
                 }
                 Message::Close(_) => break,
-                Message::Ping(_) | Message::Pong(_) => {
+                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
                     // tungstenite manages protocol control frames while polling the stream.
                 }
                 Message::Text(_) => {
