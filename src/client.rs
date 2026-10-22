@@ -386,7 +386,9 @@ async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<Boxe
         },
     )
     .await
-}async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
+}
+
+async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
     // Do the handshake
     let mut conn = do_data_channel_handshake(args.clone()).await?;
 
@@ -455,7 +457,7 @@ struct ControlChannelHandle {
 impl ControlChannelHandle {
     // Whether the channel is already serving the given config
     fn matches(&self, tunnel: &ClientTunnelConfig, heartbeat_timeout: u64, transport: &str) -> bool {
-        &self.tunnel == tunnel && self.heartbeat_timeout == heartbeat_timeout && self.transport == transport
+        &self.tunnel == tunnel && self.heartbeat_timeout == heartbeat_timeout && self.transport.as_str() == transport
     }
 }
 
