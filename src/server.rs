@@ -302,8 +302,14 @@ async fn handshake(conn: TcpStream) -> Result<TcpStream> {
 
 // Handle connections to `server_port`
 async fn handle_connection(mut conn: TcpStream, state: Arc<ServerState>) -> Result<()> {
-    // Read hello
-    let hello: ClientHello = protocol::read_payload(&mut conn).await?;
+    // Bound the complete length-prefixed hello read, including slow/partial messages.
+    // This is important for WebSocket clients too: a completed WS upgrade alone is not authentication.
+    let hello: ClientHello = time::timeout(
+        Duration::from_secs(HANDSHAKE_TIMEOUT),
+        protocol::read_payload(&mut conn),
+    )
+    .await
+    .context("Timed out waiting for client hello")??;
     protocol::check_version(hello.version())?;
 
     match hello {
