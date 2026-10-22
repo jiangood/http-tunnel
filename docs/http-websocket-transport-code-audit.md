@@ -1,7 +1,7 @@
 # WebSocket 传输代码路径审查
 
 > 分支：`feat/websocket-transport`  
-> 状态：阶段 0 审查完成；尚未修改运行时代码。
+> 状态：阶段 0 审查完成；阶段 1 原型代码已在分支中实现，尚待 CI 编译、测试与修正。
 
 ## 1. 现有连接流程
 
@@ -50,7 +50,15 @@
 - `.github/workflows/rust-checks.yml` 会执行 `cargo check --all-features`、`cargo test --all-features`、构建全部二进制及进程级 E2E 测试，因此实现必须更新锁文件并通过完整 CI。
 - 当前执行环境无法直接访问 GitHub 或运行仓库的 Cargo 测试；代码提交后应以 GitHub Actions 的实际结果为准，不应宣称本地已验证。
 
-## 5. 下一阶段任务
+## 5. 已落地的首版原型
+
+- 已增加可选客户端 transport 配置（缺省仍为 TCP）和服务端可选 control_host。
+- 已增加 WebSocket 与异步字节流之间的桥接；服务端 WebSocket 会桥接到现有 server_port TCP listener。
+- 已将客户端控制连接与数据连接统一为字节流接口，WebSocket 模式下每条逻辑连接独立建立 WebSocket。
+- 已在 HTTP 入口按 control_host + 专用路径分流，并在 README 中记录配置方式和明文传输风险。
+- 这些改动尚未经过 GitHub Actions 编译/测试；不能视为已验证可发布。
+
+## 6. 下一阶段任务
 
 1. 增加可选配置字段并保证旧配置默认仍使用 TCP。
 2. 增加 WebSocket byte-stream adapter 和依赖。
