@@ -309,8 +309,12 @@ async fn websocket_transport_routes_http() -> Result<()> {
         Some(0),
         &[("echo-ws.test", WS_ECHO_SERVER_ADDR)],
     )?;
-    let mut config = std::fs::read_to_string(&client_config)?;
-    config.push_str("\ntransport = \"websocket\"\n");
+    let config = std::fs::read_to_string(&client_config)?;
+    let config = config.replacen(
+        "\n[[tunnels]]",
+        "\ntransport = \"websocket\"\n\n[[tunnels]]",
+        1,
+    );
     std::fs::write(&client_config, config)?;
 
     let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
