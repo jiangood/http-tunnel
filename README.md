@@ -93,7 +93,7 @@ domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
 ```
 
-控制域名仅用于内部控制与数据连接；普通业务域名（例如 nas.example.com）继续通过 http_port 进入现有 Host 路由。服务端会根据 Host 和专用路径 /_http-tunnel/v1/connect 识别 WebSocket 连接，并把它桥接到现有 TCP 协议处理器。原来的 2333/TCP 模式不受影响。
+控制域名仅用于内部控制与数据连接；普通业务域名（例如 nas.example.com）继续通过 http_port 进入现有 Host 路由。服务端会根据 Host 和专用路径 /_http-tunnel/v1/connect 识别 WebSocket 连接，并把它桥接到现有 TCP 协议处理器。原来的 2333/TCP 模式不受影响。注意：hts 仍需要在本机绑定 server_port（默认 2333），但该端口不必对公网开放，可以用防火墙/安全组禁止外部访问；如果运行环境连本地绑定该端口都不允许，此桥接实现不适用。
 
 **安全提示：** 当前 WebSocket 模式使用明文 ws://，不会自动申请或配置证书。Token、控制消息和隧道数据可能被网络中间方读取或篡改，因此此模式适合可信网络或测试环境；不要在未经加密保护的公网链路上发送敏感流量。正式公网部署应通过可信 TLS 终止层提供 WSS，或在后续版本使用端到端加密。control_host 只是路由配置，不是身份认证；服务端仍会验证现有共享 Token。
 
