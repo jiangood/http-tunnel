@@ -337,7 +337,7 @@ async fn read_header(stream: &mut TcpStream) -> Result<(Vec<u8>, String), Header
 }
 
 fn parse_request_path(head: &[u8]) -> Option<String> {
-    let line = head.split(|&b| b == b'\\n').next().map(strip_cr)?;
+    let line = head.split(|&b| b == b'\n').next().map(strip_cr)?;
     let line = std::str::from_utf8(line).ok()?;
     let mut parts = line.split_whitespace();
     if parts.next()? != "GET" {
@@ -353,7 +353,7 @@ fn parse_request_path(head: &[u8]) -> Option<String> {
 fn is_websocket_upgrade(head: &[u8]) -> bool {
     let mut upgrade = false;
     let mut connection_upgrade = false;
-    for raw in head.split(|&b| b == b'\\n').skip(1) {
+    for raw in head.split(|&b| b == b'\n').skip(1) {
         let line = strip_cr(raw);
         if line.is_empty() {
             break;
@@ -537,15 +537,15 @@ mod tests {
     #[test]
     fn test_parse_request_path() {
         assert_eq!(
-            parse_request_path(b"GET /_http-tunnel/v1/connect HTTP/1.1\\r\\nHost: control.test\\r\\n\\r\\n"),
+            parse_request_path(b"GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\n\r\n"),
             Some("/_http-tunnel/v1/connect".to_string())
         );
         assert_eq!(
-            parse_request_path(b"GET /_http-tunnel/v1/connect?x=1 HTTP/1.1\\r\\nHost: control.test\\r\\n\\r\\n"),
+            parse_request_path(b"GET /_http-tunnel/v1/connect?x=1 HTTP/1.1\r\nHost: control.test\r\n\r\n"),
             Some("/_http-tunnel/v1/connect".to_string())
         );
         assert_eq!(
-            parse_request_path(b"POST /_http-tunnel/v1/connect HTTP/1.1\\r\\nHost: control.test\\r\\n\\r\\n"),
+            parse_request_path(b"POST /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\n\r\n"),
             None
         );
     }
@@ -553,10 +553,10 @@ mod tests {
     #[test]
     fn test_is_websocket_upgrade() {
         assert!(is_websocket_upgrade(
-            b"GET /_http-tunnel/v1/connect HTTP/1.1\\r\\nHost: control.test\\r\\nUpgrade: websocket\\r\\nConnection: keep-alive, Upgrade\\r\\n\\r\\n"
+            b"GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\r\n"
         ));
         assert!(!is_websocket_upgrade(
-            b"GET /_http-tunnel/v1/connect HTTP/1.1\\r\\nHost: control.test\\r\\nConnection: keep-alive\\r\\n\\r\\n"
+            b"GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\nConnection: keep-alive\r\n\r\n"
         ));
     }
 
