@@ -854,6 +854,20 @@ impl ServerConfig {
                     }
                     let domain = crate::helper::normalize_domain(&proxy.domain)
                         .ok_or_else(|| anyhow!("Invalid proxy domain `{}`", proxy.domain))?;
+                    if let Some(control_host) = config.control_host.as_deref() {
+                        let conflicts = domain == control_host
+                            || domain.strip_prefix("*.").is_some_and(|suffix| {
+                                control_host.len() > suffix.len()
+                                    && control_host.ends_with(&format!(".{}", suffix))
+                            });
+                        if conflicts {
+                            bail!(
+                                "Proxy domain `{}` overlaps the reserved control_host `{}`",
+                                domain,
+                                control_host
+                            );
+                        }
+                    }
                     if domains.insert(domain.clone(), ()).is_some() {
                         bail!("Proxy domain `{}` is configured more than once", domain);
                     }
