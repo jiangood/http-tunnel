@@ -181,7 +181,7 @@ async fn handle_visitor(
     // Reserve the configured control Host for the internal WebSocket transport.
     // Host is a routing key only; the existing token handshake still authenticates clients.
     if control_host.as_deref() == Some(host.as_str()) {
-        let path = parse_request_path(&prefetched).unwrap_or("");
+        let path = parse_request_path(&prefetched).unwrap_or_default();
         if path != "/_http-tunnel/v1/connect" {
             respond(&mut stream, "404 Not Found", "Unknown control endpoint\n").await;
             return Ok(());
