@@ -135,6 +135,7 @@ pub async fn run_server(args: ServerArgs, shutdown_rx: broadcast::Receiver<bool>
 struct Server {
     state: Arc<ServerState>,
     server_addr: String,
+    server_port: u16,
     http_port: u16,
     control_host: Option<String>,
     proxies: Vec<crate::config::ServerProxyEntry>,
@@ -167,6 +168,7 @@ impl Server {
         Server {
             state,
             server_addr,
+            server_port,
             http_port,
             control_host,
             proxies,
@@ -192,11 +194,7 @@ impl Server {
         // Run the HTTP entrypoint which routes visitors by the `Host` header
         let http_task = tokio::spawn(crate::http::serve(
             self.http_port,
-            self.server_addr
-                .rsplit(':')
-                .next()
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(2333),
+            self.server_port,
             self.control_host.clone(),
             self.state.clone(),
             shutdown_rx.resubscribe(),
