@@ -17,6 +17,8 @@ use tracing::{debug, error, info, warn};
 const MAX_HEADER_SIZE: usize = 8 * 1024;
 /// Timeout for reading the HTTP header from a visitor
 const HEADER_READ_TIMEOUT: u64 = 5;
+/// Bound persistent control/data WebSocket connections to avoid unbounded task and socket growth.
+const MAX_WEBSOCKET_CONNECTIONS: usize = 1024;
 
 /// Maps a `Host` to the digest of the tunnel that serves it. An exact match takes
 /// precedence over a wildcard domain (`*.example.com`), and among the wildcards
@@ -97,6 +99,7 @@ pub(crate) async fn serve(
     port: u16,
     server_port: u16,
     control_host: Option<String>,
+    websocket_connections: Arc<tokio::sync::Semaphore>,
     state: Arc<ServerState>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     proxies: Vec<ServerProxyEntry>,
@@ -107,6 +110,7 @@ pub(crate) async fn serve(
         .with_context(|| format!("Failed to listen at `http_port` ({})", port))?;
     info!("HTTP listening at {}", addr);
     let proxies = Arc::new(proxies);
+    let websocket_connections = Arc::new(tokio::sync::Semaphore::new(MAX_WEBSOCKET_CONNECTIONS));
 
     loop {
         tokio::select! {
@@ -116,12 +120,14 @@ pub(crate) async fn serve(
                         let state = state.clone();
                         let proxies = proxies.clone();
                         let control_host = control_host.clone();
+                        let websocket_connections = websocket_connections.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_visitor(
                                 stream,
                                 addr,
                                 server_port,
                                 control_host,
+                                websocket_connections,
                                 state,
                                 proxies,
                             ).await {
@@ -190,7 +196,15 @@ async fn handle_visitor(
             respond(&mut stream, "426 Upgrade Required", "WebSocket upgrade required\n").await;
             return Ok(());
         }
-        drop(activity);
+        let _websocket_permit = match websocket_connections.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                respond(&mut stream, "503 Service Unavailable", "WebSocket connection limit reached\\n").await;
+                return Ok(());
+            }
+        };
+        // Keep the activity guard alive for the full WebSocket lifetime so shutdown
+        // accounting includes the bridged connection, not just the HTTP handshake.
         crate::transport::websocket::accept_and_bridge(prefetched, stream, server_port).await?;
         return Ok(());
     }
