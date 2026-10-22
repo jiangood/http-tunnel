@@ -535,6 +535,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_parse_request_path() {
+        assert_eq!(
+            parse_request_path(b"GET /_http-tunnel/v1/connect HTTP/1.1\\r\\nHost: control.test\\r\\n\\r\\n"),
+            Some("/_http-tunnel/v1/connect".to_string())
+        );
+        assert_eq!(
+            parse_request_path(b"GET /_http-tunnel/v1/connect?x=1 HTTP/1.1\\r\\nHost: control.test\\r\\n\\r\\n"),
+            Some("/_http-tunnel/v1/connect".to_string())
+        );
+        assert_eq!(
+            parse_request_path(b"POST /_http-tunnel/v1/connect HTTP/1.1\\r\\nHost: control.test\\r\\n\\r\\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_is_websocket_upgrade() {
+        assert!(is_websocket_upgrade(
+            b"GET /_http-tunnel/v1/connect HTTP/1.1\\r\\nHost: control.test\\r\\nUpgrade: websocket\\r\\nConnection: keep-alive, Upgrade\\r\\n\\r\\n"
+        ));
+        assert!(!is_websocket_upgrade(
+            b"GET /_http-tunnel/v1/connect HTTP/1.1\\r\\nHost: control.test\\r\\nConnection: keep-alive\\r\\n\\r\\n"
+        ));
+    }
+
+    #[test]
     fn test_parse_host() {
         let head = b"GET / HTTP/1.1\r\nHost: Example.COM:8080\r\nAccept: */*\r\n\r\n";
         assert_eq!(parse_host(head).unwrap(), "example.com");
