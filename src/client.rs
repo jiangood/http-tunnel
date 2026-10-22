@@ -3,6 +3,7 @@ use crate::config::{ClientConfig, ClientTunnelConfig, MaskedString};
 use crate::constants::run_control_chan_backoff;
 use crate::protocol::{self, Ack, Auth, ClientHello, ControlChannelCmd, DataChannelCmd, ServerHello};
 use crate::transport::{connect, AddrMaybeCached, SocketOpts};
+use crate::transport::websocket::{connect_websocket, BoxedIo};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::future::retry_notify;
@@ -122,7 +123,8 @@ fn resolve_identity(config: &ClientConfig, config_path: &Path) -> Result<Identit
     if &*token == "replace-with-the-same-secret-as-hts" {
         bail!("Replace the placeholder token in {:?}", config_path);
     }
-    Ok(Identity { remote, name, token })
+    let transport = config.transport.clone().unwrap_or_else(|| "tcp".to_string());
+    Ok(Identity { remote, name, token, transport })
 }
 
 /// Report a startup error and then wait for a shutdown signal instead of
@@ -144,6 +146,7 @@ async fn wait_after_error(
 #[derive(Debug, Clone)]
 pub(crate) struct Identity {
     pub(crate) remote: String,
+    pub(crate) transport: String,
     pub(crate) name: String,
     pub(crate) token: MaskedString,
 }
@@ -223,6 +226,7 @@ impl ClientState {
             let config = self.config.read().await;
             (config.resolved_tunnels(), config.heartbeat_timeout())
         };
+        let transport = self.identity.transport.clone();
 
         let mut handles = self.tunnels.lock().await;
 
@@ -243,7 +247,7 @@ impl ClientState {
         // Start the new tunnels and restart the ones whose config changed
         for tunnel in tunnels {
             let restart = match handles.get(&tunnel.name) {
-                Some(handle) => !handle.matches(&tunnel, heartbeat_timeout),
+                Some(handle) => !handle.matches(&tunnel, heartbeat_timeout, &transport),
                 None => true,
             };
             if !restart {
@@ -259,6 +263,7 @@ impl ClientState {
                 self.identity.name.clone(),
                 self.identity.token.clone(),
                 self.identity.remote.clone(),
+                transport.clone(),
                 heartbeat_timeout,
                 self.connections.clone(),
                 self.fatal_tx.clone(),
@@ -346,11 +351,12 @@ impl std::error::Error for FatalControlError {
 struct RunDataChannelArgs {
     session_key: Nonce,
     remote_addr: AddrMaybeCached,
+    transport: String,
     socket_opts: SocketOpts,
     tunnel: ClientTunnelConfig,
 }
 
-async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<TcpStream> {
+async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<BoxedIo> {
     // Retry at least every 100ms, at most for 10 seconds
     let backoff = ExponentialBackoff {
         max_interval: Duration::from_millis(100),
@@ -401,7 +407,7 @@ async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
 
 // Simply copying back and forth for TCP
 #[instrument(skip(conn))]
-async fn run_data_channel_for_tcp(mut conn: TcpStream, local_addr: &str, auth: Option<&str>) -> Result<()> {
+async fn run_data_channel_for_tcp(mut conn: BoxedIo, local_addr: &str, auth: Option<&str>) -> Result<()> {
     debug!("New data channel starts forwarding");
     let mut header = Vec::with_capacity(1024);
     loop {
@@ -416,7 +422,8 @@ async fn run_data_channel_for_tcp(mut conn: TcpStream, local_addr: &str, auth: O
         crate::helper::AuthOutcome::Allowed(request) => request,
         crate::helper::AuthOutcome::Unauthorized(failure) => {
             debug!("Rejected an unauthenticated request for {}: {:?}", local_addr, failure);
-            crate::http::respond_unauthorized(&mut conn, failure).await;
+            conn.write_all(&crate::http::unauthorized_response(failure)).await
+                .context("Failed to write unauthorized response to tunnel")?;
             return Ok(());
         }
     };
@@ -446,13 +453,14 @@ struct ControlChannelHandle {
     // Keep the config that the channel was created with, so that it can be
     // compared with the one that is configured later
     tunnel: ClientTunnelConfig,
+    transport: String,
     heartbeat_timeout: u64,
 }
 
 impl ControlChannelHandle {
     // Whether the channel is already serving the given config
-    fn matches(&self, tunnel: &ClientTunnelConfig, heartbeat_timeout: u64) -> bool {
-        &self.tunnel == tunnel && self.heartbeat_timeout == heartbeat_timeout
+    fn matches(&self, tunnel: &ClientTunnelConfig, heartbeat_timeout: u64, transport: &str) -> bool {
+        &self.tunnel == tunnel && self.heartbeat_timeout == heartbeat_timeout && self.transport == transport
     }
 }
 
@@ -479,12 +487,16 @@ impl ControlChannel {
     #[instrument(skip_all)]
     async fn run(&mut self) -> Result<()> {
         let mut remote_addr = AddrMaybeCached::new(&self.remote_addr);
-        remote_addr.resolve().await?;
-
-        let mut conn = connect(&remote_addr)
-            .await
-            .with_context(|| format!("Failed to connect to {}", self.remote_addr))?;
-        SocketOpts::for_control_channel().apply(&conn);
+        let mut conn: BoxedIo = if self.transport == "websocket" {
+            connect_websocket(&self.remote_addr).await?
+        } else {
+            remote_addr.resolve().await?;
+            let tcp = connect(&remote_addr)
+                .await
+                .with_context(|| format!("Failed to connect to {}", self.remote_addr))?;
+            SocketOpts::for_control_channel().apply(&tcp);
+            Box::new(tcp)
+        };
 
         // Send hello. The client announces the domain it serves, which is how the
         // server learns its tunnels.
@@ -534,6 +546,7 @@ impl ControlChannel {
         let data_ch_args = Arc::new(RunDataChannelArgs {
             session_key,
             remote_addr,
+            transport: self.transport.clone(),
             socket_opts,
             tunnel: self.tunnel.clone(),
         });
@@ -576,6 +589,7 @@ impl ControlChannelHandle {
         name: String,
         token: MaskedString,
         remote_addr: String,
+        transport: String,
         heartbeat_timeout: u64,
         connections: Arc<AtomicUsize>,
         fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
@@ -594,6 +608,7 @@ impl ControlChannelHandle {
             token,
             shutdown_rx,
             remote_addr,
+            transport: transport.clone(),
             heartbeat_timeout,
             connections,
         };
@@ -640,6 +655,7 @@ impl ControlChannelHandle {
         ControlChannelHandle {
             shutdown_tx,
             tunnel: handle_tunnel,
+            transport,
             heartbeat_timeout,
         }
     }
