@@ -369,6 +369,78 @@ async fn websocket_transport_routes_http() -> Result<()> {
     Ok(())
 }
 
+// ==== WebSocket transport with an unavailable client-side target ====
+
+const WS_FAILURE_SERVER_PORT: u16 = 2545;
+const WS_FAILURE_HTTP_PORT: u16 = 2546;
+const WS_FAILURE_HTTP_ADDR: &str = "127.0.0.1:2546";
+const WS_FAILURE_TARGET_ADDR: &str = "127.0.0.1:2547";
+
+/// A WebSocket tunnel whose local target refuses connections must not hang
+/// visitors forever; the server eventually returns its existing 504 timeout.
+#[cfg(feature = "client-api")]
+#[tokio::test]
+async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
+    init();
+    let client_config = write_client_config(
+        "http_tunnel_websocket_unavailable_target.toml",
+        CLIENT_NAME,
+        WS_FAILURE_HTTP_ADDR,
+        CLIENT_TOKEN,
+        Some(0),
+        &[("unavailable-ws.test", WS_FAILURE_TARGET_ADDR)],
+    )?;
+    let config = std::fs::read_to_string(&client_config)?;
+    let config = config.replacen(
+        "\\n[[tunnels]]",
+        "\\ntransport = \\"websocket\\"\\n\\n[[tunnels]]",
+        1,
+    );
+    std::fs::write(&client_config, config)?;
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let server = tokio::spawn(async move {
+        run_http_tunnel_server_with_control_host(
+            WS_FAILURE_SERVER_PORT,
+            WS_FAILURE_HTTP_PORT,
+            Some("127.0.0.1"),
+            CLIENT_TOKEN,
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    time::sleep(Duration::from_millis(300)).await;
+    let client = tokio::spawn(async move {
+        run_http_tunnel_client(&client_config, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_secs(2)).await;
+
+    let mut visitor = TcpStream::connect(WS_FAILURE_HTTP_ADDR).await?;
+    visitor
+        .write_all(
+            b"GET / HTTP/1.1\\r\\nHost: unavailable-ws.test\\r\\nConnection: close\\r\\n\\r\\n",
+        )
+        .await?;
+    let mut response = Vec::new();
+    time::timeout(Duration::from_secs(18), visitor.read_to_end(&mut response))
+        .await??;
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 504"),
+        "expected 504 for an unavailable local target, got {}",
+        response
+    );
+
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server);
+    Ok(())
+}
+
 #[tokio::test]
 async fn client_api_manages_tunnels() -> Result<()> {
     init();
