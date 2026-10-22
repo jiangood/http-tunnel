@@ -63,7 +63,7 @@
 - WebSocket 帧和消息最大 1 MiB，避免单条消息无界分配。
 - WebSocket 握手超时 10 秒，本地 TCP 上游连接超时 5 秒。
 - HTTP 入口最多允许 256 条活动 WebSocket 连接；达到上限时返回 503。
-- WebSocket 活动期间保留服务端 activity guard，纳入现有关闭/活动计数。
+- WebSocket 传输连接不计入业务 visitor 的 drain 计数，避免服务端优雅关闭时等待长连接超时；真正的业务 visitor 仍由原 activity guard 统计。
 - 拒绝把保留的 control_host 注册为业务隧道，避免控制域名被业务路由覆盖。
 
 ## 7. 下一阶段任务
