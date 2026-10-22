@@ -664,15 +664,15 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
     for index in 0..256 {
         let result = time::timeout(Duration::from_secs(3), connect_async(&url)).await;
         match result {
-            Ok(Ok((socket, _))) => sockets.push(socket),
-            Ok(Err(error)) => anyhow::bail!("WebSocket connection {} failed before the limit: {}", index + 1, error),
+            std::result::Result::Ok(std::result::Result::Ok((socket, _))) => sockets.push(socket),
+            std::result::Result::Ok(Err(error)) => anyhow::bail!("WebSocket connection {} failed before the limit: {}", index + 1, error),
             Err(_) => anyhow::bail!("WebSocket connection {} timed out before the limit", index + 1),
         }
     }
 
     let excess = time::timeout(Duration::from_secs(3), connect_async(&url)).await;
     match excess {
-        Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response))) => {
+        std::result::Result::Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response))) => {
             assert_eq!(
                 response.status().as_u16(),
                 503,
@@ -680,11 +680,11 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
                 response.status()
             );
         }
-        Ok(Ok((socket, _))) => {
+        std::result::Result::Ok(std::result::Result::Ok((socket, _))) => {
             drop(socket);
             anyhow::bail!("the 257th WebSocket connection unexpectedly succeeded");
         }
-        Ok(Err(error)) => anyhow::bail!("unexpected error for the 257th connection: {}", error),
+        std::result::Result::Ok(Err(error)) => anyhow::bail!("unexpected error for the 257th connection: {}", error),
         Err(_) => anyhow::bail!("the 257th WebSocket handshake timed out"),
     }
 
@@ -693,12 +693,12 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
     time::sleep(Duration::from_millis(300)).await;
     let recovered = time::timeout(Duration::from_secs(3), connect_async(&url)).await;
     match recovered {
-        Ok(Ok((socket, _))) => drop(socket),
-        Ok(Err(error)) => anyhow::bail!("connection slot did not recover after close: {}", error),
+        std::result::Result::Ok(std::result::Result::Ok((socket, _))) => drop(socket),
+        std::result::Result::Ok(Err(error)) => anyhow::bail!("connection slot did not recover after close: {}", error),
         Err(_) => anyhow::bail!("recovery WebSocket handshake timed out"),
     }
 
     shutdown_tx.send(true)?;
     server.await?;
-    Ok(())
+    std::result::Result::Ok(())
 }
