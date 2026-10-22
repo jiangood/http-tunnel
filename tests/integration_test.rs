@@ -17,6 +17,10 @@ mod common;
 const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
 const HTTP_ENTRY_ADDR: &str = "127.0.0.1:2334";
 const HTTP_ENTRY_PORT: u16 = 2334;
+const WS_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2336";
+const WS_HTTP_ENTRY_PORT: u16 = 2336;
+const WS_SERVER_PORT: u16 = 2335;
+const WS_ECHO_SERVER_ADDR: &str = "127.0.0.1:8081";
 const SERVER_ADDR: &str = "127.0.0.1:2333";
 const SERVER_PORT: u16 = 2333;
 const CLIENT_NAME: &str = "home";
@@ -287,6 +291,59 @@ const CLIENT_API_TOKEN: &str = "a_secret_token";
 /// validated locally, written back to the client configuration file, and routed
 /// without a restart of either side.
 #[cfg(feature = "client-api")]
+#[tokio::test]
+async fn websocket_transport_routes_http() -> Result<()> {
+    init();
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(WS_ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the WebSocket echo server: {:?}", e);
+        }
+    });
+
+    let client_config = write_client_config(
+        "http_tunnel_websocket_client.toml",
+        CLIENT_NAME,
+        WS_HTTP_ENTRY_ADDR,
+        CLIENT_TOKEN,
+        Some(0),
+        &[("echo-ws.test", WS_ECHO_SERVER_ADDR)],
+    )?;
+    let mut config = std::fs::read_to_string(&client_config)?;
+    config.push_str("\ntransport = \"websocket\"\n");
+    std::fs::write(&client_config, config)?;
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    let server = tokio::spawn(async move {
+        common::run_http_tunnel_server_with_control_host(
+            WS_SERVER_PORT,
+            WS_HTTP_ENTRY_PORT,
+            Some("127.0.0.1"),
+            CLIENT_TOKEN,
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    time::sleep(Duration::from_millis(250)).await;
+
+    let client = tokio::spawn(async move {
+        run_http_tunnel_client(&client_config, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_secs(2)).await;
+
+    http_echo_hitter(WS_HTTP_ENTRY_ADDR, "echo-ws.test").await?;
+
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server);
+    Ok(())
+}
+
 #[tokio::test]
 async fn client_api_manages_tunnels() -> Result<()> {
     init();
