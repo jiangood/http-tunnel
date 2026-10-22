@@ -1,7 +1,7 @@
 # WebSocket 传输代码路径审查
 
 > 分支：`feat/websocket-transport`  
-> 状态：阶段 0 审查完成；阶段 1 原型代码已在分支中实现，尚待 CI 编译、测试与修正。
+> 状态：阶段 0 审查完成；阶段 1 原型已实现，GitHub Actions 的 check、test、build 和进程级 E2E 均通过。
 
 ## 1. 现有连接流程
 
@@ -56,7 +56,7 @@
 - 已增加 WebSocket 与异步字节流之间的桥接；服务端 WebSocket 会桥接到现有 server_port TCP listener。
 - 已将客户端控制连接与数据连接统一为字节流接口，WebSocket 模式下每条逻辑连接独立建立 WebSocket。
 - 已在 HTTP 入口按 control_host + 专用路径分流，并在 README 中记录配置方式和明文传输风险。
-- 这些改动尚未经过 GitHub Actions 编译/测试；不能视为已验证可发布。
+- 已在 GitHub Actions 中通过编译、单元/集成测试、二进制构建及进程级 E2E；仍属于实验性原型，尚未覆盖所有阶段 2 的异常、背压与恢复场景。
 
 ## 6. 下一阶段任务
 
