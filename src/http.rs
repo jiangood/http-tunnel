@@ -20,6 +20,12 @@ const HEADER_READ_TIMEOUT: u64 = 5;
 /// Bound persistent control/data WebSocket connections to avoid unbounded task and socket growth.
 const MAX_WEBSOCKET_CONNECTIONS: usize = 256;
 
+fn try_acquire_websocket_permit(
+    semaphore: Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+    semaphore.try_acquire_owned()
+}
+
 /// Maps a `Host` to the digest of the tunnel that serves it. An exact match takes
 /// precedence over a wildcard domain (`*.example.com`), and among the wildcards
 /// the longest suffix wins.
@@ -196,7 +202,7 @@ async fn handle_visitor(
             respond(&mut stream, "426 Upgrade Required", "WebSocket upgrade required\n").await;
             return Ok(());
         }
-        let _websocket_permit = match websocket_connections.clone().try_acquire_owned() {
+        let _websocket_permit = match try_acquire_websocket_permit(websocket_connections.clone()) {
             Ok(permit) => permit,
             Err(_) => {
                 respond(&mut stream, "503 Service Unavailable", "WebSocket connection limit reached\n").await;
@@ -549,6 +555,15 @@ async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_connection_permit_is_released_after_close() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = try_acquire_websocket_permit(semaphore.clone()).unwrap();
+        assert!(try_acquire_websocket_permit(semaphore.clone()).is_err());
+        drop(permit);
+        assert!(try_acquire_websocket_permit(semaphore).is_ok());
+    }
 
     #[test]
     fn test_parse_request_path() {
