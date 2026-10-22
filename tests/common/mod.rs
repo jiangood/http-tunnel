@@ -16,6 +16,7 @@ pub async fn run_http_tunnel_server(
     let cmd = http_tunnel::Command::Server(http_tunnel::ServerArgs {
         server_port,
         http_port,
+        control_host: None,
         token: token.to_string(),
         proxies: Vec::new(),
     });
