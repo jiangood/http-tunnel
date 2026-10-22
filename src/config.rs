@@ -764,6 +764,14 @@ local_addr = "127.0.0.1:80"
     }
 
     #[test]
+    fn test_proxy_domain_cannot_overlap_control_host() {
+        assert!(proxy_domain_overlaps_control_host("control.example.com", "control.example.com"));
+        assert!(proxy_domain_overlaps_control_host("*.example.com", "control.example.com"));
+        assert!(!proxy_domain_overlaps_control_host("*.example.com", "example.com"));
+        assert!(!proxy_domain_overlaps_control_host("*.other.test", "control.example.com"));
+    }
+
+    #[test]
     fn test_server_config_example_is_valid() -> Result<()> {
         let token = generate_token();
         let example = server_config_example(&token);
@@ -796,6 +804,14 @@ local_addr = "127.0.0.1:80"
     }
 }
 
+
+fn proxy_domain_overlaps_control_host(domain: &str, control_host: &str) -> bool {
+    domain == control_host
+        || domain.strip_prefix("*.").is_some_and(|suffix| {
+            control_host.len() > suffix.len()
+                && control_host.ends_with(&format!(".{}", suffix))
+        })
+}
 
 /// Server settings loaded exclusively from the fixed hts.toml file.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -855,11 +871,7 @@ impl ServerConfig {
                     let domain = crate::helper::normalize_domain(&proxy.domain)
                         .ok_or_else(|| anyhow!("Invalid proxy domain `{}`", proxy.domain))?;
                     if let Some(control_host) = config.control_host.as_deref() {
-                        let conflicts = domain == control_host
-                            || domain.strip_prefix("*.").is_some_and(|suffix| {
-                                control_host.len() > suffix.len()
-                                    && control_host.ends_with(&format!(".{}", suffix))
-                            });
+                        let conflicts = proxy_domain_overlaps_control_host(&domain, control_host);
                         if conflicts {
                             bail!(
                                 "Proxy domain `{}` overlaps the reserved control_host `{}`",
