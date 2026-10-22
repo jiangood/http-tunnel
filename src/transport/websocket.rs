@@ -12,6 +12,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::{
     accept_async_with_config, connect_async_with_config,
     tungstenite::{protocol::WebSocketConfig, Message},
+    client_async_with_config,
     WebSocketStream,
 };
 
@@ -207,5 +208,40 @@ mod tests {
         let config = websocket_config();
         assert_eq!(config.max_message_size, Some(MAX_WS_MESSAGE_SIZE));
         assert_eq!(config.max_frame_size, Some(MAX_WS_MESSAGE_SIZE));
+    }
+
+    #[tokio::test]
+    async fn oversized_websocket_message_is_rejected() {
+        let (server_io, client_io) = duplex(MAX_WS_MESSAGE_SIZE * 2);
+        let server = tokio::spawn(async move {
+            let mut ws = accept_async_with_config(server_io, Some(websocket_config()))
+                .await
+                .expect("WebSocket handshake should succeed");
+            ws.next().await
+        });
+
+        let client_config = WebSocketConfig {
+            max_message_size: None,
+            max_frame_size: None,
+            ..WebSocketConfig::default()
+        };
+        let (mut client, _) = client_async_with_config(
+            "ws://localhost/_http-tunnel/v1/connect",
+            client_io,
+            Some(client_config),
+            false,
+        )
+        .await
+        .expect("client handshake should succeed");
+        client
+            .send(Message::Binary(vec![0; MAX_WS_MESSAGE_SIZE + 1]))
+            .await
+            .expect("test client should send the oversized message");
+
+        let result = timeout(Duration::from_secs(3), server)
+            .await
+            .expect("server should reject the oversized message promptly")
+            .expect("server task should not panic");
+        assert!(matches!(result, Some(Err(_))), "oversized message was not rejected");
     }
 }
