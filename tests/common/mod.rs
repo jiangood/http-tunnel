@@ -13,10 +13,20 @@ pub async fn run_http_tunnel_server(
     token: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
+    run_http_tunnel_server_with_control_host(server_port, http_port, None, token, shutdown_rx).await
+}
+
+pub async fn run_http_tunnel_server_with_control_host(
+    server_port: u16,
+    http_port: u16,
+    control_host: Option<&str>,
+    token: &str,
+    shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
     let cmd = http_tunnel::Command::Server(http_tunnel::ServerArgs {
         server_port,
         http_port,
-        control_host: None,
+        control_host: control_host.map(str::to_string),
         token: token.to_string(),
         proxies: Vec::new(),
     });
