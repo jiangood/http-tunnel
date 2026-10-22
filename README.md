@@ -66,6 +66,39 @@ local_addr = "127.0.0.1:80"
 
 再次运行 `./htc` 启动客户端。之后访问 `http://nas.example.com`，请求会转发到客户端的本地服务。
 
+## WebSocket 传输模式（实验性）
+
+默认客户端仍使用原有 TCP 传输（服务端默认 2333 端口）。如果客户端无法连接该 TCP 端口，可以选择通过服务端 HTTP 入口建立 WebSocket 连接；服务端和客户端均不需要新增公网端口，也不需要 Nginx。
+
+在 hts.toml 中为控制连接预留一个独立域名：
+
+```toml
+server_port = 2333
+http_port = 80
+control_host = "control.example.com"
+token = "与客户端相同的随机强密钥"
+```
+
+确保 control.example.com 的 DNS 记录指向服务端。在 htc.toml 中，将 remote 指向该控制域名和 HTTP 端口，并启用 WebSocket：
+
+```toml
+remote = "control.example.com:80"
+transport = "websocket"
+name = "home"
+token = "与服务端相同的随机强密钥"
+
+[[tunnels]]
+name = "nas"
+domain = "nas.example.com"
+local_addr = "127.0.0.1:80"
+```
+
+控制域名仅用于内部控制与数据连接；普通业务域名（例如 nas.example.com）继续通过 http_port 进入现有 Host 路由。服务端会根据 Host 和专用路径 /_http-tunnel/v1/connect 识别 WebSocket 连接，并把它桥接到现有 TCP 协议处理器。原来的 2333/TCP 模式不受影响。
+
+**安全提示：** 当前 WebSocket 模式使用明文 ws://，不会自动申请或配置证书。Token、控制消息和隧道数据可能被网络中间方读取或篡改，因此此模式适合可信网络或测试环境；不要在未经加密保护的公网链路上发送敏感流量。正式公网部署应通过可信 TLS 终止层提供 WSS，或在后续版本使用端到端加密。control_host 只是路由配置，不是身份认证；服务端仍会验证现有共享 Token。
+
+该模式目前是实验性功能，部署前请通过测试环境验证长连接、代理兼容性和断线重连行为。
+
 ## 转发配置
 
 客户端使用 `[[tunnels]]`，服务端直连代理使用 `[[proxies]]`。两者均支持以下字段：
