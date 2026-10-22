@@ -211,6 +211,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_websocket_message_is_rejected_by_the_tunnel_bridge() {
+        let (server_io, client_io) = duplex(64 * 1024);
+        let (bridge_io, _bridge_peer) = duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let ws = accept_async_with_config(server_io, Some(websocket_config()))
+                .await
+                .expect("WebSocket handshake should succeed");
+            bridge_websocket_to_io(ws, bridge_io).await
+        });
+
+        let (mut client, _) = client_async_with_config(
+            "ws://localhost/_http-tunnel/v1/connect",
+            client_io,
+            Some(websocket_config()),
+        )
+        .await
+        .expect("client handshake should succeed");
+        client
+            .send(Message::Text("not a tunnel frame".to_string()))
+            .await
+            .expect("test client should send text");
+        let result = timeout(Duration::from_secs(3), server)
+            .await
+            .expect("bridge should reject text promptly")
+            .expect("bridge task should not panic");
+        assert!(result.is_err(), "text message was accepted by the bridge");
+    }
+
+    #[tokio::test]
     async fn oversized_websocket_message_is_rejected() {
         let (server_io, client_io) = duplex(MAX_WS_MESSAGE_SIZE * 2);
         let server = tokio::spawn(async move {
