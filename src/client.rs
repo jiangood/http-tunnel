@@ -363,7 +363,7 @@ async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<Boxe
         ..Default::default()
     };
 
-    retry_notify(
+    let mut conn: BoxedIo = retry_notify(
         backoff,
         || async {
             let result: Result<BoxedIo> = if args.transport == "websocket" {
@@ -385,7 +385,15 @@ async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<Boxe
             warn!("{:#}. Retry in {:?}...", e, duration);
         },
     )
-    .await
+    .await?;
+
+    // Identify this as a data channel using the same protocol handshake as TCP mode.
+    let hello = ClientHello::Data {
+        version: protocol::CURRENT_PROTO_VERSION,
+        nonce: args.session_key,
+    };
+    protocol::write_payload(&mut conn, &hello).await?;
+    Ok(conn)
 }
 
 async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
