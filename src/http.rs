@@ -18,7 +18,7 @@ const MAX_HEADER_SIZE: usize = 8 * 1024;
 /// Timeout for reading the HTTP header from a visitor
 const HEADER_READ_TIMEOUT: u64 = 5;
 /// Bound persistent control/data WebSocket connections to avoid unbounded task and socket growth.
-const MAX_WEBSOCKET_CONNECTIONS: usize = 1024;
+const MAX_WEBSOCKET_CONNECTIONS: usize = 256;
 
 /// Maps a `Host` to the digest of the tunnel that serves it. An exact match takes
 /// precedence over a wildcard domain (`*.example.com`), and among the wildcards
