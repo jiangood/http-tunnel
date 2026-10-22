@@ -336,6 +336,44 @@ async fn read_header(stream: &mut TcpStream) -> Result<(Vec<u8>, String), Header
     }
 }
 
+fn parse_request_path(head: &[u8]) -> Option<String> {
+    let line = head.split(|&b| b == b'\\n').next().map(strip_cr)?;
+    let line = std::str::from_utf8(line).ok()?;
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "GET" {
+        return None;
+    }
+    let target = parts.next()?;
+    if !target.starts_with('/') {
+        return None;
+    }
+    Some(target.split('?').next()?.to_string())
+}
+
+fn is_websocket_upgrade(head: &[u8]) -> bool {
+    let mut upgrade = false;
+    let mut connection_upgrade = false;
+    for raw in head.split(|&b| b == b'\\n').skip(1) {
+        let line = strip_cr(raw);
+        if line.is_empty() {
+            break;
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let name = trim_ascii(&line[..colon]);
+        let value = trim_ascii(&line[colon + 1..]);
+        if name.eq_ignore_ascii_case(b"upgrade") {
+            upgrade = value.eq_ignore_ascii_case(b"websocket");
+        } else if name.eq_ignore_ascii_case(b"connection") {
+            connection_upgrade = value
+                .split(|&b| b == b',')
+                .any(|v| trim_ascii(v).eq_ignore_ascii_case(b"upgrade"));
+        }
+    }
+    upgrade && connection_upgrade
+}
+
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
