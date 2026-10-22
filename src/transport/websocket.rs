@@ -196,3 +196,16 @@ pub(crate) async fn accept_and_bridge(
     .with_context(|| format!("Connecting WebSocket bridge to local TCP port {}", server_port))?;
     bridge_websocket_to_io(ws, upstream).await
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn websocket_config_bounds_incoming_messages_and_frames() {
+        let config = websocket_config();
+        assert_eq!(config.max_message_size, Some(MAX_WS_MESSAGE_SIZE));
+        assert_eq!(config.max_frame_size, Some(MAX_WS_MESSAGE_SIZE));
+    }
+}
