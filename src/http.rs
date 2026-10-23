@@ -202,7 +202,7 @@ async fn handle_visitor(
             return Ok(());
         }
         if !is_websocket_upgrade(&prefetched) {
-            respond(&mut stream, "426 Upgrade Required", "WebSocket upgrade required\n").await;
+            respond_upgrade_required(&mut stream).await;
             return Ok(());
         }
         let _websocket_permit = match try_acquire_websocket_permit(websocket_connections.clone()) {
@@ -541,17 +541,38 @@ pub(crate) async fn respond_unauthorized(
 /// the server, which writes a `504` from a stream wrapper when a tunnel closes
 /// without sending anything back.
 pub(crate) fn response(status: &str, body: &str) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{}",
-        status,
+    response_with_headers(status, &[], body)
+}
+
+/// Like [`response`], with extra headers in front of the standard ones.
+fn response_with_headers(status: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
+    let mut response = format!("HTTP/1.1 {}\r\n", status);
+    for (name, value) in headers {
+        response.push_str(&format!("{}: {}\r\n", name, value));
+    }
+    response.push_str(&format!(
+        "Content-Length: {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
-    )
-    .into_bytes()
+    ));
+    response.into_bytes()
 }
 
 async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let _ = stream.write_all(&response(status, body)).await;
+    let _ = stream.flush().await;
+}
+
+/// The `426` sent when the control host is reached without a WebSocket upgrade.
+/// RFC 7231 §6.5.15 requires the response to list the acceptable protocols in
+/// an `Upgrade` header.
+async fn respond_upgrade_required(stream: &mut TcpStream) {
+    let response = response_with_headers(
+        "426 Upgrade Required",
+        &[("Upgrade", "websocket")],
+        "WebSocket upgrade required\n",
+    );
+    let _ = stream.write_all(&response).await;
     let _ = stream.flush().await;
 }
 
@@ -566,6 +587,19 @@ mod tests {
         assert!(try_acquire_websocket_permit(semaphore.clone()).is_err());
         drop(permit);
         assert!(try_acquire_websocket_permit(semaphore).is_ok());
+    }
+
+    #[test]
+    fn test_upgrade_required_response_lists_websocket() {
+        let response = response_with_headers(
+            "426 Upgrade Required",
+            &[("Upgrade", "websocket")],
+            "WebSocket upgrade required\n",
+        );
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 426 Upgrade Required\r\n"));
+        // RFC 7231 §6.5.15 requires the acceptable protocols in `Upgrade`.
+        assert!(response.contains("\r\nUpgrade: websocket\r\n"), "{}", response);
     }
 
     #[test]

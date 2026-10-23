@@ -764,11 +764,34 @@ local_addr = "127.0.0.1:80"
     }
 
     #[test]
-    fn test_proxy_domain_cannot_overlap_control_host() {
-        assert!(proxy_domain_overlaps_control_host("control.example.com", "control.example.com"));
-        assert!(proxy_domain_overlaps_control_host("*.example.com", "control.example.com"));
-        assert!(!proxy_domain_overlaps_control_host("*.example.com", "example.com"));
-        assert!(!proxy_domain_overlaps_control_host("*.other.test", "control.example.com"));
+    fn test_domain_cannot_overlap_control_host() {
+        assert!(domain_overlaps_control_host("control.example.com", "control.example.com"));
+        assert!(domain_overlaps_control_host("*.example.com", "control.example.com"));
+        assert!(!domain_overlaps_control_host("*.example.com", "example.com"));
+        assert!(!domain_overlaps_control_host("*.other.test", "control.example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_server_config_rejects_zero_server_port() -> Result<()> {
+        // The WebSocket bridge needs a fixed, dialable port, so 0 is invalid.
+        let path = std::env::temp_dir().join(format!(
+            "http-tunnel-zero-port-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "server_port = 0\nhttp_port = 8080\ntoken = \"a_secret_token\"\n",
+        )?;
+        let err = ServerConfig::from_file(&path)
+            .await
+            .expect_err("server_port = 0 must be rejected");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            format!("{:#}", err).contains("server_port"),
+            "unexpected error: {:#}",
+            err
+        );
+        Ok(())
     }
 
     #[test]
@@ -805,7 +828,9 @@ local_addr = "127.0.0.1:80"
 }
 
 
-fn proxy_domain_overlaps_control_host(domain: &str, control_host: &str) -> bool {
+/// Whether a tunnel domain (exact or wildcard) would overlap the reserved
+/// `control_host`. A wildcard overlaps every host below its suffix.
+pub(crate) fn domain_overlaps_control_host(domain: &str, control_host: &str) -> bool {
     domain == control_host
         || domain.strip_prefix("*.").is_some_and(|suffix| {
             control_host.len() > suffix.len()
@@ -871,7 +896,7 @@ impl ServerConfig {
                     let domain = crate::helper::normalize_domain(&proxy.domain)
                         .ok_or_else(|| anyhow!("Invalid proxy domain `{}`", proxy.domain))?;
                     if let Some(control_host) = config.control_host.as_deref() {
-                        let conflicts = proxy_domain_overlaps_control_host(&domain, control_host);
+                        let conflicts = domain_overlaps_control_host(&domain, control_host);
                         if conflicts {
                             bail!(
                                 "Proxy domain `{}` overlaps the reserved control_host `{}`",
@@ -883,6 +908,11 @@ impl ServerConfig {
                     if domains.insert(domain.clone(), ()).is_some() {
                         bail!("Proxy domain `{}` is configured more than once", domain);
                     }
+                }
+                if config.server_port == 0 {
+                    bail!(
+                        "`server_port` must not be 0: clients need a fixed port to connect to"
+                    );
                 }
                 if config.token.is_empty()
                     || &*config.token == "replace-with-a-long-random-secret"

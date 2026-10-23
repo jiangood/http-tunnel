@@ -1,5 +1,5 @@
 use crate::cli::ServerArgs;
-use crate::config::MaskedString;
+use crate::config::{domain_overlaps_control_host, MaskedString};
 use crate::constants::listen_backoff;
 use crate::helper::{retry_notify_with_deadline, to_bind_addr, write_and_flush};
 use crate::http::RoutingTable;
@@ -378,8 +378,17 @@ async fn do_control_channel_handshake(
 
     let domain = crate::helper::normalize_domain(&domain)
         .ok_or_else(|| anyhow!("The domain `{}` of the client `{}` is invalid", domain, name))?;
-    if state.control_host.as_deref() == Some(domain.as_str()) {
-        bail!("The domain `{}` is reserved for the WebSocket control endpoint", domain);
+    if let Some(control_host) = state.control_host.as_deref() {
+        // Use the same wildcard-aware check as the server-side proxies: a
+        // wildcard tunnel that contains the control host can never serve it,
+        // because the control host is intercepted before routing.
+        if domain_overlaps_control_host(&domain, control_host) {
+            bail!(
+                "The domain `{}` overlaps the reserved WebSocket control host `{}`",
+                domain,
+                control_host
+            );
+        }
     }
 
     // Generate a nonce
