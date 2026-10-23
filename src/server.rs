@@ -192,17 +192,28 @@ impl Server {
         .await
         .with_context(|| "Failed to listen at `server_port`")?;
 
+        // The port that was actually bound, which differs from `server_port`
+        // when it is 0. The WebSocket bridge dials this listener, so it must
+        // use the real port rather than the configured one.
+        let server_port = l.local_addr().map(|addr| addr.port()).unwrap_or(self.server_port);
+
         info!("Listening at {}", self.server_addr);
 
-        // Run the HTTP entrypoint which routes visitors by the `Host` header
-        let http_task = tokio::spawn(crate::http::serve(
-            self.http_port,
-            self.server_port,
+        // Bind the HTTP entrypoint before serving, so that a port that cannot
+        // be bound fails startup instead of being discovered on shutdown. It
+        // routes visitors by the `Host` header.
+        let http_listener = TcpListener::bind(to_bind_addr(self.http_port))
+            .await
+            .with_context(|| format!("Failed to listen at `http_port` ({})", self.http_port))?;
+        let mut http_task = tokio::spawn(crate::http::serve(
+            http_listener,
+            server_port,
             self.control_host.clone(),
             self.state.clone(),
             shutdown_rx.resubscribe(),
             self.proxies.clone(),
         ));
+        let mut http_task_done = false;
 
         // Retry at least every 100ms
         let mut backoff = ExponentialBackoff {
@@ -254,6 +265,22 @@ impl Server {
                         }
                     }
                 },
+                // The HTTP listener is bound before startup completes, so it
+                // should only stop on shutdown. If it dies early, surface the
+                // error instead of looking healthy while serving nothing.
+                res = &mut http_task => {
+                    http_task_done = true;
+                    match res {
+                        Ok(Ok(())) => {
+                            info!("HTTP listener stopped");
+                            break;
+                        }
+                        Ok(Err(err)) => {
+                            return Err(err).context("The HTTP listener stopped unexpectedly")
+                        }
+                        Err(err) => return Err(anyhow!("The HTTP listener task failed: {}", err)),
+                    }
+                }
                 // Wait for the shutdown signal
                 _ = shutdown_rx.recv() => {
                     info!("Shuting down gracefully...");
@@ -262,7 +289,9 @@ impl Server {
             }
         }
 
-        let _ = http_task.await;
+        if !http_task_done {
+            let _ = http_task.await;
+        }
 
         // Let the in-flight visitors finish before the tunnel is torn down. The
         // control channels are still alive here, so the data keeps flowing.

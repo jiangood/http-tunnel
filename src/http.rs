@@ -2,7 +2,7 @@ use crate::helper::normalize_domain;
 use crate::protocol::Digest;
 use crate::server::{HttpVisitor, ServerState};
 use crate::config::ServerProxyEntry;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -97,23 +97,26 @@ fn find_proxy<'a>(proxies: &'a [ServerProxyEntry], host: &str) -> Option<&'a Ser
     wildcard.map(|(proxy, _)| proxy)
 }
 
-/// The HTTP entrypoint of the server. It accepts visitors on `http_port`, sniffs the
-/// `Host` header, and hands the visitor over to the corresponding tunnel.
+/// The HTTP entrypoint of the server. It accepts visitors on the already-bound
+/// listener, sniffs the `Host` header, and hands the visitor over to the
+/// corresponding tunnel.
+///
+/// The listener is bound by the server before it starts this task, so that a
+/// port that cannot be bound fails startup instead of being reported only when
+/// the server shuts down.
 ///
 /// Only the first request of a connection is inspected, so routing is connection-level.
 pub(crate) async fn serve(
-    port: u16,
+    l: TcpListener,
     server_port: u16,
     control_host: Option<String>,
     state: Arc<ServerState>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     proxies: Vec<ServerProxyEntry>,
 ) -> Result<()> {
-    let addr = crate::helper::to_bind_addr(port);
-    let l = TcpListener::bind(&addr)
-        .await
-        .with_context(|| format!("Failed to listen at `http_port` ({})", port))?;
-    info!("HTTP listening at {}", addr);
+    if let Ok(addr) = l.local_addr() {
+        info!("HTTP listening at {}", addr);
+    }
     let proxies = Arc::new(proxies);
     let websocket_connections = Arc::new(tokio::sync::Semaphore::new(MAX_WEBSOCKET_CONNECTIONS));
 

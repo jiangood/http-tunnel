@@ -701,6 +701,42 @@ async fn client_exits_on_a_wrong_token() -> Result<()> {
     Ok(())
 }
 
+const OCCUPIED_HTTP_TEST_SERVER_PORT: u16 = 2475;
+const OCCUPIED_HTTP_TEST_HTTP_PORT: u16 = 2476;
+
+/// An `http_port` that cannot be bound must fail startup with an error instead
+/// of leaving a server that looks healthy but serves no traffic.
+#[tokio::test]
+async fn server_fails_when_http_port_cannot_be_bound() -> Result<()> {
+    init();
+
+    // Bind the wildcard address, which is what the server binds.
+    let _occupied =
+        tokio::net::TcpListener::bind(("0.0.0.0", OCCUPIED_HTTP_TEST_HTTP_PORT)).await?;
+    let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+    let err = time::timeout(
+        Duration::from_secs(5),
+        run_http_tunnel_server(
+            OCCUPIED_HTTP_TEST_SERVER_PORT,
+            OCCUPIED_HTTP_TEST_HTTP_PORT,
+            CLIENT_TOKEN,
+            shutdown_rx,
+        ),
+    )
+    .await
+    .expect("server startup hung on an unboundable http_port")
+    .expect_err("server must fail when http_port cannot be bound");
+
+    assert!(
+        format!("{:#}", err).contains("http_port"),
+        "unexpected error: {:#}",
+        err
+    );
+
+    Ok(())
+}
+
 /// Send a minimal HTTP request and return the status code and the body
 async fn api_request(
     addr: &str,
