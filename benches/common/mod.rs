@@ -77,7 +77,7 @@ impl Harness {
             std::process::id()
         ));
         let config = format!(
-            "name = \"{CLIENT_NAME}\"\nremote = \"{SERVER_ADDR}\"\ntoken = \"{CLIENT_TOKEN}\"\n\n[tunnels]\n\"{ECHO_HOST}\" = \"{ECHO_SERVER_ADDR}\"\n"
+            "name = \"{CLIENT_NAME}\"\nremote = \"{SERVER_ADDR}\"\ntoken = \"{CLIENT_TOKEN}\"\n\n[[tunnels]]\nname = \"echo\"\ndomain = \"{ECHO_HOST}\"\nlocal_addr = \"{ECHO_SERVER_ADDR}\"\n"
         );
         std::fs::write(&config_path, config)?;
         let config_guard = TempFile(config_path.clone());
@@ -89,10 +89,6 @@ impl Harness {
         let client = tokio::spawn(async move {
             let cmd = http_tunnel::Command::Client(http_tunnel::ClientArgs {
                 config_path: client_config_path,
-                remote: None,
-                name: None,
-                token: None,
-                api_port: None,
             });
             let _ = http_tunnel::run(cmd, client_rx).await;
         });
@@ -104,7 +100,9 @@ impl Harness {
                 let cmd = http_tunnel::Command::Server(http_tunnel::ServerArgs {
                     server_port: SERVER_PORT,
                     http_port: HTTP_ENTRY_PORT,
+                    control_host: None,
                     token: CLIENT_TOKEN.to_string(),
+                    proxies: Vec::new(),
                 });
                 let _ = http_tunnel::run(cmd, server_rx).await;
             })
