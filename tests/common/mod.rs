@@ -8,27 +8,34 @@ use tokio::{
 };
 
 pub async fn run_http_tunnel_server(
-    server_port: Option<u16>,
     http_port: u16,
+    control_host: &str,
     token: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    run_http_tunnel_server_with_control_host(server_port, http_port, None, token, shutdown_rx).await
+    run_http_tunnel_server_with_limits(
+        http_port,
+        control_host,
+        token,
+        http_tunnel::ServerLimits::default(),
+        shutdown_rx,
+    )
+    .await
 }
 
-pub async fn run_http_tunnel_server_with_control_host(
-    server_port: Option<u16>,
+pub async fn run_http_tunnel_server_with_limits(
     http_port: u16,
-    control_host: Option<&str>,
+    control_host: &str,
     token: &str,
+    limits: http_tunnel::ServerLimits,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let cmd = http_tunnel::Command::Server(http_tunnel::ServerArgs {
-        server_port,
         http_port,
-        control_host: control_host.map(str::to_string),
+        control_host: control_host.to_string(),
         token: token.to_string(),
         proxies: Vec::new(),
+        limits,
     });
     http_tunnel::run(cmd, shutdown_rx).await
 }

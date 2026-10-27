@@ -1,7 +1,11 @@
 use anyhow::Result;
 use clap::Parser;
 use http_tunnel::{run, Command, ServerArgs, ServerConfig};
-use std::{fs::OpenOptions, path::Path, process::{Command as ProcessCommand, Stdio}};
+use std::{
+    fs::OpenOptions,
+    path::Path,
+    process::{Command as ProcessCommand, Stdio},
+};
 use tokio::{signal, sync::broadcast};
 use tracing_subscriber::EnvFilter;
 
@@ -18,10 +22,14 @@ struct Cli {
 
 fn launch_background() -> Result<()> {
     let exe = std::env::current_exe()?;
-    let log = OpenOptions::new().create(true).append(true).open("hts.log")?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("hts.log")?;
     let err_log = log.try_clone()?;
     let mut command = ProcessCommand::new(exe);
-    command.arg("--background-child")
+    command
+        .arg("--background-child")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(err_log));
@@ -31,7 +39,10 @@ fn launch_background() -> Result<()> {
         command.process_group(0);
     }
     let child = command.spawn()?;
-    println!("Started hts in background (pid {}). Log: hts.log", child.id());
+    println!(
+        "Started hts in background (pid {}). Log: hts.log",
+        child.id()
+    );
     Ok(())
 }
 
@@ -42,12 +53,13 @@ async fn main() -> Result<()> {
         return launch_background();
     }
     let config = ServerConfig::from_file(Path::new("hts.toml")).await?;
+    let limits = (&config).into();
     let cmd = Command::Server(ServerArgs {
-        server_port: config.server_port,
         http_port: config.http_port,
         control_host: config.control_host,
         token: String::from(&*config.token),
         proxies: config.proxies,
+        limits,
     });
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);

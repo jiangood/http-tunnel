@@ -1,6 +1,7 @@
 # HTTP/WebSocket 隧道传输实施计划
 
-> 状态：实施中。阶段 0/1 已完成；阶段 2 已加入 WebSocket 消息/连接上限、握手超时、保留域名冲突防护、连接上限与重连测试。剩余长稳/并发压测、错误 token 用例和按来源限流。详见 [代码路径审查](./http-websocket-transport-code-audit.md)。  
+> 状态：**已完成（v0.21.0）**。WebSocket 已成为唯一传输，TCP 传输和相关配置已移除。阶段 2 的容量与保活已落地：握手前 Token 校验、控制/数据连接分开计数、可配置的预热池、WebSocket ping/pong 保活与池内探活。剩余长稳/并发压测与按来源限流。详见 [代码路径审查](./http-websocket-transport-code-audit.md)。  
+> 历史说明：下文保留最初的设计过程，其中“保留 TCP 模式”等描述已被 v0.21.0 的决定取代。  
 > 目标仓库：`jiangood/http-tunnel`
 
 ## 1. 背景与目标

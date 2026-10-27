@@ -1,7 +1,7 @@
+use crate::config::ServerProxyEntry;
 use crate::helper::normalize_domain;
 use crate::protocol::Digest;
 use crate::server::{HttpVisitor, ServerState};
-use crate::config::ServerProxyEntry;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -17,14 +17,6 @@ use tracing::{debug, error, info, warn};
 const MAX_HEADER_SIZE: usize = 8 * 1024;
 /// Timeout for reading the HTTP header from a visitor
 const HEADER_READ_TIMEOUT: u64 = 5;
-/// Bound persistent control/data WebSocket connections to avoid unbounded task and socket growth.
-const MAX_WEBSOCKET_CONNECTIONS: usize = 256;
-
-fn try_acquire_websocket_permit(
-    semaphore: Arc<tokio::sync::Semaphore>,
-) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
-    semaphore.try_acquire_owned()
-}
 
 /// Maps a `Host` to the digest of the tunnel that serves it. An exact match takes
 /// precedence over a wildcard domain (`*.example.com`), and among the wildcards
@@ -77,7 +69,6 @@ impl RoutingTable {
     }
 }
 
-
 fn find_proxy<'a>(proxies: &'a [ServerProxyEntry], host: &str) -> Option<&'a ServerProxyEntry> {
     let mut wildcard: Option<(&ServerProxyEntry, usize)> = None;
     for proxy in proxies {
@@ -108,7 +99,6 @@ fn find_proxy<'a>(proxies: &'a [ServerProxyEntry], host: &str) -> Option<&'a Ser
 /// Only the first request of a connection is inspected, so routing is connection-level.
 pub(crate) async fn serve(
     l: TcpListener,
-    control_host: Option<String>,
     state: Arc<ServerState>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     proxies: Vec<ServerProxyEntry>,
@@ -117,7 +107,6 @@ pub(crate) async fn serve(
         info!("HTTP listening at {}", addr);
     }
     let proxies = Arc::new(proxies);
-    let websocket_connections = Arc::new(tokio::sync::Semaphore::new(MAX_WEBSOCKET_CONNECTIONS));
 
     loop {
         tokio::select! {
@@ -126,14 +115,10 @@ pub(crate) async fn serve(
                     Ok((stream, addr)) => {
                         let state = state.clone();
                         let proxies = proxies.clone();
-                        let control_host = control_host.clone();
-                        let websocket_connections = websocket_connections.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_visitor(
                                 stream,
                                 addr,
-                                control_host,
-                                websocket_connections,
                                 state,
                                 proxies,
                             ).await {
@@ -155,8 +140,6 @@ pub(crate) async fn serve(
 async fn handle_visitor(
     mut stream: TcpStream,
     addr: SocketAddr,
-    control_host: Option<String>,
-    websocket_connections: Arc<tokio::sync::Semaphore>,
     state: Arc<ServerState>,
     proxies: Arc<Vec<ServerProxyEntry>>,
 ) -> Result<()> {
@@ -191,8 +174,9 @@ async fn handle_visitor(
     };
 
     // Reserve the configured control Host for the internal WebSocket transport.
-    // Host is a routing key only; the existing token handshake still authenticates clients.
-    if control_host.as_deref() == Some(host.as_str()) {
+    // Host is a routing key only; the token in the `Authorization` header
+    // authenticates the upgrade before it can reserve any capacity.
+    if state.control_host == host {
         let path = parse_request_path(&prefetched).unwrap_or_default();
         if path != "/_http-tunnel/v1/connect" {
             respond(&mut stream, "404 Not Found", "Unknown control endpoint\n").await;
@@ -202,10 +186,26 @@ async fn handle_visitor(
             respond_upgrade_required(&mut stream).await;
             return Ok(());
         }
-        let _websocket_permit = match try_acquire_websocket_permit(websocket_connections.clone()) {
+        match parse_bearer_token(&prefetched) {
+            Some(token) if crate::helper::constant_time_eq(token, state.token.as_bytes()) => {}
+            None | Some(_) => {
+                debug!("Rejected an unauthenticated tunnel upgrade from {}", addr);
+                respond_unauthorized_bearer(&mut stream).await;
+                return Ok(());
+            }
+        }
+        // The pending permit only covers the upgrade and the protocol hello.
+        // The control/data permit is taken once the hello tells us which it is,
+        // so unauthenticated or slow handshakes never starve a real channel.
+        let _pending_permit = match state.pending_connections.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                respond(&mut stream, "503 Service Unavailable", "WebSocket connection limit reached\n").await;
+                respond(
+                    &mut stream,
+                    "503 Service Unavailable",
+                    "WebSocket handshake limit reached\n",
+                )
+                .await;
                 return Ok(());
             }
         };
@@ -213,8 +213,12 @@ async fn handle_visitor(
         // Do not include its lifetime in the visitor drain counter: shutdown drops
         // the control channels after draining actual visitor traffic.
         drop(activity);
-        let conn =
-            crate::transport::websocket::accept(prefetched, stream, _websocket_permit).await?;
+        let conn = crate::transport::websocket::accept(
+            prefetched,
+            stream,
+            state.limits.keepalive_interval,
+        )
+        .await?;
         if let Err(e) = crate::server::handle_connection(conn, state).await {
             debug!("Tunnel WebSocket connection closed: {:#}", e);
         }
@@ -222,27 +226,39 @@ async fn handle_visitor(
     }
 
     if let Some(proxy) = find_proxy(&proxies, &host) {
-        let request = match crate::helper::gate_auth_header(
-            &prefetched,
-            proxy.auth_header.as_ref().map(|v| &**v),
-        ) {
-            crate::helper::AuthOutcome::Allowed(request) => request,
-            crate::helper::AuthOutcome::Unauthorized(failure) => {
-                debug!("Rejected an unauthenticated visitor {} for host {}: {:?}", addr, host, failure);
-                respond_unauthorized(&mut stream, failure).await;
-                drop(activity);
-                return Ok(());
-            }
-        };
-        debug!("Proxying visitor {} for host {} to {}", addr, host, proxy.local_addr);
+        let request =
+            match crate::helper::gate_auth_header(&prefetched, proxy.auth_header.as_deref()) {
+                crate::helper::AuthOutcome::Allowed(request) => request,
+                crate::helper::AuthOutcome::Unauthorized(failure) => {
+                    debug!(
+                        "Rejected an unauthenticated visitor {} for host {}: {:?}",
+                        addr, host, failure
+                    );
+                    respond_unauthorized(&mut stream, failure).await;
+                    drop(activity);
+                    return Ok(());
+                }
+            };
+        debug!(
+            "Proxying visitor {} for host {} to {}",
+            addr, host, proxy.local_addr
+        );
         match crate::helper::connect_local(&proxy.local_addr).await {
             Ok(mut upstream) => {
                 upstream.write_all(&request).await?;
                 let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
             }
             Err(e) => {
-                warn!("Failed to connect server-side proxy {} to {}: {}", host, proxy.local_addr, e);
-                respond(&mut stream, "502 Bad Gateway", "The server-side proxy target is unavailable\n").await;
+                warn!(
+                    "Failed to connect server-side proxy {} to {}: {}",
+                    host, proxy.local_addr, e
+                );
+                respond(
+                    &mut stream,
+                    "502 Bad Gateway",
+                    "The server-side proxy target is unavailable\n",
+                )
+                .await;
             }
         }
         drop(activity);
@@ -256,12 +272,7 @@ async fn handle_visitor(
 
     let Some(digest) = digest else {
         debug!("No tunnel for the host `{}`", host);
-        respond(
-            &mut stream,
-            "404 Not Found",
-            "No tunnel for this host\n",
-        )
-        .await;
+        respond(&mut stream, "404 Not Found", "No tunnel for this host\n").await;
         return Ok(());
     };
 
@@ -349,10 +360,9 @@ async fn read_header(stream: &mut TcpStream) -> Result<(Vec<u8>, String), Header
         }
 
         let mut chunk = [0u8; 1024];
-        let n = stream
-            .read(&mut chunk)
-            .await
-            .map_err(|e| HeaderError::bad_request(format!("Failed to read the HTTP header: {e}")))?;
+        let n = stream.read(&mut chunk).await.map_err(|e| {
+            HeaderError::bad_request(format!("Failed to read the HTTP header: {e}"))
+        })?;
         if n == 0 {
             return Err(HeaderError::bad_request(
                 "The connection was closed before the HTTP header was complete",
@@ -374,6 +384,32 @@ fn parse_request_path(head: &[u8]) -> Option<String> {
         return None;
     }
     Some(target.split('?').next()?.to_string())
+}
+
+/// The token of an `Authorization: Bearer <token>` header, if the request has
+/// one. The tunnel clients send the shared token here so the server can reject
+/// an unauthenticated upgrade before reserving a connection slot.
+fn parse_bearer_token(head: &[u8]) -> Option<&[u8]> {
+    for raw in head.split(|&b| b == b'\n').skip(1) {
+        let line = strip_cr(raw);
+        if line.is_empty() {
+            break;
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        if !trim_ascii(&line[..colon]).eq_ignore_ascii_case(b"authorization") {
+            continue;
+        }
+        let value = trim_ascii(&line[colon + 1..]);
+        if value.len() > 7 && value[..7].eq_ignore_ascii_case(b"Bearer ") {
+            let token = trim_ascii(&value[7..]);
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
+    }
+    None
 }
 
 fn is_websocket_upgrade(head: &[u8]) -> bool {
@@ -442,8 +478,9 @@ fn parse_host(head: &[u8]) -> Result<String, HeaderError> {
     // An absolute-form request-target (`GET http://host/path HTTP/1.1`) carries
     // the authority itself; the `Host` header, if any, must be ignored.
     if let Some(authority) = absolute_form_authority(request_line) {
-        return normalize_domain_bytes(authority)
-            .ok_or_else(|| HeaderError::bad_request("The `Host` in the request target is invalid"));
+        return normalize_domain_bytes(authority).ok_or_else(|| {
+            HeaderError::bad_request("The `Host` in the request target is invalid")
+        });
     }
 
     let mut host: Option<String> = None;
@@ -564,6 +601,17 @@ async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let _ = stream.flush().await;
 }
 
+/// The `401` sent when a tunnel upgrade does not carry the shared token.
+async fn respond_unauthorized_bearer(stream: &mut TcpStream) {
+    let response = response_with_headers(
+        "401 Unauthorized",
+        &[("WWW-Authenticate", "Bearer")],
+        "Missing or invalid Authorization header\n",
+    );
+    let _ = stream.write_all(&response).await;
+    let _ = stream.flush().await;
+}
+
 /// The `426` sent when the control host is reached without a WebSocket upgrade.
 /// RFC 7231 §6.5.15 requires the response to list the acceptable protocols in
 /// an `Upgrade` header.
@@ -582,12 +630,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn websocket_connection_permit_is_released_after_close() {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = try_acquire_websocket_permit(semaphore.clone()).unwrap();
-        assert!(try_acquire_websocket_permit(semaphore.clone()).is_err());
-        drop(permit);
-        assert!(try_acquire_websocket_permit(semaphore).is_ok());
+    fn test_parse_bearer_token() {
+        let head = b"GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\nAuthorization: Bearer secret-token\r\n\r\n";
+        assert_eq!(parse_bearer_token(head), Some(&b"secret-token"[..]));
+
+        // The scheme is case-insensitive
+        let head = b"GET / HTTP/1.1\r\nAuthorization: bearer secret\r\n\r\n";
+        assert_eq!(parse_bearer_token(head), Some(&b"secret"[..]));
+
+        let head = b"GET / HTTP/1.1\r\nAuthorization: Basic abc\r\n\r\n";
+        assert_eq!(parse_bearer_token(head), None);
+
+        let head = b"GET / HTTP/1.1\r\nAuthorization: Bearer\r\n\r\n";
+        assert_eq!(parse_bearer_token(head), None);
+
+        let head = b"GET / HTTP/1.1\r\nHost: control.test\r\n\r\n";
+        assert_eq!(parse_bearer_token(head), None);
     }
 
     #[test]
@@ -600,21 +658,31 @@ mod tests {
         let response = String::from_utf8(response).unwrap();
         assert!(response.starts_with("HTTP/1.1 426 Upgrade Required\r\n"));
         // RFC 7231 §6.5.15 requires the acceptable protocols in `Upgrade`.
-        assert!(response.contains("\r\nUpgrade: websocket\r\n"), "{}", response);
+        assert!(
+            response.contains("\r\nUpgrade: websocket\r\n"),
+            "{}",
+            response
+        );
     }
 
     #[test]
     fn test_parse_request_path() {
         assert_eq!(
-            parse_request_path(b"GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\n\r\n"),
+            parse_request_path(
+                b"GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\n\r\n"
+            ),
             Some("/_http-tunnel/v1/connect".to_string())
         );
         assert_eq!(
-            parse_request_path(b"GET /_http-tunnel/v1/connect?x=1 HTTP/1.1\r\nHost: control.test\r\n\r\n"),
+            parse_request_path(
+                b"GET /_http-tunnel/v1/connect?x=1 HTTP/1.1\r\nHost: control.test\r\n\r\n"
+            ),
             Some("/_http-tunnel/v1/connect".to_string())
         );
         assert_eq!(
-            parse_request_path(b"POST /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\n\r\n"),
+            parse_request_path(
+                b"POST /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\n\r\n"
+            ),
             None
         );
     }

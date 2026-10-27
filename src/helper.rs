@@ -1,8 +1,6 @@
-use anyhow::{anyhow, Context, Result};
-use backoff::{backoff::Backoff, Notify};
-use std::{future::Future, net::SocketAddr};
+use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::net::{lookup_host, TcpStream, ToSocketAddrs};
+use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
@@ -14,8 +12,9 @@ pub async fn connect_local(addr: &str) -> Result<BoxLocalIo> {
     if let Some(path) = addr.strip_prefix("unix://") {
         #[cfg(unix)]
         {
-            return Ok(Box::new(UnixStream::connect(path).await
-                .with_context(|| format!("Failed to connect to Unix socket {}", path))?));
+            return Ok(Box::new(UnixStream::connect(path).await.with_context(
+                || format!("Failed to connect to Unix socket {}", path),
+            )?));
         }
         #[cfg(not(unix))]
         {
@@ -23,8 +22,9 @@ pub async fn connect_local(addr: &str) -> Result<BoxLocalIo> {
             anyhow::bail!("Unix sockets are not supported on this platform");
         }
     }
-    Ok(Box::new(TcpStream::connect(addr).await
-        .with_context(|| format!("Failed to connect to local TCP service {}", addr))?))
+    Ok(Box::new(TcpStream::connect(addr).await.with_context(
+        || format!("Failed to connect to local TCP service {}", addr),
+    )?))
 }
 
 /// The request header a visitor must present when a tunnel sets `auth_header`.
@@ -91,7 +91,9 @@ pub fn gate_auth_header(header: &[u8], auth: Option<&str>) -> AuthOutcome {
     }
     for raw in lines {
         let line = raw.strip_suffix(b"\r").unwrap_or(raw);
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
         match line.iter().position(|b| *b == b':') {
             Some(colon) if line[..colon].eq_ignore_ascii_case(AUTH_HEADER_NAME.as_bytes()) => {
                 present = true;
@@ -123,17 +125,25 @@ pub fn gate_auth_header(header: &[u8], auth: Option<&str>) -> AuthOutcome {
 /// Trim ASCII whitespace (spaces and tabs) from both ends of a byte slice
 fn trim_ascii(mut s: &[u8]) -> &[u8] {
     while let Some((first, rest)) = s.split_first() {
-        if first.is_ascii_whitespace() { s = rest; } else { break; }
+        if first.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
     }
     while let Some((last, rest)) = s.split_last() {
-        if last.is_ascii_whitespace() { s = rest; } else { break; }
+        if last.is_ascii_whitespace() {
+            s = rest;
+        } else {
+            break;
+        }
     }
     s
 }
 
 /// Compare two byte strings without an early exit, so that the comparison time
 /// does not reveal how many leading bytes of the secret matched.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -143,21 +153,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     }
     diff == 0
 }
-use tokio::sync::broadcast;
-
 #[allow(dead_code)]
 pub fn feature_not_compile(feature: &str) -> ! {
     panic!(
         "The feature '{}' is not compiled in this binary. Please re-compile http-tunnel",
         feature
     )
-}
-
-pub async fn to_socket_addr<A: ToSocketAddrs>(addr: A) -> Result<SocketAddr> {
-    lookup_host(addr)
-        .await?
-        .next()
-        .ok_or_else(|| anyhow!("Failed to lookup the host"))
 }
 
 /// Format the socket address of a port. The host is always `0.0.0.0`, so that
@@ -227,30 +228,6 @@ pub fn normalize_domain(raw: &str) -> Option<String> {
     Some(host.to_lowercase())
 }
 
-// Wrapper of retry_notify
-pub async fn retry_notify_with_deadline<I, E, Fn, Fut, B, N>(
-    backoff: B,
-    operation: Fn,
-    notify: N,
-    deadline: &mut broadcast::Receiver<bool>,
-) -> Result<I>
-where
-    E: std::error::Error + Send + Sync + 'static,
-    B: Backoff,
-    Fn: FnMut() -> Fut,
-    Fut: Future<Output = std::result::Result<I, backoff::Error<E>>>,
-    N: Notify<E>,
-{
-    tokio::select! {
-        v = backoff::future::retry_notify(backoff, operation, notify) => {
-            v.map_err(anyhow::Error::new)
-        }
-        _ = deadline.recv() => {
-            Err(anyhow!("shutdown"))
-        }
-    }
-}
-
 pub async fn write_and_flush<T>(conn: &mut T, data: &[u8]) -> Result<()>
 where
     T: AsyncWrite + Unpin,
@@ -292,7 +269,8 @@ mod tests {
 
     #[test]
     fn test_gate_auth_header_accepts_and_strips_the_token() {
-        let head = b"GET / HTTP/1.1\r\nHost: a.test\r\nX-HTTP-TUNNEL-TOKEN: s3cret\r\nAccept: */*\r\n\r\n";
+        let head =
+            b"GET / HTTP/1.1\r\nHost: a.test\r\nX-HTTP-TUNNEL-TOKEN: s3cret\r\nAccept: */*\r\n\r\n";
         let out = String::from_utf8(allowed(gate_auth_header(head, Some("s3cret")))).unwrap();
         assert!(out.contains("Host: a.test\r\n"));
         assert!(out.contains("Accept: */*\r\n"));
@@ -303,34 +281,53 @@ mod tests {
     #[test]
     fn test_gate_auth_header_name_is_case_insensitive() {
         let head = b"GET / HTTP/1.1\r\nhost: a.test\r\nx-http-tunnel-token: abc\r\n\r\n";
-        assert!(matches!(gate_auth_header(head, Some("abc")), AuthOutcome::Allowed(_)));
+        assert!(matches!(
+            gate_auth_header(head, Some("abc")),
+            AuthOutcome::Allowed(_)
+        ));
     }
 
     #[test]
     fn test_gate_auth_header_tolerates_value_whitespace() {
         let head = b"GET / HTTP/1.1\r\nHost: a.test\r\nX-HTTP-TUNNEL-TOKEN:   abc \r\n\r\n";
-        assert!(matches!(gate_auth_header(head, Some("abc")), AuthOutcome::Allowed(_)));
+        assert!(matches!(
+            gate_auth_header(head, Some("abc")),
+            AuthOutcome::Allowed(_)
+        ));
     }
 
     #[test]
     fn test_gate_auth_header_reports_the_reason() {
         // No header at all: the visitor is told it is missing
         let missing = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n";
-        assert_eq!(rejected(gate_auth_header(missing, Some("s3cret"))), AuthFailure::Missing);
+        assert_eq!(
+            rejected(gate_auth_header(missing, Some("s3cret"))),
+            AuthFailure::Missing
+        );
 
         // A header that does not match: the visitor is told it is invalid
         let wrong = b"GET / HTTP/1.1\r\nHost: a.test\r\nX-HTTP-TUNNEL-TOKEN: nope\r\n\r\n";
-        assert_eq!(rejected(gate_auth_header(wrong, Some("s3cret"))), AuthFailure::Invalid);
+        assert_eq!(
+            rejected(gate_auth_header(wrong, Some("s3cret"))),
+            AuthFailure::Invalid
+        );
 
         // An incomplete head cannot be inspected, so it is reported as missing
         let partial = b"GET / HTTP/1.1\r\nHost: a.test\r\n";
-        assert_eq!(rejected(gate_auth_header(partial, Some("s3cret"))), AuthFailure::Missing);
+        assert_eq!(
+            rejected(gate_auth_header(partial, Some("s3cret"))),
+            AuthFailure::Missing
+        );
     }
 
     #[test]
     fn test_auth_failure_messages_name_the_header() {
-        assert!(AuthFailure::Missing.message().contains("X-HTTP-TUNNEL-TOKEN"));
-        assert!(AuthFailure::Invalid.message().contains("X-HTTP-TUNNEL-TOKEN"));
+        assert!(AuthFailure::Missing
+            .message()
+            .contains("X-HTTP-TUNNEL-TOKEN"));
+        assert!(AuthFailure::Invalid
+            .message()
+            .contains("X-HTTP-TUNNEL-TOKEN"));
         assert!(AuthFailure::Missing.message().ends_with('\n'));
         assert!(AuthFailure::Invalid.message().ends_with('\n'));
     }

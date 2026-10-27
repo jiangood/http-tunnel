@@ -1,7 +1,11 @@
 use anyhow::Result;
 use clap::Parser;
 use http_tunnel::{run, ClientArgs, Command};
-use std::{fs::OpenOptions, path::PathBuf, process::{Command as ProcessCommand, Stdio}};
+use std::{
+    fs::OpenOptions,
+    path::PathBuf,
+    process::{Command as ProcessCommand, Stdio},
+};
 use tokio::{signal, sync::broadcast};
 use tracing_subscriber::EnvFilter;
 
@@ -18,10 +22,14 @@ struct Cli {
 
 fn launch_background() -> Result<()> {
     let exe = std::env::current_exe()?;
-    let log = OpenOptions::new().create(true).append(true).open("htc.log")?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("htc.log")?;
     let err_log = log.try_clone()?;
     let mut command = ProcessCommand::new(exe);
-    command.arg("--background-child")
+    command
+        .arg("--background-child")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(err_log));
@@ -31,7 +39,10 @@ fn launch_background() -> Result<()> {
         command.process_group(0);
     }
     let child = command.spawn()?;
-    println!("Started htc in background (pid {}). Log: htc.log", child.id());
+    println!(
+        "Started htc in background (pid {}). Log: htc.log",
+        child.id()
+    );
     Ok(())
 }
 

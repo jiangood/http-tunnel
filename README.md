@@ -4,15 +4,20 @@
 [![Build](https://img.shields.io/github/actions/workflow/status/jiangood/http-tunnel/rust-checks.yml?branch=main)](https://github.com/jiangood/http-tunnel/actions)
 [![License](https://img.shields.io/github/license/jiangood/http-tunnel)](./LICENSE)
 
-**http-tunnel** 是一个基于 Rust 的 HTTP 反向隧道工具，可将内网服务通过公网服务器对外提供访问。服务端根据 HTTP `Host` 头路由请求，客户端负责声明转发规则。
+**http-tunnel** 是一个基于 Rust 的 HTTP 反向隧道工具，可将内网服务通过公网服务器对外提供访问。服务端根据 HTTP `Host` 头路由请求，客户端负责声明转发规则。客户端与服务端之间的隧道只使用 WebSocket（`ws://` / `wss://`），服务端不需要额外的 TCP 端口。
 
 ## 功能
 
 - 多域名和泛域名路由
-- 支持 WebSocket 和 HTTP 协议升级，WebSocket 传输支持 `wss://`（TLS）
+- 隧道只使用 WebSocket，支持 `wss://`（TLS，默认）和 `ws://`（明文，仅限可信网络）
 - 支持服务端直连代理和客户端隧道
 - 支持 TCP 地址和 Unix Socket
 - 可为转发规则开启入口校验，要求访客携带 `X-HTTP-TUNNEL-TOKEN`
+- 控制连接与数据连接的容量分开计数，避免流量突发挤掉控制通道
+- WebSocket ping/pong 保活，空闲数据通道不会被反向代理静默断开
+- 握手前使用 `Authorization: Bearer` 校验共享 Token，未认证连接不占容量
+
+> **不兼容变更（v0.21.0）：** TCP 传输已移除。旧配置中的 `transport = "tcp"` 和 `hts.toml` 中的 `server_port` 不再支持；请改用 WebSocket 配置（见下文迁移说明）。
 
 ## 快速开始
 
@@ -26,12 +31,13 @@
 ./hts
 ```
 
-把生成的 `token` 填到 `htc.toml`，其余字段可按需调整：
+编辑配置：
 
 ```toml
-server_port = 2333
 http_port = 80
 token = "自动生成的随机强密钥"
+# 必填：客户端专用的控制域名，必须解析到本机
+control_host = "control.example.com"
 
 # 可选：将指定域名转发到服务端本机的服务
 [[proxies]]
@@ -40,7 +46,9 @@ domain = "grafana.example.com"
 local_addr = "127.0.0.1:3000"
 ```
 
-再次运行 `./hts` 启动服务端。客户端连接端口默认为 `2333`，HTTP 访问端口默认为 `80`。
+再次运行 `./hts` 启动服务端。服务端只监听 `http_port`，控制连接和业务请求共用这个端口。
+
+`control_host` 是流量的分流键：命中该 Host 且路径为 `/_http-tunnel/v1/connect` 的请求会走隧道协议，其余 Host 仍按业务域名路由。它必须是一个精确域名（不能是泛域名），并且不能与任何 `[[proxies]]` 或客户端隧道域名重叠。
 
 ### 2. 配置客户端
 
@@ -50,11 +58,12 @@ local_addr = "127.0.0.1:3000"
 ./htc
 ```
 
-编辑配置，填写服务端地址、与服务端相同的 `token` 和转发规则：
+编辑配置，填写控制域名、服务端 HTTP 端口、与服务端相同的 `token` 和转发规则：
 
 ```toml
-server_host = "your-server.example.com"
-server_port = 2333
+transport = "wss"                 # 默认值；可信网络可用 "ws"
+server_host = "control.example.com" # 服务端 hts.toml 的 control_host
+server_port = 443                  # 服务端 hts.toml 的 http_port
 name = "home"
 token = "与服务端相同的密钥"
 web_port = 8610
@@ -65,80 +74,79 @@ domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
 ```
 
-`server_host` 和 `server_port` 必须同时填写。默认的 TCP 模式下，`server_port` 就是服务端 `hts.toml` 的 `server_port`。
+再次运行 `./htc` 启动客户端。之后访问 `https://nas.example.com`，请求会转发到客户端的本地服务。
 
-> 旧配置中的 `remote = "host:port"` 已移除；启动时会提示改用 `server_host` 和 `server_port`。
+> 旧配置中的 `remote = "host:port"` 已移除；启动时会提示改用 `server_host` 和 `server_port`。旧版本的 `transport = "websocket"` 仍等价于 `ws`。
 
-再次运行 `./htc` 启动客户端。之后访问 `http://nas.example.com`，请求会转发到客户端的本地服务。
+## 传输模式与 TLS
 
-## WebSocket 传输模式（实验性）
-
-默认客户端仍使用原有 TCP 传输（服务端默认 2333 端口）。如果客户端无法连接该 TCP 端口，可以选择通过服务端 HTTP 入口建立 WebSocket 连接；服务端和客户端均不需要新增公网端口，也不需要 Nginx。
-
-在 hts.toml 中为控制连接预留一个独立域名：
-
-```toml
-server_port = 2333
-http_port = 80
-control_host = "control.example.com"
-token = "与客户端相同的随机强密钥"
-```
-
-确保 control.example.com 的 DNS 记录指向服务端。在 htc.toml 中，把 `server_host` 设为该控制域名，`server_port` 设为服务端 HTTP 入口端口（`http_port`，不是 `server_port`），并启用 WebSocket：
-
-```toml
-server_host = "control.example.com"
-server_port = 80
-transport = "ws"
-name = "home"
-token = "与服务端相同的随机强密钥"
-
-[[tunnels]]
-name = "nas"
-domain = "nas.example.com"
-local_addr = "127.0.0.1:80"
-```
-
-> 注意：WebSocket 模式下 `server_port` 填的是服务端的 `http_port`（上例为 `80`），`server_host` 必须与服务端的 `control_host` 一致。启动日志会明确打印当前使用的传输模式和连接地址。
-
-如果服务端 HTTP 入口是 HTTPS（例如由 Nginx、云负载均衡或安全网关终止 TLS），把 `transport` 写成 `wss` 即可（任何端口），客户端会完成 TLS 握手并校验服务端证书：
-
-```toml
-server_host = "control.example.com"
-server_port = 443
-transport = "wss"          # 使用 wss://
-```
-
-`transport` 的取值：
+隧道只支持 WebSocket，`transport` 仅用于选择是否使用 TLS：
 
 | 值 | 含义 |
 | --- | --- |
-| `tcp`（默认） | 原始 TCP 传输，连服务端 `server_port` |
-| `ws` | WebSocket 传输，明文 `ws://` |
-| `wss` | WebSocket 传输，TLS `wss://` |
+| `wss`（默认） | TLS WebSocket，公网部署必须使用 |
+| `ws` | 明文 WebSocket，仅适合可信网络或本地测试 |
 
-协议只由 `transport` 决定，不再根据端口自动推断。旧版本写的 `transport = "websocket"` 仍可用，等价于 `ws`。
+`wss` 依赖可信的 TLS 终止层（Nginx、Caddy、云负载均衡或安全网关）提供服务端证书。客户端会校验服务端证书，证书的 `subjectAltName` 必须包含 `server_host`。服务端本身不申请证书，也不监听明文以外的端口。
 
-TLS 证书的 `subjectAltName` 必须包含 `server_host`，否则握手会因证书校验失败而报错。
+Nginx 终止 TLS 的示例（`proxy_read_timeout` 必须大于客户端 `keepalive_interval`，否则空闲数据通道会被代理断开）：
 
-控制域名仅用于内部控制与数据连接；普通业务域名（例如 nas.example.com）继续通过 http_port 进入现有 Host 路由。服务端会根据 Host 和专用路径 /_http-tunnel/v1/connect 识别 WebSocket 连接，并直接交给隧道协议处理器。原来的 2333/TCP 模式不受影响。
+```nginx
+server {
+    listen 443 ssl;
+    server_name control.example.com;
 
-如果服务端完全不需要 TCP 端口，**在 `hts.toml` 中不写 `server_port` 这一行**即可关闭该监听；此时 `control_host` 必须配置，否则服务端没有客户端入口，启动时会直接报错。注意默认模板里带着 `server_port = 2333`，要关闭就得把它删掉（写成 `0` 会被拒绝）：
+    ssl_certificate     /etc/letsencrypt/live/control.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/control.example.com/privkey.pem;
 
-```toml
-# hts.toml 中不写 server_port，即不监听 TCP，只接受 WebSocket 控制连接
-http_port = 80
-control_host = "control.example.com"
-token = "与客户端相同的随机强密钥"
+    location / {
+        proxy_pass http://127.0.0.1:80;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_buffering off;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+    }
+}
 ```
 
-WebSocket 连接不再经过本地 2333 回环桥接，因此进程也不需要占用任何本地 TCP 端口（除了 `http_port`）。
+**不要在入口上开启“HTTP 强制跳转 HTTPS”**：WebSocket 客户端不会跟随 301/308 重定向，隧道会直接连不上。要启用 HTTPS 就把客户端也切到 `wss://`。
 
-**安全提示：** 明文 `ws://` 下 Token、控制消息和隧道数据可能被网络中间方读取或篡改，仅适合可信网络或测试环境。公网部署应让服务端 HTTP 入口走 TLS（由 Nginx、云负载均衡或安全网关终止证书），客户端使用 `transport = "wss"`（或将 `server_port` 设为 `443`），此时客户端使用 `wss://` 并校验服务端证书，链路由 TLS 保护。**注意：不要在入口上开启“HTTP 强制跳转 HTTPS”**——`ws://` 客户端不会跟随 301/308 重定向，隧道会直接连不上；要启用 HTTPS 就把客户端也切到 `wss://`。`control_host` 只是路由配置，不是身份认证；服务端仍会验证共享 Token。
+**安全提示：** 明文 `ws://` 下 Token、控制消息和隧道数据都可能被网络中间方读取或篡改。公网部署必须让服务端 HTTP 入口走 TLS，并在客户端使用 `transport = "wss"`。`control_host` 只是路由配置，不是身份认证；服务端仍会校验共享 Token。
 
-资源保护：单个 WebSocket 帧/消息最大 1 MiB，服务端最多允许 256 条活动 WebSocket 连接（控制通道与数据通道合计）；HTTP WebSocket 握手最长等待 10 秒，隧道协议 ClientHello 读取最长等待 5 秒。达到连接上限时，新连接会收到 503。当前上限是实验性版本的固定值，尚未提供配置项。
+### 从 TCP 迁移
 
-该模式目前是实验性功能，部署前请通过测试环境验证长连接、代理兼容性和断线重连行为。
+1. 在 `hts.toml` 中删除 `server_port`，添加 `control_host`（指向服务端的一个域名）。
+2. 在 `htc.toml` 中设置 `transport = "wss"`（或 `ws`），把 `server_host` 改成 `control_host`，把 `server_port` 改成服务端的 `http_port`。
+3. 删除旧的 2333 端口映射/防火墙放行规则；只需保留 HTTP 入口端口。
+4. 为 `control_host` 配置 TLS 证书（或让反向代理终止 TLS）。
+
+## 资源限制与保活
+
+所有限制都可以在 `hts.toml` 中配置，默认值适合大多数部署：
+
+```toml
+# 已认证但尚未发送协议 ClientHello 的升级数
+max_pending_handshakes = 256
+# 控制通道上限（每个隧道 1 条）
+max_control_connections = 256
+# 数据通道上限（预热池 + 正在转发）
+max_data_connections = 2048
+# 每个隧道的预热池下限与上限
+pool_min = 4
+pool_max = 32
+# WebSocket ping 间隔（秒），0 关闭保活
+keepalive_interval = 15
+```
+
+- 控制连接与数据连接使用独立的额度，数据流量突发不会挤掉其他客户端的控制通道。
+- 未认证的升级在 `Authorization: Bearer` 校验失败时直接返回 `401`，不会占用上述额度。
+- 超过 `max_pending_handshakes` 时返回 `503`；握手最长等待 10 秒，协议 `ClientHello` 最长等待 5 秒。
+- 单个 WebSocket 帧/消息最大 1 MiB。
+- 每个 WebSocket 连接每 `keepalive_interval` 秒发送一次 ping；连续 3 个间隔没有收到任何帧就关闭连接，并从预热池中剔除，避免把已被代理断开的通道交给访客。
+- 服务端仍会发送控制通道的应用层心跳（30 秒），作为保活的第二层保护。
 
 ## 转发配置
 
@@ -190,7 +198,7 @@ auth_header = "请替换为一个足够长的随机密钥"
 
 ## Docker
 
-服务端和客户端使用独立镜像：`ghcr.io/jiangood/hts:latest`（服务端）和 `ghcr.io/jiangood/htc:latest`（客户端），目前仅发布 `linux/amd64` 架构，其他架构请参考 [build-guide.md](./docs/build-guide.md) 自行构建。生产环境建议把 `:latest` 换成具体版本标签（例如 `:v1.2.3`），避免自动升级带来意外变更。
+服务端和客户端使用独立镜像：`ghcr.io/jiangood/hts:latest`（服务端）和 `ghcr.io/jiangood/htc:latest`（客户端），目前仅发布 `linux/amd64` 架构，其他架构请参考 [build-guide.md](./docs/build-guide.md) 自行构建。生产环境建议把 `:latest` 换成具体版本标签（例如 `:v0.21.0`），避免自动升级带来意外变更。
 
 两个程序都固定读取工作目录 `/app` 下的 `hts.toml` / `htc.toml`，所以只需要把宿主机上的配置目录挂载到容器的 `/app`。
 
@@ -203,14 +211,14 @@ mkdir -p /opt/hts /opt/htc
 docker run --rm -v /opt/hts:/app ghcr.io/jiangood/hts:latest
 ```
 
-把输出中的 `token` 填入 `htc.toml`。客户端配置可以先 `docker run --rm -v /opt/htc:/app ghcr.io/jiangood/htc:latest` 生成模板，再按 [快速开始](#快速开始) 的说明修改 `server_host`、`server_port`、`token`、`[[tunnels]]` 等字段。
+把输出中的 `token` 填入 `htc.toml`，并按 [快速开始](#快速开始) 的说明修改 `control_host`、`http_port`、`transport`、`[[tunnels]]` 等字段。
 
 ### 2. docker run
 
-启动服务端：
+启动服务端（只暴露 HTTP 入口；如果由 Nginx 终止 TLS，就只映射 80 到本机）：
 
 ```sh
-docker run -d --name hts --restart unless-stopped   -p 2333:2333 -p 80:80   -v "/opt/hts:/app/"   ghcr.io/jiangood/hts:latest
+docker run -d --name hts --restart unless-stopped   -p 80:80   -v "/opt/hts:/app/"   ghcr.io/jiangood/hts:latest
 ```
 
 启动客户端：
@@ -219,7 +227,7 @@ docker run -d --name hts --restart unless-stopped   -p 2333:2333 -p 80:80   -v "
 docker run -d --name htc --restart unless-stopped   -v "/opt/htc:/app/"   ghcr.io/jiangood/htc:latest
 ```
 
-如果需要代理 unix sock，例如docker api，还需要 参数 `-v /var/run/docker.sock:/var/run/docker.sock`
+如果需要代理 unix sock，例如 Docker API，还需要参数 `-v /var/run/docker.sock:/var/run/docker.sock`
 
 ### 3. docker-compose
 
@@ -232,7 +240,6 @@ services:
     container_name: hts
     restart: unless-stopped
     ports:
-      - "2333:2333"   # 客户端控制连接，需与 hts.toml 的 server_port 一致
       - "80:80"       # HTTP 入口，需与 hts.toml 的 http_port 一致
     volumes:
       - /opt/hts:/app
@@ -265,13 +272,13 @@ docker compose up -d
 docker compose logs -f      # 查看日志
 ```
 
-如果只是在一台机器上试用，可以把两段合并到同一个 `docker-compose.yml`，把 `htc.toml` 的 `server_host` 写成 `hts`（compose 服务名）、`server_port` 写成 `2333`，两者仍分别挂载各自的配置目录。
+如果只是在一台机器上试用，可以把两段合并到同一个 `docker-compose.yml`，把 `htc.toml` 的 `server_host` 写成 `hts`（compose 服务名）、`server_port` 写成服务端 `http_port`，两者仍分别挂载各自的配置目录。
 
 注意事项：
 
-- 端口映射必须与配置保持一致：服务端 `server_port`（默认 `2333`）、`http_port`（默认 `80`），客户端 `web_port`（默认 `8610`）。改了配置也要同步改 `docker-compose.yml`。
+- 端口映射必须与配置保持一致：服务端只有 `http_port`（默认 `80`），客户端只有 `web_port`（默认 `8610`）。
 - 客户端配置中的 `local_addr` 在客户端容器内解析：`127.0.0.1:80` 指的是客户端容器本身，不是宿主机。转发宿主机服务请用 `host.docker.internal:<端口>`（Linux 需 `extra_hosts`）或宿主机的内网 IP，转发同一 compose 中的容器用服务名。
-- 使用 WebSocket 传输模式时，客户端不需要入站端口；服务端的 `2333` 也不必对公网开放，可以删掉该端口映射，只保留 `http_port`，并把 `htc.toml` 的 `server_host` 指向控制域名（例如 `control.example.com`）、`server_port` 指向 HTTP 入口端口（例如 `80`），同时设置 `transport = "ws"`（HTTPS 入口则用 `"wss"`）。如果从 `hts.toml` 中删掉 `server_port`，服务端根本不会监听该端口，端口映射可以整条删除。
+- 客户端不需要任何入站端口（`web_port` 除外），服务端只需要 `http_port`。
 - 日志输出到容器标准输出，使用 `docker compose logs -f hts` 或 `docker logs htc` 查看，不需要额外挂载日志文件。
 
 ## 许可证

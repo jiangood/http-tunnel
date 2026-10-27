@@ -1,5 +1,6 @@
-server_host = "example.com" # The host of the server
-server_port = 2333 # The control port: server_port for TCP, http_port for WebSocket
+transport = "wss" # The WebSocket scheme: wss (TLS, default) or ws (plain text)
+server_host = "control.example.com" # The control_host of the server
+server_port = 443 # The http_port of the server
 name = "home" # The name of the client
 token = "use_a_secret_that_only_you_know" # The shared token of the server
 web_port = 8610 # The port of the client web management interface

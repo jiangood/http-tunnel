@@ -13,6 +13,21 @@ const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 40;
 /// The interval between retries to connect to the server
 const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
 
+/// The default WebSocket ping interval in secs. Kept well below the usual 60 s
+/// idle timeout of a reverse proxy or CDN.
+const DEFAULT_KEEPALIVE_INTERVAL_SECS: u64 = 15;
+
+/// The default number of unauthenticated WebSocket upgrades a server runs at once.
+pub const DEFAULT_MAX_PENDING_HANDSHAKES: usize = 256;
+/// The default number of control channels a server accepts at once.
+pub const DEFAULT_MAX_CONTROL_CONNECTIONS: usize = 256;
+/// The default number of data channels a server accepts at once.
+pub const DEFAULT_MAX_DATA_CONNECTIONS: usize = 2048;
+/// The default number of warm data channels kept per tunnel.
+pub const DEFAULT_POOL_MIN: usize = 4;
+/// The default upper bound of the warm data channels of one tunnel.
+pub const DEFAULT_POOL_MAX: usize = 32;
+
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
 #[derive(Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
@@ -59,7 +74,8 @@ pub struct ClientTunnelConfig {
     /// The address of the local service on the client side
     pub local_addr: String,
     pub auth_header: Option<MaskedString>,
-    /// Whether to enable TCP_NODELAY
+    /// Deprecated: WebSocket sockets always use TCP_NODELAY. Kept so that old
+    /// configurations stay valid.
     pub nodelay: bool,
     /// The interval between retries to connect to the server
     pub retry_interval: u64,
@@ -86,17 +102,16 @@ pub struct TunnelEntry {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
-    /// The host of the server, e.g. `example.com`, `127.0.0.1` or `::1`.
-    /// With the WebSocket transport it must be the `control_host` of the server.
+    /// The host of the server, e.g. `example.com`, `127.0.0.1` or `::1`. It must
+    /// be the `control_host` of the server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_host: Option<String>,
-    /// The control port of the server. With the TCP transport it is the
-    /// `server_port` of the server; with the WebSocket transport it is its
-    /// `http_port`.
+    /// The port of the server HTTP entrypoint, i.e. its `http_port`. Named
+    /// `server_port` for compatibility with the earlier TCP transport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_port: Option<u16>,
-    /// Optional transport mode: `tcp` (the default), `ws` (plain WebSocket) or
-    /// `wss` (WebSocket over TLS). The legacy value `websocket` means `ws`.
+    /// The WebSocket scheme: `wss` (the default, TLS) or `ws` (plain text,
+    /// only for trusted networks). The legacy value `websocket` means `ws`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
     /// The name of the client. It's used for logging and to warn when a domain
@@ -112,10 +127,14 @@ pub struct ClientConfig {
     /// Application-layer heartbeat timeout in secs. 0 disables the test
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat_timeout: Option<u64>,
+    /// WebSocket ping interval in secs. 0 disables the keepalive pings
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_interval: Option<u64>,
     /// The interval between retries to connect to the server
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_interval: Option<u64>,
-    /// Whether to enable TCP_NODELAY for the tunnels of this client
+    /// Deprecated: WebSocket sockets always use TCP_NODELAY. Accepted for
+    /// compatibility with configurations written for the TCP transport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodelay: Option<bool>,
     /// The tunnels declared by the client
@@ -150,14 +169,23 @@ impl ClientConfig {
         self.nodelay.unwrap_or(true)
     }
 
-    /// Whether the WebSocket transport is configured (`ws` or `wss`)
-    pub fn is_websocket(&self) -> bool {
-        matches!(self.transport.as_deref(), Some("ws") | Some("wss"))
+    /// The WebSocket scheme, `wss` unless `ws` is configured explicitly.
+    pub fn transport_name(&self) -> &str {
+        match self.transport.as_deref() {
+            Some("ws") => "ws",
+            _ => "wss",
+        }
     }
 
-    /// Whether the WebSocket transport uses TLS (`wss`)
+    /// Whether the WebSocket connection uses TLS. TLS is the default.
     pub fn tls(&self) -> bool {
-        self.transport.as_deref() == Some("wss")
+        self.transport_name() == "wss"
+    }
+
+    /// The WebSocket ping interval in secs, `0` meaning disabled
+    pub fn keepalive_interval(&self) -> u64 {
+        self.keepalive_interval
+            .unwrap_or(DEFAULT_KEEPALIVE_INTERVAL_SECS)
     }
 
     /// The resolved tunnels, sorted by name for a stable order
@@ -253,7 +281,8 @@ impl ClientConfig {
                 .with_context(|| format!("The configuration {:?} is invalid", path)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let example = client_config_example();
-                fs::write(path, example).await
+                fs::write(path, example)
+                    .await
                     .with_context(|| format!("Failed to generate default config {:?}", path))?;
                 bail!(
                     "Generated {:?}. Edit it with your server address, shared token and tunnel settings, then restart htc.",
@@ -275,8 +304,14 @@ impl ClientConfig {
             if transport == "websocket" {
                 *transport = "ws".to_string();
             }
-            if transport != "tcp" && transport != "ws" && transport != "wss" {
-                bail!("Unsupported transport; expected tcp, ws or wss");
+            if transport == "tcp" {
+                bail!(
+                    "The TCP transport has been removed; use the WebSocket transport \
+                     (`transport = \"wss\"`, or `\"ws\"` on a trusted network)"
+                );
+            }
+            if transport != "ws" && transport != "wss" {
+                bail!("Unsupported transport; expected ws or wss");
             }
         }
         validate_server_address(config)?;
@@ -288,8 +323,15 @@ impl ClientConfig {
             if entry.local_addr.is_empty() {
                 bail!("The `local_addr` of the tunnel `{}` is empty", entry.domain);
             }
-            if entry.auth_header.as_ref().is_some_and(|v| v.contains('\r') || v.contains('\n')) {
-                bail!("The `auth_header` of the tunnel `{}` must not contain line breaks", entry.name);
+            if entry
+                .auth_header
+                .as_ref()
+                .is_some_and(|v| v.contains('\r') || v.contains('\n'))
+            {
+                bail!(
+                    "The `auth_header` of the tunnel `{}` must not contain line breaks",
+                    entry.name
+                );
             }
 
             let domain = crate::helper::normalize_domain(&entry.domain)
@@ -351,6 +393,15 @@ fn has_legacy_remote(s: &str) -> bool {
     s.lines().any(|line| {
         line.trim_start()
             .strip_prefix("remote")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    })
+}
+
+/// Whether an hts.toml still declares the removed TCP listener port.
+fn has_legacy_server_port(s: &str) -> bool {
+    s.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("server_port")
             .is_some_and(|rest| rest.trim_start().starts_with('='))
     })
 }
@@ -458,25 +509,19 @@ fn client_config_example() -> String {
 ##
 ## Set these values before starting htc.
 ##
-## The TCP transport is the default. `server_port` is the `server_port` of
-## hts.toml.
-transport = "tcp"
-server_host = "your-server.example.com"
-server_port = 2333
-##
-## To use the WebSocket transport, comment out the three settings above and
-## uncomment the three below. `server_host` must be the `control_host` of
-## hts.toml and `server_port` must be its `http_port`, not its `server_port`.
-## `transport = "ws"` is plain `ws://`; `"wss"` is TLS (`wss://`) on any port.
-# transport = "wss"
-# server_host = "control.example.com"
-# server_port = 443
+## The client only speaks WebSocket. `server_host` must be the `control_host`
+## of hts.toml and `server_port` must be its `http_port`.
+## `transport = "wss"` is TLS (the default and the only choice for the public
+## Internet). Use `transport = "ws"` only on a trusted network.
+transport = "wss"
+server_host = "control.example.com"
+server_port = 443
 name = "home"
 token = "replace-with-the-same-secret-as-hts"
 web_port = 8610
 heartbeat_timeout = 40
+keepalive_interval = 15
 retry_interval = 1
-nodelay = true
 
 ## Add one [[tunnels]] block per service to expose.
 ##
@@ -511,14 +556,19 @@ fn server_config_example(token: &str) -> String {
 ##   #   a disabled setting, remove the single # to enable it
 ##
 ## The shared token is generated for you. Set the same token in htc.toml.
-## Client TCP port. Remove this line to disable the TCP listener and serve
-## clients only through the WebSocket transport (requires control_host below).
-server_port = 2333
 http_port = 80
 token = "{token}"
-## Optional: reserve this exact Host for WebSocket transport. It must resolve
-## to this server.
-# control_host = "control.example.com"
+## Required: the exact Host the clients use for the WebSocket tunnel. It must
+## resolve to this server and must not be a business domain or a wildcard.
+control_host = "control.example.com"
+## Optional limits. The defaults keep the control and data channels separate,
+## so a burst of visitor traffic can never starve a client's control channel.
+# max_pending_handshakes = 256
+# max_control_connections = 256
+# max_data_connections = 2048
+# pool_min = 4
+# pool_max = 32
+# keepalive_interval = 15
 
 ## Optional direct reverse-proxy routes to services running on this server.
 ##
@@ -576,15 +626,23 @@ mod tests {
         // `websocket` is the legacy spelling of `ws`
         let config = ClientConfig::parse("transport = \"WebSocket\"\n")?;
         assert_eq!(config.transport.as_deref(), Some("ws"));
-        assert!(config.is_websocket());
+        assert_eq!(config.transport_name(), "ws");
         assert!(!config.tls());
 
         assert!(ClientConfig::parse("transport = \"udp\"\n").is_err());
         assert!(ClientConfig::parse("transport = \"tls\"\n").is_err());
 
-        let tcp = ClientConfig::parse("")?;
-        assert!(!tcp.is_websocket());
-        assert!(!tcp.tls());
+        // The TCP transport is gone and must be reported clearly
+        let err = format!(
+            "{:#}",
+            ClientConfig::parse("transport = \"tcp\"\n").unwrap_err()
+        );
+        assert!(err.contains("TCP transport has been removed"), "{}", err);
+
+        // TLS is the default
+        let default = ClientConfig::parse("")?;
+        assert_eq!(default.transport_name(), "wss");
+        assert!(default.tls());
         Ok(())
     }
 
@@ -592,13 +650,17 @@ mod tests {
     fn test_ws_and_wss_transports() -> Result<()> {
         let ws = ClientConfig::parse("transport = \"WS\"\n")?;
         assert_eq!(ws.transport.as_deref(), Some("ws"));
-        assert!(ws.is_websocket());
+        assert_eq!(ws.transport_name(), "ws");
         assert!(!ws.tls());
 
         let wss = ClientConfig::parse("transport = \"wss\"\n")?;
         assert_eq!(wss.transport.as_deref(), Some("wss"));
-        assert!(wss.is_websocket());
+        assert_eq!(wss.transport_name(), "wss");
         assert!(wss.tls());
+
+        assert_eq!(ws.keepalive_interval(), DEFAULT_KEEPALIVE_INTERVAL_SECS);
+        let off = ClientConfig::parse("keepalive_interval = 0\n")?;
+        assert_eq!(off.keepalive_interval(), 0);
         Ok(())
     }
 
@@ -731,7 +793,7 @@ local_addr = "127.0.0.1:81"
         assert_eq!(tunnels[1].local_addr, "127.0.0.1:80");
 
         // The client-level options are inherited by every tunnel
-        assert!(tunnels.iter().all(|t| t.nodelay == false));
+        assert!(tunnels.iter().all(|t| !t.nodelay));
         assert!(tunnels.iter().all(|t| t.retry_interval == 7));
         assert_eq!(cfg.heartbeat_timeout(), 20);
         Ok(())
@@ -927,7 +989,11 @@ http_port = 80
 token = "123"
 "#;
         let err = format!("{:#}", ClientConfig::parse(legacy).unwrap_err());
-        assert!(err.contains("no longer takes a server configuration"), "{}", err);
+        assert!(
+            err.contains("no longer takes a server configuration"),
+            "{}",
+            err
+        );
     }
 
     #[test]
@@ -957,8 +1023,16 @@ local_addr = "127.0.0.1:81"
         let reparsed = ClientConfig::parse(&dumped)?;
         assert_eq!(cfg, reparsed);
         assert!(dumped.contains("[[tunnels]]"), "{}", dumped);
-        assert!(dumped.contains("domain = \"foo1.example.com\""), "{}", dumped);
-        assert!(dumped.contains("local_addr = \"127.0.0.1:80\""), "{}", dumped);
+        assert!(
+            dumped.contains("domain = \"foo1.example.com\""),
+            "{}",
+            dumped
+        );
+        assert!(
+            dumped.contains("local_addr = \"127.0.0.1:80\""),
+            "{}",
+            dumped
+        );
         Ok(())
     }
 
@@ -1002,47 +1076,58 @@ local_addr = "127.0.0.1:80"
 
     #[test]
     fn test_domain_cannot_overlap_control_host() {
-        assert!(domain_overlaps_control_host("control.example.com", "control.example.com"));
-        assert!(domain_overlaps_control_host("*.example.com", "control.example.com"));
-        assert!(!domain_overlaps_control_host("*.example.com", "example.com"));
-        assert!(!domain_overlaps_control_host("*.other.test", "control.example.com"));
+        assert!(domain_overlaps_control_host(
+            "control.example.com",
+            "control.example.com"
+        ));
+        assert!(domain_overlaps_control_host(
+            "*.example.com",
+            "control.example.com"
+        ));
+        assert!(!domain_overlaps_control_host(
+            "*.example.com",
+            "example.com"
+        ));
+        assert!(!domain_overlaps_control_host(
+            "*.other.test",
+            "control.example.com"
+        ));
     }
 
     #[tokio::test]
-    async fn test_server_config_allows_a_disabled_tcp_listener() -> Result<()> {
-        // Omitting `server_port` disables the TCP listener. Without a control
-        // host the clients would have no way to connect, so that is rejected.
+    async fn test_server_config_requires_control_host() -> Result<()> {
         let path = std::env::temp_dir().join(format!(
-            "http-tunnel-zero-port-{}.toml",
+            "http-tunnel-control-host-{}.toml",
             std::process::id()
         ));
+
+        // The WebSocket endpoint is routed by Host, so a server without one
+        // would accept no client at all.
         std::fs::write(&path, "http_port = 8080\ntoken = \"a_secret_token\"\n")?;
         let err = ServerConfig::from_file(&path)
             .await
-            .expect_err("a missing server_port without control_host must be rejected");
+            .expect_err("a missing control_host must be rejected");
         assert!(
             format!("{:#}", err).contains("control_host"),
             "unexpected error: {:#}",
             err
         );
 
-        // `0` is not a magic value; removing the line is how the listener is
-        // disabled, so an explicit zero is a configuration error.
+        // The removed TCP listener is reported with a migration hint.
         std::fs::write(
             &path,
-            "server_port = 0\nhttp_port = 8080\n\
+            "server_port = 2333\nhttp_port = 8080\n\
              control_host = \"control.example.com\"\ntoken = \"a_secret_token\"\n",
         )?;
         let err = ServerConfig::from_file(&path)
             .await
-            .expect_err("server_port = 0 must be rejected");
+            .expect_err("the removed server_port must be rejected");
         assert!(
-            format!("{:#}", err).contains("real port"),
+            format!("{:#}", err).contains("TCP transport has been removed"),
             "unexpected error: {:#}",
             err
         );
 
-        // With a control host and no `server_port`, the TCP listener is off.
         std::fs::write(
             &path,
             "http_port = 8080\n\
@@ -1050,14 +1135,35 @@ local_addr = "127.0.0.1:80"
         )?;
         let cfg = ServerConfig::from_file(&path).await?;
         let _ = std::fs::remove_file(&path);
-        assert_eq!(cfg.server_port, None);
-        assert_eq!(cfg.control_host.as_deref(), Some("control.example.com"));
+        assert_eq!(cfg.control_host, "control.example.com");
+        assert_eq!(ServerLimits::from(&cfg), ServerLimits::default());
         Ok(())
+    }
+
+    #[test]
+    fn test_server_limits_validation() {
+        assert!(ServerLimits::default().validate().is_ok());
+
+        let limits = ServerLimits {
+            max_data_connections: 0,
+            ..ServerLimits::default()
+        };
+        assert!(limits.validate().is_err());
+
+        let limits = ServerLimits {
+            pool_min: 9,
+            pool_max: 8,
+            ..ServerLimits::default()
+        };
+        assert!(limits.validate().is_err());
     }
 
     /// The number of lines that disable a setting with a single `#`.
     fn disabled_settings(example: &str, prefix: &str) -> usize {
-        example.lines().filter(|line| line.starts_with(prefix)).count()
+        example
+            .lines()
+            .filter(|line| line.starts_with(prefix))
+            .count()
     }
 
     /// Check the comment convention of the generated files: `##` marks
@@ -1101,7 +1207,10 @@ local_addr = "127.0.0.1:80"
         // The header documentation stays on one line: a wrapped comment reads
         // like a second setting and misleads whoever edits the file.
         assert_eq!(
-            example.lines().filter(|l| l.contains("X-HTTP-TUNNEL-TOKEN")).count(),
+            example
+                .lines()
+                .filter(|l| l.contains("X-HTTP-TUNNEL-TOKEN"))
+                .count(),
             1
         );
         // Only the Docker example documents the optional `auth_header`
@@ -1126,7 +1235,10 @@ local_addr = "127.0.0.1:80"
         // The header documentation stays on one line: a wrapped comment reads
         // like a second setting and misleads whoever edits the file.
         assert_eq!(
-            example.lines().filter(|l| l.contains("X-HTTP-TUNNEL-TOKEN")).count(),
+            example
+                .lines()
+                .filter(|l| l.contains("X-HTTP-TUNNEL-TOKEN"))
+                .count(),
             1
         );
         // Only the Docker tunnel documents the optional `auth_header`
@@ -1139,14 +1251,12 @@ local_addr = "127.0.0.1:80"
     }
 }
 
-
 /// Whether a tunnel domain (exact or wildcard) would overlap the reserved
 /// `control_host`. A wildcard overlaps every host below its suffix.
 pub(crate) fn domain_overlaps_control_host(domain: &str, control_host: &str) -> bool {
     domain == control_host
         || domain.strip_prefix("*.").is_some_and(|suffix| {
-            control_host.len() > suffix.len()
-                && control_host.ends_with(&format!(".{}", suffix))
+            control_host.len() > suffix.len() && control_host.ends_with(&format!(".{}", suffix))
         })
 }
 
@@ -1157,19 +1267,87 @@ pub struct ServerConfig {
     /// Server-side HTTP reverse proxy rules.
     #[serde(default)]
     pub proxies: Vec<ServerProxyEntry>,
-    /// Port for client control and data connections. Omit it to disable the
-    /// TCP listener, leaving the WebSocket transport as the only client
-    /// entrypoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_port: Option<u16>,
-    /// Public HTTP entrypoint.
+    /// Public HTTP entrypoint. It also carries the WebSocket tunnel endpoint.
     #[serde(default = "default_http_port")]
     pub http_port: u16,
     /// Shared secret required by every client.
     pub token: MaskedString,
-    /// Optional exact Host reserved for WebSocket control/data connections.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control_host: Option<String>,
+    /// The exact Host reserved for the WebSocket control/data connections.
+    pub control_host: String,
+    /// The number of authenticated WebSocket upgrades that may wait for their
+    /// `ClientHello` at the same time.
+    #[serde(default = "default_max_pending_handshakes")]
+    pub max_pending_handshakes: usize,
+    /// The number of control channels accepted at once.
+    #[serde(default = "default_max_control_connections")]
+    pub max_control_connections: usize,
+    /// The number of data channels accepted at once.
+    #[serde(default = "default_max_data_connections")]
+    pub max_data_connections: usize,
+    /// The base number of warm data channels kept per tunnel.
+    #[serde(default = "default_pool_min")]
+    pub pool_min: usize,
+    /// The upper bound of the warm data channels of one tunnel.
+    #[serde(default = "default_pool_max")]
+    pub pool_max: usize,
+    /// WebSocket ping interval in secs. `0` disables the keepalive pings.
+    #[serde(default = "default_keepalive_interval")]
+    pub keepalive_interval: u64,
+}
+
+/// The runtime limits derived from [`ServerConfig`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerLimits {
+    pub max_pending_handshakes: usize,
+    pub max_control_connections: usize,
+    pub max_data_connections: usize,
+    pub pool_min: usize,
+    pub pool_max: usize,
+    pub keepalive_interval: u64,
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        ServerLimits {
+            max_pending_handshakes: DEFAULT_MAX_PENDING_HANDSHAKES,
+            max_control_connections: DEFAULT_MAX_CONTROL_CONNECTIONS,
+            max_data_connections: DEFAULT_MAX_DATA_CONNECTIONS,
+            pool_min: DEFAULT_POOL_MIN,
+            pool_max: DEFAULT_POOL_MAX,
+            keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL_SECS,
+        }
+    }
+}
+
+impl From<&ServerConfig> for ServerLimits {
+    fn from(config: &ServerConfig) -> Self {
+        ServerLimits {
+            max_pending_handshakes: config.max_pending_handshakes,
+            max_control_connections: config.max_control_connections,
+            max_data_connections: config.max_data_connections,
+            pool_min: config.pool_min,
+            pool_max: config.pool_max,
+            keepalive_interval: config.keepalive_interval,
+        }
+    }
+}
+
+impl ServerLimits {
+    pub fn validate(&self) -> Result<()> {
+        if self.max_pending_handshakes == 0
+            || self.max_control_connections == 0
+            || self.max_data_connections == 0
+        {
+            bail!("The connection limits must be greater than 0");
+        }
+        if self.pool_min == 0 {
+            bail!("`pool_min` must be greater than 0");
+        }
+        if self.pool_max < self.pool_min {
+            bail!("`pool_max` must not be smaller than `pool_min`");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -1182,59 +1360,77 @@ pub struct ServerProxyEntry {
     pub auth_header: Option<MaskedString>,
 }
 
-fn default_http_port() -> u16 { 80 }
+fn default_http_port() -> u16 {
+    80
+}
+fn default_max_pending_handshakes() -> usize {
+    DEFAULT_MAX_PENDING_HANDSHAKES
+}
+fn default_max_control_connections() -> usize {
+    DEFAULT_MAX_CONTROL_CONNECTIONS
+}
+fn default_max_data_connections() -> usize {
+    DEFAULT_MAX_DATA_CONNECTIONS
+}
+fn default_pool_min() -> usize {
+    DEFAULT_POOL_MIN
+}
+fn default_pool_max() -> usize {
+    DEFAULT_POOL_MAX
+}
+fn default_keepalive_interval() -> u64 {
+    DEFAULT_KEEPALIVE_INTERVAL_SECS
+}
 
 impl ServerConfig {
     pub async fn from_file(path: &Path) -> Result<Self> {
         match fs::read_to_string(path).await {
             Ok(s) => {
-                let mut config: Self = toml::from_str(&s)
-                    .with_context(|| format!("The configuration {:?} is invalid", path))?;
-                if let Some(host) = config.control_host.as_deref() {
-                    let normalized = crate::helper::normalize_domain(host)
-                        .ok_or_else(|| anyhow!("Invalid control_host"))?;
-                    if normalized.starts_with("*.") {
-                        bail!("control_host must be an exact hostname, not a wildcard");
-                    }
-                    config.control_host = Some(normalized);
+                let mut config: Self = toml::from_str(&s).with_context(|| {
+                    let hint = if has_legacy_server_port(&s) {
+                        "\nNote: the TCP transport has been removed. Remove `server_port` from \
+                         hts.toml and set `control_host` to the Host the clients use."
+                    } else {
+                        ""
+                    };
+                    format!("The configuration {:?} is invalid{}", path, hint)
+                })?;
+                let normalized = crate::helper::normalize_domain(&config.control_host)
+                    .ok_or_else(|| anyhow!("Invalid control_host"))?;
+                if normalized.starts_with("*.") {
+                    bail!("control_host must be an exact hostname, not a wildcard");
                 }
+                config.control_host = normalized;
+                ServerLimits::from(&config).validate()?;
                 let mut domains = BTreeMap::new();
                 for proxy in &config.proxies {
                     if proxy.name.trim().is_empty() || proxy.local_addr.trim().is_empty() {
                         bail!("Each [[proxies]] entry needs non-empty name and local_addr");
                     }
-                    if proxy.auth_header.as_ref().is_some_and(|v| v.contains('\r') || v.contains('\n')) {
-                        bail!("The `auth_header` of proxy `{}` must not contain line breaks", proxy.name);
+                    if proxy
+                        .auth_header
+                        .as_ref()
+                        .is_some_and(|v| v.contains('\r') || v.contains('\n'))
+                    {
+                        bail!(
+                            "The `auth_header` of proxy `{}` must not contain line breaks",
+                            proxy.name
+                        );
                     }
                     let domain = crate::helper::normalize_domain(&proxy.domain)
                         .ok_or_else(|| anyhow!("Invalid proxy domain `{}`", proxy.domain))?;
-                    if let Some(control_host) = config.control_host.as_deref() {
-                        let conflicts = domain_overlaps_control_host(&domain, control_host);
-                        if conflicts {
-                            bail!(
-                                "Proxy domain `{}` overlaps the reserved control_host `{}`",
-                                domain,
-                                control_host
-                            );
-                        }
+                    if domain_overlaps_control_host(&domain, &config.control_host) {
+                        bail!(
+                            "Proxy domain `{}` overlaps the reserved control_host `{}`",
+                            domain,
+                            config.control_host
+                        );
                     }
                     if domains.insert(domain.clone(), ()).is_some() {
                         bail!("Proxy domain `{}` is configured more than once", domain);
                     }
                 }
-                match config.server_port {
-                    Some(0) => bail!(
-                        "`server_port` must be a real port; remove the line to disable the TCP \
-                         listener and serve clients only through the WebSocket transport"
-                    ),
-                    None if config.control_host.is_none() => bail!(
-                        "`server_port` is not set, so the TCP listener is disabled, but \
-                         `control_host` is not set either: clients would have no way to connect"
-                    ),
-                    _ => {}
-                }
-                if config.token.is_empty()
-                    || &*config.token == "replace-with-a-long-random-secret"
+                if config.token.is_empty() || &*config.token == "replace-with-a-long-random-secret"
                 {
                     bail!("Set a strong, non-placeholder shared token in {:?}", path);
                 }
@@ -1243,7 +1439,8 @@ impl ServerConfig {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let token = generate_token();
                 let example = server_config_example(&token);
-                fs::write(path, example).await
+                fs::write(path, example)
+                    .await
                     .with_context(|| format!("Failed to generate default config {:?}", path))?;
                 bail!(
                     "Generated {:?} with the shared token {:?}. Set the same token in htc.toml, then run hts again.",

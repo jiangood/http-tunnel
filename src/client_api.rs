@@ -83,7 +83,10 @@ async fn web_auth<B>(
     req: Request<B>,
     next: Next<B>,
 ) -> Result<Response, Response> {
-    let expected = format!("Basic {}", base64_encode(format!("htc:{}", token).as_bytes()));
+    let expected = format!(
+        "Basic {}",
+        base64_encode(format!("htc:{}", token).as_bytes())
+    );
     let authorized = req
         .headers()
         .get(AUTHORIZATION)
@@ -96,24 +99,32 @@ async fn web_auth<B>(
             StatusCode::UNAUTHORIZED,
             [("www-authenticate", "Basic realm=\"http-tunnel client\"")],
             "Authentication required",
-        ).into_response());
+        )
+            .into_response());
     }
     Ok(next.run(req).await)
 }
 
 // Small local encoder avoids adding a dependency just for HTTP Basic auth.
 fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let a = chunk[0] as usize;
         let b = *chunk.get(1).unwrap_or(&0) as usize;
         let c = *chunk.get(2).unwrap_or(&0) as usize;
         out.push(TABLE[a >> 2] as char);
         out.push(TABLE[((a & 3) << 4) | (b >> 4)] as char);
-        out.push(if chunk.len() > 1 { TABLE[((b & 15) << 2) | (c >> 6)] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[c & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TABLE[((b & 15) << 2) | (c >> 6)] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[c & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -196,7 +207,15 @@ async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusView> {
 }
 
 async fn list_tunnels(State(state): State<Arc<ApiState>>) -> Json<Vec<TunnelView>> {
-    Json(state.client.tunnels().await.iter().map(tunnel_view).collect())
+    Json(
+        state
+            .client
+            .tunnels()
+            .await
+            .iter()
+            .map(tunnel_view)
+            .collect(),
+    )
 }
 
 async fn put_tunnel(
@@ -205,9 +224,18 @@ async fn put_tunnel(
     Json(body): Json<PutTunnel>,
 ) -> Result<Response, ApiError> {
     let name = name.trim().to_string();
-    state.client.put_tunnel(name.clone(), body.domain, body.local_addr).await
+    state
+        .client
+        .put_tunnel(name.clone(), body.domain, body.local_addr)
+        .await
         .map_err(|e| ApiError::from_reason(format!("{:#}", e)))?;
-    match state.client.tunnels().await.into_iter().find(|t| t.name == name) {
+    match state
+        .client
+        .tunnels()
+        .await
+        .into_iter()
+        .find(|t| t.name == name)
+    {
         Some(t) => Ok((StatusCode::CREATED, Json(tunnel_view(&t))).into_response()),
         None => Ok(StatusCode::CREATED.into_response()),
     }
@@ -217,17 +245,24 @@ async fn delete_tunnel(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    state.client.delete_tunnel(name.trim()).await
+    state
+        .client
+        .delete_tunnel(name.trim())
+        .await
         .map_err(|e| ApiError::from_reason(format!("{:#}", e)))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn web_index(State(state): State<Arc<ApiState>>) -> Html<String> {
-    let connected = if state.client.connected() { "已连接" } else { "未连接" };
+    let connected = if state.client.connected() {
+        "已连接"
+    } else {
+        "未连接"
+    };
     let transport = match state.client.transport() {
         "wss" => "WebSocket（TLS）",
         "ws" => "WebSocket",
-        _ => "TCP",
+        other => other,
     };
     let tunnels = state.client.tunnels().await;
     let mut html = format!(
@@ -271,6 +306,10 @@ async fn web_delete_tunnel(
 }
 
 fn escape_html(value: &str) -> String {
-    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-        .replace('"', "&quot;").replace('\'', "&#39;")
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }

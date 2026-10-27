@@ -1,9 +1,10 @@
 use crate::cli::{ClientArgs, DEFAULT_CLIENT_WEB_PORT};
 use crate::config::{format_server_addr, ClientConfig, ClientTunnelConfig, MaskedString};
 use crate::constants::run_control_chan_backoff;
-use crate::protocol::{self, Ack, Auth, ClientHello, ControlChannelCmd, DataChannelCmd, ServerHello};
-use crate::transport::{connect, AddrMaybeCached, SocketOpts};
-use crate::transport::websocket::{connect_websocket, BoxedIo};
+use crate::protocol::{
+    self, Ack, Auth, ClientHello, ControlChannelCmd, DataChannelCmd, ServerHello,
+};
+use crate::transport::websocket::{connect_websocket, AuthenticationRejected, BoxedIo};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::future::retry_notify;
@@ -23,7 +24,10 @@ use tracing::{debug, error, info, instrument, warn, Instrument, Span};
 const COPY_BUF_SIZE: usize = 64 * 1024;
 
 // The entrypoint of running a client
-pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
+pub async fn run_client(
+    args: ClientArgs,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
     // The fixed TOML file is the only source of client configuration. A missing
     // or unusable configuration is not fatal: it is reported and the process
     // then waits for a shutdown signal. A client running in a container thus
@@ -39,18 +43,15 @@ pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<b
         Err(e) => return wait_after_error(e, &mut shutdown_rx).await,
     };
 
-    if matches!(identity.transport.as_str(), "ws" | "wss") {
-        info!(
-            "Using the WebSocket transport over {}: {} is the server's control Host and HTTP port",
-            if identity.tls { "TLS (wss)" } else { "plain TCP (ws)" },
-            identity.server_addr
-        );
-    } else {
-        info!(
-            "Using the TCP transport: {} is the server's control address (`server_port`)",
-            identity.server_addr
-        );
-    }
+    info!(
+        "Using the WebSocket transport over {}: {} is the server's control Host and HTTP port",
+        if identity.tls {
+            "TLS (wss)"
+        } else {
+            "plain text (ws); do not use it on the public Internet"
+        },
+        identity.server_addr
+    );
 
     let web_port = config.web_port.unwrap_or(DEFAULT_CLIENT_WEB_PORT);
 
@@ -117,29 +118,19 @@ pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<b
 /// Resolve the identity of a client from its configuration, rejecting a missing
 /// or placeholder value.
 fn resolve_identity(config: &ClientConfig, config_path: &Path) -> Result<Identity> {
-    let transport = config.transport.clone().unwrap_or_else(|| "tcp".to_string());
-    let websocket = config.is_websocket();
+    let transport = config.transport_name().to_string();
     let server_host = config.server_host.clone().ok_or_else(|| {
         anyhow!(
-            "The server host is missing. Set `server_host` in {:?}.{}",
-            config_path,
-            if websocket {
-                " With `transport = \"websocket\"`, it must be the server's `control_host`."
-            } else {
-                ""
-            }
+            "The server host is missing. Set `server_host` in {:?}. It must be the server's \
+             `control_host`.",
+            config_path
         )
     })?;
     let server_port = config.server_port.ok_or_else(|| {
         anyhow!(
-            "The server port is missing. Set `server_port` in {:?}.{}",
-            config_path,
-            if websocket {
-                " With `transport = \"websocket\"`, it must be the server's `http_port`, \
-                 not its `server_port`."
-            } else {
-                ""
-            }
+            "The server port is missing. Set `server_port` in {:?}. It must be the server's \
+             `http_port`.",
+            config_path
         )
     })?;
     let name = config.name.clone().ok_or_else(|| {
@@ -148,15 +139,24 @@ fn resolve_identity(config: &ClientConfig, config_path: &Path) -> Result<Identit
             config_path
         )
     })?;
-    let token = config.token.clone().ok_or_else(|| {
-        anyhow!("The token is missing. Set `token` in {:?}", config_path)
-    })?;
+    let token = config
+        .token
+        .clone()
+        .ok_or_else(|| anyhow!("The token is missing. Set `token` in {:?}", config_path))?;
     if &*token == "replace-with-the-same-secret-as-hts" {
         bail!("Replace the placeholder token in {:?}", config_path);
     }
     let server_addr = format_server_addr(&server_host, server_port);
     let tls = config.tls();
-    Ok(Identity { server_addr, name, token, transport, tls })
+    let keepalive_interval = config.keepalive_interval();
+    Ok(Identity {
+        server_addr,
+        name,
+        token,
+        transport,
+        tls,
+        keepalive_interval,
+    })
 }
 
 /// Report a startup error and then wait for a shutdown signal instead of
@@ -181,8 +181,10 @@ pub(crate) struct Identity {
     pub(crate) transport: String,
     pub(crate) name: String,
     pub(crate) token: MaskedString,
-    /// Whether the WebSocket transport uses TLS (`wss://`)
+    /// Whether the WebSocket connection uses TLS (`wss://`)
     pub(crate) tls: bool,
+    /// The WebSocket ping interval in secs, `0` meaning disabled
+    pub(crate) keepalive_interval: u64,
 }
 
 /// The state of a client, shared between the control channels and the
@@ -268,6 +270,7 @@ impl ClientState {
         };
         let transport = self.identity.transport.clone();
         let tls = self.identity.tls;
+        let keepalive_interval = self.identity.keepalive_interval;
 
         let mut handles = self.tunnels.lock().await;
 
@@ -288,7 +291,13 @@ impl ClientState {
         // Start the new tunnels and restart the ones whose config changed
         for tunnel in tunnels {
             let restart = match handles.get(&tunnel.name) {
-                Some(handle) => !handle.matches(&tunnel, heartbeat_timeout, &transport, tls),
+                Some(handle) => !handle.matches(
+                    &tunnel,
+                    heartbeat_timeout,
+                    &transport,
+                    tls,
+                    keepalive_interval,
+                ),
                 None => true,
             };
             if !restart {
@@ -306,6 +315,7 @@ impl ClientState {
                 self.identity.server_addr.clone(),
                 transport.clone(),
                 tls,
+                keepalive_interval,
                 heartbeat_timeout,
                 self.connections.clone(),
                 self.fatal_tx.clone(),
@@ -392,10 +402,10 @@ impl std::error::Error for FatalControlError {
 
 struct RunDataChannelArgs {
     session_key: Nonce,
-    server_addr: AddrMaybeCached,
-    transport: String,
+    server_addr: String,
     tls: bool,
-    socket_opts: SocketOpts,
+    token: MaskedString,
+    keepalive_interval: u64,
     tunnel: ClientTunnelConfig,
 }
 
@@ -410,20 +420,15 @@ async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<Boxe
     let mut conn: BoxedIo = retry_notify(
         backoff,
         || async {
-            let result: Result<BoxedIo> = if matches!(args.transport.as_str(), "ws" | "wss") {
-                connect_websocket(&args.server_addr.addr, args.tls).await
-            } else {
-                connect(&args.server_addr)
-                    .await
-                    .map(|tcp| {
-                        args.socket_opts.apply(&tcp);
-                        Box::new(tcp) as BoxedIo
-                    })
-                    .map_err(Into::into)
-            };
-            result
-                .with_context(|| format!("Failed to connect to {}", args.server_addr))
-                .map_err(backoff::Error::transient)
+            connect_websocket(
+                &args.server_addr,
+                args.tls,
+                &args.token,
+                args.keepalive_interval,
+            )
+            .await
+            .with_context(|| format!("Failed to connect to {}", args.server_addr))
+            .map_err(backoff::Error::transient)
         },
         |e, duration| {
             warn!("{:#}. Retry in {:?}...", e, duration);
@@ -431,7 +436,7 @@ async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<Boxe
     )
     .await?;
 
-    // Identify this as a data channel using the same protocol handshake as TCP mode.
+    // Identify this as a data channel with the same length-prefixed protocol.
     let hello = ClientHello::Data {
         version: protocol::CURRENT_PROTO_VERSION,
         nonce: args.session_key,
@@ -447,38 +452,65 @@ async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
     // Forward
     match protocol::read_payload::<DataChannelCmd, _>(&mut conn).await? {
         DataChannelCmd::StartForwardTcp => {
-            run_data_channel_for_tcp(conn, &args.tunnel.local_addr, args.tunnel.auth_header.as_ref().map(|v| &**v)).await?;
+            run_data_channel_forward(
+                conn,
+                &args.tunnel.local_addr,
+                args.tunnel.auth_header.as_ref().map(|v| &**v),
+            )
+            .await?;
         }
     }
     Ok(())
 }
 
-// Simply copying back and forth for TCP
+// Copy the visitor stream to the local service and back
 #[instrument(skip(conn))]
-async fn run_data_channel_for_tcp(mut conn: BoxedIo, local_addr: &str, auth: Option<&str>) -> Result<()> {
+async fn run_data_channel_forward(
+    mut conn: BoxedIo,
+    local_addr: &str,
+    auth: Option<&str>,
+) -> Result<()> {
     debug!("New data channel starts forwarding");
     let mut header = Vec::with_capacity(1024);
     loop {
-        if header.windows(4).any(|w| w == b"\r\n\r\n") { break; }
-        if header.len() >= 8 * 1024 { bail!("HTTP request header is too large"); }
+        if header.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if header.len() >= 8 * 1024 {
+            bail!("HTTP request header is too large");
+        }
         let mut chunk = [0u8; 1024];
-        let n = conn.read(&mut chunk).await.context("Failed to read HTTP request header from tunnel")?;
-        if n == 0 { bail!("Tunnel closed before the HTTP request header was complete"); }
+        let n = conn
+            .read(&mut chunk)
+            .await
+            .context("Failed to read HTTP request header from tunnel")?;
+        if n == 0 {
+            bail!("Tunnel closed before the HTTP request header was complete");
+        }
         header.extend_from_slice(&chunk[..n]);
     }
     let request = match crate::helper::gate_auth_header(&header, auth) {
         crate::helper::AuthOutcome::Allowed(request) => request,
         crate::helper::AuthOutcome::Unauthorized(failure) => {
-            debug!("Rejected an unauthenticated request for {}: {:?}", local_addr, failure);
-            conn.write_all(&crate::http::unauthorized_response(failure)).await
+            debug!(
+                "Rejected an unauthenticated request for {}: {:?}",
+                local_addr, failure
+            );
+            conn.write_all(&crate::http::unauthorized_response(failure))
+                .await
                 .context("Failed to write unauthorized response to tunnel")?;
             return Ok(());
         }
     };
     let mut local = crate::helper::connect_local(local_addr)
-        .await.with_context(|| format!("Failed to connect to local service {}", local_addr))?;
-    local.write_all(&request).await.context("Failed to write HTTP request to local service")?;
-    let _ = copy_bidirectional_with_sizes(&mut conn, &mut local, COPY_BUF_SIZE, COPY_BUF_SIZE).await;
+        .await
+        .with_context(|| format!("Failed to connect to local service {}", local_addr))?;
+    local
+        .write_all(&request)
+        .await
+        .context("Failed to write HTTP request to local service")?;
+    let _ =
+        copy_bidirectional_with_sizes(&mut conn, &mut local, COPY_BUF_SIZE, COPY_BUF_SIZE).await;
     Ok(())
 }
 
@@ -489,8 +521,8 @@ struct ControlChannel {
     token: MaskedString,                // The token given by `--token`
     shutdown_rx: oneshot::Receiver<u8>, // Receives the shutdown signal
     server_addr: String,                // `server_host:server_port`
-    transport: String,                  // TCP or WebSocket byte-stream transport
-    tls: bool,                          // Whether the WebSocket transport uses TLS
+    tls: bool,                          // Whether the WebSocket connection uses TLS
+    keepalive_interval: u64,            // WebSocket ping interval in secs
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
     connections: Arc<AtomicUsize>,      // The number of established control channels
 }
@@ -505,6 +537,7 @@ struct ControlChannelHandle {
     tunnel: ClientTunnelConfig,
     transport: String,
     tls: bool,
+    keepalive_interval: u64,
     heartbeat_timeout: u64,
 }
 
@@ -516,11 +549,13 @@ impl ControlChannelHandle {
         heartbeat_timeout: u64,
         transport: &str,
         tls: bool,
+        keepalive_interval: u64,
     ) -> bool {
         &self.tunnel == tunnel
             && self.heartbeat_timeout == heartbeat_timeout
             && self.transport.as_str() == transport
             && self.tls == tls
+            && self.keepalive_interval == keepalive_interval
     }
 }
 
@@ -546,16 +581,28 @@ impl Drop for ConnectionsGuard {
 impl ControlChannel {
     #[instrument(skip_all)]
     async fn run(&mut self) -> Result<()> {
-        let mut server_addr = AddrMaybeCached::new(&self.server_addr);
-        let mut conn: BoxedIo = if matches!(self.transport.as_str(), "ws" | "wss") {
-            connect_websocket(&self.server_addr, self.tls).await?
-        } else {
-            server_addr.resolve().await?;
-            let tcp = connect(&server_addr)
-                .await
-                .with_context(|| format!("Failed to connect to {}", self.server_addr))?;
-            SocketOpts::for_control_channel().apply(&tcp);
-            Box::new(tcp)
+        let mut conn: BoxedIo = match connect_websocket(
+            &self.server_addr,
+            self.tls,
+            &self.token,
+            self.keepalive_interval,
+        )
+        .await
+        {
+            Ok(conn) => conn,
+            Err(err) if err.downcast_ref::<AuthenticationRejected>().is_some() => {
+                // The token cannot change while the client runs, so retrying is
+                // pointless: mark it fatal so that the client exits.
+                return Err(FatalControlError(anyhow!(
+                    "The token was rejected by the server for the tunnel `{}`",
+                    self.tunnel.domain
+                ))
+                .into());
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to connect to {}", self.server_addr))
+            }
         };
 
         // Send hello. The client announces the domain it serves, which is how the
@@ -601,14 +648,12 @@ impl ControlChannel {
         info!("Control channel established");
         let _connected = ConnectionsGuard::new(self.connections.clone());
 
-        // Socket options for the data channel
-        let socket_opts = SocketOpts::data_channel(self.tunnel.nodelay);
         let data_ch_args = Arc::new(RunDataChannelArgs {
             session_key,
-            server_addr,
-            transport: self.transport.clone(),
+            server_addr: self.server_addr.clone(),
             tls: self.tls,
-            socket_opts,
+            token: self.token.clone(),
+            keepalive_interval: self.keepalive_interval,
             tunnel: self.tunnel.clone(),
         });
 
@@ -652,6 +697,7 @@ impl ControlChannelHandle {
         server_addr: String,
         transport: String,
         tls: bool,
+        keepalive_interval: u64,
         heartbeat_timeout: u64,
         connections: Arc<AtomicUsize>,
         fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
@@ -670,8 +716,8 @@ impl ControlChannelHandle {
             token,
             shutdown_rx,
             server_addr,
-            transport: transport.clone(),
             tls,
+            keepalive_interval,
             heartbeat_timeout,
             connections,
         };
@@ -720,6 +766,7 @@ impl ControlChannelHandle {
             tunnel: handle_tunnel,
             transport,
             tls,
+            keepalive_interval,
             heartbeat_timeout,
         }
     }

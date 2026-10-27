@@ -121,16 +121,16 @@ def main():
     for server in (server_backend, client_backend):
         threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    control_port, http_port, web_port = free_port(), free_port(), free_port()
-    while http_port in (control_port, web_port) or web_port == control_port:
-        http_port, web_port = free_port(), free_port()
+    http_port, web_port = free_port(), free_port()
+    while web_port == http_port:
+        web_port = free_port()
 
     processes = []
     work = Path(tempfile.mkdtemp(prefix="http-tunnel-e2e-"))
     try:
-        (work / "hts.toml").write_text(f"""server_port = {control_port}
-http_port = {http_port}
+        (work / "hts.toml").write_text(f"""http_port = {http_port}
 token = "{TOKEN}"
+control_host = "127.0.0.1"
 
 [[proxies]]
 name = "server-backend"
@@ -138,8 +138,9 @@ domain = "server.e2e.test"
 local_addr = "127.0.0.1:{server_backend.server_port}"
 auth_header = "{SERVER_AUTH}"
 """)
-        (work / "htc.toml").write_text(f"""server_host = "127.0.0.1"
-server_port = {control_port}
+        (work / "htc.toml").write_text(f"""transport = "ws"
+server_host = "127.0.0.1"
+server_port = {http_port}
 name = "e2e-client"
 token = "{TOKEN}"
 web_port = {web_port}
@@ -157,7 +158,6 @@ auth_header = "{CLIENT_AUTH}"
             text=True,
         )
         processes.append(server)
-        wait_for_port(control_port, server, "hts control listener")
         wait_for_port(http_port, server, "hts HTTP listener")
 
         client = subprocess.Popen(

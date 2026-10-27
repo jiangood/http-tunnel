@@ -30,10 +30,7 @@ pub fn small_requests() -> Duration {
 
         let iterations = 4_000;
         let start = Instant::now();
-        run(iterations, 32, || {
-            keep_alive_batch(HTTP_ENTRY_ADDR, 8, 64)
-        })
-        .await;
+        run(iterations, 32, || keep_alive_batch(HTTP_ENTRY_ADDR, 8, 64)).await;
         let elapsed = start.elapsed();
         println!(
             "keep-alive small requests: {} in {:?} ({:.0} req/s, {} requests reached the backend)",

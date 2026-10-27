@@ -1,16 +1,13 @@
 use crate::cli::ServerArgs;
-use crate::config::{domain_overlaps_control_host, MaskedString};
-use crate::constants::listen_backoff;
-use crate::helper::{retry_notify_with_deadline, to_bind_addr, write_and_flush};
+use crate::config::{domain_overlaps_control_host, MaskedString, ServerLimits};
+use crate::helper::{to_bind_addr, write_and_flush};
 use crate::http::RoutingTable;
 use crate::multi_map::MultiMap;
 use crate::protocol::{
     self, Ack, ClientHello, ControlChannelCmd, DataChannelCmd, ServerHello, HASH_WIDTH_IN_BYTES,
 };
-use crate::transport::{Conn, SocketOpts};
+use crate::transport::Conn;
 use anyhow::{anyhow, bail, Context, Result};
-use backoff::backoff::Backoff;
-use backoff::ExponentialBackoff;
 
 use rand::RngCore;
 use std::collections::VecDeque;
@@ -19,28 +16,27 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time;
-use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
+use tracing::{debug, error, info, instrument, warn, Instrument, Span};
 
 pub(crate) type TunnelDigest = protocol::Digest; // SHA256 of a tunnel name
 type Nonce = protocol::Digest; // Also called `session_key`
 
-const POOL_MIN: usize = 8; // Minimum number of warm data channels kept per tunnel
 const POOL_DEMAND_DECAY: usize = 8; // The remembered demand shrinks by 1/8 per replenish tick
 const POOL_REPLENISH_INTERVAL_MS: u64 = 100; // How often the data channel pool is topped up
 const DATA_CHANNEL_WAIT_TIMEOUT: u64 = 10; // Seconds to wait for a data channel before answering a visitor with 504
 const DRAIN_TIMEOUT: u64 = 30; // Seconds to wait for in-flight visitors on shutdown
-// The size of the buffers that are piped between a visitor, the tunnel and the
-// local service. Larger than the tokio default (8 KiB), which reduces the number
-// of syscalls on large transfers while keeping the per-connection memory modest.
+                               // The size of the buffers that are piped between a visitor, the tunnel and the
+                               // local service. Larger than the tokio default (8 KiB), which reduces the number
+                               // of syscalls on large transfers while keeping the per-connection memory modest.
 const COPY_BUF_SIZE: usize = 64 * 1024;
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
-// The interval between two application-layer heartbeats sent to a client. The
-// server owns it (it is the one sending the heartbeats), so it is a constant now
-// that the server has no configuration file.
+                                  // The interval between two application-layer heartbeats sent to a client. The
+                                  // server owns it (it is the one sending the heartbeats), so it is a constant now
+                                  // that the server has no configuration file.
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 // A visitor accepted by the HTTP entrypoint. `prefetched` holds the bytes that were
@@ -108,7 +104,15 @@ pub(crate) struct ServerState {
     // The shared token every client authenticates with
     pub(crate) token: MaskedString,
     // Reserved HTTP Host for the WebSocket transport; never a business tunnel.
-    control_host: Option<String>,
+    pub(crate) control_host: String,
+    // The configurable capacity and keepalive settings
+    pub(crate) limits: ServerLimits,
+    // WebSocket upgrades that are still waiting for their protocol hello
+    pub(crate) pending_connections: Arc<Semaphore>,
+    // Authenticated control channels
+    pub(crate) control_connections: Arc<Semaphore>,
+    // Authenticated data channels, including the warm pool
+    pub(crate) data_connections: Arc<Semaphore>,
     // Collection of control channels
     pub(crate) control_channels: RwLock<ControlChannelMap>,
     // `Host` -> TunnelDigest
@@ -121,13 +125,7 @@ pub(crate) struct ServerState {
 
 // The entrypoint of running a server
 pub async fn run_server(args: ServerArgs, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    let mut server = Server::new(
-        args.server_port,
-        args.http_port,
-        args.control_host,
-        args.token,
-        args.proxies,
-    );
+    let mut server = Server::new(args);
     server.run(shutdown_rx).await?;
 
     Ok(())
@@ -136,17 +134,19 @@ pub async fn run_server(args: ServerArgs, shutdown_rx: broadcast::Receiver<bool>
 // Server holds all states of running a server
 struct Server {
     state: Arc<ServerState>,
-    server_port: Option<u16>,
     http_port: u16,
-    control_host: Option<String>,
     proxies: Vec<crate::config::ServerProxyEntry>,
 }
 
 impl ServerState {
-    fn new(token: MaskedString, control_host: Option<String>) -> ServerState {
+    fn new(token: MaskedString, control_host: String, limits: ServerLimits) -> ServerState {
         ServerState {
             token,
             control_host,
+            pending_connections: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
+            control_connections: Arc::new(Semaphore::new(limits.max_control_connections)),
+            data_connections: Arc::new(Semaphore::new(limits.max_data_connections)),
+            limits,
             control_channels: RwLock::new(ControlChannelMap::new()),
             routing_table: RwLock::new(RoutingTable::default()),
             next_conn_id: AtomicUsize::new(0),
@@ -157,141 +157,56 @@ impl ServerState {
 
 impl Server {
     // Create a server from the command line options
-    pub fn new(
-        server_port: Option<u16>,
-        http_port: u16,
-        control_host: Option<String>,
-        token: String,
-        proxies: Vec<crate::config::ServerProxyEntry>,
-    ) -> Server {
-        let state = Arc::new(ServerState::new(MaskedString::from(token), control_host.clone()));
+    pub fn new(args: ServerArgs) -> Server {
+        let state = Arc::new(ServerState::new(
+            MaskedString::from(args.token),
+            args.control_host,
+            args.limits,
+        ));
 
         Server {
             state,
-            server_port,
-            http_port,
-            control_host,
-            proxies,
+            http_port: args.http_port,
+            proxies: args.proxies,
         }
     }
 
     // The entry point of Server
     pub async fn run(&mut self, mut shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-        // Listen at `server_port` for the control and data channels of clients.
-        // When it is not configured the TCP transport is disabled: clients then
-        // have to use the WebSocket transport through the HTTP entrypoint, so
-        // no local port is needed.
-        let mut tcp_listener: Option<TcpListener> = match self.server_port {
-            Some(port) => {
-                let server_addr = to_bind_addr(port);
-                let l: TcpListener = retry_notify_with_deadline(
-                    listen_backoff(),
-                    || async { Ok(TcpListener::bind(&server_addr).await?) },
-                    |e, duration| {
-                        error!("{:#}. Retry in {:?}", e, duration);
-                    },
-                    &mut shutdown_rx,
-                )
-                .await
-                .with_context(|| "Failed to listen at `server_port`")?;
-                info!("Listening at {}", server_addr);
-                Some(l)
-            }
-            None => {
-                info!(
-                    "TCP listener disabled (`server_port` is not set); clients must use the \
-                     WebSocket transport"
-                );
-                None
-            }
-        };
-
         // Bind the HTTP entrypoint before serving, so that a port that cannot
         // be bound fails startup instead of being discovered on shutdown. It
-        // routes visitors by the `Host` header.
+        // routes visitors by the `Host` header and carries the WebSocket
+        // control and data channels.
         let http_listener = TcpListener::bind(to_bind_addr(self.http_port))
             .await
             .with_context(|| format!("Failed to listen at `http_port` ({})", self.http_port))?;
         let mut http_task = tokio::spawn(crate::http::serve(
             http_listener,
-            self.control_host.clone(),
             self.state.clone(),
             shutdown_rx.resubscribe(),
             self.proxies.clone(),
         ));
         let mut http_task_done = false;
 
-        // Retry at least every 100ms
-        let mut backoff = ExponentialBackoff {
-            max_interval: Duration::from_millis(100),
-            max_elapsed_time: None,
-            ..Default::default()
-        };
-
-        // Wait for connections and shutdown signals
-        loop {
-            tokio::select! {
-                // Wait for incoming control and data channels
-                ret = accept_tunnel_connection(&mut tcp_listener) => {
-                    match ret {
-                        Err(err) => {
-                            // It is an IO error, so it's possibly an EMFILE.
-                            // Sleep for a while and retry
-                            if let Some(d) = backoff.next_backoff() {
-                                error!("Failed to accept: {:#}. Retry in {:?}...", err, d);
-                                time::sleep(d).await;
-                            } else {
-                                error!("Too many retries. Aborting...");
-                                break;
-                            }
-                        }
-                        Ok((conn, addr)) => {
-                            backoff.reset();
-
-                            // Do transport handshake with a timeout
-                            match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), handshake(conn)).await {
-                                Ok(conn) => {
-                                    match conn.with_context(|| "Failed to do transport handshake") {
-                                        Ok(conn) => {
-                                            let state = self.state.clone();
-                                            tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(Conn::Tcp(conn), state).await {
-                                                    error!("{:#}", err);
-                                                }
-                                            }.instrument(info_span!("connection", %addr)));
-                                        }, Err(e) => {
-                                            error!("{:#}", e);
-                                        }
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("Transport handshake timeout: {}", e);
-                                }
-                            }
-                        }
+        tokio::select! {
+            // The HTTP listener is bound before startup completes, so it
+            // should only stop on shutdown. If it dies early, surface the
+            // error instead of looking healthy while serving nothing.
+            res = &mut http_task => {
+                http_task_done = true;
+                match res {
+                    Ok(Ok(())) => {
+                        info!("HTTP listener stopped");
                     }
-                },
-                // The HTTP listener is bound before startup completes, so it
-                // should only stop on shutdown. If it dies early, surface the
-                // error instead of looking healthy while serving nothing.
-                res = &mut http_task => {
-                    http_task_done = true;
-                    match res {
-                        Ok(Ok(())) => {
-                            info!("HTTP listener stopped");
-                            break;
-                        }
-                        Ok(Err(err)) => {
-                            return Err(err).context("The HTTP listener stopped unexpectedly")
-                        }
-                        Err(err) => return Err(anyhow!("The HTTP listener task failed: {}", err)),
+                    Ok(Err(err)) => {
+                        return Err(err).context("The HTTP listener stopped unexpectedly")
                     }
+                    Err(err) => return Err(anyhow!("The HTTP listener task failed: {}", err)),
                 }
-                // Wait for the shutdown signal
-                _ = shutdown_rx.recv() => {
-                    info!("Shuting down gracefully...");
-                    break;
-                }
+            }
+            // Wait for the shutdown signal
+            _ = shutdown_rx.recv() => {
+                info!("Shuting down gracefully...");
             }
         }
 
@@ -330,27 +245,10 @@ impl Server {
     }
 }
 
-// Accept the next client connection, or wait forever when the TCP listener is
-// disabled. Omitting `server_port` makes the whole TCP transport optional.
-async fn accept_tunnel_connection(
-    listener: &mut Option<TcpListener>,
-) -> std::io::Result<(TcpStream, std::net::SocketAddr)> {
-    match listener {
-        Some(listener) => listener.accept().await,
-        None => std::future::pending().await,
-    }
-}
-
-// Plain TCP accepts the connection as is
-async fn handshake(conn: TcpStream) -> Result<TcpStream> {
-    Ok(conn)
-}
-
-// Handle connections to `server_port` and WebSocket connections accepted by the
-// HTTP entrypoint. Both expose the tunnel protocol and are handled identically.
+// Handle a tunnel WebSocket accepted by the HTTP entrypoint.
 pub(crate) async fn handle_connection(mut conn: Conn, state: Arc<ServerState>) -> Result<()> {
     // Bound the complete length-prefixed hello read, including slow/partial messages.
-    // This is important for WebSocket clients too: a completed WS upgrade alone is not authentication.
+    // A completed WebSocket upgrade alone is not authentication.
     let hello: ClientHello = time::timeout(
         Duration::from_secs(HANDSHAKE_TIMEOUT),
         protocol::read_payload(&mut conn),
@@ -360,19 +258,35 @@ pub(crate) async fn handle_connection(mut conn: Conn, state: Arc<ServerState>) -
     protocol::check_version(hello.version())?;
 
     match hello {
-        ClientHello::Control {
-            domain,
-            name,
-            nodelay,
-            ..
-        } => {
-            do_control_channel_handshake(conn, state, domain, name, nodelay).await?;
+        ClientHello::Control { domain, name, .. } => {
+            let permit = state
+                .control_connections
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| anyhow!("The control connection limit is reached"))?;
+            do_control_channel_handshake(conn, state, domain, name, permit).await?;
         }
         ClientHello::Data { nonce, .. } => {
-            do_data_channel_handshake(conn, state, nonce).await?;
+            let permit = match state.data_connections.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    reject_data_channel(&state, &nonce).await;
+                    return Err(anyhow!("The data connection limit is reached"));
+                }
+            };
+            do_data_channel_handshake(conn.with_permit(permit), state, nonce).await?;
         }
     }
     Ok(())
+}
+
+/// Count a data channel that was rejected before it could enter its pool as
+/// failed, so the pool does not wait for it until the visitor times out.
+async fn reject_data_channel(state: &ServerState, nonce: &Nonce) {
+    let channels = state.control_channels.read().await;
+    if let Some(handle) = channels.get2(nonce) {
+        handle.data_pool.failed();
+    }
 }
 
 // Establish a control channel for `domain`.
@@ -388,25 +302,26 @@ async fn do_control_channel_handshake(
     state: Arc<ServerState>,
     domain: String,
     name: String,
-    nodelay: bool,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
-    conn.apply(SocketOpts::for_control_channel());
-
-    let domain = crate::helper::normalize_domain(&domain)
-        .ok_or_else(|| anyhow!("The domain `{}` of the client `{}` is invalid", domain, name))?;
-    if let Some(control_host) = state.control_host.as_deref() {
-        // Use the same wildcard-aware check as the server-side proxies: a
-        // wildcard tunnel that contains the control host can never serve it,
-        // because the control host is intercepted before routing.
-        if domain_overlaps_control_host(&domain, control_host) {
-            bail!(
-                "The domain `{}` overlaps the reserved WebSocket control host `{}`",
-                domain,
-                control_host
-            );
-        }
+    let domain = crate::helper::normalize_domain(&domain).ok_or_else(|| {
+        anyhow!(
+            "The domain `{}` of the client `{}` is invalid",
+            domain,
+            name
+        )
+    })?;
+    // Use the same wildcard-aware check as the server-side proxies: a
+    // wildcard tunnel that contains the control host can never serve it,
+    // because the control host is intercepted before routing.
+    if domain_overlaps_control_host(&domain, &state.control_host) {
+        bail!(
+            "The domain `{}` overlaps the reserved WebSocket control host `{}`",
+            domain,
+            state.control_host
+        );
     }
 
     // Generate a nonce
@@ -421,8 +336,13 @@ async fn do_control_channel_handshake(
     };
     protocol::write_payload(&mut conn, &hello_send).await?;
 
-    // Read auth
-    let protocol::Auth(d) = protocol::read_payload(&mut conn).await?;
+    // Read auth, bounded so a slow client cannot hold the control permit forever
+    let protocol::Auth(d) = time::timeout(
+        Duration::from_secs(HANDSHAKE_TIMEOUT),
+        protocol::read_payload(&mut conn),
+    )
+    .await
+    .context("Timed out waiting for the client auth")??;
 
     // Validate against the shared token
     let mut concat = Vec::from(state.token.as_bytes());
@@ -449,9 +369,11 @@ async fn do_control_channel_handshake(
         conn,
         domain.clone(),
         name.clone(),
-        nodelay,
+        permit,
         HEARTBEAT_INTERVAL_SECS,
         conn_id,
+        &state.limits,
+        state.data_connections.clone(),
     );
 
     // Register the handle and the route. The removal of a previous handle and the
@@ -507,8 +429,6 @@ async fn do_data_channel_handshake(
     let control_channels_guard = state.control_channels.read().await;
     match control_channels_guard.get2(&nonce) {
         Some(handle) => {
-            conn.apply(SocketOpts::data_channel(handle.nodelay));
-
             // Send the data channel to the corresponding control channel. The
             // pool is told whether it made it, so that a channel that never
             // arrives doesn't count as outstanding forever.
@@ -542,15 +462,29 @@ pub(crate) struct DataChannelPool {
     // keep the pool warm for the next burst instead of only for the visitors
     // that are being forwarded right now
     demand: Arc<AtomicUsize>,
+    // The base and the maximum number of warm channels of this tunnel
+    min: usize,
+    max: usize,
+    // The server-wide data capacity, so an exhausted budget does not make every
+    // tunnel spin new upgrades that are closed immediately.
+    data_permits: Arc<Semaphore>,
 }
 
 impl DataChannelPool {
-    fn new(req_tx: mpsc::UnboundedSender<bool>) -> DataChannelPool {
+    fn new(
+        req_tx: mpsc::UnboundedSender<bool>,
+        min: usize,
+        max: usize,
+        data_permits: Arc<Semaphore>,
+    ) -> DataChannelPool {
         DataChannelPool {
             req_tx,
             inflight: Arc::new(AtomicUsize::new(0)),
             warm: Arc::new(AtomicUsize::new(0)),
             demand: Arc::new(AtomicUsize::new(0)),
+            min,
+            max,
+            data_permits,
         }
     }
 
@@ -584,33 +518,33 @@ impl DataChannelPool {
     /// A requested data channel arrived and was handed to the pool receiver. It
     /// stops counting as in flight, but is still outstanding until consumed.
     fn arrived(&self) {
-        let _ = self.inflight.try_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |v| Some(v.saturating_sub(1)),
-        );
+        let _ = self
+            .inflight
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
         self.warm.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A requested data channel could not be handed over. Nothing will arrive
     /// for it, so it stops counting as outstanding.
     fn failed(&self) {
-        let _ = self.inflight.try_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |v| Some(v.saturating_sub(1)),
-        );
+        let _ = self
+            .inflight
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 
     /// A data channel was taken out of the pool. The visitor already asked for
     /// its own channel when it was routed, so this only updates the counters
     /// instead of asking for another one (which would double the requests).
     fn consume(&self) {
-        let _ = self.warm.try_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |v| Some(v.saturating_sub(1)),
-        );
+        let _ = self
+            .warm
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
         self.note_demand();
     }
 
@@ -622,11 +556,13 @@ impl DataChannelPool {
     }
 
     /// The number of channels to keep warm and on their way: the base buffer
-    /// plus the recent demand, so that a burst is served without waiting for a
-    /// fresh round trip. The demand decays, so an idle tunnel shrinks back to
-    /// the base buffer.
+    /// plus the recent demand, capped at `pool_max` so that one busy tunnel
+    /// cannot exhaust the global data channel budget. The demand decays, so an
+    /// idle tunnel shrinks back to the base buffer.
     fn target(&self) -> usize {
-        POOL_MIN + self.demand.load(Ordering::Relaxed)
+        self.min
+            .saturating_add(self.demand.load(Ordering::Relaxed))
+            .min(self.max.max(self.min))
     }
 
     /// How many warm channels are wanted once the ones that are still on their
@@ -647,6 +583,14 @@ impl DataChannelPool {
         self.demand
             .store(demand.saturating_sub(decay), Ordering::Relaxed);
 
+        // Every channel that arrives needs one of these permits. Stop topping
+        // the pool up while the server-wide data budget cannot cover the
+        // channels that are already on their way.
+        let available = self.data_permits.available_permits();
+        if available <= self.inflight.load(Ordering::Relaxed) {
+            return;
+        }
+
         while self.warm.load(Ordering::Relaxed) + self.inflight.load(Ordering::Relaxed)
             < self.target()
         {
@@ -665,11 +609,11 @@ impl DataChannelPool {
     /// A warm channel was dropped by the trimming. It was already counted as
     /// outstanding, so stop counting it.
     fn drop_warm(&self) {
-        let _ = self.warm.try_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |v| Some(v.saturating_sub(1)),
-        );
+        let _ = self
+            .warm
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 }
 
@@ -679,8 +623,6 @@ pub(crate) struct ControlChannelHandle {
     id: usize,
     // The client that owns the channel, to warn when a domain changes hands
     name: String,
-    // The client's TCP_NODELAY preference for the data channels of the tunnel
-    nodelay: bool,
     // Shutdown the control channel by dropping it
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<Conn>,
@@ -697,9 +639,11 @@ impl ControlChannelHandle {
         conn: Conn,
         domain: String,
         name: String,
-        nodelay: bool,
+        permit: tokio::sync::OwnedSemaphorePermit,
         heartbeat_interval: u64,
         id: usize,
+        limits: &ServerLimits,
+        data_permits: Arc<Semaphore>,
     ) -> (ControlChannelHandle, JoinHandle<()>) {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -714,14 +658,19 @@ impl ControlChannelHandle {
         let (visitor_tx, visitor_rx) = mpsc::channel(CHAN_SIZE);
 
         // The pool that keeps the data channels warm
-        let data_pool = DataChannelPool::new(data_ch_req_tx);
+        let data_pool = DataChannelPool::new(
+            data_ch_req_tx,
+            limits.pool_min,
+            limits.pool_max,
+            data_permits,
+        );
 
         let pool_task = data_pool.clone();
         tokio::spawn(
             async move {
-                if let Err(e) = run_tcp_connection_pool(data_ch_rx, visitor_rx, pool_task)
+                if let Err(e) = run_data_channel_pool(data_ch_rx, visitor_rx, pool_task)
                     .await
-                    .with_context(|| "Failed to run TCP connection pool")
+                    .with_context(|| "Failed to run the data channel pool")
                 {
                     error!("{:#}", e);
                 }
@@ -729,12 +678,14 @@ impl ControlChannelHandle {
             .instrument(Span::current()),
         );
 
-        // Create the control channel
+        // Create the control channel. It holds the control capacity permit
+        // until the channel is gone.
         let ch = ControlChannel {
             conn,
             shutdown_rx,
             data_ch_req_rx,
             heartbeat_interval,
+            _permit: permit,
         };
 
         // Run the control channel. Its `JoinHandle` is returned so that the caller can
@@ -754,7 +705,6 @@ impl ControlChannelHandle {
             ControlChannelHandle {
                 id,
                 name,
-                nodelay,
                 _shutdown_tx: shutdown_tx,
                 data_ch_tx,
                 visitor_tx,
@@ -771,6 +721,7 @@ struct ControlChannel {
     shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
     data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives data channel creation requests
     heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
+    _permit: tokio::sync::OwnedSemaphorePermit,    // Holds the control capacity slot
 }
 
 impl ControlChannel {
@@ -782,6 +733,7 @@ impl ControlChannel {
             mut shutdown_rx,
             mut data_ch_req_rx,
             heartbeat_interval,
+            _permit,
         } = self;
 
         // Split the connection, so that the writes and the read that watches for the
@@ -849,7 +801,7 @@ impl ControlChannel {
 /// demand decays. The waiters never hold a lock, so a visitor that gives up
 /// doesn't block the others.
 #[instrument(skip_all)]
-async fn run_tcp_connection_pool(
+async fn run_data_channel_pool(
     mut data_ch_rx: mpsc::Receiver<Conn>,
     mut visitor_rx: mpsc::Receiver<HttpVisitor>,
     data_pool: DataChannelPool,
@@ -886,6 +838,11 @@ async fn run_tcp_connection_pool(
                 let Some(channel) = channel else {
                     break;
                 };
+                if !channel.is_alive() {
+                    // The keepalive already noticed that the socket is gone.
+                    data_pool.drop_warm();
+                    continue;
+                }
                 warm.push_back(channel);
                 serve_waiters(&mut warm, &mut waiters, &data_pool);
             }
@@ -929,6 +886,11 @@ fn serve_waiters(
 ) {
     while !warm.is_empty() && !waiters.is_empty() {
         let channel = warm.pop_front().unwrap();
+        if !channel.is_alive() {
+            // Do not hand a channel whose WebSocket bridge is gone to a visitor.
+            data_pool.drop_warm();
+            continue;
+        }
         let waiter = waiters.pop_front().unwrap();
         match waiter.send(channel) {
             Ok(()) => data_pool.consume(),
@@ -1067,7 +1029,7 @@ async fn forward_visitor(
                 // cannot reach its `local_addr` does not land here: it opens the
                 // data channel first and only dials the local service afterwards,
                 // so that failure shows up on the client side instead (see
-                // `run_data_channel_for_tcp`).
+                // `run_data_channel_forward`).
                 warn!(
                     "The tunnel did not provide a data channel within {}s; \
                      answering the visitor with 504",
@@ -1087,9 +1049,7 @@ async fn forward_visitor(
             }
             ChannelWait::PoolClosed => {
                 // The control channel is gone, so no data channel will ever come.
-                warn!(
-                    "The control channel of the tunnel is gone; answering the visitor with 503"
-                );
+                warn!("The control channel of the tunnel is gone; answering the visitor with 503");
                 crate::http::respond_tunnel_unavailable(&mut stream).await;
                 return Ok(());
             }

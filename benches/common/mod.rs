@@ -17,7 +17,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-pub const SERVER_PORT: u16 = 2333;
 pub const HTTP_ENTRY_PORT: u16 = 2334;
 pub const HTTP_ENTRY_ADDR: &str = "127.0.0.1:2334";
 pub const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
@@ -71,12 +70,10 @@ impl Harness {
 
         // Write a client config on the fly, so the benchmark doesn't depend on
         // the test fixtures.
-        let config_path = std::env::temp_dir().join(format!(
-            "http-tunnel-bench-{}.toml",
-            std::process::id()
-        ));
+        let config_path =
+            std::env::temp_dir().join(format!("http-tunnel-bench-{}.toml", std::process::id()));
         let config = format!(
-            "name = \"{CLIENT_NAME}\"\nserver_host = \"127.0.0.1\"\nserver_port = {SERVER_PORT}\ntoken = \"{CLIENT_TOKEN}\"\n\n[[tunnels]]\nname = \"echo\"\ndomain = \"{ECHO_HOST}\"\nlocal_addr = \"{ECHO_SERVER_ADDR}\"\n"
+            "transport = \"ws\"\nname = \"{CLIENT_NAME}\"\nserver_host = \"127.0.0.1\"\nserver_port = {HTTP_ENTRY_PORT}\ntoken = \"{CLIENT_TOKEN}\"\n\n[[tunnels]]\nname = \"echo\"\ndomain = \"{ECHO_HOST}\"\nlocal_addr = \"{ECHO_SERVER_ADDR}\"\n"
         );
         std::fs::write(&config_path, config)?;
         let config_guard = TempFile(config_path.clone());
@@ -97,11 +94,11 @@ impl Harness {
         let server = {
             tokio::spawn(async move {
                 let cmd = http_tunnel::Command::Server(http_tunnel::ServerArgs {
-                    server_port: Some(SERVER_PORT),
                     http_port: HTTP_ENTRY_PORT,
-                    control_host: None,
+                    control_host: "127.0.0.1".to_string(),
                     token: CLIENT_TOKEN.to_string(),
                     proxies: Vec::new(),
+                    limits: http_tunnel::ServerLimits::default(),
                 });
                 let _ = http_tunnel::run(cmd, server_rx).await;
             })

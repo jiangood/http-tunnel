@@ -11,7 +11,7 @@ use tokio::{
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
-use crate::common::{run_http_tunnel_server, run_http_tunnel_server_with_control_host};
+use crate::common::{run_http_tunnel_server, run_http_tunnel_server_with_limits};
 
 mod common;
 const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
@@ -19,10 +19,8 @@ const HTTP_ENTRY_ADDR: &str = "127.0.0.1:2334";
 const HTTP_ENTRY_PORT: u16 = 2334;
 const WS_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2336";
 const WS_HTTP_ENTRY_PORT: u16 = 2336;
-const WS_SERVER_PORT: u16 = 2335;
 const WS_ECHO_SERVER_ADDR: &str = "127.0.0.1:8081";
 const SERVER_HOST: &str = "127.0.0.1";
-const SERVER_PORT: u16 = 2333;
 const CLIENT_NAME: &str = "home";
 const CLIENT_TOKEN: &str = "a_secret_token";
 const ECHO_HOST: &str = "echo.test";
@@ -63,7 +61,7 @@ fn write_client_config(
         .map(|p| format!("web_port = {}\n", p))
         .unwrap_or_default();
     let content = format!(
-        "name = \"{}\"\nserver_host = \"{}\"\nserver_port = {}\ntoken = \"{}\"\n{}\n{}",
+        "transport = \"ws\"\nname = \"{}\"\nserver_host = \"{}\"\nserver_port = {}\ntoken = \"{}\"\n{}\n{}",
         name, server_host, server_port, token, api, tunnels_toml
     );
 
@@ -87,7 +85,7 @@ async fn http_routing() -> Result<()> {
         "http_tunnel_routing_client.toml",
         CLIENT_NAME,
         SERVER_HOST,
-        SERVER_PORT,
+        HTTP_ENTRY_PORT,
         CLIENT_TOKEN,
         None,
         &[(ECHO_HOST, ECHO_SERVER_ADDR)],
@@ -110,9 +108,14 @@ async fn http_routing() -> Result<()> {
     // Start the server
     info!("start the server");
     let server = tokio::spawn(async move {
-        run_http_tunnel_server(Some(SERVER_PORT), HTTP_ENTRY_PORT, CLIENT_TOKEN, server_shutdown_rx)
-            .await
-            .unwrap();
+        run_http_tunnel_server(
+            HTTP_ENTRY_PORT,
+            SERVER_HOST,
+            CLIENT_TOKEN,
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
     });
     time::sleep(Duration::from_millis(2500)).await; // Wait for the client to retry
 
@@ -171,9 +174,14 @@ async fn http_routing() -> Result<()> {
     info!("restart the server");
     let server_shutdown_rx = server_shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
-        run_http_tunnel_server(Some(SERVER_PORT), HTTP_ENTRY_PORT, CLIENT_TOKEN, server_shutdown_rx)
-            .await
-            .unwrap();
+        run_http_tunnel_server(
+            HTTP_ENTRY_PORT,
+            SERVER_HOST,
+            CLIENT_TOKEN,
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
     });
     time::sleep(Duration::from_millis(2500)).await; // Wait for the client to retry
 
@@ -239,7 +247,11 @@ async fn wait_for_tcp(addr: &'static str, timeout: Duration) -> Result<()> {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            anyhow::bail!("nothing accepted connections at {} within {:?}", addr, timeout);
+            anyhow::bail!(
+                "nothing accepted connections at {} within {:?}",
+                addr,
+                timeout
+            );
         }
         time::sleep(Duration::from_millis(50)).await;
     }
@@ -325,7 +337,6 @@ const CLIENT_API_ECHO_SERVER_ADDR: &str = "127.0.0.1:8093";
 const CLIENT_API_HTTP_ENTRY_PORT: u16 = 2464;
 const CLIENT_API_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2464";
 const CLIENT_API_ADDR: &str = "127.0.0.1:2465";
-const CLIENT_API_SERVER_PORT: u16 = 2463;
 const CLIENT_API_TOKEN: &str = "a_secret_token";
 
 /// A WebSocket transport carries the control channel and every data channel
@@ -349,22 +360,13 @@ async fn websocket_transport_routes_http() -> Result<()> {
         Some(0),
         &[("echo-ws.test", WS_ECHO_SERVER_ADDR)],
     )?;
-    let config = std::fs::read_to_string(&client_config)?;
-    let config = config.replacen(
-        "\n[[tunnels]]",
-        "\ntransport = \"ws\"\n\n[[tunnels]]",
-        1,
-    );
-    std::fs::write(&client_config, config)?;
-
     let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
 
     let server = tokio::spawn(async move {
-        common::run_http_tunnel_server_with_control_host(
-            Some(WS_SERVER_PORT),
+        common::run_http_tunnel_server(
             WS_HTTP_ENTRY_PORT,
-            Some("127.0.0.1"),
+            "127.0.0.1",
             CLIENT_TOKEN,
             server_shutdown_rx,
         )
@@ -387,10 +389,9 @@ async fn websocket_transport_routes_http() -> Result<()> {
 
     let (server2_shutdown_tx, server2_shutdown_rx) = broadcast::channel(1);
     let server2 = tokio::spawn(async move {
-        common::run_http_tunnel_server_with_control_host(
-            Some(WS_SERVER_PORT),
+        common::run_http_tunnel_server(
             WS_HTTP_ENTRY_PORT,
-            Some("127.0.0.1"),
+            "127.0.0.1",
             CLIENT_TOKEN,
             server2_shutdown_rx,
         )
@@ -406,14 +407,14 @@ async fn websocket_transport_routes_http() -> Result<()> {
     Ok(())
 }
 
-// ==== WebSocket transport with the TCP listener disabled ====
+// ==== WebSocket transport on a separate entrypoint ====
 
 const WS_ONLY_HTTP_PORT: u16 = 2555;
 const WS_ONLY_HTTP_ADDR: &str = "127.0.0.1:2555";
 const WS_ONLY_ECHO_ADDR: &str = "127.0.0.1:2556";
 
-/// Omitting `server_port` disables the TCP listener entirely, so the WebSocket
-/// transport has to carry the whole tunnel through the HTTP entrypoint.
+/// The WebSocket transport carries the whole tunnel through the HTTP
+/// entrypoint, so no extra control port exists.
 #[tokio::test]
 async fn websocket_transport_works_without_a_tcp_listener() -> Result<()> {
     init();
@@ -433,22 +434,13 @@ async fn websocket_transport_works_without_a_tcp_listener() -> Result<()> {
         Some(0),
         &[("echo-ws-only.test", WS_ONLY_ECHO_ADDR)],
     )?;
-    let config = std::fs::read_to_string(&client_config)?;
-    let config = config.replacen(
-        "\n[[tunnels]]",
-        "\ntransport = \"ws\"\n\n[[tunnels]]",
-        1,
-    );
-    std::fs::write(&client_config, config)?;
-
     let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
 
     let server = tokio::spawn(async move {
-        common::run_http_tunnel_server_with_control_host(
-            None, // no TCP listener at all
+        common::run_http_tunnel_server(
             WS_ONLY_HTTP_PORT,
-            Some("127.0.0.1"),
+            "127.0.0.1",
             CLIENT_TOKEN,
             server_shutdown_rx,
         )
@@ -477,7 +469,6 @@ async fn websocket_transport_works_without_a_tcp_listener() -> Result<()> {
 
 // ==== WebSocket transport with an unavailable client-side target ====
 
-const WS_FAILURE_SERVER_PORT: u16 = 2545;
 const WS_FAILURE_HTTP_PORT: u16 = 2546;
 const WS_FAILURE_HTTP_ADDR: &str = "127.0.0.1:2546";
 const WS_FAILURE_TARGET_ADDR: &str = "127.0.0.1:2547";
@@ -496,21 +487,12 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
         Some(0),
         &[("unavailable-ws.test", WS_FAILURE_TARGET_ADDR)],
     )?;
-    let config = std::fs::read_to_string(&client_config)?;
-    let config = config.replacen(
-        "\n[[tunnels]]",
-        "\ntransport = \"ws\"\n\n[[tunnels]]",
-        1,
-    );
-    std::fs::write(&client_config, config)?;
-
     let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
     let server = tokio::spawn(async move {
-        run_http_tunnel_server_with_control_host(
-            Some(WS_FAILURE_SERVER_PORT),
+        run_http_tunnel_server(
             WS_FAILURE_HTTP_PORT,
-            Some("127.0.0.1"),
+            "127.0.0.1",
             CLIENT_TOKEN,
             server_shutdown_rx,
         )
@@ -529,13 +511,10 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
 
     let mut visitor = TcpStream::connect(WS_FAILURE_HTTP_ADDR).await?;
     visitor
-        .write_all(
-            b"GET / HTTP/1.1\r\nHost: unavailable-ws.test\r\nConnection: close\r\n\r\n",
-        )
+        .write_all(b"GET / HTTP/1.1\r\nHost: unavailable-ws.test\r\nConnection: close\r\n\r\n")
         .await?;
     let mut response = Vec::new();
-    time::timeout(Duration::from_secs(18), visitor.read_to_end(&mut response))
-        .await??;
+    time::timeout(Duration::from_secs(18), visitor.read_to_end(&mut response)).await??;
     let response = String::from_utf8_lossy(&response);
     assert!(
         response.starts_with("HTTP/1.1 504"),
@@ -561,7 +540,7 @@ async fn client_api_manages_tunnels() -> Result<()> {
         "http_tunnel_client_api_test.toml",
         "home",
         "127.0.0.1",
-        CLIENT_API_SERVER_PORT,
+        CLIENT_API_HTTP_ENTRY_PORT,
         CLIENT_API_TOKEN,
         Some(2465),
         &[],
@@ -578,8 +557,8 @@ async fn client_api_manages_tunnels() -> Result<()> {
 
     let server = tokio::spawn(async move {
         run_http_tunnel_server(
-            Some(CLIENT_API_SERVER_PORT),
             CLIENT_API_HTTP_ENTRY_PORT,
+            "127.0.0.1",
             CLIENT_API_TOKEN,
             server_shutdown_rx,
         )
@@ -635,8 +614,16 @@ async fn client_api_manages_tunnels() -> Result<()> {
     .await?;
     assert_eq!(status, 201, "unexpected response: {}", body);
     assert!(body.contains("127.0.0.1:8093"), "unexpected body: {}", body);
-    assert!(body.contains("\"name\":\"echo\""), "unexpected body: {}", body);
-    assert!(body.contains("\"domain\":\"echo.test\""), "unexpected body: {}", body);
+    assert!(
+        body.contains("\"name\":\"echo\""),
+        "unexpected body: {}",
+        body
+    );
+    assert!(
+        body.contains("\"domain\":\"echo.test\""),
+        "unexpected body: {}",
+        body
+    );
 
     // The client starts the tunnel
     time::sleep(Duration::from_millis(1500)).await;
@@ -719,7 +706,7 @@ async fn client_api_manages_tunnels() -> Result<()> {
 
 // ==== The fatal auth error test ====
 
-const FATAL_SERVER_PORT: u16 = 2453;
+const FATAL_HTTP_PORT: u16 = 2454;
 
 /// A client whose token is rejected must exit with an error instead of retrying
 /// forever. The timeout fails the test if the client keeps retrying.
@@ -731,7 +718,7 @@ async fn client_exits_on_a_wrong_token() -> Result<()> {
         "http_tunnel_fatal_test.toml",
         "home",
         "127.0.0.1",
-        FATAL_SERVER_PORT,
+        FATAL_HTTP_PORT,
         "wrong_token",
         None,
         &[("echo.test", "127.0.0.1:8092")],
@@ -740,8 +727,8 @@ async fn client_exits_on_a_wrong_token() -> Result<()> {
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
     let server = tokio::spawn(async move {
         run_http_tunnel_server(
-            Some(FATAL_SERVER_PORT),
-            2454,
+            FATAL_HTTP_PORT,
+            "127.0.0.1",
             CLIENT_TOKEN,
             server_shutdown_rx,
         )
@@ -774,7 +761,6 @@ async fn client_exits_on_a_wrong_token() -> Result<()> {
     Ok(())
 }
 
-const OCCUPIED_HTTP_TEST_SERVER_PORT: u16 = 2475;
 const OCCUPIED_HTTP_TEST_HTTP_PORT: u16 = 2476;
 
 /// An `http_port` that cannot be bound must fail startup with an error instead
@@ -791,8 +777,8 @@ async fn server_fails_when_http_port_cannot_be_bound() -> Result<()> {
     let err = time::timeout(
         Duration::from_secs(5),
         run_http_tunnel_server(
-            Some(OCCUPIED_HTTP_TEST_SERVER_PORT),
             OCCUPIED_HTTP_TEST_HTTP_PORT,
+            "127.0.0.1",
             CLIENT_TOKEN,
             shutdown_rx,
         ),
@@ -849,34 +835,57 @@ async fn api_request(
     Ok((status, body))
 }
 
-
 // ==== WebSocket resource-limit integration test ====
 
-const WS_LIMIT_SERVER_PORT: u16 = 2535;
 const WS_LIMIT_HTTP_PORT: u16 = 2536;
 const WS_LIMIT_HTTP_ADDR: &str = "127.0.0.1:2536";
+const WS_LIMIT: usize = 8;
 
-/// Exercise the real HTTP upgrade path at the configured WebSocket connection
-/// limit, verify excess connections receive 503, and ensure closed connections
-/// release their slots for subsequent clients.
+/// Build an upgrade request with the shared token in the `Authorization` header.
+fn websocket_request(
+    url: &str,
+    token: Option<&str>,
+) -> tokio_tungstenite::tungstenite::http::Request<()> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let mut request = url.into_client_request().expect("valid WebSocket URL");
+    if let Some(token) = token {
+        let value = tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!(
+            "Bearer {}",
+            token
+        ))
+        .expect("valid token header");
+        request.headers_mut().insert("Authorization", value);
+    }
+    request
+}
+
+/// Exercise the real HTTP upgrade path at the configured handshake limit:
+/// authenticated excess upgrades receive 503, an unauthenticated one still
+/// receives 401 even when the budget is full, and closing the sockets releases
+/// their slots for subsequent clients.
 #[tokio::test]
 async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
     use tokio_tungstenite::connect_async;
 
     init();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let limits = http_tunnel::ServerLimits {
+        max_pending_handshakes: WS_LIMIT,
+        ..http_tunnel::ServerLimits::default()
+    };
     let server = tokio::spawn(async move {
-        run_http_tunnel_server_with_control_host(
-            Some(WS_LIMIT_SERVER_PORT),
+        run_http_tunnel_server_with_limits(
             WS_LIMIT_HTTP_PORT,
-            Some("127.0.0.1"),
+            "127.0.0.1",
             CLIENT_TOKEN,
+            limits,
             shutdown_rx,
         )
         .await
         .unwrap();
     });
-    // Wait until both listeners are bound before creating the connection burst.
+    // Wait until the listener is bound before creating the connection burst.
     wait_for_tcp(WS_LIMIT_HTTP_ADDR, Duration::from_secs(10)).await?;
 
     // Check control endpoint routing before consuming the connection budget.
@@ -914,36 +923,70 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
     }
 
     let url = format!("ws://{}/_http-tunnel/v1/connect", WS_LIMIT_HTTP_ADDR);
-    // The server reclaims a bridged WebSocket that has not sent the tunnel
-    // protocol ClientHello after five seconds. Opening the burst is therefore
-    // only meaningful while the earliest connections are still inside that
-    // window; otherwise their slots have legitimately been released again.
-    // Retry the burst instead of reporting a false regression on a slow runner.
+    // A bridged WebSocket that has not sent the tunnel protocol ClientHello is
+    // reclaimed after five seconds. The burst must therefore stay inside that
+    // window; retry instead of reporting a false regression on a slow runner.
     const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
     const BURST_BUDGET: Duration = Duration::from_secs(4);
     let mut held = None;
     for attempt in 1..=3 {
         let started = Instant::now();
-        let attempts = futures_util::future::join_all((0..256).map(|_| async {
-            time::timeout(Duration::from_secs(8), connect_async(&url)).await
+        let attempts = futures_util::future::join_all((0..WS_LIMIT).map(|_| async {
+            time::timeout(
+                Duration::from_secs(8),
+                connect_async(websocket_request(&url, Some(CLIENT_TOKEN))),
+            )
+            .await
         }))
         .await;
-        let mut sockets = Vec::with_capacity(256);
+        let mut sockets = Vec::with_capacity(WS_LIMIT);
         for (index, result) in attempts.into_iter().enumerate() {
             match result {
-                std::result::Result::Ok(std::result::Result::Ok((socket, _))) => sockets.push(socket),
-                std::result::Result::Ok(Err(error)) => anyhow::bail!("WebSocket connection {} failed before the limit: {}", index + 1, error),
-                Err(_) => anyhow::bail!("WebSocket connection {} timed out before the limit", index + 1),
+                std::result::Result::Ok(std::result::Result::Ok((socket, _))) => {
+                    sockets.push(socket)
+                }
+                std::result::Result::Ok(Err(error)) => anyhow::bail!(
+                    "WebSocket connection {} failed before the limit: {}",
+                    index + 1,
+                    error
+                ),
+                Err(_) => anyhow::bail!(
+                    "WebSocket connection {} timed out before the limit",
+                    index + 1
+                ),
             }
         }
         let burst = started.elapsed();
         if burst >= BURST_BUDGET {
-            debug!("opening 256 WebSockets took {:?} on attempt {}; retrying", burst, attempt);
+            debug!(
+                "opening {} WebSockets took {:?} on attempt {}; retrying",
+                WS_LIMIT, burst, attempt
+            );
             drop(sockets);
             continue;
         }
 
-        let excess = time::timeout(Duration::from_secs(3), connect_async(&url)).await;
+        // Authentication is checked before the handshake permit is taken, so an
+        // unauthenticated upgrade is still answered with 401, not 503.
+        let unauthenticated = time::timeout(
+            Duration::from_secs(3),
+            connect_async(websocket_request(&url, None)),
+        )
+        .await;
+        match unauthenticated {
+            std::result::Result::Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response)))
+                if response.status().as_u16() == 401 => {}
+            other => anyhow::bail!(
+                "an unauthenticated upgrade was not answered with 401: {:?}",
+                other
+            ),
+        }
+
+        let excess = time::timeout(
+            Duration::from_secs(3),
+            connect_async(websocket_request(&url, Some(CLIENT_TOKEN))),
+        )
+        .await;
         match excess {
             std::result::Result::Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response)))
                 if response.status().as_u16() == 503 =>
@@ -953,17 +996,20 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
             }
             std::result::Result::Ok(std::result::Result::Ok((socket, _))) => {
                 drop(socket);
-                // The burst finished inside the hello window, so all 256 slots
-                // were still held: accepting the 257th connection is a regression.
-                anyhow::bail!("the 257th WebSocket connection unexpectedly succeeded");
+                // The burst finished inside the hello window, so every slot was
+                // still held: accepting one more connection is a regression.
+                anyhow::bail!("an extra WebSocket connection unexpectedly succeeded");
             }
-            std::result::Result::Ok(Err(error)) => anyhow::bail!("unexpected error for the 257th connection: {}", error),
-            Err(_) => anyhow::bail!("the 257th WebSocket handshake timed out"),
+            std::result::Result::Ok(Err(error)) => {
+                anyhow::bail!("unexpected error for the extra connection: {}", error)
+            }
+            std::result::Result::Err(_) => anyhow::bail!("the extra WebSocket handshake timed out"),
         }
     }
     let sockets = held.ok_or_else(|| {
         anyhow::anyhow!(
-            "could not open 256 WebSocket connections within the {:?} hello window",
+            "could not open {} WebSocket connections within the {:?} hello window",
+            WS_LIMIT,
             HELLO_TIMEOUT
         )
     })?;
@@ -972,7 +1018,7 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
     drop(sockets);
     let mut recovered = false;
     for _ in 0..50 {
-        match connect_async(&url).await {
+        match connect_async(websocket_request(&url, Some(CLIENT_TOKEN))).await {
             std::result::Result::Ok((socket, _)) => {
                 drop(socket);
                 recovered = true;

@@ -1,5 +1,6 @@
 # The server address may be omitted by the parser; `htc` requires
-# `server_host` and `server_port` when it starts.
+# `server_host` (the control_host) and `server_port` (the http_port) when it
+# starts.
 name = "home"
 token = "use_a_secret_that_only_you_know"
 
