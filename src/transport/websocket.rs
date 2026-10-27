@@ -36,10 +36,13 @@ impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 
 pub(crate) type BoxedIo = Box<dyn AsyncReadWrite + Unpin + Send + Sync>;
 
-/// Connect to the control Host over plain WebSocket and expose it as a byte stream.
+/// Connect to the control Host over WebSocket and expose it as a byte stream.
 /// The existing length-prefixed protocol therefore does not need to know about WS frames.
-pub(crate) async fn connect_websocket(server_addr: &str) -> Result<BoxedIo> {
-    let url = format!("ws://{}/_http-tunnel/v1/connect", server_addr);
+///
+/// `tls` selects `wss://` instead of `ws://`; the TLS handshake is part of the
+/// WebSocket connect, so callers only pass the resolved setting.
+pub(crate) async fn connect_websocket(server_addr: &str, tls: bool) -> Result<BoxedIo> {
+    let url = websocket_url(server_addr, tls);
     let (ws, _) = timeout(
         WS_HANDSHAKE_TIMEOUT,
         // The tunnel carries small interactive frames; keep the same
@@ -57,6 +60,12 @@ pub(crate) async fn connect_websocket(server_addr: &str) -> Result<BoxedIo> {
         }
     });
     Ok(Box::new(client))
+}
+
+/// The URL of the tunnel WebSocket endpoint, `wss://` when TLS is enabled.
+pub(crate) fn websocket_url(server_addr: &str, tls: bool) -> String {
+    let scheme = if tls { "wss" } else { "ws" };
+    format!("{}://{}/_http-tunnel/v1/connect", scheme, server_addr)
 }
 
 /// Bridge a WebSocket connection to an ordinary async byte stream.
@@ -219,6 +228,22 @@ mod tests {
         let config = websocket_config();
         assert_eq!(config.max_message_size, Some(MAX_WS_MESSAGE_SIZE));
         assert_eq!(config.max_frame_size, Some(MAX_WS_MESSAGE_SIZE));
+    }
+
+    #[test]
+    fn websocket_url_selects_the_scheme_from_the_tls_setting() {
+        assert_eq!(
+            websocket_url("control.example.com:443", true),
+            "wss://control.example.com:443/_http-tunnel/v1/connect"
+        );
+        assert_eq!(
+            websocket_url("control.example.com:80", false),
+            "ws://control.example.com:80/_http-tunnel/v1/connect"
+        );
+        assert_eq!(
+            websocket_url("[::1]:443", true),
+            "wss://[::1]:443/_http-tunnel/v1/connect"
+        );
     }
 
     #[tokio::test]

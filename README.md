@@ -9,7 +9,7 @@
 ## 功能
 
 - 多域名和泛域名路由
-- 支持 WebSocket 和 HTTP 协议升级
+- 支持 WebSocket 和 HTTP 协议升级，WebSocket 传输支持 `wss://`（TLS）
 - 支持服务端直连代理和客户端隧道
 - 支持 TCP 地址和 Unix Socket
 - 可为转发规则开启入口校验，要求访客携带 `X-HTTP-TUNNEL-TOKEN`
@@ -89,7 +89,7 @@ token = "与客户端相同的随机强密钥"
 ```toml
 server_host = "control.example.com"
 server_port = 80
-transport = "websocket"
+transport = "ws"
 name = "home"
 token = "与服务端相同的随机强密钥"
 
@@ -100,6 +100,26 @@ local_addr = "127.0.0.1:80"
 ```
 
 > 注意：WebSocket 模式下 `server_port` 填的是服务端的 `http_port`（上例为 `80`），`server_host` 必须与服务端的 `control_host` 一致。启动日志会明确打印当前使用的传输模式和连接地址。
+
+如果服务端 HTTP 入口是 HTTPS（例如由 Nginx、云负载均衡或安全网关终止 TLS），把 `transport` 写成 `wss` 即可（任何端口），客户端会完成 TLS 握手并校验服务端证书：
+
+```toml
+server_host = "control.example.com"
+server_port = 443
+transport = "wss"          # 使用 wss://
+```
+
+`transport` 的取值：
+
+| 值 | 含义 |
+| --- | --- |
+| `tcp`（默认） | 原始 TCP 传输，连服务端 `server_port` |
+| `ws` | WebSocket 传输，明文 `ws://` |
+| `wss` | WebSocket 传输，TLS `wss://` |
+
+协议只由 `transport` 决定，不再根据端口自动推断。旧版本写的 `transport = "websocket"` 仍可用，等价于 `ws`。
+
+TLS 证书的 `subjectAltName` 必须包含 `server_host`，否则握手会因证书校验失败而报错。
 
 控制域名仅用于内部控制与数据连接；普通业务域名（例如 nas.example.com）继续通过 http_port 进入现有 Host 路由。服务端会根据 Host 和专用路径 /_http-tunnel/v1/connect 识别 WebSocket 连接，并直接交给隧道协议处理器。原来的 2333/TCP 模式不受影响。
 
@@ -114,7 +134,7 @@ token = "与客户端相同的随机强密钥"
 
 WebSocket 连接不再经过本地 2333 回环桥接，因此进程也不需要占用任何本地 TCP 端口（除了 `http_port`）。
 
-**安全提示：** 当前 WebSocket 模式使用明文 ws://，不会自动申请或配置证书。Token、控制消息和隧道数据可能被网络中间方读取或篡改，因此此模式适合可信网络或测试环境；不要在未经加密保护的公网链路上发送敏感流量。正式公网部署应通过可信 TLS 终止层提供 WSS，或在后续版本使用端到端加密。control_host 只是路由配置，不是身份认证；服务端仍会验证现有共享 Token。
+**安全提示：** 明文 `ws://` 下 Token、控制消息和隧道数据可能被网络中间方读取或篡改，仅适合可信网络或测试环境。公网部署应让服务端 HTTP 入口走 TLS（由 Nginx、云负载均衡或安全网关终止证书），客户端使用 `transport = "wss"`（或将 `server_port` 设为 `443`），此时客户端使用 `wss://` 并校验服务端证书，链路由 TLS 保护。**注意：不要在入口上开启“HTTP 强制跳转 HTTPS”**——`ws://` 客户端不会跟随 301/308 重定向，隧道会直接连不上；要启用 HTTPS 就把客户端也切到 `wss://`。`control_host` 只是路由配置，不是身份认证；服务端仍会验证共享 Token。
 
 资源保护：单个 WebSocket 帧/消息最大 1 MiB，服务端最多允许 256 条活动 WebSocket 连接（控制通道与数据通道合计）；HTTP WebSocket 握手最长等待 10 秒，隧道协议 ClientHello 读取最长等待 5 秒。达到连接上限时，新连接会收到 503。当前上限是实验性版本的固定值，尚未提供配置项。
 
@@ -251,7 +271,7 @@ docker compose logs -f      # 查看日志
 
 - 端口映射必须与配置保持一致：服务端 `server_port`（默认 `2333`）、`http_port`（默认 `80`），客户端 `web_port`（默认 `8610`）。改了配置也要同步改 `docker-compose.yml`。
 - 客户端配置中的 `local_addr` 在客户端容器内解析：`127.0.0.1:80` 指的是客户端容器本身，不是宿主机。转发宿主机服务请用 `host.docker.internal:<端口>`（Linux 需 `extra_hosts`）或宿主机的内网 IP，转发同一 compose 中的容器用服务名。
-- 使用 WebSocket 传输模式时，客户端不需要入站端口；服务端的 `2333` 也不必对公网开放，可以删掉该端口映射，只保留 `http_port`，并把 `htc.toml` 的 `server_host` 指向控制域名（例如 `control.example.com`）、`server_port` 指向 HTTP 入口端口（例如 `80`），同时设置 `transport = "websocket"`。如果从 `hts.toml` 中删掉 `server_port`，服务端根本不会监听该端口，端口映射可以整条删除。
+- 使用 WebSocket 传输模式时，客户端不需要入站端口；服务端的 `2333` 也不必对公网开放，可以删掉该端口映射，只保留 `http_port`，并把 `htc.toml` 的 `server_host` 指向控制域名（例如 `control.example.com`）、`server_port` 指向 HTTP 入口端口（例如 `80`），同时设置 `transport = "ws"`（HTTPS 入口则用 `"wss"`）。如果从 `hts.toml` 中删掉 `server_port`，服务端根本不会监听该端口，端口映射可以整条删除。
 - 日志输出到容器标准输出，使用 `docker compose logs -f hts` 或 `docker logs htc` 查看，不需要额外挂载日志文件。
 
 ## 许可证

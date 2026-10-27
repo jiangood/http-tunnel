@@ -352,7 +352,7 @@ async fn websocket_transport_routes_http() -> Result<()> {
     let config = std::fs::read_to_string(&client_config)?;
     let config = config.replacen(
         "\n[[tunnels]]",
-        "\ntransport = \"websocket\"\n\n[[tunnels]]",
+        "\ntransport = \"ws\"\n\n[[tunnels]]",
         1,
     );
     std::fs::write(&client_config, config)?;
@@ -436,7 +436,7 @@ async fn websocket_transport_works_without_a_tcp_listener() -> Result<()> {
     let config = std::fs::read_to_string(&client_config)?;
     let config = config.replacen(
         "\n[[tunnels]]",
-        "\ntransport = \"websocket\"\n\n[[tunnels]]",
+        "\ntransport = \"ws\"\n\n[[tunnels]]",
         1,
     );
     std::fs::write(&client_config, config)?;
@@ -499,7 +499,7 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
     let config = std::fs::read_to_string(&client_config)?;
     let config = config.replacen(
         "\n[[tunnels]]",
-        "\ntransport = \"websocket\"\n\n[[tunnels]]",
+        "\ntransport = \"ws\"\n\n[[tunnels]]",
         1,
     );
     std::fs::write(&client_config, config)?;

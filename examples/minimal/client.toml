@@ -13,9 +13,14 @@ name = "home_nas"
 token = "use_a_secret_that_only_you_know"
 
 ## WebSocket transport example:
-# transport = "websocket"
+# transport = "ws"          # plain ws://
 # server_host = "control.example.com"
 # server_port = 80
+##
+## Use `transport = "wss"` for TLS (wss://), for example behind an HTTPS entry:
+# transport = "wss"
+# server_host = "control.example.com"
+# server_port = 443
 
 [[tunnels]]
 ## The name identifies the tunnel within the client and is required.

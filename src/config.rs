@@ -95,7 +95,8 @@ pub struct ClientConfig {
     /// `http_port`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_port: Option<u16>,
-    /// Optional transport mode. Missing means the legacy TCP transport.
+    /// Optional transport mode: `tcp` (the default), `ws` (plain WebSocket) or
+    /// `wss` (WebSocket over TLS). The legacy value `websocket` means `ws`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
     /// The name of the client. It's used for logging and to warn when a domain
@@ -147,6 +148,16 @@ impl ClientConfig {
     /// Whether the tunnels of this client enable TCP_NODELAY
     pub fn nodelay(&self) -> bool {
         self.nodelay.unwrap_or(true)
+    }
+
+    /// Whether the WebSocket transport is configured (`ws` or `wss`)
+    pub fn is_websocket(&self) -> bool {
+        matches!(self.transport.as_deref(), Some("ws") | Some("wss"))
+    }
+
+    /// Whether the WebSocket transport uses TLS (`wss`)
+    pub fn tls(&self) -> bool {
+        self.transport.as_deref() == Some("wss")
     }
 
     /// The resolved tunnels, sorted by name for a stable order
@@ -259,8 +270,13 @@ impl ClientConfig {
     pub fn validate(config: &mut ClientConfig) -> Result<()> {
         if let Some(transport) = config.transport.as_mut() {
             *transport = transport.trim().to_ascii_lowercase();
-            if transport.as_str() != "tcp" && transport.as_str() != "websocket" {
-                bail!("Unsupported transport; expected tcp or websocket");
+            // `websocket` is the name used before `ws`/`wss` existed. It always
+            // meant a plain WebSocket, so it is an alias for `ws`.
+            if transport == "websocket" {
+                *transport = "ws".to_string();
+            }
+            if transport != "tcp" && transport != "ws" && transport != "wss" {
+                bail!("Unsupported transport; expected tcp, ws or wss");
             }
         }
         validate_server_address(config)?;
@@ -451,9 +467,10 @@ server_port = 2333
 ## To use the WebSocket transport, comment out the three settings above and
 ## uncomment the three below. `server_host` must be the `control_host` of
 ## hts.toml and `server_port` must be its `http_port`, not its `server_port`.
-# transport = "websocket"
+## `transport = "ws"` is plain `ws://`; `"wss"` is TLS (`wss://`) on any port.
+# transport = "wss"
 # server_host = "control.example.com"
-# server_port = 80
+# server_port = 443
 name = "home"
 token = "replace-with-the-same-secret-as-hts"
 web_port = 8610
@@ -556,9 +573,32 @@ mod tests {
 
     #[test]
     fn test_transport_validation() -> Result<()> {
+        // `websocket` is the legacy spelling of `ws`
         let config = ClientConfig::parse("transport = \"WebSocket\"\n")?;
-        assert_eq!(config.transport.as_deref(), Some("websocket"));
+        assert_eq!(config.transport.as_deref(), Some("ws"));
+        assert!(config.is_websocket());
+        assert!(!config.tls());
+
         assert!(ClientConfig::parse("transport = \"udp\"\n").is_err());
+        assert!(ClientConfig::parse("transport = \"tls\"\n").is_err());
+
+        let tcp = ClientConfig::parse("")?;
+        assert!(!tcp.is_websocket());
+        assert!(!tcp.tls());
+        Ok(())
+    }
+
+    #[test]
+    fn test_ws_and_wss_transports() -> Result<()> {
+        let ws = ClientConfig::parse("transport = \"WS\"\n")?;
+        assert_eq!(ws.transport.as_deref(), Some("ws"));
+        assert!(ws.is_websocket());
+        assert!(!ws.tls());
+
+        let wss = ClientConfig::parse("transport = \"wss\"\n")?;
+        assert_eq!(wss.transport.as_deref(), Some("wss"));
+        assert!(wss.is_websocket());
+        assert!(wss.tls());
         Ok(())
     }
 

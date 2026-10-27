@@ -39,9 +39,10 @@ pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<b
         Err(e) => return wait_after_error(e, &mut shutdown_rx).await,
     };
 
-    if identity.transport == "websocket" {
+    if matches!(identity.transport.as_str(), "ws" | "wss") {
         info!(
-            "Using the WebSocket transport: {} is the server's control Host and HTTP port",
+            "Using the WebSocket transport over {}: {} is the server's control Host and HTTP port",
+            if identity.tls { "TLS (wss)" } else { "plain TCP (ws)" },
             identity.server_addr
         );
     } else {
@@ -117,7 +118,7 @@ pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<b
 /// or placeholder value.
 fn resolve_identity(config: &ClientConfig, config_path: &Path) -> Result<Identity> {
     let transport = config.transport.clone().unwrap_or_else(|| "tcp".to_string());
-    let websocket = transport == "websocket";
+    let websocket = config.is_websocket();
     let server_host = config.server_host.clone().ok_or_else(|| {
         anyhow!(
             "The server host is missing. Set `server_host` in {:?}.{}",
@@ -154,7 +155,8 @@ fn resolve_identity(config: &ClientConfig, config_path: &Path) -> Result<Identit
         bail!("Replace the placeholder token in {:?}", config_path);
     }
     let server_addr = format_server_addr(&server_host, server_port);
-    Ok(Identity { server_addr, name, token, transport })
+    let tls = config.tls();
+    Ok(Identity { server_addr, name, token, transport, tls })
 }
 
 /// Report a startup error and then wait for a shutdown signal instead of
@@ -179,6 +181,8 @@ pub(crate) struct Identity {
     pub(crate) transport: String,
     pub(crate) name: String,
     pub(crate) token: MaskedString,
+    /// Whether the WebSocket transport uses TLS (`wss://`)
+    pub(crate) tls: bool,
 }
 
 /// The state of a client, shared between the control channels and the
@@ -263,6 +267,7 @@ impl ClientState {
             (config.resolved_tunnels(), config.heartbeat_timeout())
         };
         let transport = self.identity.transport.clone();
+        let tls = self.identity.tls;
 
         let mut handles = self.tunnels.lock().await;
 
@@ -283,7 +288,7 @@ impl ClientState {
         // Start the new tunnels and restart the ones whose config changed
         for tunnel in tunnels {
             let restart = match handles.get(&tunnel.name) {
-                Some(handle) => !handle.matches(&tunnel, heartbeat_timeout, &transport),
+                Some(handle) => !handle.matches(&tunnel, heartbeat_timeout, &transport, tls),
                 None => true,
             };
             if !restart {
@@ -300,6 +305,7 @@ impl ClientState {
                 self.identity.token.clone(),
                 self.identity.server_addr.clone(),
                 transport.clone(),
+                tls,
                 heartbeat_timeout,
                 self.connections.clone(),
                 self.fatal_tx.clone(),
@@ -388,6 +394,7 @@ struct RunDataChannelArgs {
     session_key: Nonce,
     server_addr: AddrMaybeCached,
     transport: String,
+    tls: bool,
     socket_opts: SocketOpts,
     tunnel: ClientTunnelConfig,
 }
@@ -403,8 +410,8 @@ async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<Boxe
     let mut conn: BoxedIo = retry_notify(
         backoff,
         || async {
-            let result: Result<BoxedIo> = if args.transport == "websocket" {
-                connect_websocket(&args.server_addr.addr).await
+            let result: Result<BoxedIo> = if matches!(args.transport.as_str(), "ws" | "wss") {
+                connect_websocket(&args.server_addr.addr, args.tls).await
             } else {
                 connect(&args.server_addr)
                     .await
@@ -483,6 +490,7 @@ struct ControlChannel {
     shutdown_rx: oneshot::Receiver<u8>, // Receives the shutdown signal
     server_addr: String,                // `server_host:server_port`
     transport: String,                  // TCP or WebSocket byte-stream transport
+    tls: bool,                          // Whether the WebSocket transport uses TLS
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
     connections: Arc<AtomicUsize>,      // The number of established control channels
 }
@@ -496,13 +504,23 @@ struct ControlChannelHandle {
     // compared with the one that is configured later
     tunnel: ClientTunnelConfig,
     transport: String,
+    tls: bool,
     heartbeat_timeout: u64,
 }
 
 impl ControlChannelHandle {
     // Whether the channel is already serving the given config
-    fn matches(&self, tunnel: &ClientTunnelConfig, heartbeat_timeout: u64, transport: &str) -> bool {
-        &self.tunnel == tunnel && self.heartbeat_timeout == heartbeat_timeout && self.transport.as_str() == transport
+    fn matches(
+        &self,
+        tunnel: &ClientTunnelConfig,
+        heartbeat_timeout: u64,
+        transport: &str,
+        tls: bool,
+    ) -> bool {
+        &self.tunnel == tunnel
+            && self.heartbeat_timeout == heartbeat_timeout
+            && self.transport.as_str() == transport
+            && self.tls == tls
     }
 }
 
@@ -529,8 +547,8 @@ impl ControlChannel {
     #[instrument(skip_all)]
     async fn run(&mut self) -> Result<()> {
         let mut server_addr = AddrMaybeCached::new(&self.server_addr);
-        let mut conn: BoxedIo = if self.transport == "websocket" {
-            connect_websocket(&self.server_addr).await?
+        let mut conn: BoxedIo = if matches!(self.transport.as_str(), "ws" | "wss") {
+            connect_websocket(&self.server_addr, self.tls).await?
         } else {
             server_addr.resolve().await?;
             let tcp = connect(&server_addr)
@@ -589,6 +607,7 @@ impl ControlChannel {
             session_key,
             server_addr,
             transport: self.transport.clone(),
+            tls: self.tls,
             socket_opts,
             tunnel: self.tunnel.clone(),
         });
@@ -632,6 +651,7 @@ impl ControlChannelHandle {
         token: MaskedString,
         server_addr: String,
         transport: String,
+        tls: bool,
         heartbeat_timeout: u64,
         connections: Arc<AtomicUsize>,
         fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
@@ -651,6 +671,7 @@ impl ControlChannelHandle {
             shutdown_rx,
             server_addr,
             transport: transport.clone(),
+            tls,
             heartbeat_timeout,
             connections,
         };
@@ -698,6 +719,7 @@ impl ControlChannelHandle {
             shutdown_tx,
             tunnel: handle_tunnel,
             transport,
+            tls,
             heartbeat_timeout,
         }
     }
