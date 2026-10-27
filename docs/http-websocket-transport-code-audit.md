@@ -33,7 +33,7 @@
 - 客户端增加统一的异步字节流抽象：TCP 模式使用原始 TCP stream；WebSocket 模式用后台任务在 WebSocket binary message 与 `tokio::io::DuplexStream` 之间搬运字节。
 - 控制连接和每条数据连接各自建立 WebSocket；第一版不做多路复用，不改变现有协议帧，也不合并控制/数据通道。
 
-该设计会增加每条逻辑连接的 WebSocket 帧封装与桥接任务开销，但比重写现有协议和服务端会话模型更容易验证，也最有利于保持 TCP 模式不变。它仍要求 hts 在本机绑定原有 server_port（默认 2333）；该端口可以在防火墙/安全组中禁止公网访问，但若运行环境禁止进程本地绑定该端口，就需要下一阶段改为直接接入共享的内部连接处理器，而不是 loopback bridge。
+该设计会增加每条逻辑连接的 WebSocket 帧封装与桥接任务开销，但比重写现有协议和服务端会话模型更容易验证，也最有利于保持 TCP 模式不变。首版曾用 loopback bridge 复用 `server_port` 监听；现已改为把 WebSocket 字节流直接交给同一个 `handle_connection`，因此 WebSocket 模式不再需要绑定 `server_port`。
 
 ## 3. 配置与路由建议
 
@@ -53,7 +53,7 @@
 ## 5. 已落地的首版原型
 
 - 已增加可选客户端 transport 配置（缺省仍为 TCP）和服务端可选 control_host。
-- 已增加 WebSocket 与异步字节流之间的桥接；服务端 WebSocket 会桥接到现有 server_port TCP listener。
+- 已增加 WebSocket 与异步字节流之间的桥接；服务端 WebSocket 直接交给现有 `handle_connection`，不再经过 `server_port` 的本地 TCP 回环。
 - 已将客户端控制连接与数据连接统一为字节流接口，WebSocket 模式下每条逻辑连接独立建立 WebSocket。
 - 已在 HTTP 入口按 control_host + 专用路径分流，并在 README 中记录配置方式和明文传输风险。
 - 已在 GitHub Actions 中通过编译、单元/集成测试、二进制构建及进程级 E2E；仍属于实验性原型，尚未覆盖所有阶段 2 的异常、背压与恢复场景。
@@ -61,7 +61,7 @@
 ## 6. 阶段 2 追加的资源与生命周期保护
 
 - WebSocket 帧和消息最大 1 MiB，避免单条消息无界分配。
-- HTTP WebSocket 握手超时 10 秒；服务端完整读取隧道协议 ClientHello 超时 5 秒；本地 TCP 上游连接超时 5 秒。
+- HTTP WebSocket 握手超时 10 秒；服务端完整读取隧道协议 ClientHello 超时 5 秒。
 - HTTP 入口最多允许 256 条活动 WebSocket 连接；达到上限时返回 503。
 - WebSocket 传输连接不计入业务 visitor 的 drain 计数，避免服务端优雅关闭时等待长连接超时；真正的业务 visitor 仍由原 activity guard 统计。
 - 拒绝把保留的 control_host 注册为业务隧道，避免控制域名被业务路由覆盖。

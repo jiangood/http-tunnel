@@ -6,7 +6,7 @@ pub const DEFAULT_CLIENT_WEB_PORT: u16 = 8610;
 /// Server runtime settings loaded from hts.toml.
 #[derive(Debug, Clone)]
 pub struct ServerArgs {
-    pub server_port: u16,
+    pub server_port: Option<u16>,
     pub http_port: u16,
     pub control_host: Option<String>,
     pub token: String,

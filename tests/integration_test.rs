@@ -108,7 +108,7 @@ async fn http_routing() -> Result<()> {
     // Start the server
     info!("start the server");
     let server = tokio::spawn(async move {
-        run_http_tunnel_server(SERVER_PORT, HTTP_ENTRY_PORT, CLIENT_TOKEN, server_shutdown_rx)
+        run_http_tunnel_server(Some(SERVER_PORT), HTTP_ENTRY_PORT, CLIENT_TOKEN, server_shutdown_rx)
             .await
             .unwrap();
     });
@@ -169,7 +169,7 @@ async fn http_routing() -> Result<()> {
     info!("restart the server");
     let server_shutdown_rx = server_shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
-        run_http_tunnel_server(SERVER_PORT, HTTP_ENTRY_PORT, CLIENT_TOKEN, server_shutdown_rx)
+        run_http_tunnel_server(Some(SERVER_PORT), HTTP_ENTRY_PORT, CLIENT_TOKEN, server_shutdown_rx)
             .await
             .unwrap();
     });
@@ -360,7 +360,7 @@ async fn websocket_transport_routes_http() -> Result<()> {
 
     let server = tokio::spawn(async move {
         common::run_http_tunnel_server_with_control_host(
-            WS_SERVER_PORT,
+            Some(WS_SERVER_PORT),
             WS_HTTP_ENTRY_PORT,
             Some("127.0.0.1"),
             CLIENT_TOKEN,
@@ -386,7 +386,7 @@ async fn websocket_transport_routes_http() -> Result<()> {
     let (server2_shutdown_tx, server2_shutdown_rx) = broadcast::channel(1);
     let server2 = tokio::spawn(async move {
         common::run_http_tunnel_server_with_control_host(
-            WS_SERVER_PORT,
+            Some(WS_SERVER_PORT),
             WS_HTTP_ENTRY_PORT,
             Some("127.0.0.1"),
             CLIENT_TOKEN,
@@ -401,6 +401,74 @@ async fn websocket_transport_routes_http() -> Result<()> {
     client_shutdown_tx.send(true)?;
     server2_shutdown_tx.send(true)?;
     let _ = tokio::join!(client, server2);
+    Ok(())
+}
+
+// ==== WebSocket transport with the TCP listener disabled ====
+
+const WS_ONLY_HTTP_PORT: u16 = 2555;
+const WS_ONLY_HTTP_ADDR: &str = "127.0.0.1:2555";
+const WS_ONLY_ECHO_ADDR: &str = "127.0.0.1:2556";
+
+/// Omitting `server_port` disables the TCP listener entirely, so the WebSocket
+/// transport has to carry the whole tunnel through the HTTP entrypoint.
+#[tokio::test]
+async fn websocket_transport_works_without_a_tcp_listener() -> Result<()> {
+    init();
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(WS_ONLY_ECHO_ADDR).await {
+            panic!("Failed to run the WebSocket echo server: {:?}", e);
+        }
+    });
+
+    let client_config = write_client_config(
+        "http_tunnel_websocket_no_tcp.toml",
+        CLIENT_NAME,
+        WS_ONLY_HTTP_ADDR,
+        CLIENT_TOKEN,
+        Some(0),
+        &[("echo-ws-only.test", WS_ONLY_ECHO_ADDR)],
+    )?;
+    let config = std::fs::read_to_string(&client_config)?;
+    let config = config.replacen(
+        "\n[[tunnels]]",
+        "\ntransport = \"websocket\"\n\n[[tunnels]]",
+        1,
+    );
+    std::fs::write(&client_config, config)?;
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    let server = tokio::spawn(async move {
+        common::run_http_tunnel_server_with_control_host(
+            None, // no TCP listener at all
+            WS_ONLY_HTTP_PORT,
+            Some("127.0.0.1"),
+            CLIENT_TOKEN,
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_tcp(WS_ONLY_HTTP_ADDR, Duration::from_secs(10)).await?;
+
+    let client = tokio::spawn(async move {
+        run_http_tunnel_client(&client_config, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_echo(
+        WS_ONLY_HTTP_ADDR,
+        "echo-ws-only.test",
+        Duration::from_secs(20),
+    )
+    .await?;
+
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server);
     Ok(())
 }
 
@@ -436,7 +504,7 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
     let server = tokio::spawn(async move {
         run_http_tunnel_server_with_control_host(
-            WS_FAILURE_SERVER_PORT,
+            Some(WS_FAILURE_SERVER_PORT),
             WS_FAILURE_HTTP_PORT,
             Some("127.0.0.1"),
             CLIENT_TOKEN,
@@ -505,7 +573,7 @@ async fn client_api_manages_tunnels() -> Result<()> {
 
     let server = tokio::spawn(async move {
         run_http_tunnel_server(
-            CLIENT_API_SERVER_PORT,
+            Some(CLIENT_API_SERVER_PORT),
             CLIENT_API_HTTP_ENTRY_PORT,
             CLIENT_API_TOKEN,
             server_shutdown_rx,
@@ -667,7 +735,7 @@ async fn client_exits_on_a_wrong_token() -> Result<()> {
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
     let server = tokio::spawn(async move {
         run_http_tunnel_server(
-            FATAL_SERVER_PORT,
+            Some(FATAL_SERVER_PORT),
             2454,
             CLIENT_TOKEN,
             server_shutdown_rx,
@@ -718,7 +786,7 @@ async fn server_fails_when_http_port_cannot_be_bound() -> Result<()> {
     let err = time::timeout(
         Duration::from_secs(5),
         run_http_tunnel_server(
-            OCCUPIED_HTTP_TEST_SERVER_PORT,
+            Some(OCCUPIED_HTTP_TEST_SERVER_PORT),
             OCCUPIED_HTTP_TEST_HTTP_PORT,
             CLIENT_TOKEN,
             shutdown_rx,
@@ -794,7 +862,7 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let server = tokio::spawn(async move {
         run_http_tunnel_server_with_control_host(
-            WS_LIMIT_SERVER_PORT,
+            Some(WS_LIMIT_SERVER_PORT),
             WS_LIMIT_HTTP_PORT,
             Some("127.0.0.1"),
             CLIENT_TOKEN,

@@ -98,7 +98,7 @@ impl Harness {
         let server = {
             tokio::spawn(async move {
                 let cmd = http_tunnel::Command::Server(http_tunnel::ServerArgs {
-                    server_port: SERVER_PORT,
+                    server_port: Some(SERVER_PORT),
                     http_port: HTTP_ENTRY_PORT,
                     control_host: None,
                     token: CLIENT_TOKEN.to_string(),

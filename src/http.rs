@@ -108,7 +108,6 @@ fn find_proxy<'a>(proxies: &'a [ServerProxyEntry], host: &str) -> Option<&'a Ser
 /// Only the first request of a connection is inspected, so routing is connection-level.
 pub(crate) async fn serve(
     l: TcpListener,
-    server_port: u16,
     control_host: Option<String>,
     state: Arc<ServerState>,
     mut shutdown_rx: broadcast::Receiver<bool>,
@@ -133,7 +132,6 @@ pub(crate) async fn serve(
                             if let Err(e) = handle_visitor(
                                 stream,
                                 addr,
-                                server_port,
                                 control_host,
                                 websocket_connections,
                                 state,
@@ -157,7 +155,6 @@ pub(crate) async fn serve(
 async fn handle_visitor(
     mut stream: TcpStream,
     addr: SocketAddr,
-    server_port: u16,
     control_host: Option<String>,
     websocket_connections: Arc<tokio::sync::Semaphore>,
     state: Arc<ServerState>,
@@ -216,7 +213,11 @@ async fn handle_visitor(
         // Do not include its lifetime in the visitor drain counter: shutdown drops
         // the control channels after draining actual visitor traffic.
         drop(activity);
-        crate::transport::websocket::accept_and_bridge(prefetched, stream, server_port).await?;
+        let conn =
+            crate::transport::websocket::accept(prefetched, stream, _websocket_permit).await?;
+        if let Err(e) = crate::server::handle_connection(conn, state).await {
+            debug!("Tunnel WebSocket connection closed: {:#}", e);
+        }
         return Ok(());
     }
 

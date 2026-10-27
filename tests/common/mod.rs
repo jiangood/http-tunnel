@@ -8,7 +8,7 @@ use tokio::{
 };
 
 pub async fn run_http_tunnel_server(
-    server_port: u16,
+    server_port: Option<u16>,
     http_port: u16,
     token: &str,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -17,7 +17,7 @@ pub async fn run_http_tunnel_server(
 }
 
 pub async fn run_http_tunnel_server_with_control_host(
-    server_port: u16,
+    server_port: Option<u16>,
     http_port: u16,
     control_host: Option<&str>,
     token: &str,

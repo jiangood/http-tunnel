@@ -15,13 +15,12 @@ use tokio_tungstenite::{
     WebSocketStream,
 };
 
-use super::SocketOpts;
+use super::{Conn, SocketOpts};
 
 /// Keep individual WebSocket messages bounded; the byte-stream protocol does
 /// not need large WS messages because the bridge chunks writes into 16 KiB pieces.
 const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024;
 const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn websocket_config() -> WebSocketConfig {
     WebSocketConfig {
@@ -35,7 +34,7 @@ fn websocket_config() -> WebSocketConfig {
 pub(crate) trait AsyncReadWrite: AsyncRead + AsyncWrite {}
 impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 
-pub(crate) type BoxedIo = Box<dyn AsyncReadWrite + Unpin + Send>;
+pub(crate) type BoxedIo = Box<dyn AsyncReadWrite + Unpin + Send + Sync>;
 
 /// Connect to the control Host over plain WebSocket and expose it as a byte stream.
 /// The existing length-prefixed protocol therefore does not need to know about WS frames.
@@ -176,13 +175,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<S> {
     }
 }
 
-/// Accept a WebSocket on the HTTP listener and bridge it to the existing TCP
-/// protocol listener. The server's original protocol handlers remain unchanged.
-pub(crate) async fn accept_and_bridge(
+/// Accept a tunnel WebSocket on the HTTP listener and expose it as a byte stream.
+///
+/// The stream is handed to the same protocol handler as the TCP transport, so
+/// the WebSocket mode needs no local TCP listener at all. `permit` keeps the
+/// connection counted against the WebSocket limit until the bridge closes.
+pub(crate) async fn accept(
     prefix: Vec<u8>,
     stream: TcpStream,
-    server_port: u16,
-) -> Result<()> {
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<Conn> {
     // This socket carries the whole tunnel for the rest of its life, so it has
     // the same latency requirements as a control channel.
     SocketOpts::for_control_channel().apply(&stream);
@@ -194,15 +196,16 @@ pub(crate) async fn accept_and_bridge(
     .await
     .context("Timed out accepting tunnel WebSocket handshake")?
     .context("Accepting tunnel WebSocket handshake")?;
-    let upstream = timeout(
-        UPSTREAM_CONNECT_TIMEOUT,
-        TcpStream::connect(("127.0.0.1", server_port)),
-    )
-    .await
-    .context("Timed out connecting WebSocket bridge to local TCP listener")?
-    .with_context(|| format!("Connecting WebSocket bridge to local TCP port {}", server_port))?;
-    SocketOpts::for_control_channel().apply(&upstream);
-    bridge_websocket_to_io(ws, upstream).await
+
+    let (io, bridge) = duplex(64 * 1024);
+    tokio::spawn(async move {
+        // Held until the bridge is done, which is when the socket is closed.
+        let _permit = permit;
+        if let Err(err) = bridge_websocket_to_io(ws, bridge).await {
+            tracing::debug!("WebSocket stream bridge closed: {:#}", err);
+        }
+    });
+    Ok(Conn::Stream(Box::new(io)))
 }
 
 

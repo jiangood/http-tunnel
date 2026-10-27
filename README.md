@@ -93,11 +93,22 @@ domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
 ```
 
-控制域名仅用于内部控制与数据连接；普通业务域名（例如 nas.example.com）继续通过 http_port 进入现有 Host 路由。服务端会根据 Host 和专用路径 /_http-tunnel/v1/connect 识别 WebSocket 连接，并把它桥接到现有 TCP 协议处理器。原来的 2333/TCP 模式不受影响。注意：hts 仍需要在本机绑定 server_port（默认 2333），但该端口不必对公网开放，可以用防火墙/安全组禁止外部访问；如果运行环境连本地绑定该端口都不允许，此桥接实现不适用。
+控制域名仅用于内部控制与数据连接；普通业务域名（例如 nas.example.com）继续通过 http_port 进入现有 Host 路由。服务端会根据 Host 和专用路径 /_http-tunnel/v1/connect 识别 WebSocket 连接，并直接交给隧道协议处理器。原来的 2333/TCP 模式不受影响。
+
+如果服务端完全不需要 TCP 端口，**不写 `server_port` 这一行**即可关闭该监听；此时 `control_host` 必须配置，否则服务端没有客户端入口，启动时会直接报错。注意默认模板里带着 `server_port = 2333`，要关闭就得把它删掉（写成 `0` 会被拒绝）：
+
+```toml
+# 不写 server_port，即不监听 TCP，只接受 WebSocket 控制连接
+http_port = 80
+control_host = "control.example.com"
+token = "与客户端相同的随机强密钥"
+```
+
+WebSocket 连接不再经过本地 2333 回环桥接，因此进程也不需要占用任何本地 TCP 端口（除了 `http_port`）。
 
 **安全提示：** 当前 WebSocket 模式使用明文 ws://，不会自动申请或配置证书。Token、控制消息和隧道数据可能被网络中间方读取或篡改，因此此模式适合可信网络或测试环境；不要在未经加密保护的公网链路上发送敏感流量。正式公网部署应通过可信 TLS 终止层提供 WSS，或在后续版本使用端到端加密。control_host 只是路由配置，不是身份认证；服务端仍会验证现有共享 Token。
 
-资源保护：单个 WebSocket 帧/消息最大 1 MiB，服务端最多允许 256 条活动 WebSocket 连接（控制通道与数据通道合计）；HTTP WebSocket 握手最长等待 10 秒，隧道协议 ClientHello 读取和本地 TCP 上游连接各最长等待 5 秒。达到连接上限时，新连接会收到 503。当前上限是实验性版本的固定值，尚未提供配置项。
+资源保护：单个 WebSocket 帧/消息最大 1 MiB，服务端最多允许 256 条活动 WebSocket 连接（控制通道与数据通道合计）；HTTP WebSocket 握手最长等待 10 秒，隧道协议 ClientHello 读取最长等待 5 秒。达到连接上限时，新连接会收到 503。当前上限是实验性版本的固定值，尚未提供配置项。
 
 该模式目前是实验性功能，部署前请通过测试环境验证长连接、代理兼容性和断线重连行为。
 
@@ -232,7 +243,7 @@ docker compose logs -f      # 查看日志
 
 - 端口映射必须与配置保持一致：服务端 `server_port`（默认 `2333`）、`http_port`（默认 `80`），客户端 `web_port`（默认 `8610`）。改了配置也要同步改 `docker-compose.yml`。
 - 客户端配置中的 `local_addr` 在客户端容器内解析：`127.0.0.1:80` 指的是客户端容器本身，不是宿主机。转发宿主机服务请用 `host.docker.internal:<端口>`（Linux 需 `extra_hosts`）或宿主机的内网 IP，转发同一 compose 中的容器用服务名。
-- 使用 WebSocket 传输模式时，客户端不需要入站端口；服务端的 `2333` 也不必对公网开放，可以删掉该端口映射，只保留 `http_port`，并把 `htc.toml` 的 `remote` 指向控制域名（例如 `control.example.com:80`），同时设置 `transport = "websocket"`。
+- 使用 WebSocket 传输模式时，客户端不需要入站端口；服务端的 `2333` 也不必对公网开放，可以删掉该端口映射，只保留 `http_port`，并把 `htc.toml` 的 `remote` 指向控制域名（例如 `control.example.com:80`），同时设置 `transport = "websocket"`。如果从 `hts.toml` 中删掉 `server_port`，服务端根本不会监听该端口，端口映射可以整条删除。
 - 日志输出到容器标准输出，使用 `docker compose logs -f hts` 或 `docker logs htc` 查看，不需要额外挂载日志文件。
 
 ## 许可证

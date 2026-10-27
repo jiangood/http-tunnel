@@ -7,7 +7,7 @@ use crate::multi_map::MultiMap;
 use crate::protocol::{
     self, Ack, ClientHello, ControlChannelCmd, DataChannelCmd, ServerHello, HASH_WIDTH_IN_BYTES,
 };
-use crate::transport::SocketOpts;
+use crate::transport::{Conn, SocketOpts};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
@@ -136,8 +136,7 @@ pub async fn run_server(args: ServerArgs, shutdown_rx: broadcast::Receiver<bool>
 // Server holds all states of running a server
 struct Server {
     state: Arc<ServerState>,
-    server_addr: String,
-    server_port: u16,
+    server_port: Option<u16>,
     http_port: u16,
     control_host: Option<String>,
     proxies: Vec<crate::config::ServerProxyEntry>,
@@ -159,18 +158,16 @@ impl ServerState {
 impl Server {
     // Create a server from the command line options
     pub fn new(
-        server_port: u16,
+        server_port: Option<u16>,
         http_port: u16,
         control_host: Option<String>,
         token: String,
         proxies: Vec<crate::config::ServerProxyEntry>,
     ) -> Server {
-        let server_addr = to_bind_addr(server_port);
         let state = Arc::new(ServerState::new(MaskedString::from(token), control_host.clone()));
 
         Server {
             state,
-            server_addr,
             server_port,
             http_port,
             control_host,
@@ -180,24 +177,34 @@ impl Server {
 
     // The entry point of Server
     pub async fn run(&mut self, mut shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-        // Listen at `server_port` for the control and data channels of clients
-        let l: TcpListener = retry_notify_with_deadline(
-            listen_backoff(),
-            || async { Ok(TcpListener::bind(&self.server_addr).await?) },
-            |e, duration| {
-                error!("{:#}. Retry in {:?}", e, duration);
-            },
-            &mut shutdown_rx,
-        )
-        .await
-        .with_context(|| "Failed to listen at `server_port`")?;
-
-        // The port that was actually bound, which differs from `server_port`
-        // when it is 0. The WebSocket bridge dials this listener, so it must
-        // use the real port rather than the configured one.
-        let server_port = l.local_addr().map(|addr| addr.port()).unwrap_or(self.server_port);
-
-        info!("Listening at {}", self.server_addr);
+        // Listen at `server_port` for the control and data channels of clients.
+        // When it is not configured the TCP transport is disabled: clients then
+        // have to use the WebSocket transport through the HTTP entrypoint, so
+        // no local port is needed.
+        let mut tcp_listener: Option<TcpListener> = match self.server_port {
+            Some(port) => {
+                let server_addr = to_bind_addr(port);
+                let l: TcpListener = retry_notify_with_deadline(
+                    listen_backoff(),
+                    || async { Ok(TcpListener::bind(&server_addr).await?) },
+                    |e, duration| {
+                        error!("{:#}. Retry in {:?}", e, duration);
+                    },
+                    &mut shutdown_rx,
+                )
+                .await
+                .with_context(|| "Failed to listen at `server_port`")?;
+                info!("Listening at {}", server_addr);
+                Some(l)
+            }
+            None => {
+                info!(
+                    "TCP listener disabled (`server_port` is not set); clients must use the \
+                     WebSocket transport"
+                );
+                None
+            }
+        };
 
         // Bind the HTTP entrypoint before serving, so that a port that cannot
         // be bound fails startup instead of being discovered on shutdown. It
@@ -207,7 +214,6 @@ impl Server {
             .with_context(|| format!("Failed to listen at `http_port` ({})", self.http_port))?;
         let mut http_task = tokio::spawn(crate::http::serve(
             http_listener,
-            server_port,
             self.control_host.clone(),
             self.state.clone(),
             shutdown_rx.resubscribe(),
@@ -226,7 +232,7 @@ impl Server {
         loop {
             tokio::select! {
                 // Wait for incoming control and data channels
-                ret = l.accept() => {
+                ret = accept_tunnel_connection(&mut tcp_listener) => {
                     match ret {
                         Err(err) => {
                             // It is an IO error, so it's possibly an EMFILE.
@@ -249,7 +255,7 @@ impl Server {
                                         Ok(conn) => {
                                             let state = self.state.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, state).await {
+                                                if let Err(err) = handle_connection(Conn::Tcp(conn), state).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -324,13 +330,25 @@ impl Server {
     }
 }
 
+// Accept the next client connection, or wait forever when the TCP listener is
+// disabled. Omitting `server_port` makes the whole TCP transport optional.
+async fn accept_tunnel_connection(
+    listener: &mut Option<TcpListener>,
+) -> std::io::Result<(TcpStream, std::net::SocketAddr)> {
+    match listener {
+        Some(listener) => listener.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
 // Plain TCP accepts the connection as is
 async fn handshake(conn: TcpStream) -> Result<TcpStream> {
     Ok(conn)
 }
 
-// Handle connections to `server_port`
-async fn handle_connection(mut conn: TcpStream, state: Arc<ServerState>) -> Result<()> {
+// Handle connections to `server_port` and WebSocket connections accepted by the
+// HTTP entrypoint. Both expose the tunnel protocol and are handled identically.
+pub(crate) async fn handle_connection(mut conn: Conn, state: Arc<ServerState>) -> Result<()> {
     // Bound the complete length-prefixed hello read, including slow/partial messages.
     // This is important for WebSocket clients too: a completed WS upgrade alone is not authentication.
     let hello: ClientHello = time::timeout(
@@ -366,7 +384,7 @@ async fn handle_connection(mut conn: TcpStream, state: Arc<ServerState>) -> Resu
 // over, which is how a reconnecting client is handled; taking a domain from a
 // client of another name is logged as a warning.
 async fn do_control_channel_handshake(
-    mut conn: TcpStream,
+    mut conn: Conn,
     state: Arc<ServerState>,
     domain: String,
     name: String,
@@ -374,7 +392,7 @@ async fn do_control_channel_handshake(
 ) -> Result<()> {
     info!("Try to handshake a control channel");
 
-    SocketOpts::for_control_channel().apply(&conn);
+    conn.apply(SocketOpts::for_control_channel());
 
     let domain = crate::helper::normalize_domain(&domain)
         .ok_or_else(|| anyhow!("The domain `{}` of the client `{}` is invalid", domain, name))?;
@@ -479,7 +497,7 @@ async fn do_control_channel_handshake(
 }
 
 async fn do_data_channel_handshake(
-    conn: TcpStream,
+    conn: Conn,
     state: Arc<ServerState>,
     nonce: Nonce,
 ) -> Result<()> {
@@ -489,7 +507,7 @@ async fn do_data_channel_handshake(
     let control_channels_guard = state.control_channels.read().await;
     match control_channels_guard.get2(&nonce) {
         Some(handle) => {
-            SocketOpts::data_channel(handle.nodelay).apply(&conn);
+            conn.apply(SocketOpts::data_channel(handle.nodelay));
 
             // Send the data channel to the corresponding control channel. The
             // pool is told whether it made it, so that a channel that never
@@ -665,7 +683,7 @@ pub(crate) struct ControlChannelHandle {
     nodelay: bool,
     // Shutdown the control channel by dropping it
     _shutdown_tx: broadcast::Sender<bool>,
-    data_ch_tx: mpsc::Sender<TcpStream>,
+    data_ch_tx: mpsc::Sender<Conn>,
     pub(crate) visitor_tx: mpsc::Sender<HttpVisitor>,
     // The data channel pool of the tunnel
     pub(crate) data_pool: DataChannelPool,
@@ -676,7 +694,7 @@ impl ControlChannelHandle {
     // and the connection pool task are created.
     #[instrument(name = "handle", skip_all, fields(tunnel = %domain, client = %name))]
     fn new(
-        conn: TcpStream,
+        conn: Conn,
         domain: String,
         name: String,
         nodelay: bool,
@@ -749,7 +767,7 @@ impl ControlChannelHandle {
 
 // Control channel
 struct ControlChannel {
-    conn: TcpStream,                               // The connection of control channel
+    conn: Conn,                                    // The connection of control channel
     shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
     data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives data channel creation requests
     heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
@@ -832,15 +850,15 @@ impl ControlChannel {
 /// doesn't block the others.
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool(
-    mut data_ch_rx: mpsc::Receiver<TcpStream>,
+    mut data_ch_rx: mpsc::Receiver<Conn>,
     mut visitor_rx: mpsc::Receiver<HttpVisitor>,
     data_pool: DataChannelPool,
 ) -> Result<()> {
     // The visitors that are waiting for a channel, in arrival order
-    let (waiters_tx, mut waiters_rx) = mpsc::unbounded_channel::<oneshot::Sender<TcpStream>>();
+    let (waiters_tx, mut waiters_rx) = mpsc::unbounded_channel::<oneshot::Sender<Conn>>();
     // The channels that arrived and were not handed to a visitor yet
-    let mut warm: VecDeque<TcpStream> = VecDeque::new();
-    let mut waiters: VecDeque<oneshot::Sender<TcpStream>> = VecDeque::new();
+    let mut warm: VecDeque<Conn> = VecDeque::new();
+    let mut waiters: VecDeque<oneshot::Sender<Conn>> = VecDeque::new();
 
     let mut replenish = time::interval(Duration::from_millis(POOL_REPLENISH_INTERVAL_MS));
     replenish.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
@@ -905,8 +923,8 @@ async fn run_tcp_connection_pool(
 /// Hand the warm channels to the visitors that are waiting, dropping a channel
 /// whose visitor gave up in the meantime.
 fn serve_waiters(
-    warm: &mut VecDeque<TcpStream>,
-    waiters: &mut VecDeque<oneshot::Sender<TcpStream>>,
+    warm: &mut VecDeque<Conn>,
+    waiters: &mut VecDeque<oneshot::Sender<Conn>>,
     data_pool: &DataChannelPool,
 ) {
     while !warm.is_empty() && !waiters.is_empty() {
@@ -932,8 +950,8 @@ fn serve_waiters(
 /// visitor. `copy_bidirectional_with_sizes` cannot be used here: it returns on
 /// the first IO error before it can answer the visitor.
 #[instrument(skip_all)]
-async fn relay(channel: TcpStream, stream: TcpStream) {
-    let (mut ch_rd, mut ch_wr) = channel.into_split();
+async fn relay(channel: Conn, stream: TcpStream) {
+    let (mut ch_rd, mut ch_wr) = split(channel);
     let (mut v_rd, mut v_wr) = stream.into_split();
 
     // Visitor -> tunnel, until either side is done
@@ -999,7 +1017,7 @@ async fn relay(channel: TcpStream, stream: TcpStream) {
 #[instrument(skip_all)]
 async fn forward_visitor(
     visitor: HttpVisitor,
-    waiters_tx: mpsc::UnboundedSender<oneshot::Sender<TcpStream>>,
+    waiters_tx: mpsc::UnboundedSender<oneshot::Sender<Conn>>,
     data_pool: DataChannelPool,
 ) -> Result<()> {
     let HttpVisitor {
@@ -1081,7 +1099,7 @@ async fn forward_visitor(
 
 /// The outcome of waiting for a data channel.
 enum ChannelWait {
-    Got(TcpStream),
+    Got(Conn),
     TimedOut,
     VisitorGone,
     PoolClosed,
@@ -1092,7 +1110,7 @@ enum ChannelWait {
 /// any data is seen it's left alone, since only the EOF means it's gone.
 async fn wait_for_channel(
     stream: &mut TcpStream,
-    mut waiter_rx: oneshot::Receiver<TcpStream>,
+    mut waiter_rx: oneshot::Receiver<Conn>,
 ) -> ChannelWait {
     let deadline = time::sleep(Duration::from_secs(DATA_CHANNEL_WAIT_TIMEOUT));
     tokio::pin!(deadline);

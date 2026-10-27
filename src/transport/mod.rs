@@ -3,7 +3,11 @@ pub(crate) mod websocket;
 use crate::helper::to_socket_addr;
 use anyhow::{Context, Result};
 use std::fmt::Display;
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::{error, trace};
 
@@ -80,6 +84,67 @@ impl SocketOpts {
             {
                 error!("{:#}", e);
             }
+        }
+    }
+}
+
+/// A connection that carries the tunnel protocol.
+///
+/// The legacy transport is a plain TCP socket, while the WebSocket transport
+/// exposes the tunnel as an opaque byte stream. Both are handed to the same
+/// protocol handler, so the WebSocket mode does not need a local TCP listener.
+pub(crate) enum Conn {
+    Tcp(TcpStream),
+    Stream(websocket::BoxedIo),
+}
+
+impl Conn {
+    /// Apply socket options when the underlying transport is a TCP socket. A
+    /// WebSocket connection already had its options set on the HTTP socket, so
+    /// this is a no-op for it.
+    pub(crate) fn apply(&self, opts: SocketOpts) {
+        if let Conn::Tcp(conn) = self {
+            opts.apply(conn);
+        }
+    }
+}
+
+impl AsyncRead for Conn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Conn::Tcp(conn) => Pin::new(conn).poll_read(cx, buf),
+            Conn::Stream(conn) => Pin::new(&mut **conn).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Conn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Conn::Tcp(conn) => Pin::new(conn).poll_write(cx, buf),
+            Conn::Stream(conn) => Pin::new(&mut **conn).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Conn::Tcp(conn) => Pin::new(conn).poll_flush(cx),
+            Conn::Stream(conn) => Pin::new(&mut **conn).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Conn::Tcp(conn) => Pin::new(conn).poll_shutdown(cx),
+            Conn::Stream(conn) => Pin::new(&mut **conn).poll_shutdown(cx),
         }
     }
 }

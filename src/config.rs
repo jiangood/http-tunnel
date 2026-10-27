@@ -330,11 +330,16 @@ fn generate_token() -> String {
 /// It shows two tunnels: a plain TCP one and a Docker socket one. The token is
 /// left as a placeholder because it must match the one of the server.
 fn client_config_example() -> String {
-    r#"# http-tunnel client configuration
-# Set these values before starting htc.
+    r#"## http-tunnel client configuration
+##
+## Comment convention:
+##   ##  documentation, leave it as it is
+##   #   a disabled setting, remove the single # to enable it
+##
+## Set these values before starting htc.
 remote = "your-server.example.com:2333"
-# Optional: "tcp" (default) or "websocket". For WebSocket, set remote to "control.example.com:80"
-# and configure the same control_host in hts.toml.
+## Optional: "tcp" (default) or "websocket". For WebSocket set remote to
+## "control.example.com:80" and configure the same control_host in hts.toml.
 # transport = "websocket"
 name = "home"
 token = "replace-with-the-same-secret-as-hts"
@@ -343,20 +348,22 @@ heartbeat_timeout = 40
 retry_interval = 1
 nodelay = true
 
-# Add one [[tunnels]] block per service to expose.
-# A plain TCP service:
+## Add one [[tunnels]] block per service to expose.
+##
+## Example 1, a plain TCP service.
+## Uncomment the block below to enable it.
 # [[tunnels]]
 # name = "nas"
 # domain = "nas.example.com"
 # local_addr = "127.0.0.1:80"
 
-# A service reachable over a Unix socket:
+## Example 2, a Docker API reachable over a Unix socket.
+## Uncomment the block below to enable it.
+## auth_header is optional; when set, requests need X-HTTP-TUNNEL-TOKEN: <secret> or get 401.
 # [[tunnels]]
 # name = "docker-api"
 # domain = "docker.example.com"
 # local_addr = "unix:///var/run/docker.sock"
-# auth_header is optional; when set, a request must carry
-# `X-HTTP-TUNNEL-TOKEN: <secret>` or it is answered with 401
 # auth_header = "replace-with-a-long-secret"
 "#
     .to_string()
@@ -367,28 +374,40 @@ nodelay = true
 /// The shared token is generated when the file is first created.
 fn server_config_example(token: &str) -> String {
     format!(
-        r#"# http-tunnel server configuration
-# The shared token is generated for you. Set the same token in htc.toml.
+        r#"## http-tunnel server configuration
+##
+## Comment convention:
+##   ##  documentation, leave it as it is
+##   #   a disabled setting, remove the single # to enable it
+##
+## The shared token is generated for you. Set the same token in htc.toml.
+## Client TCP port. Remove this line to disable the TCP listener and serve
+## clients only through the WebSocket transport (requires control_host below).
 server_port = 2333
 http_port = 80
 token = "{token}"
-# Optional: reserve this exact Host for WebSocket transport. It must resolve to this server.
+## Optional: reserve this exact Host for WebSocket transport. It must resolve
+## to this server.
 # control_host = "control.example.com"
 
-# Optional direct reverse-proxy routes to services running on this server.
-# A plain TCP service:
+## Optional direct reverse-proxy routes to services running on this server.
+##
+## Example 1, a plain TCP service.
+## Uncomment the block below to enable it.
 # [[proxies]]
 # name = "grafana"
 # domain = "grafana.example.com"
 # local_addr = "127.0.0.1:3000"
 
-# A service reachable over a Unix socket:
+## Example 2, a Docker API reachable over a Unix socket. The path is resolved
+## on this host, so inside a container the socket must be mounted, e.g.
+## -v /var/run/docker.sock:/var/run/docker.sock
+## Uncomment the block below to enable it.
+## auth_header is optional; when set, requests need X-HTTP-TUNNEL-TOKEN: <secret> or get 401.
 # [[proxies]]
 # name = "docker-api"
 # domain = "docker.example.com"
 # local_addr = "unix:///var/run/docker.sock"
-# auth_header is optional; when set, a request must carry
-# `X-HTTP-TUNNEL-TOKEN: <secret>` or it is answered with 401
 # auth_header = "replace-with-a-long-secret"
 "#
     )
@@ -772,26 +791,81 @@ local_addr = "127.0.0.1:80"
     }
 
     #[tokio::test]
-    async fn test_server_config_rejects_zero_server_port() -> Result<()> {
-        // The WebSocket bridge needs a fixed, dialable port, so 0 is invalid.
+    async fn test_server_config_allows_a_disabled_tcp_listener() -> Result<()> {
+        // Omitting `server_port` disables the TCP listener. Without a control
+        // host the clients would have no way to connect, so that is rejected.
         let path = std::env::temp_dir().join(format!(
             "http-tunnel-zero-port-{}.toml",
             std::process::id()
         ));
+        std::fs::write(&path, "http_port = 8080\ntoken = \"a_secret_token\"\n")?;
+        let err = ServerConfig::from_file(&path)
+            .await
+            .expect_err("a missing server_port without control_host must be rejected");
+        assert!(
+            format!("{:#}", err).contains("control_host"),
+            "unexpected error: {:#}",
+            err
+        );
+
+        // `0` is not a magic value; removing the line is how the listener is
+        // disabled, so an explicit zero is a configuration error.
         std::fs::write(
             &path,
-            "server_port = 0\nhttp_port = 8080\ntoken = \"a_secret_token\"\n",
+            "server_port = 0\nhttp_port = 8080\n\
+             control_host = \"control.example.com\"\ntoken = \"a_secret_token\"\n",
         )?;
         let err = ServerConfig::from_file(&path)
             .await
             .expect_err("server_port = 0 must be rejected");
-        let _ = std::fs::remove_file(&path);
         assert!(
-            format!("{:#}", err).contains("server_port"),
+            format!("{:#}", err).contains("real port"),
             "unexpected error: {:#}",
             err
         );
+
+        // With a control host and no `server_port`, the TCP listener is off.
+        std::fs::write(
+            &path,
+            "http_port = 8080\n\
+             control_host = \"control.example.com\"\ntoken = \"a_secret_token\"\n",
+        )?;
+        let cfg = ServerConfig::from_file(&path).await?;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(cfg.server_port, None);
+        assert_eq!(cfg.control_host.as_deref(), Some("control.example.com"));
         Ok(())
+    }
+
+    /// The number of lines that disable a setting with a single `#`.
+    fn disabled_settings(example: &str, prefix: &str) -> usize {
+        example.lines().filter(|line| line.starts_with(prefix)).count()
+    }
+
+    /// Check the comment convention of the generated files: `##` marks
+    /// documentation and a single `#` only ever disables a setting.
+    ///
+    /// The distinction matters because a documentation sentence starting with a
+    /// single `#` reads like another setting that should be uncommented.
+    fn assert_comment_convention(example: &str) {
+        for line in example.lines() {
+            if line.trim().is_empty() || line.starts_with("##") {
+                continue;
+            }
+            let Some(rest) = line.strip_prefix("# ") else {
+                assert!(
+                    !line.starts_with('#'),
+                    "a comment must start with ##: {:?}",
+                    line
+                );
+                continue;
+            };
+            assert!(
+                rest.contains(" = ") || rest.starts_with("[["),
+                "documentation must start with ##, not a single #: {:?}",
+                line
+            );
+        }
     }
 
     #[test]
@@ -802,9 +876,22 @@ local_addr = "127.0.0.1:80"
         let cfg: ServerConfig = toml::from_str(&example)?;
         assert_eq!(String::from(&*cfg.token), token);
         assert!(cfg.proxies.is_empty());
-        // A plain and a Docker socket proxy example are both present
-        assert_eq!(example.matches("# [[proxies]]").count(), 2);
+        // A plain and a Docker socket proxy example are both disabled
+        assert_eq!(disabled_settings(&example, "# [[proxies]]"), 2);
         assert!(example.contains("unix:///var/run/docker.sock"));
+        assert_comment_convention(&example);
+        // The header documentation stays on one line: a wrapped comment reads
+        // like a second setting and misleads whoever edits the file.
+        assert_eq!(
+            example.lines().filter(|l| l.contains("X-HTTP-TUNNEL-TOKEN")).count(),
+            1
+        );
+        // Only the Docker example documents the optional `auth_header`
+        let (plain, docker) = example
+            .split_once("## Example 2")
+            .expect("the Docker proxy example is present");
+        assert!(!plain.contains("auth_header"), "{}", plain);
+        assert!(docker.contains("auth_header"), "{}", docker);
         Ok(())
     }
 
@@ -814,12 +901,19 @@ local_addr = "127.0.0.1:80"
         // The commented tunnels are inactive, so the example parses as-is
         let cfg = ClientConfig::parse(&example)?;
         assert!(cfg.tunnels.is_empty());
-        // A plain and a Docker socket tunnel example are both present
-        assert_eq!(example.matches("# [[tunnels]]").count(), 2);
+        // A plain and a Docker socket tunnel example are both disabled
+        assert_eq!(disabled_settings(&example, "# [[tunnels]]"), 2);
         assert!(example.contains("unix:///var/run/docker.sock"));
+        assert_comment_convention(&example);
+        // The header documentation stays on one line: a wrapped comment reads
+        // like a second setting and misleads whoever edits the file.
+        assert_eq!(
+            example.lines().filter(|l| l.contains("X-HTTP-TUNNEL-TOKEN")).count(),
+            1
+        );
         // Only the Docker tunnel documents the optional `auth_header`
         let (plain, docker) = example
-            .split_once("# A service reachable over a Unix socket:")
+            .split_once("## Example 2")
             .expect("the Docker tunnel example is present");
         assert!(!plain.contains("auth_header"), "{}", plain);
         assert!(docker.contains("auth_header"), "{}", docker);
@@ -845,9 +939,11 @@ pub struct ServerConfig {
     /// Server-side HTTP reverse proxy rules.
     #[serde(default)]
     pub proxies: Vec<ServerProxyEntry>,
-    /// Port for client control and data connections.
-    #[serde(default = "default_server_port")]
-    pub server_port: u16,
+    /// Port for client control and data connections. Omit it to disable the
+    /// TCP listener, leaving the WebSocket transport as the only client
+    /// entrypoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_port: Option<u16>,
     /// Public HTTP entrypoint.
     #[serde(default = "default_http_port")]
     pub http_port: u16,
@@ -868,7 +964,6 @@ pub struct ServerProxyEntry {
     pub auth_header: Option<MaskedString>,
 }
 
-fn default_server_port() -> u16 { 2333 }
 fn default_http_port() -> u16 { 80 }
 
 impl ServerConfig {
@@ -909,10 +1004,16 @@ impl ServerConfig {
                         bail!("Proxy domain `{}` is configured more than once", domain);
                     }
                 }
-                if config.server_port == 0 {
-                    bail!(
-                        "`server_port` must not be 0: clients need a fixed port to connect to"
-                    );
+                match config.server_port {
+                    Some(0) => bail!(
+                        "`server_port` must be a real port; remove the line to disable the TCP \
+                         listener and serve clients only through the WebSocket transport"
+                    ),
+                    None if config.control_host.is_none() => bail!(
+                        "`server_port` is not set, so the TCP listener is disabled, but \
+                         `control_host` is not set either: clients would have no way to connect"
+                    ),
+                    _ => {}
                 }
                 if config.token.is_empty()
                     || &*config.token == "replace-with-a-long-random-secret"
