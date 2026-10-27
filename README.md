@@ -151,7 +151,22 @@ auth_header = "请替换为一个足够长的随机密钥"
 
 ## Docker
 
-服务端和客户端使用独立镜像。请先在宿主机准备好 `hts.toml` 和 `htc.toml`。
+服务端和客户端使用独立镜像：`ghcr.io/jiangood/hts:latest`（服务端）和 `ghcr.io/jiangood/htc:latest`（客户端），目前仅发布 `linux/amd64` 架构，其他架构请参考 [build-guide.md](./docs/build-guide.md) 自行构建。生产环境建议把 `:latest` 换成具体版本标签（例如 `:v1.2.3`），避免自动升级带来意外变更。
+
+两个程序都固定读取工作目录 `/app` 下的 `hts.toml` / `htc.toml`，所以只需要把宿主机上的配置目录挂载到容器的 `/app`。
+
+### 1. 准备配置
+
+在宿主机上创建配置目录，并让容器首次启动生成 `hts.toml`（服务端会自动生成随机 `token`，写入配置后退出）：
+
+```sh
+mkdir -p /opt/hts /opt/htc
+docker run --rm -v /opt/hts:/app ghcr.io/jiangood/hts:latest
+```
+
+把输出中的 `token` 填入 `htc.toml`。客户端配置可以先 `docker run --rm -v /opt/htc:/app ghcr.io/jiangood/htc:latest` 生成模板，再按 [快速开始](#快速开始) 的说明修改 `remote`、`token`、`[[tunnels]]` 等字段。
+
+### 2. docker run
 
 启动服务端：
 
@@ -166,6 +181,59 @@ docker run -d --name htc --restart unless-stopped   -v "/opt/htc:/app/"   ghcr.i
 ```
 
 如果需要代理 unix sock，例如docker api，还需要 参数 `-v /var/run/docker.sock:/var/run/docker.sock`
+
+### 3. docker-compose
+
+服务端 `docker-compose.yml`（部署在公网服务器）：
+
+```yaml
+services:
+  hts:
+    image: ghcr.io/jiangood/hts:latest
+    container_name: hts
+    restart: unless-stopped
+    ports:
+      - "2333:2333"   # 客户端控制连接，需与 hts.toml 的 server_port 一致
+      - "80:80"       # HTTP 入口，需与 hts.toml 的 http_port 一致
+    volumes:
+      - /opt/hts:/app
+```
+
+客户端 `docker-compose.yml`（部署在内网机器）：
+
+```yaml
+services:
+  htc:
+    image: ghcr.io/jiangood/htc:latest
+    container_name: htc
+    restart: unless-stopped
+    ports:
+      - "8610:8610"   # Web 管理页与 API，htc.toml 中 web_port = 0 可关闭
+    volumes:
+      - /opt/htc:/app
+      # 需要转发 Unix Socket（例如 Docker API）时取消注释，
+      # 并保证路径与 htc.toml 中 local_addr 的 unix:// 路径一致
+      # - /var/run/docker.sock:/var/run/docker.sock
+    # 需要转发宿主机上的服务时（Linux 需额外添加下面两行）
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+```
+
+保存后分别执行：
+
+```sh
+docker compose up -d
+docker compose logs -f      # 查看日志
+```
+
+如果只是在一台机器上试用，可以把两段合并到同一个 `docker-compose.yml`，把 `htc.toml` 的 `remote` 写成 `hts:2333`（compose 服务名），两者仍分别挂载各自的配置目录。
+
+注意事项：
+
+- 端口映射必须与配置保持一致：服务端 `server_port`（默认 `2333`）、`http_port`（默认 `80`），客户端 `web_port`（默认 `8610`）。改了配置也要同步改 `docker-compose.yml`。
+- 客户端配置中的 `local_addr` 在客户端容器内解析：`127.0.0.1:80` 指的是客户端容器本身，不是宿主机。转发宿主机服务请用 `host.docker.internal:<端口>`（Linux 需 `extra_hosts`）或宿主机的内网 IP，转发同一 compose 中的容器用服务名。
+- 使用 WebSocket 传输模式时，客户端不需要入站端口；服务端的 `2333` 也不必对公网开放，可以删掉该端口映射，只保留 `http_port`，并把 `htc.toml` 的 `remote` 指向控制域名（例如 `control.example.com:80`），同时设置 `transport = "websocket"`。
+- 日志输出到容器标准输出，使用 `docker compose logs -f hts` 或 `docker logs htc` 查看，不需要额外挂载日志文件。
 
 ## 许可证
 
