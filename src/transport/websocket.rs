@@ -38,8 +38,8 @@ pub(crate) type BoxedIo = Box<dyn AsyncReadWrite + Unpin + Send + Sync>;
 
 /// Connect to the control Host over plain WebSocket and expose it as a byte stream.
 /// The existing length-prefixed protocol therefore does not need to know about WS frames.
-pub(crate) async fn connect_websocket(remote: &str) -> Result<BoxedIo> {
-    let url = format!("ws://{}/_http-tunnel/v1/connect", remote);
+pub(crate) async fn connect_websocket(server_addr: &str) -> Result<BoxedIo> {
+    let url = format!("ws://{}/_http-tunnel/v1/connect", server_addr);
     let (ws, _) = timeout(
         WS_HANDSHAKE_TIMEOUT,
         // The tunnel carries small interactive frames; keep the same

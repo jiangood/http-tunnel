@@ -19,7 +19,6 @@ use tokio::task::JoinHandle;
 
 pub const SERVER_PORT: u16 = 2333;
 pub const HTTP_ENTRY_PORT: u16 = 2334;
-pub const SERVER_ADDR: &str = "127.0.0.1:2333";
 pub const HTTP_ENTRY_ADDR: &str = "127.0.0.1:2334";
 pub const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
 pub const CLIENT_NAME: &str = "bench";
@@ -77,7 +76,7 @@ impl Harness {
             std::process::id()
         ));
         let config = format!(
-            "name = \"{CLIENT_NAME}\"\nremote = \"{SERVER_ADDR}\"\ntoken = \"{CLIENT_TOKEN}\"\n\n[[tunnels]]\nname = \"echo\"\ndomain = \"{ECHO_HOST}\"\nlocal_addr = \"{ECHO_SERVER_ADDR}\"\n"
+            "name = \"{CLIENT_NAME}\"\nserver_host = \"127.0.0.1\"\nserver_port = {SERVER_PORT}\ntoken = \"{CLIENT_TOKEN}\"\n\n[[tunnels]]\nname = \"echo\"\ndomain = \"{ECHO_HOST}\"\nlocal_addr = \"{ECHO_SERVER_ADDR}\"\n"
         );
         std::fs::write(&config_path, config)?;
         let config_guard = TempFile(config_path.clone());

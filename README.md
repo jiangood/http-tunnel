@@ -53,7 +53,8 @@ local_addr = "127.0.0.1:3000"
 编辑配置，填写服务端地址、与服务端相同的 `token` 和转发规则：
 
 ```toml
-remote = "your-server.example.com:2333"
+server_host = "your-server.example.com"
+server_port = 2333
 name = "home"
 token = "与服务端相同的密钥"
 web_port = 8610
@@ -63,6 +64,10 @@ name = "nas"
 domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
 ```
+
+`server_host` 和 `server_port` 必须同时填写。默认的 TCP 模式下，`server_port` 就是服务端 `hts.toml` 的 `server_port`。
+
+> 旧配置中的 `remote = "host:port"` 已移除；启动时会提示改用 `server_host` 和 `server_port`。
 
 再次运行 `./htc` 启动客户端。之后访问 `http://nas.example.com`，请求会转发到客户端的本地服务。
 
@@ -79,10 +84,11 @@ control_host = "control.example.com"
 token = "与客户端相同的随机强密钥"
 ```
 
-确保 control.example.com 的 DNS 记录指向服务端。在 htc.toml 中，将 remote 指向该控制域名和 HTTP 端口，并启用 WebSocket：
+确保 control.example.com 的 DNS 记录指向服务端。在 htc.toml 中，把 `server_host` 设为该控制域名，`server_port` 设为服务端 HTTP 入口端口（`http_port`，不是 `server_port`），并启用 WebSocket：
 
 ```toml
-remote = "control.example.com:80"
+server_host = "control.example.com"
+server_port = 80
 transport = "websocket"
 name = "home"
 token = "与服务端相同的随机强密钥"
@@ -93,12 +99,14 @@ domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
 ```
 
+> 注意：WebSocket 模式下 `server_port` 填的是服务端的 `http_port`（上例为 `80`），`server_host` 必须与服务端的 `control_host` 一致。启动日志会明确打印当前使用的传输模式和连接地址。
+
 控制域名仅用于内部控制与数据连接；普通业务域名（例如 nas.example.com）继续通过 http_port 进入现有 Host 路由。服务端会根据 Host 和专用路径 /_http-tunnel/v1/connect 识别 WebSocket 连接，并直接交给隧道协议处理器。原来的 2333/TCP 模式不受影响。
 
-如果服务端完全不需要 TCP 端口，**不写 `server_port` 这一行**即可关闭该监听；此时 `control_host` 必须配置，否则服务端没有客户端入口，启动时会直接报错。注意默认模板里带着 `server_port = 2333`，要关闭就得把它删掉（写成 `0` 会被拒绝）：
+如果服务端完全不需要 TCP 端口，**在 `hts.toml` 中不写 `server_port` 这一行**即可关闭该监听；此时 `control_host` 必须配置，否则服务端没有客户端入口，启动时会直接报错。注意默认模板里带着 `server_port = 2333`，要关闭就得把它删掉（写成 `0` 会被拒绝）：
 
 ```toml
-# 不写 server_port，即不监听 TCP，只接受 WebSocket 控制连接
+# hts.toml 中不写 server_port，即不监听 TCP，只接受 WebSocket 控制连接
 http_port = 80
 control_host = "control.example.com"
 token = "与客户端相同的随机强密钥"
@@ -175,7 +183,7 @@ mkdir -p /opt/hts /opt/htc
 docker run --rm -v /opt/hts:/app ghcr.io/jiangood/hts:latest
 ```
 
-把输出中的 `token` 填入 `htc.toml`。客户端配置可以先 `docker run --rm -v /opt/htc:/app ghcr.io/jiangood/htc:latest` 生成模板，再按 [快速开始](#快速开始) 的说明修改 `remote`、`token`、`[[tunnels]]` 等字段。
+把输出中的 `token` 填入 `htc.toml`。客户端配置可以先 `docker run --rm -v /opt/htc:/app ghcr.io/jiangood/htc:latest` 生成模板，再按 [快速开始](#快速开始) 的说明修改 `server_host`、`server_port`、`token`、`[[tunnels]]` 等字段。
 
 ### 2. docker run
 
@@ -237,13 +245,13 @@ docker compose up -d
 docker compose logs -f      # 查看日志
 ```
 
-如果只是在一台机器上试用，可以把两段合并到同一个 `docker-compose.yml`，把 `htc.toml` 的 `remote` 写成 `hts:2333`（compose 服务名），两者仍分别挂载各自的配置目录。
+如果只是在一台机器上试用，可以把两段合并到同一个 `docker-compose.yml`，把 `htc.toml` 的 `server_host` 写成 `hts`（compose 服务名）、`server_port` 写成 `2333`，两者仍分别挂载各自的配置目录。
 
 注意事项：
 
 - 端口映射必须与配置保持一致：服务端 `server_port`（默认 `2333`）、`http_port`（默认 `80`），客户端 `web_port`（默认 `8610`）。改了配置也要同步改 `docker-compose.yml`。
 - 客户端配置中的 `local_addr` 在客户端容器内解析：`127.0.0.1:80` 指的是客户端容器本身，不是宿主机。转发宿主机服务请用 `host.docker.internal:<端口>`（Linux 需 `extra_hosts`）或宿主机的内网 IP，转发同一 compose 中的容器用服务名。
-- 使用 WebSocket 传输模式时，客户端不需要入站端口；服务端的 `2333` 也不必对公网开放，可以删掉该端口映射，只保留 `http_port`，并把 `htc.toml` 的 `remote` 指向控制域名（例如 `control.example.com:80`），同时设置 `transport = "websocket"`。如果从 `hts.toml` 中删掉 `server_port`，服务端根本不会监听该端口，端口映射可以整条删除。
+- 使用 WebSocket 传输模式时，客户端不需要入站端口；服务端的 `2333` 也不必对公网开放，可以删掉该端口映射，只保留 `http_port`，并把 `htc.toml` 的 `server_host` 指向控制域名（例如 `control.example.com`）、`server_port` 指向 HTTP 入口端口（例如 `80`），同时设置 `transport = "websocket"`。如果从 `hts.toml` 中删掉 `server_port`，服务端根本不会监听该端口，端口映射可以整条删除。
 - 日志输出到容器标准输出，使用 `docker compose logs -f hts` 或 `docker logs htc` 查看，不需要额外挂载日志文件。
 
 ## 许可证

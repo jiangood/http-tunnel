@@ -34,7 +34,8 @@ pub async fn run_http_tunnel_server_with_control_host(
 }
 
 /// Run a client from its configuration file. The file carries the identity
-/// (`remote`, `name`, `token`) and the tunnels the client serves.
+/// (`server_host`, `server_port`, `name`, `token`) and the tunnels the client
+/// serves.
 pub async fn run_http_tunnel_client(
     config_path: &str,
     shutdown_rx: broadcast::Receiver<bool>,

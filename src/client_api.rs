@@ -140,6 +140,7 @@ fn tunnel_view(t: &ClientTunnelConfig) -> TunnelView {
 #[derive(Serialize)]
 struct StatusView {
     name: String,
+    transport: String,
     remote: String,
     connected: bool,
     tunnels: usize,
@@ -187,7 +188,8 @@ impl ApiError {
 async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusView> {
     Json(StatusView {
         name: state.client.name().to_string(),
-        remote: state.client.remote().to_string(),
+        transport: state.client.transport().to_string(),
+        remote: state.client.server_addr().to_string(),
         connected: state.client.connected(),
         tunnels: state.client.tunnels().await.len(),
     })
@@ -222,10 +224,11 @@ async fn delete_tunnel(
 
 async fn web_index(State(state): State<Arc<ApiState>>) -> Html<String> {
     let connected = if state.client.connected() { "已连接" } else { "未连接" };
+    let transport = if state.client.transport() == "websocket" { "WebSocket" } else { "TCP" };
     let tunnels = state.client.tunnels().await;
     let mut html = format!(
-        "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>http-tunnel 管理</title><body><h1>http-tunnel 客户端管理</h1><p>客户端：{}；服务端：{}；状态：{}；隧道数：{}</p><h2>新增或更新隧道</h2><form method=\"post\" action=\"/web/tunnels\"><p>名称：<input name=\"name\" required pattern=\"[A-Za-z0-9._-]+\"></p><p>域名：<input name=\"domain\" required></p><p>本地地址：<input name=\"local_addr\" required placeholder=\"127.0.0.1:8080 或 unix:///path.sock\"></p><button type=\"submit\">保存</button></form><h2>隧道列表</h2><table border=\"1\" cellpadding=\"6\"><tr><th>名称</th><th>域名</th><th>本地地址</th><th>操作</th></tr>",
-        escape_html(state.client.name()), escape_html(state.client.remote()), connected, tunnels.len()
+        "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>http-tunnel 管理</title><body><h1>http-tunnel 客户端管理</h1><p>客户端：{}；服务端：{}；传输：{}；状态：{}；隧道数：{}</p><h2>新增或更新隧道</h2><form method=\"post\" action=\"/web/tunnels\"><p>名称：<input name=\"name\" required pattern=\"[A-Za-z0-9._-]+\"></p><p>域名：<input name=\"domain\" required></p><p>本地地址：<input name=\"local_addr\" required placeholder=\"127.0.0.1:8080 或 unix:///path.sock\"></p><button type=\"submit\">保存</button></form><h2>隧道列表</h2><table border=\"1\" cellpadding=\"6\"><tr><th>名称</th><th>域名</th><th>本地地址</th><th>操作</th></tr>",
+        escape_html(state.client.name()), escape_html(state.client.server_addr()), transport, connected, tunnels.len()
     );
     for tunnel in tunnels {
         html.push_str(&format!(

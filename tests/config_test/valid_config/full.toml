@@ -1,4 +1,5 @@
-remote = "example.com:2333" # The address of the server
+server_host = "example.com" # The host of the server
+server_port = 2333 # The control port: server_port for TCP, http_port for WebSocket
 name = "home" # The name of the client
 token = "use_a_secret_that_only_you_know" # The shared token of the server
 web_port = 8610 # The port of the client web management interface

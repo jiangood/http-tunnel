@@ -14,7 +14,7 @@
 
 ### 客户端
 
-- `src/client.rs::ControlChannel::run` 连接 `remote`，执行现有控制握手和认证。
+- `src/client.rs::ControlChannel::run` 连接客户端配置的 `server_host:server_port`，执行现有控制握手和认证。
 - 收到 `CreateDataChannel` 后，客户端创建新的连接；数据连接先发送 `ClientHello::Data`，收到 `StartForwardTcp` 后把数据转发到本地目标。
 - 现有控制连接与数据连接均依赖同一套长度前缀 bincode 协议，但它们是独立的 TCP 连接。
 
@@ -38,8 +38,8 @@
 ## 3. 配置与路由建议
 
 - 服务端新增可选 `control_host`，默认未配置时完全保持旧行为。
-- 客户端新增可选 `transport`，缺省为 `tcp`；WebSocket 模式用 `remote` 中的主机与 HTTP 端口作为连接目标，避免同时维护两个地址字段。
-- 约定 `transport = "websocket"` 时，客户端将 `remote` 解释为控制 Host 的 `host:port` 地址，并使用专用 WebSocket 路径。
+- 客户端新增可选 `transport`，缺省为 `tcp`；TCP 模式用 `server_host` + `server_port` 指向服务端 `server_port`，WebSocket 模式用同一组字段指向控制 Host 和 `http_port`，避免同时维护两套地址字段。
+- 约定 `transport = "websocket"` 时，`server_host` 必须是服务端的 `control_host`，`server_port` 必须是服务端的 `http_port`，并使用专用 WebSocket 路径。
 - 控制 Host 必须与业务 Host 区分；Host 只用于路由，仍必须执行现有 token 认证。
 - 服务端处理 WebSocket 请求前必须检查 Host 与路径。其他 Host 的普通 HTTP 业务请求继续走原路由。
 - 第一版使用 `ws://`，不会自动申请证书；文档必须明确它是明文传输，公网敏感流量不应在未加密情况下使用。

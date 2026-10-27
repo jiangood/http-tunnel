@@ -25,7 +25,7 @@ Authorization: Bearer <token>
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/api/status` | 客户端名称、服务端地址、连接状态和隧道数量 |
+| `GET` | `/api/status` | 客户端名称、传输模式、服务端地址、连接状态和隧道数量 |
 | `GET` | `/api/tunnels` | 列出隧道 |
 | `PUT` | `/api/tunnels/{name}` | 新增或更新隧道，请求体为 `{ "domain": "...", "local_addr": "..." }` |
 | `DELETE` | `/api/tunnels/{name}` | 删除隧道 |

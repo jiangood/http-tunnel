@@ -138,7 +138,8 @@ domain = "server.e2e.test"
 local_addr = "127.0.0.1:{server_backend.server_port}"
 auth_header = "{SERVER_AUTH}"
 """)
-        (work / "htc.toml").write_text(f"""remote = "127.0.0.1:{control_port}"
+        (work / "htc.toml").write_text(f"""server_host = "127.0.0.1"
+server_port = {control_port}
 name = "e2e-client"
 token = "{TOKEN}"
 web_port = {web_port}

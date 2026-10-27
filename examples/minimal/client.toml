@@ -1,13 +1,21 @@
 ## The configuration of a client.
 ##
-## The server takes no configuration file: it is started with `--server-port`,
-## `--http-port` and `--token`. The tunnels are declared here, on the client.
+## The server takes no configuration file: it is configured in `hts.toml`.
+## The tunnels are declared here, on the client.
 ##
-## The identity (`remote`, `name` and `token`) can also be passed on the command
-## line or through the environment, in which case the command line wins.
-remote = "myserver.example.com:2333"
+## `server_host` and `server_port` are required. With the default TCP transport
+## they point to the `server_port` of hts.toml. With the WebSocket transport,
+## `server_host` must be its `control_host` and `server_port` its `http_port`.
+transport = "tcp"
+server_host = "myserver.example.com"
+server_port = 2333
 name = "home_nas"
 token = "use_a_secret_that_only_you_know"
+
+## WebSocket transport example:
+# transport = "websocket"
+# server_host = "control.example.com"
+# server_port = 80
 
 [[tunnels]]
 ## The name identifies the tunnel within the client and is required.

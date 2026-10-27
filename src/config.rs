@@ -86,9 +86,15 @@ pub struct TunnelEntry {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
-    /// The address of the server, e.g. `example.com:2333`
+    /// The host of the server, e.g. `example.com`, `127.0.0.1` or `::1`.
+    /// With the WebSocket transport it must be the `control_host` of the server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote: Option<String>,
+    pub server_host: Option<String>,
+    /// The control port of the server. With the TCP transport it is the
+    /// `server_port` of the server; with the WebSocket transport it is its
+    /// `http_port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_port: Option<u16>,
     /// Optional transport mode. Missing means the legacy TCP transport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
@@ -117,6 +123,14 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
+    /// The `host:port` address of the server, with an IPv6 host bracketed.
+    pub fn server_addr(&self) -> Option<String> {
+        Some(format_server_addr(
+            self.server_host.as_deref()?,
+            self.server_port?,
+        ))
+    }
+
     /// The interval between two application-layer heartbeats expected from the
     /// server. `0` disables the test
     pub fn heartbeat_timeout(&self) -> u64 {
@@ -191,10 +205,21 @@ impl ClientConfig {
     pub fn parse(s: &str) -> Result<ClientConfig> {
         let mut config: ClientConfig = toml::from_str(s)
             .map_err(|e| {
-                if s.contains("server_port") || s.contains("http_port") || s.contains("[clients") {
+                if has_legacy_remote(s) {
                     anyhow!(
-                        "{}\nNote: `http-tunnel` no longer takes a server configuration file. The \
-                         configure the server in `hts.toml`; client routes belong in \
+                        "{}\nNote: `remote` is no longer supported. Set `server_host` and \
+                         `server_port` instead.",
+                        e
+                    )
+                } else if s.contains("http_port")
+                    || s.contains("control_host")
+                    || s.contains("[clients")
+                    || s.contains("[[proxies")
+                    || s.contains("[proxies")
+                {
+                    anyhow!(
+                        "{}\nNote: `http-tunnel` no longer takes a server configuration file. \
+                         Configure the server in `hts.toml`; client routes belong in \
                          the `[[tunnels]]` array of `htc.toml`.",
                         e
                     )
@@ -238,6 +263,7 @@ impl ClientConfig {
                 bail!("Unsupported transport; expected tcp or websocket");
             }
         }
+        validate_server_address(config)?;
         let mut names: BTreeMap<String, ()> = BTreeMap::new();
         let mut domains: BTreeMap<String, ()> = BTreeMap::new();
         let mut entries: Vec<TunnelEntry> = Vec::new();
@@ -295,6 +321,84 @@ impl ClientConfig {
     }
 }
 
+/// Format a host and a port as a `host:port` authority, bracketing IPv6 hosts.
+pub(crate) fn format_server_addr(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
+/// Whether the TOML source still declares the removed top-level `remote` key.
+fn has_legacy_remote(s: &str) -> bool {
+    s.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("remote")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    })
+}
+
+/// Validate and normalize the address of the server.
+///
+/// The host and the port are optional together: a partial configuration is
+/// accepted by the parser, but an address with only one of the two is always a
+/// mistake. `resolve_identity` rejects a completely missing address at startup.
+fn validate_server_address(config: &mut ClientConfig) -> Result<()> {
+    match (config.server_host.as_mut(), config.server_port) {
+        (None, None) => Ok(()),
+        (Some(_), None) => bail!("The server port is missing. Set `server_port`"),
+        (None, Some(_)) => bail!("The server host is missing. Set `server_host`"),
+        (Some(host), Some(port)) => {
+            if port == 0 {
+                bail!("The `server_port` must not be 0");
+            }
+            *host = normalize_server_host(host)?;
+            Ok(())
+        }
+    }
+}
+
+/// Normalize and validate a server host.
+///
+/// A host is a DNS name, an IPv4 address or an IPv6 address. The port lives in
+/// `server_port`, so a `host:port` value is rejected with a hint. IPv6 literals
+/// may be written with or without brackets.
+fn normalize_server_host(raw: &str) -> Result<String> {
+    let host = raw.trim();
+    if host.is_empty() {
+        bail!("The `server_host` must not be empty");
+    }
+    if host.contains("://") {
+        bail!("The `server_host` must not include a scheme; set `server_port` separately");
+    }
+    if host.chars().any(|c| c.is_whitespace()) {
+        bail!("The `server_host` must not contain whitespace");
+    }
+    if host.contains('/') || host.contains('\\') || host.contains('?') || host.contains('#') {
+        bail!("The `server_host` `{}` is not a valid host", raw);
+    }
+
+    if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        inner
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| anyhow!("The `server_host` `{}` is not a valid IPv6 address", raw))?;
+        return Ok(inner.to_string());
+    }
+    if host.contains('[') || host.contains(']') {
+        bail!("The `server_host` `{}` is not a valid host", raw);
+    }
+    if host.contains(':') {
+        host.parse::<std::net::Ipv6Addr>().map_err(|_| {
+            anyhow!(
+                "The `server_host` `{}` must not include a port; set `server_port` instead",
+                raw
+            )
+        })?;
+    }
+    Ok(host.to_string())
+}
+
 /// Validate a tunnel name and return it trimmed.
 ///
 /// A name is used in the path of the administration API, so it is restricted to
@@ -337,10 +441,19 @@ fn client_config_example() -> String {
 ##   #   a disabled setting, remove the single # to enable it
 ##
 ## Set these values before starting htc.
-remote = "your-server.example.com:2333"
-## Optional: "tcp" (default) or "websocket". For WebSocket set remote to
-## "control.example.com:80" and configure the same control_host in hts.toml.
+##
+## The TCP transport is the default. `server_port` is the `server_port` of
+## hts.toml.
+transport = "tcp"
+server_host = "your-server.example.com"
+server_port = 2333
+##
+## To use the WebSocket transport, comment out the three settings above and
+## uncomment the three below. `server_host` must be the `control_host` of
+## hts.toml and `server_port` must be its `http_port`, not its `server_port`.
 # transport = "websocket"
+# server_host = "control.example.com"
+# server_port = 80
 name = "home"
 token = "replace-with-the-same-secret-as-hts"
 web_port = 8610
@@ -450,6 +563,68 @@ mod tests {
     }
 
     #[test]
+    fn test_server_addr() -> Result<()> {
+        let cfg = ClientConfig::parse("server_host = \"example.com\"\nserver_port = 2333\n")?;
+        assert_eq!(cfg.server_addr().as_deref(), Some("example.com:2333"));
+
+        let cfg = ClientConfig::parse("server_host = \"::1\"\nserver_port = 2333\n")?;
+        assert_eq!(cfg.server_host.as_deref(), Some("::1"));
+        assert_eq!(cfg.server_addr().as_deref(), Some("[::1]:2333"));
+
+        // Brackets are accepted and normalized away
+        let cfg = ClientConfig::parse("server_host = \"[::1]\"\nserver_port = 2333\n")?;
+        assert_eq!(cfg.server_host.as_deref(), Some("::1"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_rejects_a_partial_server_address() {
+        assert!(ClientConfig::parse("server_host = \"example.com\"\n").is_err());
+        assert!(ClientConfig::parse("server_port = 2333\n").is_err());
+        let err = format!(
+            "{:#}",
+            ClientConfig::parse("server_host = \"example.com\"\n").unwrap_err()
+        );
+        assert!(err.contains("server_port"), "{}", err);
+    }
+
+    #[test]
+    fn test_rejects_an_invalid_server_address() {
+        for source in [
+            "server_host = \"example.com:2333\"\nserver_port = 2333\n",
+            "server_host = \"tcp://example.com\"\nserver_port = 2333\n",
+            "server_host = \"\"\nserver_port = 2333\n",
+            "server_host = \"example.com\"\nserver_port = 0\n",
+        ] {
+            assert!(ClientConfig::parse(source).is_err(), "{} is valid", source);
+        }
+    }
+
+    #[test]
+    fn test_rejects_the_legacy_remote_field() {
+        let err = format!(
+            "{:#}",
+            ClientConfig::parse("remote = \"example.com:2333\"\n").unwrap_err()
+        );
+        assert!(err.contains("server_host"), "{}", err);
+        assert!(err.contains("server_port"), "{}", err);
+    }
+
+    #[test]
+    fn test_server_port_does_not_trigger_the_server_config_hint() {
+        let err = format!(
+            "{:#}",
+            ClientConfig::parse("server_host = \"example.com\"\nserver_port = 2333\nunknown = 1\n")
+                .unwrap_err()
+        );
+        assert!(
+            !err.contains("no longer takes a server configuration"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
     fn test_example_config() -> Result<()> {
         let paths = get_all_example_config()?;
         assert!(!paths.is_empty());
@@ -485,7 +660,8 @@ mod tests {
     #[test]
     fn test_resolved_tunnels() -> Result<()> {
         let s = r#"
-remote = "example.com:2333"
+server_host = "example.com"
+server_port = 2333
 name = "home"
 token = "123"
 heartbeat_timeout = 20
@@ -717,7 +893,8 @@ token = "123"
     #[test]
     fn test_config_roundtrip() -> Result<()> {
         let s = r#"
-remote = "example.com:2333"
+server_host = "example.com"
+server_port = 2333
 name = "home"
 token = "123"
 web_port = 8611
@@ -760,7 +937,8 @@ local_addr = "127.0.0.1:80"
         let dumped = cfg.to_toml()?;
         // `None` options must be omitted rather than serialized as an error
         assert!(!dumped.contains("nodelay"));
-        assert!(!dumped.contains("remote"));
+        assert!(!dumped.contains("server_host"));
+        assert!(!dumped.contains("server_port"));
         let reparsed = ClientConfig::parse(&dumped)?;
         assert_eq!(cfg, reparsed);
         Ok(())

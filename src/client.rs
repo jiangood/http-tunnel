@@ -1,5 +1,5 @@
 use crate::cli::{ClientArgs, DEFAULT_CLIENT_WEB_PORT};
-use crate::config::{ClientConfig, ClientTunnelConfig, MaskedString};
+use crate::config::{format_server_addr, ClientConfig, ClientTunnelConfig, MaskedString};
 use crate::constants::run_control_chan_backoff;
 use crate::protocol::{self, Ack, Auth, ClientHello, ControlChannelCmd, DataChannelCmd, ServerHello};
 use crate::transport::{connect, AddrMaybeCached, SocketOpts};
@@ -38,6 +38,18 @@ pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<b
         Ok(identity) => identity,
         Err(e) => return wait_after_error(e, &mut shutdown_rx).await,
     };
+
+    if identity.transport == "websocket" {
+        info!(
+            "Using the WebSocket transport: {} is the server's control Host and HTTP port",
+            identity.server_addr
+        );
+    } else {
+        info!(
+            "Using the TCP transport: {} is the server's control address (`server_port`)",
+            identity.server_addr
+        );
+    }
 
     let web_port = config.web_port.unwrap_or(DEFAULT_CLIENT_WEB_PORT);
 
@@ -104,10 +116,29 @@ pub async fn run_client(args: ClientArgs, mut shutdown_rx: broadcast::Receiver<b
 /// Resolve the identity of a client from its configuration, rejecting a missing
 /// or placeholder value.
 fn resolve_identity(config: &ClientConfig, config_path: &Path) -> Result<Identity> {
-    let remote = config.remote.clone().ok_or_else(|| {
+    let transport = config.transport.clone().unwrap_or_else(|| "tcp".to_string());
+    let websocket = transport == "websocket";
+    let server_host = config.server_host.clone().ok_or_else(|| {
         anyhow!(
-            "The address of the server is missing. Set `remote` in {:?}",
-            config_path
+            "The server host is missing. Set `server_host` in {:?}.{}",
+            config_path,
+            if websocket {
+                " With `transport = \"websocket\"`, it must be the server's `control_host`."
+            } else {
+                ""
+            }
+        )
+    })?;
+    let server_port = config.server_port.ok_or_else(|| {
+        anyhow!(
+            "The server port is missing. Set `server_port` in {:?}.{}",
+            config_path,
+            if websocket {
+                " With `transport = \"websocket\"`, it must be the server's `http_port`, \
+                 not its `server_port`."
+            } else {
+                ""
+            }
         )
     })?;
     let name = config.name.clone().ok_or_else(|| {
@@ -122,8 +153,8 @@ fn resolve_identity(config: &ClientConfig, config_path: &Path) -> Result<Identit
     if &*token == "replace-with-the-same-secret-as-hts" {
         bail!("Replace the placeholder token in {:?}", config_path);
     }
-    let transport = config.transport.clone().unwrap_or_else(|| "tcp".to_string());
-    Ok(Identity { remote, name, token, transport })
+    let server_addr = format_server_addr(&server_host, server_port);
+    Ok(Identity { server_addr, name, token, transport })
 }
 
 /// Report a startup error and then wait for a shutdown signal instead of
@@ -144,7 +175,7 @@ async fn wait_after_error(
 /// file
 #[derive(Debug, Clone)]
 pub(crate) struct Identity {
-    pub(crate) remote: String,
+    pub(crate) server_addr: String,
     pub(crate) transport: String,
     pub(crate) name: String,
     pub(crate) token: MaskedString,
@@ -201,8 +232,14 @@ impl ClientState {
 
     /// The address of the server, reported by the administration API
     #[cfg_attr(not(feature = "client-api"), allow(dead_code))]
-    pub(crate) fn remote(&self) -> &str {
-        &self.identity.remote
+    pub(crate) fn server_addr(&self) -> &str {
+        &self.identity.server_addr
+    }
+
+    /// The transport mode, reported by the administration API
+    #[cfg_attr(not(feature = "client-api"), allow(dead_code))]
+    pub(crate) fn transport(&self) -> &str {
+        &self.identity.transport
     }
 
     /// Whether at least one control channel is established, reported by the
@@ -261,7 +298,7 @@ impl ClientState {
                 tunnel.clone(),
                 self.identity.name.clone(),
                 self.identity.token.clone(),
-                self.identity.remote.clone(),
+                self.identity.server_addr.clone(),
                 transport.clone(),
                 heartbeat_timeout,
                 self.connections.clone(),
@@ -349,7 +386,7 @@ impl std::error::Error for FatalControlError {
 
 struct RunDataChannelArgs {
     session_key: Nonce,
-    remote_addr: AddrMaybeCached,
+    server_addr: AddrMaybeCached,
     transport: String,
     socket_opts: SocketOpts,
     tunnel: ClientTunnelConfig,
@@ -367,9 +404,9 @@ async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<Boxe
         backoff,
         || async {
             let result: Result<BoxedIo> = if args.transport == "websocket" {
-                connect_websocket(&args.remote_addr.addr).await
+                connect_websocket(&args.server_addr.addr).await
             } else {
-                connect(&args.remote_addr)
+                connect(&args.server_addr)
                     .await
                     .map(|tcp| {
                         args.socket_opts.apply(&tcp);
@@ -378,7 +415,7 @@ async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<Boxe
                     .map_err(Into::into)
             };
             result
-                .with_context(|| format!("Failed to connect to {}", args.remote_addr))
+                .with_context(|| format!("Failed to connect to {}", args.server_addr))
                 .map_err(backoff::Error::transient)
         },
         |e, duration| {
@@ -444,7 +481,7 @@ struct ControlChannel {
     tunnel: ClientTunnelConfig,         // The tunnel: its name, domain and `local_addr`
     token: MaskedString,                // The token given by `--token`
     shutdown_rx: oneshot::Receiver<u8>, // Receives the shutdown signal
-    remote_addr: String,                // `--remote`
+    server_addr: String,                // `server_host:server_port`
     transport: String,                  // TCP or WebSocket byte-stream transport
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
     connections: Arc<AtomicUsize>,      // The number of established control channels
@@ -491,14 +528,14 @@ impl Drop for ConnectionsGuard {
 impl ControlChannel {
     #[instrument(skip_all)]
     async fn run(&mut self) -> Result<()> {
-        let mut remote_addr = AddrMaybeCached::new(&self.remote_addr);
+        let mut server_addr = AddrMaybeCached::new(&self.server_addr);
         let mut conn: BoxedIo = if self.transport == "websocket" {
-            connect_websocket(&self.remote_addr).await?
+            connect_websocket(&self.server_addr).await?
         } else {
-            remote_addr.resolve().await?;
-            let tcp = connect(&remote_addr)
+            server_addr.resolve().await?;
+            let tcp = connect(&server_addr)
                 .await
-                .with_context(|| format!("Failed to connect to {}", self.remote_addr))?;
+                .with_context(|| format!("Failed to connect to {}", self.server_addr))?;
             SocketOpts::for_control_channel().apply(&tcp);
             Box::new(tcp)
         };
@@ -550,7 +587,7 @@ impl ControlChannel {
         let socket_opts = SocketOpts::data_channel(self.tunnel.nodelay);
         let data_ch_args = Arc::new(RunDataChannelArgs {
             session_key,
-            remote_addr,
+            server_addr,
             transport: self.transport.clone(),
             socket_opts,
             tunnel: self.tunnel.clone(),
@@ -593,7 +630,7 @@ impl ControlChannelHandle {
         tunnel: ClientTunnelConfig,
         name: String,
         token: MaskedString,
-        remote_addr: String,
+        server_addr: String,
         transport: String,
         heartbeat_timeout: u64,
         connections: Arc<AtomicUsize>,
@@ -612,7 +649,7 @@ impl ControlChannelHandle {
             tunnel,
             token,
             shutdown_rx,
-            remote_addr,
+            server_addr,
             transport: transport.clone(),
             heartbeat_timeout,
             connections,

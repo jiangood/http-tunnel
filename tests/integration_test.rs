@@ -21,7 +21,7 @@ const WS_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2336";
 const WS_HTTP_ENTRY_PORT: u16 = 2336;
 const WS_SERVER_PORT: u16 = 2335;
 const WS_ECHO_SERVER_ADDR: &str = "127.0.0.1:8081";
-const SERVER_ADDR: &str = "127.0.0.1:2333";
+const SERVER_HOST: &str = "127.0.0.1";
 const SERVER_PORT: u16 = 2333;
 const CLIENT_NAME: &str = "home";
 const CLIENT_TOKEN: &str = "a_secret_token";
@@ -43,7 +43,8 @@ fn init() {
 fn write_client_config(
     file: &str,
     name: &str,
-    remote: &str,
+    server_host: &str,
+    server_port: u16,
     token: &str,
     web_port: Option<u16>,
     tunnels: &[(&str, &str)],
@@ -62,8 +63,8 @@ fn write_client_config(
         .map(|p| format!("web_port = {}\n", p))
         .unwrap_or_default();
     let content = format!(
-        "name = \"{}\"\nremote = \"{}\"\ntoken = \"{}\"\n{}\n{}",
-        name, remote, token, api, tunnels_toml
+        "name = \"{}\"\nserver_host = \"{}\"\nserver_port = {}\ntoken = \"{}\"\n{}\n{}",
+        name, server_host, server_port, token, api, tunnels_toml
     );
 
     let path = std::env::temp_dir().join(file);
@@ -85,7 +86,8 @@ async fn http_routing() -> Result<()> {
     let client_config = write_client_config(
         "http_tunnel_routing_client.toml",
         CLIENT_NAME,
-        SERVER_ADDR,
+        SERVER_HOST,
+        SERVER_PORT,
         CLIENT_TOKEN,
         None,
         &[(ECHO_HOST, ECHO_SERVER_ADDR)],
@@ -323,7 +325,6 @@ const CLIENT_API_ECHO_SERVER_ADDR: &str = "127.0.0.1:8093";
 const CLIENT_API_HTTP_ENTRY_PORT: u16 = 2464;
 const CLIENT_API_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2464";
 const CLIENT_API_ADDR: &str = "127.0.0.1:2465";
-const CLIENT_API_SERVER_ADDR: &str = "127.0.0.1:2463";
 const CLIENT_API_SERVER_PORT: u16 = 2463;
 const CLIENT_API_TOKEN: &str = "a_secret_token";
 
@@ -342,7 +343,8 @@ async fn websocket_transport_routes_http() -> Result<()> {
     let client_config = write_client_config(
         "http_tunnel_websocket_client.toml",
         CLIENT_NAME,
-        WS_HTTP_ENTRY_ADDR,
+        "127.0.0.1",
+        WS_HTTP_ENTRY_PORT,
         CLIENT_TOKEN,
         Some(0),
         &[("echo-ws.test", WS_ECHO_SERVER_ADDR)],
@@ -425,7 +427,8 @@ async fn websocket_transport_works_without_a_tcp_listener() -> Result<()> {
     let client_config = write_client_config(
         "http_tunnel_websocket_no_tcp.toml",
         CLIENT_NAME,
-        WS_ONLY_HTTP_ADDR,
+        "127.0.0.1",
+        WS_ONLY_HTTP_PORT,
         CLIENT_TOKEN,
         Some(0),
         &[("echo-ws-only.test", WS_ONLY_ECHO_ADDR)],
@@ -487,7 +490,8 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
     let client_config = write_client_config(
         "http_tunnel_websocket_unavailable_target.toml",
         CLIENT_NAME,
-        WS_FAILURE_HTTP_ADDR,
+        "127.0.0.1",
+        WS_FAILURE_HTTP_PORT,
         CLIENT_TOKEN,
         Some(0),
         &[("unavailable-ws.test", WS_FAILURE_TARGET_ADDR)],
@@ -556,7 +560,8 @@ async fn client_api_manages_tunnels() -> Result<()> {
     let config_path = write_client_config(
         "http_tunnel_client_api_test.toml",
         "home",
-        CLIENT_API_SERVER_ADDR,
+        "127.0.0.1",
+        CLIENT_API_SERVER_PORT,
         CLIENT_API_TOKEN,
         Some(2465),
         &[],
@@ -715,7 +720,6 @@ async fn client_api_manages_tunnels() -> Result<()> {
 // ==== The fatal auth error test ====
 
 const FATAL_SERVER_PORT: u16 = 2453;
-const FATAL_SERVER_ADDR: &str = "127.0.0.1:2453";
 
 /// A client whose token is rejected must exit with an error instead of retrying
 /// forever. The timeout fails the test if the client keeps retrying.
@@ -726,7 +730,8 @@ async fn client_exits_on_a_wrong_token() -> Result<()> {
     let config_path = write_client_config(
         "http_tunnel_fatal_test.toml",
         "home",
-        FATAL_SERVER_ADDR,
+        "127.0.0.1",
+        FATAL_SERVER_PORT,
         "wrong_token",
         None,
         &[("echo.test", "127.0.0.1:8092")],
