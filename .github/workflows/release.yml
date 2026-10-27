@@ -36,6 +36,17 @@ jobs:
       - name: Install target
         if: matrix.cross == false
         run: rustup target add ${{ matrix.target }}
+      # `ring` (through rustls) compiles C code, which needs a musl C compiler
+      # when the cache is cold. Using `musl-gcc` for the target avoids depending
+      # on a `x86_64-linux-musl-gcc` symlink that the runner does not provide.
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Use musl-gcc for the musl target
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+          echo "AR_x86_64_unknown_linux_musl=ar" >> "$GITHUB_ENV"
       - name: Run tests
         if: matrix.cross == false && matrix.target != 'aarch64-apple-darwin'
         run: cargo test --release --target ${{ matrix.target }} --verbose
