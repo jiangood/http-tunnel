@@ -7,5 +7,10 @@ perf.data.old
 # Environment files, which hold the client token
 .env
 
+# Background log of ht -b
+/ht.log
+# Local Docker release staging directory
+/build-out/
+
 # IDE settings
 .idea/

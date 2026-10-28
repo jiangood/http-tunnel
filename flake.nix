@@ -25,6 +25,7 @@
             root = ./.;
             fileset = final.lib.fileset.unions [
               ./src
+              ./examples
               ./build.rs
               ./Cargo.toml
               ./Cargo.lock
@@ -38,7 +39,7 @@
             description = "A secure, stable and high-performance HTTP reverse proxy for NAT traversal";
             homepage = "https://github.com/jiangood/http-tunnel";
             license = final.lib.licenses.asl20;
-            mainProgram = "http-tunnel";
+            mainProgram = "ht";
           };
         };
       };

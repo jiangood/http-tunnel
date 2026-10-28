@@ -1,6 +1,6 @@
-//! A minimal harness for the benchmarks: it starts an echo backend behind the
-//! NAT, a server, and a client, and exposes a helper to time a batch of
-//! requests.
+//! A minimal harness for the benchmarks: it starts an echo backend behind a
+//! leaf, an ingress, and a leaf with one upstream session, and exposes a helper
+//! to time a batch of requests.
 //!
 //! The ports are fixed so that the three benchmarks can run in sequence without
 //! colliding. The integration tests use the same ports, so `cargo bench` and
@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 
 pub const HTTP_ENTRY_PORT: u16 = 2334;
 pub const HTTP_ENTRY_ADDR: &str = "127.0.0.1:2334";
-pub const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
+pub const ECHO_SERVER_ADDR: &str = "127.0.0.1:18080";
 pub const CLIENT_NAME: &str = "bench";
 pub const CLIENT_TOKEN: &str = "bench_token";
 
@@ -68,12 +68,17 @@ impl Harness {
             })
         };
 
-        // Write a client config on the fly, so the benchmark doesn't depend on
+        // Write a leaf config on the fly, so the benchmark doesn't depend on
         // the test fixtures.
         let config_path =
             std::env::temp_dir().join(format!("http-tunnel-bench-{}.toml", std::process::id()));
         let config = format!(
-            "server = \"ws://127.0.0.1:{HTTP_ENTRY_PORT}\"\nname = \"{CLIENT_NAME}\"\ntoken = \"{CLIENT_TOKEN}\"\n\n[[tunnels]]\nname = \"echo\"\ndomain = \"{ECHO_HOST}\"\nlocal_addr = \"{ECHO_SERVER_ADDR}\"\n"
+            "server_port = 0\nbind_host = \"127.0.0.1\"\nserver_host = \"127.0.0.1\"\n\
+             name = \"{CLIENT_NAME}\"\ntoken = \"{CLIENT_TOKEN}\"\nweb_port = 0\n\n\
+             [[proxies]]\nname = \"echo\"\ndomain = \"{ECHO_HOST}\"\n\
+             local_addr = \"{ECHO_SERVER_ADDR}\"\n\n\
+             [upstream]\nserver = \"ws://127.0.0.1:{HTTP_ENTRY_PORT}\"\n\
+             token = \"{CLIENT_TOKEN}\"\nmirror = true\n"
         );
         std::fs::write(&config_path, config)?;
         let config_guard = TempFile(config_path.clone());
@@ -83,25 +88,26 @@ impl Harness {
 
         let client_config_path = config_path.clone();
         let client = tokio::spawn(async move {
-            let cmd = http_tunnel::Command::Client(http_tunnel::ClientArgs {
-                config_path: client_config_path,
-            });
-            let _ = http_tunnel::run(cmd, client_rx).await;
+            let config = match http_tunnel::load_config(&client_config_path).await {
+                Ok(config) => config,
+                Err(e) => {
+                    eprintln!("bench leaf config failed: {e:#}");
+                    return;
+                }
+            };
+            let _ = http_tunnel::run(config, client_rx).await;
         });
-        // Let the client retry at least once while the server comes up
+        // Let the leaf retry at least once while the ingress comes up
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let server = {
             tokio::spawn(async move {
-                let cmd = http_tunnel::Command::Server(http_tunnel::ServerArgs {
-                    server_port: HTTP_ENTRY_PORT,
-                    server_host: "127.0.0.1".to_string(),
-                    bind_host: "127.0.0.1".to_string(),
-                    token: CLIENT_TOKEN.to_string(),
-                    proxies: Vec::new(),
-                    limits: http_tunnel::ServerLimits::default(),
-                });
-                let _ = http_tunnel::run(cmd, server_rx).await;
+                let config = http_tunnel::Config::parse(&format!(
+                    "server_port = {HTTP_ENTRY_PORT}\nbind_host = \"127.0.0.1\"\n\
+                     server_host = \"127.0.0.1\"\ntoken = \"{CLIENT_TOKEN}\"\n"
+                ))
+                .expect("the benchmark ingress config must be valid");
+                let _ = http_tunnel::run(config, server_rx).await;
             })
         };
 

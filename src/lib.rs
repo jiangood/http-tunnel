@@ -1,4 +1,4 @@
-mod cli;
+mod client_env;
 mod config;
 mod constants;
 mod helper;
@@ -6,28 +6,15 @@ mod helper;
 mod protocol_v4;
 mod transport;
 
-#[cfg(feature = "client")]
-mod client_env;
-
-pub use cli::{ClientArgs, Command, NodeArgs, ServerArgs};
 pub use config::{
-    ClientConfig, NodeConfig, ServerConfig, ServerLimits, ServerProxyEntry, UpstreamConfig,
+    Config, MaskedString, ServerLimits, ServerProxyEntry, UpstreamConfig, DEFAULT_SERVER_PORT,
 };
 
 use anyhow::Result;
+use std::path::Path;
 use tokio::sync::broadcast;
 #[cfg(feature = "server")]
 use tracing::debug;
-
-#[cfg(feature = "client")]
-mod client;
-#[cfg(feature = "client")]
-use client::run_client;
-
-// The administration API of the client. It needs an HTTP server, so it's a
-// feature of its own, kept out of a minimal client build
-#[cfg(all(feature = "client", feature = "client-api"))]
-mod client_api;
 
 #[cfg(feature = "server")]
 mod http;
@@ -35,55 +22,40 @@ mod http;
 mod server;
 #[cfg(feature = "server")]
 mod session_server;
-#[cfg(feature = "server")]
-use server::run_server;
 
 #[cfg(feature = "client")]
 mod session_client;
 
-// A node is a server and a client in one process: it needs both roles.
+// The administration API manages the local proxies of the same universal
+// process. It needs an HTTP server, so it is a feature of its own.
+#[cfg(all(feature = "server", feature = "client-api"))]
+mod client;
+
+#[cfg(all(feature = "server", feature = "client-api"))]
+mod client_api;
+
+// The router is a server and a client in one process: it needs both roles.
 #[cfg(all(feature = "server", feature = "client"))]
 mod node;
-#[cfg(all(feature = "server", feature = "client"))]
-use node::run_node;
 
+/// Load `ht.toml` and overlay the `HT_*` (and legacy `HTC_*`) environment.
+pub async fn load_config(path: &Path) -> Result<Config> {
+    client_env::load(path).await
+}
+
+/// Run the universal process from an already-loaded configuration.
 #[allow(unused_variables)]
-pub async fn run(cmd: Command, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
+pub async fn run(config: Config, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
     // Raise `nofile` limit on linux and mac
     #[cfg(any(feature = "server", feature = "client"))]
     fdlimit::raise_fd_limit();
 
-    match cmd {
-        #[allow(unused_variables)]
-        Command::Server(args) => {
-            #[cfg(not(feature = "server"))]
-            crate::helper::feature_not_compile("server");
+    #[cfg(not(all(feature = "server", feature = "client")))]
+    crate::helper::feature_not_compile("node");
 
-            #[cfg(feature = "server")]
-            {
-                debug!("{:?}", args);
-                run_server(args, shutdown_rx).await
-            }
-        }
-        #[allow(unused_variables)]
-        Command::Client(args) => {
-            #[cfg(not(feature = "client"))]
-            crate::helper::feature_not_compile("client");
-
-            #[cfg(feature = "client")]
-            {
-                run_client(args, shutdown_rx).await
-            }
-        }
-        #[allow(unused_variables)]
-        Command::Node(args) => {
-            #[cfg(not(all(feature = "server", feature = "client")))]
-            crate::helper::feature_not_compile("node");
-
-            #[cfg(all(feature = "server", feature = "client"))]
-            {
-                run_node(args, shutdown_rx).await
-            }
-        }
+    #[cfg(all(feature = "server", feature = "client"))]
+    {
+        debug!(?config, "Starting the universal process");
+        node::run_router(config, shutdown_rx).await
     }
 }

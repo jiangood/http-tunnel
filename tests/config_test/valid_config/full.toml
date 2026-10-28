@@ -1,23 +1,30 @@
-server = "wss://control.example.com:443" # The WebSocket endpoint: server_host and server_port
-name = "home" # The name of the client
-token = "use_a_secret_that_only_you_know" # The shared token of the server
-web_port = 8610 # The port of the client web management interface
-web_host = "127.0.0.1" # The address the client web management interface binds
-heartbeat_timeout = 40 # The application-layer heartbeat timeout. Set to 0 to disable the test
-retry_interval = 1 # The interval between retries to connect to the server
-nodelay = true # Whether to enable TCP_NODELAY for the tunnels
+server_port = 9000 # The listener port, shared by visitors and control sessions
+bind_host = "127.0.0.1" # The address the listener binds
+server_host = "control.example.com" # The reserved Host of the WebSocket endpoint
+name = "edge" # The name of the process
+token = "use_a_secret_that_only_you_know" # The listener token for downstream peers
+web_port = 8610 # The port of the web management interface
+web_host = "127.0.0.1" # The address the web management interface binds
+heartbeat_timeout = 40 # The upstream heartbeat timeout. Set to 0 to disable the test
+retry_interval = 1 # The interval between retries to connect to the next hop
+nodelay = true # Deprecated; accepted for compatibility
 
-[[tunnels]] # Each tunnel is a table with its own name, domain and local_addr
+[[proxies]] # Each local service is a table with its own name, domain and local_addr
 name = "nas"
 domain = "nas.example.com" # Requests with this `Host` are forwarded to `local_addr`
 local_addr = "127.0.0.1:80"
 
-[[tunnels]]
+[[proxies]]
 name = "git"
 domain = "git.example.com"
 local_addr = "127.0.0.1:3000"
 
-[[tunnels]]
+[[proxies]]
 name = "www"
 domain = "www.example.com" # The same address can serve several domains
 local_addr = "127.0.0.1:80"
+
+[upstream] # Remove this table to run as a standalone ingress
+server = "wss://upper.example.com:443" # The next hop: server_host and server_port
+token = "use_a_different_secret_per_hop"
+mirror = true # Publish every local proxy and downstream route

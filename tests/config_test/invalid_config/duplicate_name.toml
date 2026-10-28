@@ -1,5 +1,6 @@
 name = "home"
 token = "secret"
+server_host = "control.example.com"
 
 [[tunnels]]
 name = "nas"

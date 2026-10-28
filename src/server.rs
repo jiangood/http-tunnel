@@ -1,6 +1,4 @@
-use crate::cli::ServerArgs;
-use crate::config::{domain_overlaps_server_host, MaskedString, ServerLimits};
-use crate::helper::to_bind_addr;
+use crate::config::{domain_overlaps_server_host, MaskedString, ServerLimits, ServerProxyEntry};
 use crate::session_server::V4SessionHandle;
 use anyhow::{anyhow, Context, Result};
 use std::collections::{BTreeSet, HashMap};
@@ -78,55 +76,35 @@ pub(crate) struct ServerState {
     // The domains this server can advertise upstream: its downstream routes
     // plus its local proxies, excluding `server_host`.
     pub(crate) routes: watch::Sender<BTreeSet<String>>,
+    // The local services served by this process. The administration API can
+    // replace this list at runtime.
+    pub(crate) proxies: RwLock<Vec<ServerProxyEntry>>,
     // The visitors that are currently being served
     pub(crate) activity: ActivityTracker,
 }
 
-/// The entrypoint of running a server.
-pub async fn run_server(args: ServerArgs, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    // Bind the HTTP entrypoint before serving, so that a port that cannot be
-    // bound fails startup instead of being discovered on shutdown.
-    let bind_addr = to_bind_addr(&args.bind_host, args.server_port);
-    let http_listener = TcpListener::bind(&bind_addr)
-        .await
-        .with_context(|| format!("Failed to listen at `server_port` ({})", bind_addr))?;
-    run_server_with_listener(http_listener, args, shutdown_rx).await
-}
-
-/// Run a server on an already-bound listener.
-pub(crate) async fn run_server_with_listener(
-    http_listener: TcpListener,
-    args: ServerArgs,
-    shutdown_rx: broadcast::Receiver<bool>,
-) -> Result<()> {
-    let (routes, _) = watch::channel(BTreeSet::new());
-    run_server_with_listener_and_routes(http_listener, args, shutdown_rx, routes).await
-}
-
 /// Run a server on an already-bound listener, publishing its routes through
-/// `routes`. A node subscribes to that watch to advertise the domains of its
-/// downstream peers and local proxies to its next hop.
-pub(crate) async fn run_server_with_listener_and_routes(
+/// `routes`. A relay subscribes to that watch to advertise its downstream routes
+/// and local proxies to its next hop.
+pub(crate) async fn run_server_with_listener_and_state(
     http_listener: TcpListener,
-    args: ServerArgs,
+    state: Arc<ServerState>,
     shutdown_rx: broadcast::Receiver<bool>,
-    routes: watch::Sender<BTreeSet<String>>,
 ) -> Result<()> {
-    let mut server = Server::new(args, routes);
-    server.run(http_listener, shutdown_rx).await
+    Server { state }.run(http_listener, shutdown_rx).await
 }
 
 struct Server {
     state: Arc<ServerState>,
-    proxies: Vec<crate::config::ServerProxyEntry>,
 }
 
 impl ServerState {
-    fn new(
+    pub(crate) fn new(
         token: MaskedString,
         server_host: String,
         limits: ServerLimits,
         routes: watch::Sender<BTreeSet<String>>,
+        proxies: Vec<ServerProxyEntry>,
     ) -> ServerState {
         let max_sessions = limits.max_control_connections;
         ServerState {
@@ -139,36 +117,34 @@ impl ServerState {
             v4_shutdown: broadcast::channel(1).0,
             next_v4_session_id: AtomicU64::new(0),
             routes,
+            proxies: RwLock::new(proxies),
             activity: ActivityTracker::default(),
         }
+    }
+
+    /// Replace the local service list and publish the new route set.
+    #[cfg_attr(not(feature = "client-api"), allow(dead_code))]
+    pub(crate) async fn set_proxies(&self, proxies: Vec<ServerProxyEntry>) {
+        *self.proxies.write().await = proxies;
+        self.refresh_routes().await;
+    }
+
+    /// Recompute the advertised route set as the union of the local proxy
+    /// domains and the domains claimed by downstream sessions.
+    pub(crate) async fn refresh_routes(&self) {
+        let proxies = self.proxies.read().await;
+        let v4_routes = self.v4_routes.read().await;
+        let mut routes: BTreeSet<String> = proxies
+            .iter()
+            .filter_map(|proxy| crate::helper::normalize_domain(&proxy.domain))
+            .filter(|domain| !domain_overlaps_server_host(domain, &self.server_host))
+            .collect();
+        routes.extend(v4_routes.keys().cloned());
+        self.routes.send_modify(|current| *current = routes);
     }
 }
 
 impl Server {
-    fn new(args: ServerArgs, routes: watch::Sender<BTreeSet<String>>) -> Server {
-        // Local proxies are configured for the whole lifetime of the server, so
-        // they are part of the initial route set.
-        let initial: BTreeSet<String> = args
-            .proxies
-            .iter()
-            .filter_map(|proxy| crate::helper::normalize_domain(&proxy.domain))
-            .filter(|domain| !domain_overlaps_server_host(domain, &args.server_host))
-            .collect();
-        routes.send_modify(|routes| *routes = initial);
-
-        let state = Arc::new(ServerState::new(
-            MaskedString::from(args.token),
-            args.server_host,
-            args.limits,
-            routes,
-        ));
-
-        Server {
-            state,
-            proxies: args.proxies,
-        }
-    }
-
     async fn run(
         &mut self,
         http_listener: TcpListener,
@@ -178,7 +154,6 @@ impl Server {
             http_listener,
             self.state.clone(),
             shutdown_rx.resubscribe(),
-            self.proxies.clone(),
         ));
         let mut http_task_done = false;
 

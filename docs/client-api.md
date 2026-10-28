@@ -1,51 +1,62 @@
-# 客户端 Web 管理与 API
+# Web management and administration API
 
-客户端的 Web 管理页面和 REST API 共用一个端口，默认监听 `8610`，地址由 `web_host` 决定（默认 `0.0.0.0`）。在 `htc.toml` 中设置 `web_port = 0` 可关闭整个管理服务；设置 `web_host = "127.0.0.1"` 可只允许本机访问。`HTC_WEB_HOST` 与 `HTC_WEB_PORT` 可从环境变量覆盖这两项。
+The universal `ht` process can expose a small web page and a REST API on the
+same port. It manages the local `[[proxies]]` of the running process:
 
-浏览器访问 `http://客户端地址:8610/`。浏览器弹出 HTTP Basic 认证时，用户名填写 `htc`，密码填写客户端配置中的 `token`。管理页面只使用原生 HTML 表单，不包含 CSS 或 JavaScript。
+- A standalone ingress serves them directly.
+- A leaf or relay also advertises them to its `[upstream]` according to
+  `mirror`/`claim`.
 
-管理服务默认绑定到 `0.0.0.0`，可从网络访问。请使用防火墙、私有网络或带 TLS 的反向代理限制访问，不要直接暴露在公网；也可以设置 `web_host = "127.0.0.1"` 只允许本机访问。
+The management interface is disabled by default. Set `web_port` in `ht.toml` to
+enable it; `web_host` selects the bind address and defaults to `0.0.0.0`.
 
-## 页面功能
-
-- 查看客户端名称、服务端地址、连接状态和隧道数量
-- 列出已有隧道
-- 新增隧道；使用已有名称可更新其域名和本地地址
-- 删除隧道
-
-通过页面进行的修改会校验配置、写入 `htc.toml`，并立即应用，无需重启客户端。配置文件必须可写。
-
-如果隧道来自 `HTC_TUNNELS` 环境变量，页面和 API 对隧道的修改会被拒绝（`409 Conflict`）：环境变量只影响运行时配置，不会写回 `htc.toml`，修改后需要重启客户端。环境变量覆盖的标量配置（`HTC_SERVER`、`HTC_TOKEN` 等）也不会被写入文件。
-
-## REST API
-
-原有 API 路径与 Bearer Token 认证保持不变。每个请求都需要：
-
-```http
-Authorization: Bearer <token>
+```toml
+web_port = 8610
+web_host = "127.0.0.1"
 ```
 
-| 方法 | 路径 | 说明 |
+`HT_WEB_PORT` and `HT_WEB_HOST` override these values. `web_port = 0` disables
+the interface.
+
+Open `http://<process address>:8610/`. The browser-native HTTP Basic login uses
+username `ht` and the listener `token` as the password. The page is plain HTML
+with no CSS or JavaScript.
+
+## API
+
+The API uses a Bearer token, which is also the listener `token`:
+
+| Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/api/status` | 客户端名称、传输模式（`ws`/`wss`）、服务端地址、连接状态和隧道数量 |
-| `GET` | `/api/tunnels` | 列出隧道 |
-| `PUT` | `/api/tunnels/{name}` | 新增或更新隧道，请求体为 `{ "domain": "...", "local_addr": "..." }` |
-| `DELETE` | `/api/tunnels/{name}` | 删除隧道 |
+| GET | `/api/status` | Name, transport, upstream, connectivity, proxy count |
+| GET | `/api/tunnels` | List local `[[proxies]]` as `name`/`domain`/`local_addr` |
+| PUT | `/api/tunnels/{name}` | Create or replace a local proxy |
+| DELETE | `/api/tunnels/{name}` | Delete a local proxy |
 
-例如：
+The paths keep the historical name `tunnels`; the configuration and the storage
+section are `[[proxies]]`.
 
-```bash
-TOKEN=replace-with-your-client-token
-BASE=http://127.0.0.1:8610
-
-curl "$BASE/api/status" -H "Authorization: Bearer $TOKEN"
-curl "$BASE/api/tunnels" -H "Authorization: Bearer $TOKEN"
-curl -X PUT "$BASE/api/tunnels/nas" \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"domain":"nas.example.com","local_addr":"127.0.0.1:80"}'
-curl -X DELETE "$BASE/api/tunnels/nas" -H "Authorization: Bearer $TOKEN"
+```sh
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8610/api/tunnels
+curl -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"domain":"nas.example.com","local_addr":"127.0.0.1:80"}' \
+  http://127.0.0.1:8610/api/tunnels/nas
 ```
 
-## 安全注意事项
+A change is validated locally, written atomically to `ht.toml`, applied to the
+running server's proxy list, and published on the route watch. An upstream
+session therefore mirrors or withdraws the route immediately, without a restart.
 
-客户端共享令牌同时用于连接服务端和管理 API；任何持有该令牌的人都能修改客户端隧道。妥善保管令牌，并限制管理端口的网络访问。
+## Environment-managed proxies
+
+If `HT_PROXIES` is set, the local services come from the environment and are
+read-only at runtime:
+
+- The web form is hidden.
+- `PUT` and `DELETE /api/tunnels/*` return `409 Conflict`.
+- Nothing is written to `ht.toml`.
+
+Scalar environment overrides (`HT_TOKEN`, `HT_SERVER`, ...) also win at runtime
+but are never persisted by an API change: the file baseline is saved, and the
+environment is reapplied to the effective configuration.

@@ -1,8 +1,11 @@
-# The server endpoint may be omitted by the parser; `htc` requires it when it
-# starts. The host is the server's `server_host` and the port its `server_port`.
+# The listener host is required without `[upstream]`. The process is a
+# standalone ingress here.
+server_host = "control.example.com"
 name = "home"
 token = "use_a_secret_that_only_you_know"
 
+# `[[tunnels]]` is accepted as an alias of `[[proxies]]` for configurations
+# written for the old client.
 [[tunnels]]
 name = "nas"
 domain = "nas.example.com"

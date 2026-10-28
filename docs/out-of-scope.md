@@ -19,9 +19,10 @@
 - *Mesh discovery and route advertisement*
 
   A chain is configured explicitly, hop by hop: a downstream always dials its
-  upstream, and a node advertises its routes on the next hop. A v4 session
-  carries many prefixes and many visitor streams; there is no automatic peer
-  discovery, no prefix aggregation across independent sessions, no hop count and
-  no per-request loop detection. A node validates that its upstream is not its
-  own listener and rejects duplicate prefixes, but general loop detection belongs
-  to a later protocol iteration, not to the HTTP-only data plane.
+  upstream, and a process with `[upstream]` advertises its routes on the next
+  hop. A v4 session carries many prefixes and many visitor streams; there is no
+  automatic peer discovery, no prefix aggregation across independent sessions, no
+  hop count and no per-request loop detection. `ht` validates that its upstream
+  is not its own listener and rejects duplicate prefixes, but general loop
+  detection belongs to a later protocol iteration, not to the HTTP-only data
+  plane.

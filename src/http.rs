@@ -50,12 +50,10 @@ pub(crate) async fn serve(
     l: TcpListener,
     state: Arc<ServerState>,
     mut shutdown_rx: broadcast::Receiver<bool>,
-    proxies: Vec<ServerProxyEntry>,
 ) -> Result<()> {
     if let Ok(addr) = l.local_addr() {
         info!("HTTP listening at {}", addr);
     }
-    let proxies = Arc::new(proxies);
 
     loop {
         tokio::select! {
@@ -63,13 +61,11 @@ pub(crate) async fn serve(
                 match ret {
                     Ok((stream, addr)) => {
                         let state = state.clone();
-                        let proxies = proxies.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_visitor(
                                 stream,
                                 addr,
                                 state,
-                                proxies,
                             ).await {
                                 debug!("Failed to route visitor {}: {:#}", addr, e);
                             }
@@ -90,7 +86,6 @@ async fn handle_visitor(
     mut stream: TcpStream,
     addr: SocketAddr,
     state: Arc<ServerState>,
-    proxies: Arc<Vec<ServerProxyEntry>>,
 ) -> Result<()> {
     // Count the visitor as active from the moment it's accepted, so that a
     // shutdown can wait for it instead of cutting it off.
@@ -145,7 +140,10 @@ async fn handle_visitor(
         return Ok(());
     }
 
-    if let Some(proxy) = find_proxy(&proxies, &host) {
+    if let Some(proxy) = {
+        let proxies = state.proxies.read().await;
+        find_proxy(&proxies, &host).cloned()
+    } {
         let request =
             match crate::helper::gate_auth_header(&prefetched, proxy.auth_header.as_deref()) {
                 crate::helper::AuthOutcome::Allowed(request) => request,

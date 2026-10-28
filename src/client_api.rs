@@ -1,7 +1,7 @@
-//! Client administration API and minimal server-rendered web UI.
+//! Management API and minimal server-rendered web UI of the universal process.
 
-use crate::client::ClientState;
-use crate::config::ClientTunnelConfig;
+use crate::client::ManagementState;
+use crate::config::ServerProxyEntry;
 use anyhow::{Context, Result};
 use axum::extract::{Form, Path, State};
 use axum::http::header::AUTHORIZATION;
@@ -17,48 +17,48 @@ use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 struct ApiState {
-    client: Arc<ClientState>,
+    management: Arc<ManagementState>,
 }
 
-/// Run the web UI and the existing administration API on the same address.
+/// Run the web UI and the administration API on the same address.
 pub(crate) async fn serve(
     host: &str,
     port: u16,
     token: String,
-    client: Arc<ClientState>,
+    management: Arc<ManagementState>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let addr: SocketAddr = crate::helper::to_bind_addr(host, port)
         .parse()
         .with_context(|| format!("`web_host` `{}` is not a valid bind address", host))?;
-    let state = Arc::new(ApiState { client });
+    let state = Arc::new(ApiState { management });
 
     let api = Router::new()
         .route("/status", get(status))
-        .route("/tunnels", get(list_tunnels))
-        .route("/tunnels/:name", put(put_tunnel).delete(delete_tunnel))
+        .route("/tunnels", get(list_proxies))
+        .route("/tunnels/:name", put(put_proxy).delete(delete_proxy))
         .route_layer(middleware::from_fn_with_state(token.clone(), api_auth));
 
     // The browser-native HTTP Basic login avoids shipping JavaScript or CSS.
-    // Use username "htc" and the client token as the password.
+    // Use username "ht" and the process token as the password.
     let web = Router::new()
         .route("/", get(web_index))
-        .route("/web/tunnels", post(web_put_tunnel))
-        .route("/web/tunnels/:name/delete", post(web_delete_tunnel))
+        .route("/web/tunnels", post(web_put_proxy))
+        .route("/web/tunnels/:name/delete", post(web_delete_proxy))
         .route_layer(middleware::from_fn_with_state(token, web_auth));
 
     let app = Router::new().nest("/api", api).merge(web).with_state(state);
 
-    info!("Client web management listening at {}", addr);
+    info!("Web management listening at {}", addr);
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.recv().await;
         })
         .await
-        .with_context(|| "The client web management server exited with an error")?;
+        .with_context(|| "The web management server exited with an error")?;
 
-    info!("Client web management shutdown");
+    info!("Web management shutdown");
     Ok(())
 }
 
@@ -75,7 +75,7 @@ async fn api_auth<B>(
         .map(|t| t == token)
         .unwrap_or(false);
     if !authorized {
-        warn!("Rejected an unauthenticated client API request");
+        warn!("Rejected an unauthenticated API request");
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(req).await)
@@ -88,7 +88,7 @@ async fn web_auth<B>(
 ) -> Result<Response, Response> {
     let expected = format!(
         "Basic {}",
-        base64_encode(format!("htc:{}", token).as_bytes())
+        base64_encode(format!("ht:{}", token).as_bytes())
     );
     let authorized = req
         .headers()
@@ -97,10 +97,10 @@ async fn web_auth<B>(
         .map(|v| v == expected)
         .unwrap_or(false);
     if !authorized {
-        warn!("Rejected an unauthenticated client web request");
+        warn!("Rejected an unauthenticated web request");
         return Err((
             StatusCode::UNAUTHORIZED,
-            [("www-authenticate", "Basic realm=\"http-tunnel client\"")],
+            [("www-authenticate", "Basic realm=\"http-tunnel\"")],
             "Authentication required",
         )
             .into_response());
@@ -133,21 +133,17 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 #[derive(Serialize)]
-struct TunnelView {
+struct ProxyView {
     name: String,
     domain: String,
     local_addr: String,
-    nodelay: bool,
-    retry_interval: u64,
 }
 
-fn tunnel_view(t: &ClientTunnelConfig) -> TunnelView {
-    TunnelView {
-        name: t.name.clone(),
-        domain: t.domain.clone(),
-        local_addr: t.local_addr.clone(),
-        nodelay: t.nodelay,
-        retry_interval: t.retry_interval,
+fn proxy_view(proxy: &ServerProxyEntry) -> ProxyView {
+    ProxyView {
+        name: proxy.name.clone(),
+        domain: proxy.domain.clone(),
+        local_addr: proxy.local_addr.clone(),
     }
 }
 
@@ -157,17 +153,19 @@ struct StatusView {
     transport: String,
     remote: String,
     connected: bool,
+    proxies: usize,
+    /// Kept for clients of the old client API
     tunnels: usize,
 }
 
 #[derive(Deserialize)]
-struct PutTunnel {
+struct PutProxy {
     domain: String,
     local_addr: String,
 }
 
 #[derive(Deserialize)]
-struct WebTunnelForm {
+struct WebProxyForm {
     name: String,
     domain: String,
     local_addr: String,
@@ -190,8 +188,8 @@ impl ApiError {
     fn from_reason(reason: String) -> ApiError {
         let status = if reason.contains("No such") {
             StatusCode::NOT_FOUND
-        } else if reason.contains("HTC_TUNNELS") {
-            // The tunnels come from the environment and cannot be changed
+        } else if reason.contains("HT_PROXIES") {
+            // The local services come from the environment and cannot change
             StatusCode::CONFLICT
         } else if reason.contains("Failed to") {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -203,119 +201,122 @@ impl ApiError {
 }
 
 async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusView> {
+    let proxies = state.management.proxies().await.len();
     Json(StatusView {
-        name: state.client.name().to_string(),
-        transport: state.client.transport().to_string(),
-        remote: state.client.server_addr().to_string(),
-        connected: state.client.connected(),
-        tunnels: state.client.tunnels().await.len(),
+        name: state.management.name().to_string(),
+        transport: state.management.transport().to_string(),
+        remote: state.management.server_addr().to_string(),
+        connected: state.management.connected(),
+        proxies,
+        tunnels: proxies,
     })
 }
 
-async fn list_tunnels(State(state): State<Arc<ApiState>>) -> Json<Vec<TunnelView>> {
+async fn list_proxies(State(state): State<Arc<ApiState>>) -> Json<Vec<ProxyView>> {
     Json(
         state
-            .client
-            .tunnels()
+            .management
+            .proxies()
             .await
             .iter()
-            .map(tunnel_view)
+            .map(proxy_view)
             .collect(),
     )
 }
 
-async fn put_tunnel(
+async fn put_proxy(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
-    Json(body): Json<PutTunnel>,
+    Json(body): Json<PutProxy>,
 ) -> Result<Response, ApiError> {
     let name = name.trim().to_string();
     state
-        .client
-        .put_tunnel(name.clone(), body.domain, body.local_addr)
+        .management
+        .put_proxy(name.clone(), body.domain, body.local_addr)
         .await
         .map_err(|e| ApiError::from_reason(format!("{:#}", e)))?;
     match state
-        .client
-        .tunnels()
+        .management
+        .proxies()
         .await
         .into_iter()
-        .find(|t| t.name == name)
+        .find(|proxy| proxy.name == name)
     {
-        Some(t) => Ok((StatusCode::CREATED, Json(tunnel_view(&t))).into_response()),
+        Some(proxy) => Ok((StatusCode::CREATED, Json(proxy_view(&proxy))).into_response()),
         None => Ok(StatusCode::CREATED.into_response()),
     }
 }
 
-async fn delete_tunnel(
+async fn delete_proxy(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     state
-        .client
-        .delete_tunnel(name.trim())
+        .management
+        .delete_proxy(name.trim())
         .await
         .map_err(|e| ApiError::from_reason(format!("{:#}", e)))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn web_index(State(state): State<Arc<ApiState>>) -> Html<String> {
-    let connected = if state.client.connected() {
+    let connected = if state.management.connected() {
         "已连接"
     } else {
         "未连接"
     };
-    let transport = match state.client.transport() {
+    let transport = match state.management.transport() {
         "wss" => "WebSocket（TLS）",
         "ws" => "WebSocket",
+        "ingress" => "独立入口（无上游）",
         other => other,
     };
-    let read_only = state.client.tunnels_managed();
-    let tunnels = state.client.tunnels().await;
+    let read_only = state.management.proxies_managed();
+    let proxies = state.management.proxies().await;
     let mut html = format!(
-        "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>http-tunnel 管理</title><body><h1>http-tunnel 客户端管理</h1><p>客户端：{}；服务端：{}；传输：{}；状态：{}；隧道数：{}</p><h2>新增或更新隧道</h2>",
-        escape_html(state.client.name()), escape_html(state.client.server_addr()), transport, connected, tunnels.len()
+        "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>http-tunnel 管理</title><body><h1>http-tunnel 管理</h1><p>名称：{}；上游：{}；传输：{}；状态：{}；本地服务数：{}</p><h2>新增或更新本地服务</h2>",
+        escape_html(state.management.name()), escape_html(state.management.server_addr()), transport, connected, proxies.len()
     );
     if read_only {
-        html.push_str("<p>隧道由环境变量 <code>HTC_TUNNELS</code> 管理，网页与 API 不可修改；如需变更，请修改该环境变量并重启 htc。</p>");
+        html.push_str("<p>本地服务由环境变量 <code>HT_PROXIES</code> 管理，网页与 API 不可修改；如需变更，请修改该环境变量并重启 ht。</p>");
     } else {
         html.push_str("<form method=\"post\" action=\"/web/tunnels\"><p>名称：<input name=\"name\" required pattern=\"[A-Za-z0-9._-]+\"></p><p>域名：<input name=\"domain\" required></p><p>本地地址：<input name=\"local_addr\" required placeholder=\"127.0.0.1:8080 或 unix:///path.sock\"></p><button type=\"submit\">保存</button></form>");
     }
-    html.push_str("<h2>隧道列表</h2><table border=\"1\" cellpadding=\"6\"><tr><th>名称</th><th>域名</th><th>本地地址</th>");
+    html.push_str("<h2>本地服务列表</h2><table border=\"1\" cellpadding=\"6\"><tr><th>名称</th><th>域名</th><th>本地地址</th>");
     if !read_only {
         html.push_str("<th>操作</th>");
     }
     html.push_str("</tr>");
-    for tunnel in tunnels {
+    for proxy in proxies {
         let action = if read_only {
             String::new()
         } else {
             format!(
                 "<td><form method=\"post\" action=\"/web/tunnels/{}/delete\"><button type=\"submit\">删除</button></form></td>",
-                escape_html(&tunnel.name)
+                escape_html(&proxy.name)
             )
         };
         html.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td>{}</td>{}</tr>",
-            escape_html(&tunnel.name),
-            escape_html(&tunnel.domain),
-            escape_html(&tunnel.local_addr),
+            escape_html(&proxy.name),
+            escape_html(&proxy.domain),
+            escape_html(&proxy.local_addr),
             action
         ));
     }
     if read_only {
-        html.push_str("</table><p>隧道来自 HTC_TUNNELS，修改该环境变量并重启 htc 后才会生效。</p><p>原管理 API 仍可通过 /api/status、/api/tunnels 使用。</p></body></html>");
+        html.push_str("</table><p>本地服务来自 HT_PROXIES，修改该环境变量并重启 ht 后才会生效。</p><p>管理 API 仍可通过 /api/status、/api/tunnels 使用。</p></body></html>");
     } else {
-        html.push_str("</table><p>更新隧道时填写相同名称即可。修改会立即生效并写入 htc.toml。</p><p>原管理 API 仍可通过 /api/status、/api/tunnels 使用。</p></body></html>");
+        html.push_str("</table><p>更新本地服务时填写相同名称即可。修改会立即生效并写入 ht.toml。</p><p>管理 API 仍可通过 /api/status、/api/tunnels 使用。</p></body></html>");
     }
     Html(html)
 }
 
-/// Render a failed web form operation, with `409` for the tunnels that the
+/// Render a failed web form operation, with `409` for the proxies that the
 /// environment manages.
 fn web_error(title: &str, e: anyhow::Error) -> Response {
     let reason = format!("{:#}", e);
-    let status = if reason.contains("HTC_TUNNELS") {
+    let status = if reason.contains("HT_PROXIES") {
         StatusCode::CONFLICT
     } else {
         StatusCode::BAD_REQUEST
@@ -332,13 +333,13 @@ fn web_error(title: &str, e: anyhow::Error) -> Response {
         .into_response()
 }
 
-async fn web_put_tunnel(
+async fn web_put_proxy(
     State(state): State<Arc<ApiState>>,
-    Form(body): Form<WebTunnelForm>,
+    Form(body): Form<WebProxyForm>,
 ) -> Response {
     match state
-        .client
-        .put_tunnel(body.name, body.domain, body.local_addr)
+        .management
+        .put_proxy(body.name, body.domain, body.local_addr)
         .await
     {
         Ok(()) => Redirect::to("/").into_response(),
@@ -346,11 +347,11 @@ async fn web_put_tunnel(
     }
 }
 
-async fn web_delete_tunnel(
+async fn web_delete_proxy(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Response {
-    match state.client.delete_tunnel(&name).await {
+    match state.management.delete_proxy(&name).await {
         Ok(()) => Redirect::to("/").into_response(),
         Err(e) => web_error("删除失败", e),
     }

@@ -7,27 +7,40 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::cli::{NodeArgs, ServerArgs};
-use crate::config::NodeConfig;
+use crate::config::Config;
 use crate::helper::to_bind_addr;
 use crate::protocol_v4::Role;
-use crate::server::run_server_with_listener_and_routes;
+use crate::server::{run_server_with_listener_and_state, ServerState};
 use crate::session_client::{self, RouteMap, RouteTarget, SessionArgs};
 
-/// Run a node: an embedded server plus one optional upstream v4 session.
+/// Run the universal process: an embedded server plus one optional upstream
+/// v4 session.
 ///
 /// The data plane is recursive, so an upstream session forwards the visitors it
-/// receives to `127.0.0.1:<server_port>`, where the embedded server routes them
-/// by `Host` again. A node without `[upstream]` is an ingress and behaves like
-/// `hts`. With `[upstream].mirror = true` it advertises every route of its
-/// downstream peers and its local proxies; with `[upstream].claim` it advertises
-/// one exact or wildcard domain.
-pub(crate) async fn run_node(args: NodeArgs, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    let config = args.config;
-    ensure_upstream_is_not_self(&config).await?;
+/// receives to `127.0.0.1:<actual server_port>`, where the embedded server
+/// routes them by `Host` again. Without `[upstream]` the process is a
+/// standalone ingress. With `[upstream].mirror` it advertises every route of
+/// its downstream peers and its local `[[proxies]]`; with `[upstream].claim` it
+/// advertises one exact or wildcard domain.
+pub(crate) async fn run_router(
+    config: Config,
+    shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    // Bind before starting the upstream session, so that the route is never
+    // advertised before this process can serve the visitors it receives.
+    let bind_addr = to_bind_addr(&config.bind_host, config.server_port);
+    let http_listener = TcpListener::bind(&bind_addr)
+        .await
+        .with_context(|| format!("Failed to listen at `server_port` ({})", bind_addr))?;
+    let actual_port = http_listener
+        .local_addr()
+        .context("Failed to read the bound listener address")?
+        .port();
 
-    if let Some(upstream) = &config.upstream {
-        if upstream.token == config.token {
+    ensure_upstream_is_not_self(&config, actual_port).await?;
+
+    if let (Some(token), Some(upstream)) = (&config.token, &config.upstream) {
+        if token == &upstream.token {
             warn!(
                 "The downstream `token` and `[upstream].token` are the same; use a different \
                  token per hop so that each hop has its own trust boundary"
@@ -43,48 +56,55 @@ pub(crate) async fn run_node(args: NodeArgs, shutdown_rx: broadcast::Receiver<bo
     info!(
         name = %config.name,
         role = %role,
-        server_host = %config.server_host,
-        server_port = config.server_port,
-        "Node starting"
+        server_host = %config.server_host(),
+        server_port = actual_port,
+        "ht starting"
     );
 
-    let server_args = ServerArgs {
-        server_port: config.server_port,
-        server_host: config.server_host.clone(),
-        bind_host: config.bind_host.clone(),
-        token: String::from(&*config.token),
-        proxies: config.proxies.clone(),
-        limits: config.server_limits(),
-    };
-
-    // Bind before starting the upstream session, so that the route is never
-    // advertised before this node can serve the visitors it receives.
-    let bind_addr = to_bind_addr(&config.bind_host, config.server_port);
-    let http_listener = TcpListener::bind(&bind_addr)
-        .await
-        .with_context(|| format!("Failed to listen at `server_port` ({})", bind_addr))?;
-
-    // The node owns the shutdown of the embedded server, so that it can close
-    // the upstream session before the server drains the in-flight visitors.
-    let (stop_tx, _) = broadcast::channel::<bool>(1);
-    let (route_tx, route_rx) = watch::channel(BTreeSet::new());
-    let server_task = tokio::spawn(run_server_with_listener_and_routes(
-        http_listener,
-        server_args,
-        stop_tx.subscribe(),
-        route_tx,
+    let token = config
+        .listener_token()
+        .cloned()
+        .ok_or_else(|| anyhow!("The listener token is missing"))?;
+    let (routes, route_rx) = watch::channel(BTreeSet::new());
+    let state = Arc::new(ServerState::new(
+        token,
+        config.server_host().to_string(),
+        config.server_limits(),
+        routes,
+        config.proxies.clone(),
     ));
+    state.refresh_routes().await;
+
+    // The router owns the shutdown of the embedded server, so that it can
+    // close the upstream session before the server drains in-flight visitors.
+    let (stop_tx, _) = broadcast::channel::<bool>(1);
+    let server_task = tokio::spawn(run_server_with_listener_and_state(
+        http_listener,
+        state.clone(),
+        stop_tx.subscribe(),
+    ));
+    // A standalone ingress has no upstream to wait for and is always ready.
+    let connected = Arc::new(AtomicBool::new(config.upstream.is_none()));
+    let web_task = spawn_web(
+        &config,
+        state.clone(),
+        connected.clone(),
+        stop_tx.subscribe(),
+    );
 
     match config.upstream.clone() {
-        None => run_ingress(server_task, stop_tx, shutdown_rx).await,
+        None => run_ingress(server_task, web_task, stop_tx, shutdown_rx).await,
         Some(upstream) => {
             run_relay(
                 &config,
                 upstream,
+                actual_port,
                 route_rx,
                 server_task,
+                web_task,
                 stop_tx,
                 shutdown_rx,
+                connected,
             )
             .await
         }
@@ -94,29 +114,42 @@ pub(crate) async fn run_node(args: NodeArgs, shutdown_rx: broadcast::Receiver<bo
 /// An ingress serves the visitors and downstream peers on its own.
 async fn run_ingress(
     mut server_task: JoinHandle<Result<()>>,
+    web_task: Option<JoinHandle<()>>,
     stop_tx: broadcast::Sender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    info!("The node has no upstream, so it is a public ingress");
+    info!("No upstream is configured, so ht is a standalone ingress");
+    let mut server_stopped = None;
     tokio::select! {
-        res = &mut server_task => return flatten_server(res),
+        res = &mut server_task => server_stopped = Some(res),
         _ = shutdown_rx.recv() => {}
     }
+
     let _ = stop_tx.send(true);
-    flatten_server(server_task.await)
+    let server_result = match server_stopped {
+        Some(res) => flatten_server(res),
+        None => flatten_server(server_task.await),
+    };
+    if let Some(web_task) = web_task {
+        let _ = web_task.await;
+    }
+    server_result
 }
 
-/// A relay advertises its routes on one v4 session to its next hop.
+/// A relay advertises its route set on one v4 session to its next hop.
 async fn run_relay(
-    config: &NodeConfig,
+    config: &Config,
     upstream: crate::config::UpstreamConfig,
+    actual_port: u16,
     route_rx: watch::Receiver<BTreeSet<String>>,
     mut server_task: JoinHandle<Result<()>>,
+    mut web_task: Option<JoinHandle<()>>,
     stop_tx: broadcast::Sender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
+    connected: Arc<AtomicBool>,
 ) -> Result<()> {
     let local_target = RouteTarget {
-        local_addr: format!("127.0.0.1:{}", config.server_port),
+        local_addr: format!("127.0.0.1:{}", actual_port),
         auth_header: None,
     };
 
@@ -128,7 +161,7 @@ async fn run_relay(
             upstream = %upstream.server,
             claim,
             "Advertising one upstream route; visitors are forwarded to 127.0.0.1:{}",
-            config.server_port
+            actual_port
         );
         let (tx, rx) = watch::channel(RouteMap::new());
         let mut map = RouteMap::new();
@@ -139,8 +172,8 @@ async fn run_relay(
     } else {
         info!(
             upstream = %upstream.server,
-            "Advertising the downstream routes; visitors are forwarded to 127.0.0.1:{}",
-            config.server_port
+            "Advertising the mirrored routes; visitors are forwarded to 127.0.0.1:{}",
+            actual_port
         );
         mirrored_routes(route_rx, local_target, config.max_mirrored_routes)
     };
@@ -159,7 +192,7 @@ async fn run_relay(
         retry_interval: config.retry_interval,
         routes,
         fatal_tx,
-        connected: Arc::new(AtomicBool::new(false)),
+        connected: connected.clone(),
     };
     let mut session_task = tokio::spawn(session_client::run(session_args, session_stop_rx));
 
@@ -173,7 +206,7 @@ async fn run_relay(
             session_done = true;
             session_result = Some(flatten_task(res, "session"));
         }
-        err = fatal_rx.recv() => fatal_error = err,
+        Some(err) = fatal_rx.recv() => fatal_error = Some(err),
         _ = shutdown_rx.recv() => {}
     }
 
@@ -185,13 +218,14 @@ async fn run_relay(
         let _ = session_task.await;
     }
 
+    let _ = stop_tx.send(true);
     let server_result = match server_stopped {
         Some(res) => flatten_server(res),
-        None => {
-            let _ = stop_tx.send(true);
-            flatten_server(server_task.await)
-        }
+        None => flatten_server(server_task.await),
     };
+    if let Some(web_task) = web_task.take() {
+        let _ = web_task.await;
+    }
 
     if let Some(err) = fatal_error {
         return Err(err);
@@ -233,15 +267,63 @@ fn mirrored_routes(
     rx
 }
 
-/// Fail startup when the upstream endpoint is this node's own listener. The
-/// config validation already rejects the reserved host and the literal loopback
-/// forms; this catches a DNS name that resolves back to the local machine.
-async fn ensure_upstream_is_not_self(config: &NodeConfig) -> Result<()> {
+/// Spawn the web management interface when a port is configured.
+#[cfg(feature = "client-api")]
+fn spawn_web(
+    config: &Config,
+    server: Arc<ServerState>,
+    connected: Arc<AtomicBool>,
+    shutdown_rx: broadcast::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
+    if config.web_port == 0 {
+        return None;
+    }
+    let management = Arc::new(crate::client::ManagementState::new(
+        config.clone(),
+        server,
+        connected,
+    ));
+    let host = config.web_host().to_string();
+    let port = config.web_port;
+    let token = String::from(
+        &**config
+            .listener_token()
+            .expect("validation requires a listener token"),
+    );
+    Some(tokio::spawn(async move {
+        if let Err(e) = crate::client_api::serve(&host, port, token, management, shutdown_rx).await
+        {
+            tracing::error!("{:#}", e);
+        }
+    }))
+}
+
+#[cfg(not(feature = "client-api"))]
+fn spawn_web(
+    config: &Config,
+    _server: Arc<ServerState>,
+    _connected: Arc<AtomicBool>,
+    _shutdown_rx: broadcast::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
+    if config.web_port != 0 {
+        warn!(
+            "The web management interface is configured, but this build has no `client-api` \
+             feature. It is disabled"
+        );
+    }
+    None
+}
+
+/// Fail startup when the upstream endpoint is this process's own listener. The
+/// configuration validation already rejects the reserved host and the literal
+/// loopback forms when the port is known; this catches a DNS name that resolves
+/// back to the local machine and the actual port of an ephemeral listener.
+async fn ensure_upstream_is_not_self(config: &Config, actual_port: u16) -> Result<()> {
     let Some(upstream) = config.upstream.as_ref() else {
         return Ok(());
     };
     let (host, port) = upstream.host_port()?;
-    if port != config.server_port {
+    if port != actual_port {
         return Ok(());
     }
 
@@ -252,7 +334,7 @@ async fn ensure_upstream_is_not_self(config: &NodeConfig) -> Result<()> {
     let addrs = match tokio::net::lookup_host((bare, port)).await {
         Ok(addrs) => addrs,
         Err(e) => {
-            // A transient DNS failure must not stop a node that would retry
+            // A transient DNS failure must not stop a process that would retry
             // anyway; the upstream session reports the failure.
             warn!(
                 "Failed to resolve the upstream host `{}`: {:#}. The self-loop check is skipped",
@@ -264,8 +346,8 @@ async fn ensure_upstream_is_not_self(config: &NodeConfig) -> Result<()> {
     for addr in addrs {
         if addr.ip().is_loopback() || addr.ip().is_unspecified() {
             anyhow::bail!(
-                "The upstream `{}` resolves to {}, which is this node's own listener; \
-                 a node must dial its next hop, not itself",
+                "The upstream `{}` resolves to {}, which is this process's own listener; \
+                 configure the next hop instead of itself",
                 upstream.server,
                 addr
             );
@@ -274,7 +356,7 @@ async fn ensure_upstream_is_not_self(config: &NodeConfig) -> Result<()> {
     Ok(())
 }
 
-/// Turn the result of the embedded server task into the result of the node.
+/// Turn the result of the embedded server task into the result of the process.
 fn flatten_server(result: std::result::Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
     flatten_task(result, "server").context("The embedded server stopped")
 }
@@ -285,6 +367,6 @@ fn flatten_task(
     what: &str,
 ) -> Result<()> {
     result
-        .map_err(|e| anyhow!("The node {} task failed: {}", what, e))
+        .map_err(|e| anyhow!("The {} task failed: {}", what, e))
         .and_then(|result| result)
 }

@@ -1,95 +1,104 @@
 # Internals
 
-## Conceptions
+## Concepts
 
-### Tunnel
-The entity that maps a domain to the traffic that needs to be forwarded.
+### Local service / proxy
+The entry in `[[proxies]]` that maps a domain to a local TCP address or Unix
+Socket. The same entry is used whether the process is an ingress, a relay or a
+leaf. It optionally carries an `auth_header` gate.
 
-### Server
-The host that runs `http-tunnel` in the server mode. It reads `hts.toml` for its
-HTTP port, shared token, `server_host` and limits, and it learns the routes of
-its clients from the v4 sessions they open.
+### Listener / embedded server
+Every `ht` process runs an embedded HTTP server. It listens on `server_port`,
+serves local proxies, routes visitors to downstream v4 sessions, and accepts v4
+sessions on the reserved `server_host`.
 
-### Client
-The host behind the NAT that runs `http-tunnel` in the client mode. It declares
-its own tunnels in a configuration file: each tunnel maps a domain to a local
-service. One v4 session carries every tunnel of the client.
+### Upstream
+The optional `[upstream]` table. When present, the process opens one v4 session
+to the next hop and advertises either its full route set (`mirror`) or one
+`claim`. When absent, the process is a standalone ingress and no session is
+opened.
 
-### Node
-A relay hop that runs `htn`. It embeds a *server* (it listens for visitors and
-downstream peers) and one upstream v4 session (it advertises the routes of its
-downstream peers and local proxies). It is how a chain of isolated network
-segments is built with one process per hop; a node without `[upstream]` is an
-ingress.
+### Route
+A domain served by the process. The route watch is the union of local
+`[[proxies]]` and the prefixes claimed by downstream v4 sessions, excluding the
+reserved `server_host`.
 
 ### Visitor
-Who visits a *tunnel*, via the *server*.
+Who visits a route through the public ingress.
 
 ### Session
-One WebSocket between a *server* and a *client* or *node*, carrying the v4
-frames. It replaces the per-tunnel control and data channels of v3. The session
-announces the peer identity, advertises routes as a snapshot and diffs, and
-multiplexes every visitor stream.
+One WebSocket between two processes, carrying v4 frames. It announces the peer
+identity, advertises routes as a snapshot and diffs, and multiplexes every
+visitor stream. One downstream process has one session.
 
 ### Stream
-A logical byte pipe inside a session, one per visitor. The upstream server opens
-a stream with the resolved domain and the visitor's prefetched HTTP header; the
+A logical byte pipe inside a session, one per visitor. The upstream side opens a
+stream with the resolved domain and the visitor's prefetched HTTP header; the
 downstream connects to the route's `local_addr` and pipes bytes. Streams have
 half-close, a reset reason, and a per-direction credit window.
 
 ## The process
 
-When `htc` starts, it reads its configuration file: a list of *tunnels*, each an
-HTTP domain mapped to a `local_addr` on the client (a tunnel also carries a
-`name`, its identity within the client). Every setting also has an `HTC_*`
-environment counterpart that wins over the file, which lets a container run
-without a mounted `htc.toml`. The client opens one v4 session to the server's
-`server_host:server_port` and advertises its tunnels.
+`ht` reads `ht.toml`, then overlays `HT_*` environment variables (`HTC_*` is
+accepted as a legacy fallback). Configuration validation normalizes domains,
+requires strong tokens, rejects duplicate routes, and rejects an upstream that
+points at the process itself.
 
-The upgrade carries the shared token in `Authorization: Bearer`; the session then
-challenges the peer with a nonce and checks a proof bound to the node id and the
-server id. Once authenticated, the server installs the advertised prefixes in
-its routing table. A route is removed when the session closes or sends an update.
+The process binds the listener before doing anything else. That guarantees the
+route is never advertised before the process can serve a visitor, and it resolves
+an ephemeral `server_port = 0` to the actual port used as the loopback target of
+the upstream session.
 
-The server listens on `server_port` for HTTP visitors. When a visitor connects, it
-reads the request line and the `Host` header, looks up the session that serves
-the domain, and opens a stream. The visitor's prefetched header is sent in the
-`OpenStream` frame; the downstream connects to its `local_addr`, applies the
-tunnel's `auth_header` if any, writes the header and pipes the rest. The response
-comes back over the same stream.
+The embedded server accepts visitors on one port. It reads the request line and
+`Host`, resolves a local proxy first and then a downstream session, and either
+connects to the local service or opens a stream. The visitor's prefetched header
+is sent in `OpenStream`; the downstream applies the route's `auth_header`, writes
+the header and pipes the rest. The response comes back over the same stream.
 
-Each stream has an initial window (256 KiB) in each direction. The receiver sends
-`StreamWindowUpdate` as it consumes bytes, so a slow local service pauses the
-sender instead of buffering without bound. Stream data frames are 64 KiB, small
-enough to interleave interactive streams on one session. A session is still one
-ordered WebSocket, so a large transfer can add some head-of-line delay; this is
-the tradeoff for replacing hundreds of sockets with one.
+The proxy list is held behind an `RwLock` in `ServerState`, so the management API
+can replace it at runtime. The route watch is recomputed from the local proxies
+and the downstream session routes; `http.rs` reads the current proxy list on each
+visitor, and a mirroring session sees the new route immediately.
 
 A stream whose downstream cannot reach its `local_addr` is reset with
-`ConnectFailed`; the server answers the visitor with `502`. A stream whose session
-dies is closed and the visitor gets a `503`/`504` instead of hanging. A domain is
-served while its session is connected; a duplicate advertisement from another
-session is rejected with `Conflict` and logged.
+`ConnectFailed`; the server answers the visitor with `502`. A stream whose
+session dies is closed and the visitor gets a `503`/`504` instead of hanging. A
+duplicate advertisement from another session is rejected with `Conflict`.
 
 Each WebSocket bridge sends a protocol ping every `keepalive_interval` seconds
 (15 by default) and gives up after three intervals without any inbound frame, so
-a silently dropped session is detected within 45 seconds. The v4 session relies
-on that keepalive; there is no separate application heartbeat.
+a silently dropped session is detected within 45 seconds. v4 relies on that
+keepalive; there is no separate application heartbeat.
 
-On shutdown, after the HTTP listener stops accepting, the server waits for the
-in-flight visitors (up to `DRAIN_TIMEOUT`, 30 seconds) before it closes the
-sessions, so a graceful restart doesn't cut the flows off. The `ActivityTracker`
-counts the visitors that are still being served for that.
+## Upstream session
 
-A *node* composes the two roles in one process. Its upstream session forwards
-visitors to `127.0.0.1:<server_port>`, where the embedded server routes them by
-`Host` again: the data plane is recursive because a stream is a raw byte pipe and
-the `Host` header is never rewritten. On shutdown a node closes its upstream
-session before the embedded server drains, so no new visitor is routed to it
-while the in-flight ones finish.
+With `[upstream]`, the process converts its route watch into a `RouteMap` whose
+targets all point to `127.0.0.1:<actual server_port>`. This is true for both
+`mirror` and `claim`; the difference is only what is advertised:
+
+- `mirror`: every route of the union above, sent as a snapshot and then diffed
+  as `Update` frames.
+- `claim`: one exact or wildcard prefix.
+
+When the upstream session receives an `OpenStream`, it connects to the loopback
+target. The embedded listener routes the request by `Host` again. The data plane
+is recursive and the HTTP request is never rewritten, so WebSocket upgrades and
+other upgrades traverse any number of hops.
+
+## Shutdown
+
+On shutdown the process:
+
+1. sends `GoAway` on the upstream session, withdrawing its routes;
+2. stops the listener and waits for in-flight visitors for up to 30 seconds;
+3. closes downstream v4 sessions.
+
+A fatal upstream authentication failure (wrong token) ends the process instead
+of retrying. Transient network failures reconnect with backoff and re-advertise
+the current route set on the new session.
 
 ## Protocol v4
 
 The frames, route advertisement, stream flow control, identity and the remaining
 work are described in [protocol-v4.md](./protocol-v4.md). v3 is not supported;
-all three binaries upgrade together.
+every hop must run a v4-compatible `ht`.

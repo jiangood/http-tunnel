@@ -16,18 +16,8 @@ name = "http_tunnel"
 path = "src/lib.rs"
 
 [[bin]]
-name = "hts"
-path = "src/bin/hts.rs"
-required-features = ["server"]
-
-[[bin]]
-name = "htc"
-path = "src/bin/htc.rs"
-required-features = ["client"]
-
-[[bin]]
-name = "htn"
-path = "src/bin/htn.rs"
+name = "ht"
+path = "src/bin/ht.rs"
 required-features = ["node"]
 
 # The benchmarks of the HTTP path. They are plain `harness = false` binaries, so

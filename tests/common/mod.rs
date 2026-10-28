@@ -1,11 +1,25 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use http_tunnel::{Config, MaskedString};
 use tokio::{
     io,
     net::{TcpListener, ToSocketAddrs},
     sync::broadcast,
 };
+
+/// Build a standalone ingress configuration for the test listeners.
+pub fn ingress_config(server_port: u16, server_host: &str, token: &str) -> Config {
+    let mut config = Config::default();
+    config.name = "test-ingress".to_string();
+    config.server_port = server_port;
+    config.server_host = Some(server_host.to_string());
+    // Keep the test listeners on loopback: a wildcard listener triggers the
+    // Windows Firewall prompt for every test binary.
+    config.bind_host = "127.0.0.1".to_string();
+    config.token = Some(MaskedString::from(token));
+    config
+}
 
 pub async fn run_http_tunnel_server(
     server_port: u16,
@@ -30,39 +44,29 @@ pub async fn run_http_tunnel_server_with_limits(
     limits: http_tunnel::ServerLimits,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let cmd = http_tunnel::Command::Server(http_tunnel::ServerArgs {
-        server_port,
-        server_host: server_host.to_string(),
-        // Keep the test listeners on loopback: a wildcard listener triggers the
-        // Windows Firewall prompt for every test binary.
-        bind_host: "127.0.0.1".to_string(),
-        token: token.to_string(),
-        proxies: Vec::new(),
-        limits,
-    });
-    http_tunnel::run(cmd, shutdown_rx).await
+    let mut config = ingress_config(server_port, server_host, token);
+    config.max_pending_handshakes = limits.max_pending_handshakes;
+    config.max_control_connections = limits.max_control_connections;
+    config.keepalive_interval = limits.keepalive_interval;
+    http_tunnel::run(config, shutdown_rx).await
 }
 
-/// Run a client from its configuration file. The file carries the identity
-/// (`server`, `name`, `token`) and the tunnels the client serves.
+/// Run a universal process from its configuration file. The file carries the
+/// listener identity and local `[[proxies]]`, plus an optional `[upstream]`.
 pub async fn run_http_tunnel_client(
     config_path: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let cmd = http_tunnel::Command::Client(http_tunnel::ClientArgs {
-        config_path: PathBuf::from(config_path),
-    });
-    http_tunnel::run(cmd, shutdown_rx).await
+    let config = http_tunnel::load_config(&PathBuf::from(config_path)).await?;
+    http_tunnel::run(config, shutdown_rx).await
 }
 
-/// Run a node from its configuration file.
+/// Kept as an alias while the tests describe a relay as a "node".
 pub async fn run_http_tunnel_node(
     config_path: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let config = http_tunnel::NodeConfig::from_file(std::path::Path::new(config_path)).await?;
-    let cmd = http_tunnel::Command::Node(http_tunnel::NodeArgs { config });
-    http_tunnel::run(cmd, shutdown_rx).await
+    run_http_tunnel_client(config_path, shutdown_rx).await
 }
 
 pub mod tcp {

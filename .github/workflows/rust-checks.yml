@@ -15,5 +15,5 @@ jobs:
       - run: cargo check --all-targets --all-features
       - run: cargo test --all-features
       - run: cargo build --all-features --bins
-      - name: Run process-level client/server E2E test
+      - name: Run process-level E2E test
         run: python3 tests/process_e2e.py

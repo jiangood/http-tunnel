@@ -1,8 +1,8 @@
 # Protocol v4 — Design Proposal
 
-Status: **implemented for `hts`/`htc`/`htn`**. v4 is the only protocol the
-binaries speak; the v3 implementation has been removed. This document describes
-the protocol as it is implemented and the parts that are still pending.
+Status: **implemented for `ht`**. v4 is the only protocol `ht` speaks; the v3
+implementation has been removed. This document describes the protocol as it is
+implemented and the parts that are still pending.
 
 The issue that introduced node mode leaves v4 deliberately open: it is only worth
 doing when multi-tenant relays, large route sets, or loop-proof topologies are
@@ -203,7 +203,7 @@ protocol change.
 Planned: the server gets an optional node table.
 
 ```toml
-# hts.toml (planned)
+# ht.toml (planned)
 [[nodes]]
 id = "relay-a"
 token = "per-node-secret"
@@ -263,10 +263,10 @@ allow = ["home.example.com"]
 
 ## Migration
 
-There is no mixed-version support. `hts`, `htc` and `htn` must be upgraded
-together; an old client gets `404` on the v4 entrypoint. The configuration keys
-(`server`, `token`, `[[tunnels]]`, `[[proxies]]`, `[upstream]`) are unchanged, so
-a deployment only needs new binaries.
+There is no mixed-version support. Every hop must be upgraded together to a
+v4-compatible `ht`; an old peer gets `404` on the v4 entrypoint. The unified
+configuration keys (`token`, `[[proxies]]`, `[upstream]`) describe the same
+roles as before.
 
 ## Implementation map
 
@@ -276,11 +276,13 @@ a deployment only needs new binaries.
 - `src/session_client.rs`: v4 handshake, route snapshots/updates, streams to
   `local_addr`, reconnect backoff.
 - `src/http.rs`: the v4 entrypoint and visitor-to-stream routing.
-- `src/client.rs`: one session per client; the tunnels are a route map.
-- `src/node.rs`: one upstream session; the embedded server's route set becomes
-  the advertised map (or one claim).
-- `src/server.rs`: the shared state, activity drain, shutdown and the stream
-  relay.
+- `src/client.rs`: management state for the running server's `[[proxies]]` and
+  persistence to `ht.toml`.
+- `src/client_env.rs`: the `HT_*` (and legacy `HTC_*`) environment overlay.
+- `src/node.rs`: the universal router: embedded server plus one optional upstream
+  session, whose advertised map is the route set or one claim.
+- `src/server.rs`: the shared state, dynamic proxy list, activity drain,
+  shutdown and the stream relay.
 - `docs/`, `examples/`, `Dockerfile`/release scripts: v4 docs and examples.
 
 ## Test plan
@@ -293,7 +295,8 @@ a deployment only needs new binaries.
   control (a slow reader pauses the sender), large bodies, WebSocket upgrades.
 - Node: 3-hop chain with v4 sessions, fan-out, route withdrawal on leaf stop,
   ingress restart and re-advertisement, loop rejection, ACL rejection.
-- Process E2E: real `hts`/`htn`/`htc` binaries, including a node chain.
+- Process E2E: real `ht` processes for an ingress, a leaf, an env-only leaf and
+  a mirroring relay chain.
 - Soak: 1 000 streams, 1 000 routes, route churn.
 
 ## Implemented and pending

@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 use crate::common::{run_http_tunnel_server, run_http_tunnel_server_with_limits};
 
 mod common;
-const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
+const ECHO_SERVER_ADDR: &str = "127.0.0.1:18080";
 const HTTP_ENTRY_ADDR: &str = "127.0.0.1:2334";
 const HTTP_ENTRY_PORT: u16 = 2334;
 const WS_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2336";
@@ -35,9 +35,11 @@ fn init() {
         .try_init();
 }
 
-/// Write a client configuration to a temporary file and return its path. The
-/// identity and the tunnels both live in the client configuration, since the
-/// server takes no configuration file.
+/// Write a universal leaf configuration to a temporary file and return its path.
+///
+/// The leaf always runs its own listener (an ephemeral loopback port is fine)
+/// and dials the given ingress through `[upstream]`. Its local services are
+/// declared with `[[proxies]]`.
 fn write_client_config(
     file: &str,
     name: &str,
@@ -47,27 +49,32 @@ fn write_client_config(
     web_port: Option<u16>,
     tunnels: &[(&str, &str)],
 ) -> Result<String> {
-    let mut tunnels_toml = String::new();
+    let mut proxies_toml = String::new();
     for (domain, local_addr) in tunnels {
-        // Tunnel names are required by the current client config schema.
-        // Use the first domain label as a stable name for these integration
-        // tests; a wildcard domain uses the label after `*.`.
+        // The local-service names are required. Use the first domain label as a
+        // stable name for these integration tests; a wildcard domain uses the
+        // label after `*.`.
         let name = domain
             .trim_start_matches("*.")
             .split('.')
             .next()
             .unwrap_or(domain);
-        tunnels_toml.push_str(&format!(
-            "\n[[tunnels]]\nname = \"{}\"\ndomain = \"{}\"\nlocal_addr = \"{}\"\n",
+        proxies_toml.push_str(&format!(
+            "\n[[proxies]]\nname = \"{}\"\ndomain = \"{}\"\nlocal_addr = \"{}\"\n",
             name, domain, local_addr
         ));
     }
     // Disable the web management port unless the test explicitly needs it; a
-    // default 8610 would make parallel clients collide.
-    let api = format!("web_port = {}\n", web_port.unwrap_or(0));
+    // default 8610 would make parallel processes collide.
+    let api = format!(
+        "web_port = {}\nweb_host = \"127.0.0.1\"\n",
+        web_port.unwrap_or(0)
+    );
     let content = format!(
-        "server = \"ws://{}:{}\"\nname = \"{}\"\ntoken = \"{}\"\nweb_host = \"127.0.0.1\"\n{}\n{}",
-        server_host, server_port, name, token, api, tunnels_toml
+        "server_port = 0\nbind_host = \"127.0.0.1\"\nserver_host = \"127.0.0.1\"\n\
+         name = \"{}\"\ntoken = \"{}\"\n{}\n{}\
+         \n[upstream]\nserver = \"ws://{}:{}\"\ntoken = \"{}\"\nmirror = true\n",
+        name, token, api, proxies_toml, server_host, server_port, token
     );
 
     let path = std::env::temp_dir().join(file);
@@ -267,19 +274,19 @@ async fn wait_for_tcp(addr: &'static str, timeout: Duration) -> Result<()> {
 /// connection, both of which `http_echo_hitter` reports as an error.
 async fn wait_for_echo(addr: &'static str, host: &'static str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
-    let mut last_error = None;
     loop {
-        match time::timeout(Duration::from_secs(5), http_echo_hitter(addr, host)).await {
-            std::result::Result::Ok(std::result::Result::Ok(())) => return Ok(()),
-            std::result::Result::Ok(Err(e)) => last_error = Some(format!("{:#}", e)),
-            std::result::Result::Err(_) => last_error = Some("the request timed out".to_string()),
-        }
+        let last_error =
+            match time::timeout(Duration::from_secs(5), http_echo_hitter(addr, host)).await {
+                std::result::Result::Ok(std::result::Result::Ok(())) => return Ok(()),
+                std::result::Result::Ok(Err(e)) => format!("{:#}", e),
+                std::result::Result::Err(_) => "the request timed out".to_string(),
+            };
         if Instant::now() >= deadline {
             anyhow::bail!(
                 "the tunnel did not serve {} within {:?}: {}",
                 host,
                 timeout,
-                last_error.unwrap_or_default()
+                last_error
             );
         }
         time::sleep(Duration::from_millis(100)).await;
@@ -526,6 +533,8 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
         "expected 502 for an unavailable local target, got {}",
         response
     );
+    // Let the ingress observe the visitor close before it drains for shutdown.
+    drop(visitor);
 
     client_shutdown_tx.send(true)?;
     server_shutdown_tx.send(true)?;
@@ -1097,8 +1106,8 @@ fn write_node_config(
     Ok(path.to_str().unwrap().to_string())
 }
 
-/// `hts` -> node A (wildcard claim) -> node B (exact claim + local proxy) ->
-/// echo service. A visitor to the public ingress reaches the service across
+/// `ht` ingress -> node A (wildcard claim) -> node B (exact claim + local proxy)
+/// -> echo service. A visitor to the public ingress reaches the service across
 /// three hops with one process per hop.
 ///
 /// Stopping node B withdraws its route, so the ingress answers with `404`

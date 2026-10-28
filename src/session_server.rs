@@ -362,12 +362,11 @@ async fn apply_routes(
             }
             routes.insert(prefix.clone(), handle.clone());
         }
-        state.routes.send_modify(|routes| {
-            routes.insert(prefix.clone());
-        });
         owned.insert(prefix.clone());
         accepted.push(prefix);
     }
+
+    state.refresh_routes().await;
 
     (generation, accepted, rejected)
 }
@@ -386,9 +385,7 @@ async fn remove_route(state: &ServerState, session_id: u64, prefix: &str) {
         }
     };
     if removed {
-        state.routes.send_modify(|routes| {
-            routes.remove(prefix);
-        });
+        state.refresh_routes().await;
     }
 }
 

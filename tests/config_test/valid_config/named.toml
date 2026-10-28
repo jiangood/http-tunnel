@@ -1,16 +1,17 @@
-# The current format: every tunnel is a table with its own `name`, `domain` and
-# `local_addr`. The `name` identifies the tunnel within the client and is what
-# the administration API addresses; the `domain` is the `Host` it serves.
+# Every local service is a table with its own `name`, `domain` and
+# `local_addr`. The `name` identifies it within the process and is what the
+# administration API addresses; the `domain` is the `Host` it serves.
+server_host = "control.example.com"
 name = "home"
 token = "use_a_secret_that_only_you_know"
 
-[[tunnels]]
+[[proxies]]
 name = "nas"
 domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
 
-[[tunnels]]
-# Every tunnel must have an explicit name.
+[[proxies]]
+# Every local service must have an explicit name.
 name = "git"
 domain = "git.example.com"
 local_addr = "127.0.0.1:3000"
