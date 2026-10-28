@@ -80,7 +80,7 @@ pub struct ServerProxyEntry {
 /// Without this table the process is a standalone ingress: it only runs its
 /// embedded server. With it, the process also dials the next hop with one v4
 /// session and advertises either one `claim` or a mirror of its route set.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     /// The WebSocket endpoint of the next hop, e.g. `ws://a.lan:9000` or
@@ -96,17 +96,6 @@ pub struct UpstreamConfig {
     /// the next hop. It is the default when neither `mirror` nor `claim` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mirror: Option<bool>,
-}
-
-impl Default for UpstreamConfig {
-    fn default() -> Self {
-        UpstreamConfig {
-            server: String::new(),
-            token: MaskedString::default(),
-            claim: None,
-            mirror: None,
-        }
-    }
 }
 
 impl UpstreamConfig {

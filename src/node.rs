@@ -92,45 +92,44 @@ pub(crate) async fn run_router(
         stop_tx.subscribe(),
     );
 
+    let runtime = RouterRuntime {
+        server_task,
+        web_task,
+        stop_tx,
+        shutdown_rx,
+        connected,
+    };
+
     match config.upstream.clone() {
-        None => run_ingress(server_task, web_task, stop_tx, shutdown_rx).await,
-        Some(upstream) => {
-            run_relay(
-                &config,
-                upstream,
-                actual_port,
-                route_rx,
-                server_task,
-                web_task,
-                stop_tx,
-                shutdown_rx,
-                connected,
-            )
-            .await
-        }
+        None => run_ingress(runtime).await,
+        Some(upstream) => run_relay(&config, upstream, actual_port, route_rx, runtime).await,
     }
 }
 
-/// An ingress serves the visitors and downstream peers on its own.
-async fn run_ingress(
-    mut server_task: JoinHandle<Result<()>>,
+/// The tasks and channels the router has started and must shut down.
+struct RouterRuntime {
+    server_task: JoinHandle<Result<()>>,
     web_task: Option<JoinHandle<()>>,
     stop_tx: broadcast::Sender<bool>,
-    mut shutdown_rx: broadcast::Receiver<bool>,
-) -> Result<()> {
+    shutdown_rx: broadcast::Receiver<bool>,
+    connected: Arc<AtomicBool>,
+}
+
+/// An ingress serves the visitors and downstream peers on its own.
+async fn run_ingress(mut runtime: RouterRuntime) -> Result<()> {
     info!("No upstream is configured, so ht is a standalone ingress");
     let mut server_stopped = None;
     tokio::select! {
-        res = &mut server_task => server_stopped = Some(res),
-        _ = shutdown_rx.recv() => {}
+        res = &mut runtime.server_task => server_stopped = Some(res),
+        _ = runtime.shutdown_rx.recv() => {}
     }
 
-    let _ = stop_tx.send(true);
+    let _ = runtime.stop_tx.send(true);
     let server_result = match server_stopped {
         Some(res) => flatten_server(res),
-        None => flatten_server(server_task.await),
+        None => flatten_server(runtime.server_task.await),
     };
-    if let Some(web_task) = web_task {
+    if let Some(web_task) = runtime.web_task {
         let _ = web_task.await;
     }
     server_result
@@ -142,12 +141,16 @@ async fn run_relay(
     upstream: crate::config::UpstreamConfig,
     actual_port: u16,
     route_rx: watch::Receiver<BTreeSet<String>>,
-    mut server_task: JoinHandle<Result<()>>,
-    mut web_task: Option<JoinHandle<()>>,
-    stop_tx: broadcast::Sender<bool>,
-    mut shutdown_rx: broadcast::Receiver<bool>,
-    connected: Arc<AtomicBool>,
+    runtime: RouterRuntime,
 ) -> Result<()> {
+    let RouterRuntime {
+        mut server_task,
+        mut web_task,
+        stop_tx,
+        mut shutdown_rx,
+        connected,
+    } = runtime;
+
     let local_target = RouteTarget {
         local_addr: format!("127.0.0.1:{}", actual_port),
         auth_header: None,
@@ -192,7 +195,7 @@ async fn run_relay(
         retry_interval: config.retry_interval,
         routes,
         fatal_tx,
-        connected: connected.clone(),
+        connected,
     };
     let mut session_task = tokio::spawn(session_client::run(session_args, session_stop_rx));
 

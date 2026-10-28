@@ -213,7 +213,7 @@ where
                     ));
                 }
                 ws_sink
-                    .send(Message::Ping(Vec::new().into()))
+                    .send(Message::Ping(Vec::new()))
                     .await
                     .context("Sending a WebSocket keepalive ping")?;
             }

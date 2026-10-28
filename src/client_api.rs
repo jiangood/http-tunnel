@@ -81,11 +81,7 @@ async fn api_auth<B>(
     Ok(next.run(req).await)
 }
 
-async fn web_auth<B>(
-    State(token): State<String>,
-    req: Request<B>,
-    next: Next<B>,
-) -> Result<Response, Response> {
+async fn web_auth<B>(State(token): State<String>, req: Request<B>, next: Next<B>) -> Response {
     let expected = format!(
         "Basic {}",
         base64_encode(format!("ht:{}", token).as_bytes())
@@ -98,14 +94,14 @@ async fn web_auth<B>(
         .unwrap_or(false);
     if !authorized {
         warn!("Rejected an unauthenticated web request");
-        return Err((
+        return (
             StatusCode::UNAUTHORIZED,
             [("www-authenticate", "Basic realm=\"http-tunnel\"")],
             "Authentication required",
         )
-            .into_response());
+            .into_response();
     }
-    Ok(next.run(req).await)
+    next.run(req).await
 }
 
 // Small local encoder avoids adding a dependency just for HTTP Basic auth.
