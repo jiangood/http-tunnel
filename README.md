@@ -165,25 +165,19 @@ server {
 所有限制都可以在 `hts.toml` 中配置，默认值适合大多数部署：
 
 ```toml
-# 已认证但尚未发送协议 ClientHello 的升级数
+# 已认证但尚未完成 v4 握手的升级数
 max_pending_handshakes = 256
-# 控制通道上限（每个隧道 1 条）
+# v4 会话上限（每个客户端或节点 1 条）
 max_control_connections = 256
-# 数据通道上限（预热池 + 正在转发）
-max_data_connections = 2048
-# 每个隧道的预热池下限与上限
-pool_min = 4
-pool_max = 32
 # WebSocket ping 间隔（秒），0 关闭保活
 keepalive_interval = 15
 ```
 
-- 控制连接与数据连接使用独立的额度，数据流量突发不会挤掉其他客户端的控制通道。
+- 一个客户端或节点只建立一条 v4 会话，所有域名和访客流都复用它。
 - 未认证的升级在 `Authorization: Bearer` 校验失败时直接返回 `401`，不会占用上述额度。
-- 超过 `max_pending_handshakes` 时返回 `503`；握手最长等待 10 秒，协议 `ClientHello` 最长等待 5 秒。
-- 单个 WebSocket 帧/消息最大 1 MiB。
-- 每个 WebSocket 连接每 `keepalive_interval` 秒发送一次 ping；连续 3 个间隔没有收到任何帧就关闭连接，并从预热池中剔除，避免把已被代理断开的通道交给访客。
-- 服务端仍会发送控制通道的应用层心跳（30 秒），作为保活的第二层保护。
+- 超过 `max_pending_handshakes` 时返回 `503`；升级握手最长等待 10 秒，v4 会话握手最长等待 5 秒。
+- 单个 WebSocket 帧/消息最大 1 MiB；流数据帧为 64 KiB，每个方向有 256 KiB 的初始窗口，接收方消费后发送窗口更新。
+- 每个 WebSocket 连接每 `keepalive_interval` 秒发送一次 ping；连续 3 个间隔没有收到任何帧就关闭连接。v4 不再有单独的预热连接池或应用层控制心跳。
 
 ## 转发配置
 
@@ -243,12 +237,12 @@ local_addr = "127.0.0.1:8080"
 ```
 
 - 没有 `[upstream]` 的节点就是公网入口，行为与 `hts` 相同。
-- `mirror = true` 与 `claim` 二选一：前者随下游路由动态增删上游 control channel，后者只认领一个精确/泛域名。
-- 每个节点只监听一个端口（`server_port`），`server_host` 是该端口上保留给对等连接的 Host；`bind_host` 必须是 `0.0.0.0` 或回环地址，因为上游隧道会把访客转发到 `127.0.0.1:<server_port>`。
-- 数据面是递归的：上游隧道把访客转发到本节点的 `127.0.0.1:<server_port>`，本节点再按 `Host` 路由一次。`Host` 和报文不做任何改写，因此 WebSocket 升级同样可以穿过整条链。
-- 关闭时会先撤销上游路由，再 drain 进行中的访客，最后断开下游控制通道。
+- `mirror = true` 与 `claim` 二选一：前者随下游路由动态增删会话中的路由通告，后者只声明一个精确/泛域名。
+- 每个节点只监听一个端口（`server_port`），`server_host` 是该端口上保留给对等连接的 Host；`bind_host` 必须是 `0.0.0.0` 或回环地址，因为上游会话会把访客转发到 `127.0.0.1:<server_port>`。
+- 数据面是递归的：上游会话把访客转发到本节点的 `127.0.0.1:<server_port>`，本节点再按 `Host` 路由一次。`Host` 和报文不做任何改写，因此 WebSocket 升级同样可以穿过整条链。
+- 关闭时会先关闭上游会话（撤销路由），再 drain 进行中的访客，最后关闭下游会话。
 - 每个节点用不同的 token；`claim` 不要与 `server_host` 重叠，指向自身监听地址的 `[upstream]` 会在启动时被拒绝。
-- 镜像模式下每个域名占 1 条 control channel + 上游 `pool_min` 条预热 data channel；域名较多时在中继上设 `pool_min = 1`，并注意 `max_control_connections`（默认 256）与 `max_mirrored_routes`（默认 256，`0` 关闭上限）会限制单跳可镜像的域名数。
+- 所有域名和访客流复用一条 v4 会话：没有按域名的 control channel，也没有预热池。`max_mirrored_routes`（默认 256，`0` 关闭上限）限制单跳可通告的域名数；重复域名会被拒绝为 `Conflict`。
 
 完整的配置字段、校验规则、失败语义和示例见 [docs/node-mode.md](./docs/node-mode.md)。
 

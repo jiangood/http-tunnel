@@ -2,8 +2,8 @@ mod cli;
 mod config;
 mod constants;
 mod helper;
-mod multi_map;
-mod protocol;
+#[cfg(any(feature = "server", feature = "client"))]
+mod protocol_v4;
 mod transport;
 
 #[cfg(feature = "client")]
@@ -34,7 +34,12 @@ mod http;
 #[cfg(feature = "server")]
 mod server;
 #[cfg(feature = "server")]
+mod session_server;
+#[cfg(feature = "server")]
 use server::run_server;
+
+#[cfg(feature = "client")]
+mod session_client;
 
 // A node is a server and a client in one process: it needs both roles.
 #[cfg(all(feature = "server", feature = "client"))]

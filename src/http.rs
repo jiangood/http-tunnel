@@ -1,9 +1,7 @@
 use crate::config::ServerProxyEntry;
 use crate::helper::normalize_domain;
-use crate::protocol::Digest;
-use crate::server::{HttpVisitor, ServerState};
+use crate::server::ServerState;
 use anyhow::Result;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,57 +15,8 @@ use tracing::{debug, error, info, warn};
 const MAX_HEADER_SIZE: usize = 8 * 1024;
 /// Timeout for reading the HTTP header from a visitor
 const HEADER_READ_TIMEOUT: u64 = 5;
-
-/// Maps a `Host` to the digest of the tunnel that serves it. An exact match takes
-/// precedence over a wildcard domain (`*.example.com`), and among the wildcards
-/// the longest suffix wins.
-#[derive(Default)]
-pub struct RoutingTable {
-    exact: HashMap<String, Digest>,
-    // Keyed by the suffix including the leading dot, e.g. `.example.com`
-    wildcard: HashMap<String, Digest>,
-}
-
-impl RoutingTable {
-    pub fn insert(&mut self, domain: &str, digest: Digest) {
-        if let Some(suffix) = domain.strip_prefix("*.") {
-            if !suffix.is_empty() {
-                self.wildcard.insert(format!(".{}", suffix), digest);
-            }
-        } else {
-            self.exact.insert(domain.to_string(), digest);
-        }
-    }
-
-    /// Remove the route of a domain, whether it was an exact or a wildcard one.
-    /// It's called when the control channel that registered the domain goes away.
-    pub fn remove(&mut self, domain: &str) {
-        if let Some(suffix) = domain.strip_prefix("*.") {
-            if !suffix.is_empty() {
-                self.wildcard.remove(&format!(".{}", suffix));
-            }
-        } else {
-            self.exact.remove(domain);
-        }
-    }
-
-    pub fn get(&self, host: &str) -> Option<Digest> {
-        if let Some(digest) = self.exact.get(host) {
-            return Some(*digest);
-        }
-
-        let mut best: Option<(usize, Digest)> = None;
-        for (suffix, digest) in &self.wildcard {
-            if host.len() > suffix.len()
-                && host.ends_with(suffix.as_str())
-                && best.map(|(len, _)| suffix.len() > len).unwrap_or(true)
-            {
-                best = Some((suffix.len(), *digest));
-            }
-        }
-        best.map(|(_, digest)| digest)
-    }
-}
+/// Timeout for a v4 session to open a stream for a visitor
+const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn find_proxy<'a>(proxies: &'a [ServerProxyEntry], host: &str) -> Option<&'a ServerProxyEntry> {
     let mut wildcard: Option<(&ServerProxyEntry, usize)> = None;
@@ -178,48 +127,19 @@ async fn handle_visitor(
     // authenticates the upgrade before it can reserve any capacity.
     if state.server_host == host {
         let path = parse_request_path(&prefetched).unwrap_or_default();
-        if path != "/_http-tunnel/v1/connect" {
+        if path != crate::protocol_v4::V4_PATH {
             respond(&mut stream, "404 Not Found", "Unknown control endpoint\n").await;
             return Ok(());
         }
-        if !is_websocket_upgrade(&prefetched) {
-            respond_upgrade_required(&mut stream).await;
+        let Some((conn, _pending_permit)) =
+            accept_tunnel_websocket(prefetched, stream, &state, addr).await?
+        else {
             return Ok(());
-        }
-        match parse_bearer_token(&prefetched) {
-            Some(token) if crate::helper::constant_time_eq(token, state.token.as_bytes()) => {}
-            None | Some(_) => {
-                debug!("Rejected an unauthenticated tunnel upgrade from {}", addr);
-                respond_unauthorized_bearer(&mut stream).await;
-                return Ok(());
-            }
-        }
-        // The pending permit only covers the upgrade and the protocol hello.
-        // The control/data permit is taken once the hello tells us which it is,
-        // so unauthenticated or slow handshakes never starve a real channel.
-        let _pending_permit = match state.pending_connections.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                respond(
-                    &mut stream,
-                    "503 Service Unavailable",
-                    "WebSocket handshake limit reached\n",
-                )
-                .await;
-                return Ok(());
-            }
         };
-        // This is a transport/control connection, not an in-flight visitor request.
-        // Do not include its lifetime in the visitor drain counter: shutdown drops
-        // the control channels after draining actual visitor traffic.
+        // This is a transport/session connection, not an in-flight visitor
+        // request. Do not include its lifetime in the visitor drain counter.
         drop(activity);
-        let conn = crate::transport::websocket::accept(
-            prefetched,
-            stream,
-            state.limits.keepalive_interval,
-        )
-        .await?;
-        if let Err(e) = crate::server::handle_connection(conn, state).await {
+        if let Err(e) = crate::session_server::accept(conn, state).await {
             debug!("Tunnel WebSocket connection closed: {:#}", e);
         }
         return Ok(());
@@ -265,56 +185,75 @@ async fn handle_visitor(
         return Ok(());
     }
 
-    let digest = {
-        let rt = state.routing_table.read().await;
-        rt.get(&host)
-    };
-
-    let Some(digest) = digest else {
-        debug!("No tunnel for the host `{}`", host);
-        respond(&mut stream, "404 Not Found", "No tunnel for this host\n").await;
-        return Ok(());
-    };
-
-    let handle = {
-        let ccs = state.control_channels.read().await;
-        ccs.get1(&digest)
-            .map(|h| (h.visitor_tx.clone(), h.data_pool.clone()))
-    };
-
-    let Some((visitor_tx, data_pool)) = handle else {
-        debug!("No control channel for the host `{}`", host);
-        respond_tunnel_unavailable(&mut stream).await;
-        return Ok(());
-    };
-
-    // Ask the client for a data channel to forward this visitor through. The
-    // pool caches warm channels, but a visitor consumes one, so each visitor
-    // requests one of its own: that keeps the count of channels on their way in
-    // step with the visitors, instead of with the (transient) number of active
-    // forwardings. The pool forgets the requests that never arrive. A failed
-    // request means that the control channel is gone.
-    if !data_pool.request_for_visitor() {
-        debug!("No control channel for the host `{}`", host);
-        respond_tunnel_unavailable(&mut stream).await;
-        return Ok(());
+    // A v4 session multiplexes every visitor of a peer over one connection.
+    if let Some(handle) = crate::session_server::lookup(&state, &host).await {
+        match handle.open(&host, prefetched, STREAM_OPEN_TIMEOUT).await {
+            Ok(io) => {
+                debug!("Routing visitor {} to a v4 stream for `{}`", addr, host);
+                tokio::spawn(async move {
+                    let _activity = activity;
+                    crate::server::relay(io, stream).await;
+                });
+                return Ok(());
+            }
+            Err(e) => {
+                debug!("Failed to open a v4 stream for `{}`: {:#}", host, e);
+                respond(
+                    &mut stream,
+                    "502 Bad Gateway",
+                    "The tunnel is not available\n",
+                )
+                .await;
+                return Ok(());
+            }
+        }
     }
 
-    debug!("Routing visitor {} to the host `{}`", addr, host);
-
-    if visitor_tx
-        .send(HttpVisitor {
-            stream,
-            prefetched,
-            activity,
-        })
-        .await
-        .is_err()
-    {
-        warn!("Failed to hand over the visitor to the tunnel `{}`", host);
-    }
-
+    debug!("No tunnel for the host `{}`", host);
+    respond(&mut stream, "404 Not Found", "No tunnel for this host\n").await;
     Ok(())
+}
+
+/// Perform the generic pre-upgrade checks of a tunnel WebSocket: the upgrade
+/// header, the bearer token and the pending-handshake budget. On failure it
+/// writes the response itself and returns `None`.
+async fn accept_tunnel_websocket(
+    prefetched: Vec<u8>,
+    mut stream: TcpStream,
+    state: &Arc<ServerState>,
+    addr: SocketAddr,
+) -> Result<Option<(crate::transport::Conn, tokio::sync::OwnedSemaphorePermit)>> {
+    if !is_websocket_upgrade(&prefetched) {
+        respond_upgrade_required(&mut stream).await;
+        return Ok(None);
+    }
+    match parse_bearer_token(&prefetched) {
+        Some(token) if crate::helper::constant_time_eq(token, state.token.as_bytes()) => {}
+        None | Some(_) => {
+            debug!("Rejected an unauthenticated tunnel upgrade from {}", addr);
+            respond_unauthorized_bearer(&mut stream).await;
+            return Ok(None);
+        }
+    }
+    // The pending permit only covers the upgrade and the protocol hello. The
+    // session permit is taken once the hello is authenticated, so unauthenticated
+    // or slow handshakes never starve a real session.
+    let pending_permit = match state.pending_connections.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            respond(
+                &mut stream,
+                "503 Service Unavailable",
+                "WebSocket handshake limit reached\n",
+            )
+            .await;
+            return Ok(None);
+        }
+    };
+    let conn =
+        crate::transport::websocket::accept(prefetched, stream, state.limits.keepalive_interval)
+            .await?;
+    Ok(Some((conn, pending_permit)))
 }
 
 /// An error while reading or parsing the first request of a visitor. It carries
@@ -536,29 +475,6 @@ fn normalize_domain_bytes(raw: &[u8]) -> Option<String> {
     std::str::from_utf8(raw).ok().and_then(normalize_domain)
 }
 
-/// Answer a visitor with a `503`, either because no tunnel is connected for its
-/// `Host`, or because the control channel of the tunnel went away after the visitor
-/// was already handed over.
-pub(crate) async fn respond_tunnel_unavailable(stream: &mut TcpStream) {
-    respond(
-        stream,
-        "503 Service Unavailable",
-        "The tunnel is not connected\n",
-    )
-    .await;
-}
-
-/// Answer a visitor with a `504`, when the tunnel is connected but no data
-/// channel arrives within the timeout.
-pub(crate) async fn respond_gateway_timeout(stream: &mut TcpStream) {
-    respond(
-        stream,
-        "504 Gateway Timeout",
-        "The tunnel did not provide a data channel in time\n",
-    )
-    .await;
-}
-
 /// The `401` sent when a tunnel sets `auth_header` and the visitor does not
 /// present the expected `X-HTTP-TUNNEL-TOKEN`. It carries no `WWW-Authenticate`:
 /// that header describes an `Authorization` scheme, which this is not.
@@ -743,30 +659,6 @@ mod tests {
         assert!(normalize_domain("foo/bar").is_none());
         assert!(normalize_domain("*").is_none());
         assert!(normalize_domain("foo*bar").is_none());
-    }
-
-    #[test]
-    fn test_routing_table_wildcard() {
-        let exact = [1u8; 32];
-        let wildcard = [2u8; 32];
-        let deep = [3u8; 32];
-
-        let mut rt = RoutingTable::default();
-        rt.insert("exact.example.com", exact);
-        rt.insert("*.example.com", wildcard);
-        rt.insert("*.sub.example.com", deep);
-
-        // An exact match wins over a wildcard
-        assert_eq!(rt.get("exact.example.com"), Some(exact));
-        // A wildcard matches at any depth
-        assert_eq!(rt.get("a.example.com"), Some(wildcard));
-        assert_eq!(rt.get("a.b.example.com"), Some(wildcard));
-        // The longest wildcard suffix wins
-        assert_eq!(rt.get("a.sub.example.com"), Some(deep));
-        // The apex is not matched by `*.example.com`
-        assert_eq!(rt.get("example.com"), None);
-        // An unknown host matches nothing
-        assert_eq!(rt.get("other.test"), None);
     }
 
     #[test]

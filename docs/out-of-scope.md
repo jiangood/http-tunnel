@@ -19,10 +19,9 @@
 - *Mesh discovery and route advertisement*
 
   A chain is configured explicitly, hop by hop: a downstream always dials its
-  upstream, and a node publishes one domain per control channel on the next hop.
-  Mirroring re-publishes the local route set with one v3 control channel per
-  domain; it is not a wire-level route advertisement, and prefixes are not
-  aggregated. There is no automatic peer discovery, no hop count and no loop
-  detection at the protocol level. A node validates that its upstream is not its
-  own listener, but general loop detection belongs to a future protocol version,
-  not to the HTTP-only data plane.
+  upstream, and a node advertises its routes on the next hop. A v4 session
+  carries many prefixes and many visitor streams; there is no automatic peer
+  discovery, no prefix aggregation across independent sessions, no hop count and
+  no per-request loop detection. A node validates that its upstream is not its
+  own listener and rejects duplicate prefixes, but general loop detection belongs
+  to a later protocol iteration, not to the HTTP-only data plane.

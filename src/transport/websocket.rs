@@ -2,8 +2,6 @@ use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::io::{self, Cursor};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -54,19 +52,35 @@ impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 
 pub(crate) type BoxedIo = Box<dyn AsyncReadWrite + Unpin + Send + Sync>;
 
-/// Connect to the server host over WebSocket and expose it as a byte stream.
-/// The existing length-prefixed protocol therefore does not need to know about WS frames.
-///
-/// `tls` selects `wss://` instead of `ws://`. The shared token is sent in the
-/// `Authorization` header, so the server can reject an unauthenticated upgrade
-/// before it spends a connection slot on it.
-pub(crate) async fn connect_websocket(
+/// Connect a protocol v4 session, announcing the node id in the upgrade so the
+/// server can select a per-node credential before the handshake.
+pub(crate) async fn connect_websocket_v4(
     server_addr: &str,
     tls: bool,
     token: &str,
     keepalive_interval: u64,
+    node_id: &str,
 ) -> Result<BoxedIo> {
-    let url = websocket_url(server_addr, tls);
+    connect_websocket_path(
+        server_addr,
+        tls,
+        token,
+        keepalive_interval,
+        crate::protocol_v4::V4_PATH,
+        Some(node_id),
+    )
+    .await
+}
+
+async fn connect_websocket_path(
+    server_addr: &str,
+    tls: bool,
+    token: &str,
+    keepalive_interval: u64,
+    path: &str,
+    node_id: Option<&str>,
+) -> Result<BoxedIo> {
+    let url = websocket_url_path(server_addr, tls, path);
     let mut request = url
         .as_str()
         .into_client_request()
@@ -74,6 +88,10 @@ pub(crate) async fn connect_websocket(
     let authorization = HeaderValue::from_str(&format!("Bearer {}", token))
         .context("The token cannot be sent in an HTTP header")?;
     request.headers_mut().insert("Authorization", authorization);
+    if let Some(node_id) = node_id {
+        let value = HeaderValue::from_str(node_id).context("The node id is not a valid header")?;
+        request.headers_mut().insert("X-HTTP-Tunnel-Node", value);
+    }
 
     let result = timeout(
         WS_HANDSHAKE_TIMEOUT,
@@ -104,10 +122,10 @@ pub(crate) async fn connect_websocket(
     Ok(Box::new(client))
 }
 
-/// The URL of the tunnel WebSocket endpoint, `wss://` when TLS is enabled.
-pub(crate) fn websocket_url(server_addr: &str, tls: bool) -> String {
+/// The URL of a tunnel WebSocket endpoint, `wss://` when TLS is enabled.
+fn websocket_url_path(server_addr: &str, tls: bool, path: &str) -> String {
     let scheme = if tls { "wss" } else { "ws" };
-    format!("{}://{}/_http-tunnel/v1/connect", scheme, server_addr)
+    format!("{}://{}{}", scheme, server_addr, path)
 }
 
 /// Wait for the next keepalive tick, or forever when the keepalive is disabled.
@@ -282,15 +300,12 @@ pub(crate) async fn accept(
     .context("Accepting tunnel WebSocket handshake")?;
 
     let (io, bridge) = duplex(64 * 1024);
-    let alive = Arc::new(AtomicBool::new(true));
-    let bridge_alive = alive.clone();
     tokio::spawn(async move {
         if let Err(err) = bridge_websocket_to_io(ws, bridge, keepalive_interval).await {
             tracing::debug!("WebSocket stream bridge closed: {:#}", err);
         }
-        bridge_alive.store(false, Ordering::Relaxed);
     });
-    Ok(Conn::new(Box::new(io), alive))
+    Ok(Conn::new(Box::new(io)))
 }
 
 #[cfg(test)]
@@ -303,22 +318,6 @@ mod tests {
         let config = websocket_config();
         assert_eq!(config.max_message_size, Some(MAX_WS_MESSAGE_SIZE));
         assert_eq!(config.max_frame_size, Some(MAX_WS_MESSAGE_SIZE));
-    }
-
-    #[test]
-    fn websocket_url_selects_the_scheme_from_the_tls_setting() {
-        assert_eq!(
-            websocket_url("control.example.com:443", true),
-            "wss://control.example.com:443/_http-tunnel/v1/connect"
-        );
-        assert_eq!(
-            websocket_url("control.example.com:80", false),
-            "ws://control.example.com:80/_http-tunnel/v1/connect"
-        );
-        assert_eq!(
-            websocket_url("[::1]:443", true),
-            "wss://[::1]:443/_http-tunnel/v1/connect"
-        );
     }
 
     #[tokio::test]

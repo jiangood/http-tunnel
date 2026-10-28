@@ -18,16 +18,9 @@ const DEFAULT_KEEPALIVE_INTERVAL_SECS: u64 = 15;
 
 /// The default number of unauthenticated WebSocket upgrades a server runs at once.
 pub const DEFAULT_MAX_PENDING_HANDSHAKES: usize = 256;
-/// The default number of control channels a server accepts at once.
+/// The default number of v4 sessions a server accepts at once.
 pub const DEFAULT_MAX_CONTROL_CONNECTIONS: usize = 256;
-/// The default number of data channels a server accepts at once.
-pub const DEFAULT_MAX_DATA_CONNECTIONS: usize = 2048;
-/// The default number of warm data channels kept per tunnel.
-pub const DEFAULT_POOL_MIN: usize = 4;
-/// The default upper bound of the warm data channels of one tunnel.
-pub const DEFAULT_POOL_MAX: usize = 32;
-/// The default cap on the routes one node mirrors to its next hop. It matches
-/// the default control-channel limit of a server.
+/// The default cap on the routes one node advertises to its next hop.
 pub const DEFAULT_MAX_MIRRORED_ROUTES: usize = 256;
 
 /// String with Debug implementation that emits "MASKED"
@@ -1234,14 +1227,7 @@ local_addr = "127.0.0.1:80"
         assert!(ServerLimits::default().validate().is_ok());
 
         let limits = ServerLimits {
-            max_data_connections: 0,
-            ..ServerLimits::default()
-        };
-        assert!(limits.validate().is_err());
-
-        let limits = ServerLimits {
-            pool_min: 9,
-            pool_max: 8,
+            max_control_connections: 0,
             ..ServerLimits::default()
         };
         assert!(limits.validate().is_err());
@@ -1577,18 +1563,9 @@ pub struct ServerConfig {
     /// `ClientHello` at the same time.
     #[serde(default = "default_max_pending_handshakes")]
     pub max_pending_handshakes: usize,
-    /// The number of control channels accepted at once.
+    /// The number of v4 sessions accepted at once.
     #[serde(default = "default_max_control_connections")]
     pub max_control_connections: usize,
-    /// The number of data channels accepted at once.
-    #[serde(default = "default_max_data_connections")]
-    pub max_data_connections: usize,
-    /// The base number of warm data channels kept per tunnel.
-    #[serde(default = "default_pool_min")]
-    pub pool_min: usize,
-    /// The upper bound of the warm data channels of one tunnel.
-    #[serde(default = "default_pool_max")]
-    pub pool_max: usize,
     /// WebSocket ping interval in secs. `0` disables the keepalive pings.
     #[serde(default = "default_keepalive_interval")]
     pub keepalive_interval: u64,
@@ -1599,9 +1576,6 @@ pub struct ServerConfig {
 pub struct ServerLimits {
     pub max_pending_handshakes: usize,
     pub max_control_connections: usize,
-    pub max_data_connections: usize,
-    pub pool_min: usize,
-    pub pool_max: usize,
     pub keepalive_interval: u64,
 }
 
@@ -1610,9 +1584,6 @@ impl Default for ServerLimits {
         ServerLimits {
             max_pending_handshakes: DEFAULT_MAX_PENDING_HANDSHAKES,
             max_control_connections: DEFAULT_MAX_CONTROL_CONNECTIONS,
-            max_data_connections: DEFAULT_MAX_DATA_CONNECTIONS,
-            pool_min: DEFAULT_POOL_MIN,
-            pool_max: DEFAULT_POOL_MAX,
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL_SECS,
         }
     }
@@ -1623,9 +1594,6 @@ impl From<&ServerConfig> for ServerLimits {
         ServerLimits {
             max_pending_handshakes: config.max_pending_handshakes,
             max_control_connections: config.max_control_connections,
-            max_data_connections: config.max_data_connections,
-            pool_min: config.pool_min,
-            pool_max: config.pool_max,
             keepalive_interval: config.keepalive_interval,
         }
     }
@@ -1633,17 +1601,8 @@ impl From<&ServerConfig> for ServerLimits {
 
 impl ServerLimits {
     pub fn validate(&self) -> Result<()> {
-        if self.max_pending_handshakes == 0
-            || self.max_control_connections == 0
-            || self.max_data_connections == 0
-        {
+        if self.max_pending_handshakes == 0 || self.max_control_connections == 0 {
             bail!("The connection limits must be greater than 0");
-        }
-        if self.pool_min == 0 {
-            bail!("`pool_min` must be greater than 0");
-        }
-        if self.pool_max < self.pool_min {
-            bail!("`pool_max` must not be smaller than `pool_min`");
         }
         Ok(())
     }
@@ -1670,15 +1629,6 @@ fn default_max_pending_handshakes() -> usize {
 }
 fn default_max_control_connections() -> usize {
     DEFAULT_MAX_CONTROL_CONNECTIONS
-}
-fn default_max_data_connections() -> usize {
-    DEFAULT_MAX_DATA_CONNECTIONS
-}
-fn default_pool_min() -> usize {
-    DEFAULT_POOL_MIN
-}
-fn default_pool_max() -> usize {
-    DEFAULT_POOL_MAX
 }
 fn default_keepalive_interval() -> u64 {
     DEFAULT_KEEPALIVE_INTERVAL_SECS
@@ -1772,20 +1722,11 @@ pub struct NodeConfig {
     /// `ClientHello` at the same time.
     #[serde(default = "default_max_pending_handshakes")]
     pub max_pending_handshakes: usize,
-    /// The number of control channels accepted at once.
+    /// The number of v4 sessions accepted at once.
     #[serde(default = "default_max_control_connections")]
     pub max_control_connections: usize,
-    /// The number of data channels accepted at once.
-    #[serde(default = "default_max_data_connections")]
-    pub max_data_connections: usize,
-    /// The base number of warm data channels kept per tunnel.
-    #[serde(default = "default_pool_min")]
-    pub pool_min: usize,
-    /// The upper bound of the warm data channels of one tunnel.
-    #[serde(default = "default_pool_max")]
-    pub pool_max: usize,
     /// WebSocket ping interval in secs. `0` disables the keepalive pings of the
-    /// embedded server and of the upstream tunnel.
+    /// embedded server and of the upstream session.
     #[serde(default = "default_keepalive_interval")]
     pub keepalive_interval: u64,
 }
@@ -1865,9 +1806,6 @@ impl NodeConfig {
         ServerLimits {
             max_pending_handshakes: self.max_pending_handshakes,
             max_control_connections: self.max_control_connections,
-            max_data_connections: self.max_data_connections,
-            pool_min: self.pool_min,
-            pool_max: self.pool_max,
             keepalive_interval: self.keepalive_interval,
         }
     }

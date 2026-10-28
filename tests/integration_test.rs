@@ -62,9 +62,9 @@ fn write_client_config(
             name, domain, local_addr
         ));
     }
-    let api = web_port
-        .map(|p| format!("web_port = {}\n", p))
-        .unwrap_or_default();
+    // Disable the web management port unless the test explicitly needs it; a
+    // default 8610 would make parallel clients collide.
+    let api = format!("web_port = {}\n", web_port.unwrap_or(0));
     let content = format!(
         "server = \"ws://{}:{}\"\nname = \"{}\"\ntoken = \"{}\"\nweb_host = \"127.0.0.1\"\n{}\n{}",
         server_host, server_port, name, token, api, tunnels_toml
@@ -478,8 +478,8 @@ const WS_FAILURE_HTTP_PORT: u16 = 2546;
 const WS_FAILURE_HTTP_ADDR: &str = "127.0.0.1:2546";
 const WS_FAILURE_TARGET_ADDR: &str = "127.0.0.1:2547";
 
-/// A WebSocket tunnel whose local target refuses connections must not hang
-/// visitors forever; the server eventually returns its existing 504 timeout.
+/// A tunnel whose local target refuses connections must not hang visitors
+/// forever; v4 reports the connect failure with a `502 Bad Gateway`.
 #[tokio::test]
 async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
     init();
@@ -511,7 +511,7 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
             .unwrap();
     });
     // Give the client time to register the tunnel before the visitor arrives;
-    // this test is about the 504, not about the unregistered-tunnel path.
+    // this test is about the connect failure, not the unregistered-tunnel path.
     time::sleep(Duration::from_secs(2)).await;
 
     let mut visitor = TcpStream::connect(WS_FAILURE_HTTP_ADDR).await?;
@@ -522,8 +522,8 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
     time::timeout(Duration::from_secs(18), visitor.read_to_end(&mut response)).await??;
     let response = String::from_utf8_lossy(&response);
     assert!(
-        response.starts_with("HTTP/1.1 504"),
-        "expected 504 for an unavailable local target, got {}",
+        response.starts_with("HTTP/1.1 502"),
+        "expected 502 for an unavailable local target, got {}",
         response
     );
 
@@ -900,15 +900,15 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
             "HTTP/1.1 404",
         ),
         (
-            "GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: other.test\r\nConnection: close\r\n\r\n",
+            "GET /_http-tunnel/v4/connect HTTP/1.1\r\nHost: other.test\r\nConnection: close\r\n\r\n",
             "HTTP/1.1 404",
         ),
         (
-            "GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            "GET /_http-tunnel/v4/connect HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
             "HTTP/1.1 426",
         ),
         (
-            "GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n",
+            "GET /_http-tunnel/v4/connect HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n",
             "HTTP/1.1 426",
         ),
     ] {
@@ -927,7 +927,7 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
         );
     }
 
-    let url = format!("ws://{}/_http-tunnel/v1/connect", WS_LIMIT_HTTP_ADDR);
+    let url = format!("ws://{}/_http-tunnel/v4/connect", WS_LIMIT_HTTP_ADDR);
     // A bridged WebSocket that has not sent the tunnel protocol ClientHello is
     // reclaimed after five seconds. The burst must therefore stay inside that
     // window; retry instead of reporting a false regression on a slow runner.

@@ -1,8 +1,16 @@
 use anyhow::{Context, Result};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use sha2::{Digest as _, Sha256};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
+
+/// The SHA-256 digest of a byte string.
+pub(crate) fn digest(data: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&Sha256::digest(data));
+    out
+}
 
 pub trait LocalIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> LocalIo for T {}
@@ -259,17 +267,6 @@ pub fn normalize_domain(raw: &str) -> Option<String> {
     }
 
     Some(host.to_lowercase())
-}
-
-pub async fn write_and_flush<T>(conn: &mut T, data: &[u8]) -> Result<()>
-where
-    T: AsyncWrite + Unpin,
-{
-    conn.write_all(data)
-        .await
-        .with_context(|| "Failed to write data")?;
-    conn.flush().await.with_context(|| "Failed to flush data")?;
-    Ok(())
 }
 
 #[cfg(test)]

@@ -57,7 +57,7 @@ upx --best --lzma http-tunnel
 The HTTP path has a small benchmark harness in [`benches/`](../benches). It
 starts an echo backend behind the NAT, a server and a client, then measures three
 scenarios: many small keep-alive requests, many short-lived connections (the
-per-connection setup cost, where the data channel pool shows up), and several
+per-connection setup cost, where stream setup shows up), and several
 1 MiB bodies in flight at once (the large-transfer throughput).
 
 ```sh

@@ -1,8 +1,8 @@
 # Protocol v4 — Design Proposal
 
-Status: **proposal, not implemented**. Stage 1 (node mode) and Stage 2 (route
-mirroring) work on protocol v3. This document defines what a v4 would change,
-what it would keep, and how a chain can migrate without breaking v3 peers.
+Status: **implemented for `hts`/`htc`/`htn`**. v4 is the only protocol the
+binaries speak; the v3 implementation has been removed. This document describes
+the protocol as it is implemented and the parts that are still pending.
 
 The issue that introduced node mode leaves v4 deliberately open: it is only worth
 doing when multi-tenant relays, large route sets, or loop-proof topologies are
@@ -36,7 +36,7 @@ adds route advertisement, identity/ACL, hop limits and tracing.
 - A trace id per visitor, carried in stream metadata.
 - Keep the HTTP data plane unchanged: a stream is still a raw byte pipe to a
   registered `local_addr`, and `Host` is never rewritten.
-- Keep protocol v3 working; v3 and v4 peers can coexist on one entrypoint.
+- Break the old wire protocol: all three binaries upgrade together.
 
 ## Non-goals
 
@@ -47,24 +47,18 @@ adds route advertisement, identity/ACL, hop limits and tracing.
 - Replacing HTTP routing / request logging.
 - HTTP/2 or WebSocket-over-WebSocket changes for visitors.
 
-## Version negotiation
+## Entry point
 
-v3 and v4 use different session paths on the same listener:
+v4 uses one entry point on the existing listener:
 
 ```
-/_http-tunnel/v1/connect    protocol v3 (unchanged)
-/_http-tunnel/v4/connect    protocol v4 session
+/_http-tunnel/v4/connect
 ```
 
-The path is versioned instead of the frame preamble because a v3 server decodes
-the first frame as a bincode `ClientHello`; an unambiguous path lets an old
-server answer `404` instead of misparsing a v4 frame. The server host and token
-reservation logic is shared by both paths.
-
-A v4-capable server accepts both paths. A v4 client configured with
-`protocol = "auto"` tries v4 first and falls back to v3 only on a transport-level
-`404`/`405` from the entrypoint (an old server). It does not fall back on an auth
-failure or a protocol error.
+The old `/_http-tunnel/v1/connect` path returns `404`. There is no version
+preamble and no fallback: a v3 peer is not supported. The path keeps the
+protocol version explicit in logs and lets the entrypoint reject old clients
+without parsing their frames.
 
 ## Session handshake
 
@@ -98,7 +92,6 @@ client                                            server
   (HMAC-SHA-256 is preferable; it needs no new dependency because `sha2` is
   already present, but a small HMAC helper is required.)
 - `role` is `client` (leaf) or `node`; it is advisory for logging, not for trust.
-- A v3 upgrade with no node header is handled by the v3 path exactly as today.
 
 ## Messages
 
@@ -153,16 +146,16 @@ relay hops it has crossed.
   `AclDenied`, `ReservedHost`, `Conflict`, `TooManyRoutes`, `LoopDetected`,
   `HopsExceeded`, `InvalidPrefix`.
 - The peer logs a rejection once and does not retry that prefix until its
-  advertisement changes. This replaces the v3 "permanent rejection retried
-  forever" behaviour.
+  advertisement changes. There is no per-prefix control channel to retry.
 - A node re-advertises the routes of its downstream sessions with `hops + 1` and
   the original `origin`. Its own proxies and local routes have `origin = self`
   and `hops = 0`.
 
 Conflict policy is an open question. The recommendation is **reject the later
-advertisement** (`Conflict`) by default in v4, with an explicit
+advertisement** (`Conflict`) by default, with an explicit
 `allow_takeover = true` option that reproduces v3 semantics. Silent takeover is
-the main reason a multi-tenant relay is unsafe today.
+the main reason a multi-tenant relay is unsafe today; the current prototype
+rejects duplicates.
 
 ## Streams
 
@@ -207,12 +200,10 @@ protocol change.
 
 ## Identity and ACL
 
-The server gets an optional node table:
+Planned: the server gets an optional node table.
 
 ```toml
-# hts.toml (v4)
-protocol = "auto"          # "v3", "v4" or "auto"
-
+# hts.toml (planned)
 [[nodes]]
 id = "relay-a"
 token = "per-node-secret"
@@ -226,8 +217,8 @@ allow = ["home.example.com"]
 ```
 
 - The upgrade's `X-HTTP-Tunnel-Node` selects the row; the bearer token must match
-  that row. A v3 upgrade without the header uses the shared `token` and maps to
-  an anonymous principal (no ACL, v3 behaviour).
+  that row. Until this is implemented, the session authenticates the shared token
+  and the node id is only logged.
 - A node may advertise only prefixes contained in its `allow` list. `*.a.example.com`
   allows `x.a.example.com`, but not `a.example.com` (the same apex rule as the
   routing table). An allowed wildcard covers deeper wildcards.
@@ -270,42 +261,27 @@ allow = ["home.example.com"]
 - There is no stream resumption in v1. A reconnect sends a full route snapshot
   with a new generation.
 
-## Compatibility and rollout
+## Migration
 
-| Pair | Behaviour |
-| --- | --- |
-| v3 client ↔ v3 server | unchanged |
-| v3 client ↔ v4 server | v3 path, shared token, no ACL unless configured for the shared principal |
-| v4 client ↔ v3 server | `auto` falls back to v3 after a 404/405; `v4` fails fast |
-| v4 client ↔ v4 server | full v4 |
-| v4 node ↔ v4 upstream | batch ads, ACL, hop count, streams |
-| v4 node ↔ v3 upstream | falls back to Stage 2 per-domain control channels; no v4 features |
-| v3 node/client ↔ v4 node | v3 path into the node; the node can mirror it upward with v4 |
-
-Rollout:
-
-1. Ship a v4-capable server that still serves v3. No behaviour change by default.
-2. Add v4 to `htn`/`htc` behind `protocol = "auto"`. Mixed chains degrade per
-   hop, never break.
-3. Enable v4 by default once the session/stream tests are green.
-4. Deprecate v3 only after a release with both paths.
+There is no mixed-version support. `hts`, `htc` and `htn` must be upgraded
+together; an old client gets `404` on the v4 entrypoint. The configuration keys
+(`server`, `token`, `[[tunnels]]`, `[[proxies]]`, `[upstream]`) are unchanged, so
+a deployment only needs new binaries.
 
 ## Implementation map
 
-- `src/protocol.rs`: add the v4 types and encode/decode helpers; leave v3 intact.
-- `src/transport/websocket.rs`: add a frame-oriented session bridge; keep the
-  byte-stream bridge for v3.
-- `src/server.rs`: `Session` registry, prefix routing, stream dispatch, ACL,
-  route generations; keep v3 control/data channels.
-- `src/client.rs`: a session runner that advertises the route set and opens
-  streams to `local_addr`; v3 runner stays for fallback.
-- `src/node.rs`: the mirror task becomes an advertiser (one session, batched
-  diffs) when v4 is negotiated; the v3 mirror remains.
-- `src/http.rs`: route `/_http-tunnel/v4/connect`, reserve the host, prefetch the
-  header, open a stream instead of a data channel.
-- `src/config.rs`: `protocol`, `[[nodes]]`, limits, `max_hops`, session windows.
-- `docs/`, `examples/`, `Dockerfile`/release scripts: v4 docs and a mixed-chain
-  example.
+- `src/protocol_v4.rs`: the frame types and length-prefixed bincode codec.
+- `src/session_server.rs`: v4 handshake, session loop, route table, streams and
+  flow control.
+- `src/session_client.rs`: v4 handshake, route snapshots/updates, streams to
+  `local_addr`, reconnect backoff.
+- `src/http.rs`: the v4 entrypoint and visitor-to-stream routing.
+- `src/client.rs`: one session per client; the tunnels are a route map.
+- `src/node.rs`: one upstream session; the embedded server's route set becomes
+  the advertised map (or one claim).
+- `src/server.rs`: the shared state, activity drain, shutdown and the stream
+  relay.
+- `docs/`, `examples/`, `Dockerfile`/release scripts: v4 docs and examples.
 
 ## Test plan
 
@@ -317,32 +293,51 @@ Rollout:
   control (a slow reader pauses the sender), large bodies, WebSocket upgrades.
 - Node: 3-hop chain with v4 sessions, fan-out, route withdrawal on leaf stop,
   ingress restart and re-advertisement, loop rejection, ACL rejection.
-- Compatibility: v3/v4 matrix above; a chain with one v3 hop.
-- Process E2E: real `hts`/`htn`/`htc` binaries, including a mixed v3/v4 chain.
+- Process E2E: real `hts`/`htn`/`htc` binaries, including a node chain.
 - Soak: 1 000 streams, 1 000 routes, route churn.
+
+## Implemented and pending
+
+Implemented:
+
+- one v4 session per peer; v3 is removed;
+- route snapshots/diffs with accepted/rejected prefixes;
+- exact/wildcard route lookup on both sides;
+- visitor streams with half-close, reset on connect failure, initial windows and
+  window updates;
+- reconnect with a full snapshot, and a rejected token as a fatal error;
+- the existing config keys, so the binaries upgrade together.
+
+Pending:
+
+- per-node identity and ACL (`[[nodes]]`; the session currently uses the shared
+  token);
+- route origin/hop enforcement (the fields exist, but the prototype advertises
+  `hops = 0` and does not reject loops at the protocol level);
+- stream sharding / head-of-line mitigation beyond 64 KiB frames and windows;
+- a drain window on `GoAway` (the prototype closes streams immediately);
+- soak and large-scale tests.
 
 ## Open questions
 
 1. **Binary schema stability.** bincode is compact but not self-describing. Is a
    versioned field list enough, or should v4 use a self-describing format
    (postcard/CBOR) for forward compatibility?
-2. **Conflict policy.** Reject duplicates by default (recommended) or keep v3's
-   last-writer-wins? This changes takeover semantics for multi-tenant relays.
+2. **Conflict policy.** Reject duplicates by default (implemented) or allow
+   explicit takeover? This changes multi-tenant semantics.
 3. **Head-of-line blocking.** Is one session per peer enough, or should sharding
-   be part of v1 of the protocol?
+   be part of the next iteration?
 4. **Hop enforcement.** Is advertisement-level loop detection sufficient, or
    must per-request hop counts be carried through the node's loopback listener
    (which would require either an internal header or an in-process handoff)?
-5. **Warm pool.** v4 opens streams on demand; is a warm stream pool worth the
+5. **Warm stream pool.** v4 opens streams on demand; is a warm pool worth the
    extra state for latency-sensitive short requests?
 6. **ACL source.** Static `[[nodes]]` only, or an external auth hook/resource?
 7. **Timeout defaults.** Session idle, stream open timeout and drain deadline.
-8. **Migration window.** How long must v3 coexist after v4 is enabled by default?
 
 ## Recommendation
 
-Do not start v4 until the conflict policy, ACL source and HOL answer are agreed.
-The smallest useful next step is a prototype that covers only one v4 session per
-peer, exact/wildcard route advertisements, streams with flow control, and the
-v3 fallback, leaving identity/ACL and hop counts behind a follow-up. That
-prototype can be feature-gated and does not touch the v3 path.
+The session core is the foundation; do not add more deployment features until
+the ACL, hop enforcement and HOL answers are decided. The next step is to add
+`[[nodes]]` ACLs and hop validation on top of the existing frames, then decide
+whether sharding is needed.
