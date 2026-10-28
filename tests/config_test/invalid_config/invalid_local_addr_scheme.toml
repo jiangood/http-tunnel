@@ -1,0 +1,8 @@
+name = "home"
+token = "secret"
+server_host = "control.example.com"
+
+[[proxies]]
+name = "nas"
+domain = "nas.example.com"
+local_addr = "http://127.0.0.1:80"

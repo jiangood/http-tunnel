@@ -369,6 +369,8 @@ server {
 
 TCP 示例：`127.0.0.1:3000`。Unix Socket 示例：`unix:///var/run/docker.sock`。
 
+`local_addr` 是原始 TCP 地址，不是 URL：写 `http://127.0.0.1:3000` 会在启动或保存规则时报错，删掉 `http://` 即可。
+
 ```toml
 [[proxies]]
 name = "docker-api"

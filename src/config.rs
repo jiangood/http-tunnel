@@ -421,11 +421,26 @@ impl Config {
         let mut domains: BTreeMap<String, ()> = BTreeMap::new();
         let mut entries: Vec<ServerProxyEntry> = Vec::new();
         for entry in std::mem::take(&mut config.proxies) {
-            if entry.local_addr.trim().is_empty() {
+            let local_addr = entry.local_addr.trim();
+            if local_addr.is_empty() {
                 bail!(
                     "The `local_addr` of the local service `{}` is empty",
                     entry.domain
                 );
+            }
+            // The address is dialed as raw TCP, so a URL scheme such as
+            // `http://` is never meaningful and would only fail later, when the
+            // first visitor arrives. Reject it while the config is loaded.
+            if let Some((scheme, _)) = local_addr.split_once("://") {
+                if scheme != "unix" {
+                    bail!(
+                        "The `local_addr` of the local service `{}` must be `host:port` or \
+                         `unix:///path`, not a URL: remove the `{}://` from `{}`",
+                        entry.name,
+                        scheme,
+                        local_addr
+                    );
+                }
             }
             if entry
                 .auth_header
@@ -462,7 +477,7 @@ impl Config {
             entries.push(ServerProxyEntry {
                 name,
                 domain,
-                local_addr: entry.local_addr,
+                local_addr: local_addr.to_string(),
                 auth_header: entry.auth_header,
             });
         }
@@ -1109,6 +1124,51 @@ domain = "foo.example.com"
 local_addr = ""
 "#;
         assert!(Config::parse(s).is_err());
+    }
+
+    #[test]
+    fn test_rejects_a_url_scheme_in_local_addr() {
+        for local_addr in [
+            "http://127.0.0.1:80",
+            "https://nas.example.com",
+            "tcp://127.0.0.1:80",
+            "HTTPS://nas.example.com",
+        ] {
+            let s = format!(
+                "server_host = \"control.test\"\ntoken = \"secret\"\n\n[[proxies]]\n\
+                 name = \"foo\"\ndomain = \"foo.example.com\"\nlocal_addr = {:?}\n",
+                local_addr
+            );
+            let error = Config::parse(&s).expect_err(local_addr);
+            let message = format!("{:#}", error);
+            assert!(
+                message.contains("must be `host:port` or `unix:///path`"),
+                "{}",
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn test_accepts_a_unix_socket_and_trims_local_addr() -> Result<()> {
+        let s = r#"
+server_host = "control.test"
+token = "secret"
+
+[[proxies]]
+name = "docker"
+domain = "docker.example.com"
+local_addr = "unix:///var/run/docker.sock"
+
+[[proxies]]
+name = "nas"
+domain = "nas.example.com"
+local_addr = "  127.0.0.1:80  "
+"#;
+        let config = Config::parse(s)?;
+        assert_eq!(config.proxies[0].local_addr, "unix:///var/run/docker.sock");
+        assert_eq!(config.proxies[1].local_addr, "127.0.0.1:80");
+        Ok(())
     }
 
     #[test]

@@ -303,4 +303,47 @@ local_addr = "127.0.0.1:80"
         assert!(!path.exists(), "no configuration file must be created");
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_url_local_addr_is_rejected_before_persisting() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "http-tunnel-management-{}-url-local-addr.toml",
+            std::process::id()
+        ));
+        let persisted = Config::parse(
+            r#"
+server_host = "control.example.com"
+name = "file"
+token = "file-token"
+
+[[proxies]]
+name = "nas"
+domain = "nas.example.com"
+local_addr = "127.0.0.1:80"
+"#,
+        )?;
+        std::fs::write(&path, persisted.to_toml()?)?;
+        let state = state(persisted, path.clone());
+
+        let err = state
+            .put_proxy(
+                "git".to_string(),
+                "git.example.com".to_string(),
+                "http://127.0.0.1:81".to_string(),
+            )
+            .await
+            .expect_err("a URL must not be accepted as a local address");
+        let message = format!("{:#}", err);
+        let saved = std::fs::read_to_string(&path)?;
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            message.contains("must be `host:port` or `unix:///path`"),
+            "{}",
+            message
+        );
+        assert!(!saved.contains("http://127.0.0.1:81"), "{}", saved);
+        assert_eq!(state.proxies().await.len(), 1);
+        Ok(())
+    }
 }
