@@ -7,7 +7,8 @@ mod protocol_v4;
 mod transport;
 
 pub use config::{
-    Config, MaskedString, ServerLimits, ServerProxyEntry, UpstreamConfig, DEFAULT_SERVER_PORT,
+    Config, GeneratedConfigError, MaskedString, ServerLimits, ServerProxyEntry, UpstreamConfig,
+    DEFAULT_SERVER_PORT,
 };
 
 use anyhow::Result;

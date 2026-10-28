@@ -513,7 +513,12 @@ local_addr = "127.0.0.1:80"
         let err = load_with(&path, EnvConfig::default())
             .await
             .expect_err("the first start must ask the user to edit the example");
-        assert!(format!("{:#}", err).contains("Generated"), "{}", err);
+        assert!(
+            err.downcast_ref::<crate::GeneratedConfigError>().is_some(),
+            "the first start must return the bootstrap marker: {:#}",
+            err
+        );
+        assert!(format!("{:#}", err).contains("已生成"), "{}", err);
         let example = std::fs::read_to_string(&path)?;
         let _ = std::fs::remove_file(&path);
         assert!(example.contains("[[proxies]]"), "{}", example);

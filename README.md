@@ -26,13 +26,44 @@
 
 ## 快速开始
 
-从 [Releases](https://github.com/jiangood/http-tunnel/releases) 下载 `ht`。首次运行时，如果当前目录没有 `ht.toml`，程序会写入一个带注释的模板后退出：
+从 [Releases](https://github.com/jiangood/http-tunnel/releases) 下载 `ht`，放到一个空目录并运行一次：
 
 ```sh
 ./ht
 ```
 
-编辑 `ht.toml`，至少填写 `server_host` 和强 `token`（可用 `openssl rand -hex 16` 生成）：
+当前目录没有 `ht.toml` 时，程序会写出一份带注释的模板后以退出码 0 正常退出。按下面的场景选择配置，保存为 `ht.toml`，再运行 `./ht`。
+
+命令行只有以下选项：
+
+```text
+ht [-c/--config ht.toml] [-b/--background]
+```
+
+`-b/--background` 会把输出写入当前目录的 `ht.log`。角色完全由 `ht.toml` 是否包含 `[upstream]` 决定：没有就是入口，有就是客户端或中继。
+
+## 按场景配置
+
+| 场景 | 节点数 | 适用情况 | 关键区别 |
+| --- | --- | --- | --- |
+| 单节点 | 1 | 有公网服务器，服务也在这台机器或同一内网 | 不需要 `[upstream]` |
+| 两个节点 | 2 | 公网入口 + 家庭/公司内网机器 | 客户端用 `[upstream]` 主动拨出 |
+| 三个节点 | 3 | 内网机器不能直接访问公网入口，需要跳板 | 中间多一层中继 |
+
+下面用 `app.example.com` 表示业务域名，`control.example.com` 表示入口的保留域名，请替换成自己的域名。Token 可用 `openssl rand -hex 16` 生成；示例里的中文 Token 只是占位符，部署前必须替换。
+
+三个场景不是互斥模式：入口也可以同时写 `[[proxies]]` 直接代理本地服务，中继也可以代理自己所在机器的服务；场景只描述最常见的拓扑。
+
+### 场景一：单节点（入口 + 本地代理）
+
+```text
+访客 ──> ht（公网服务器，server_host = control.example.com）
+           └──> 127.0.0.1:3000
+```
+
+一台机器同时做入口和代理，不需要 `[upstream]`。
+
+`ht.toml`：
 
 ```toml
 name = "edge"
@@ -42,20 +73,173 @@ server_host = "control.example.com"
 token = "把 openssl rand -hex 16 的输出填在这里"
 
 [[proxies]]
-name = "nas"
-domain = "nas.example.com"
-local_addr = "127.0.0.1:80"
+name = "app"
+domain = "app.example.com"
+local_addr = "127.0.0.1:3000"
 ```
 
-再次运行 `./ht` 即可。访问 `http://nas.example.com` 的请求会被转发到这台机器的 `127.0.0.1:80`。
+启动并验证：
 
-命令行只有以下选项：
+```sh
+./ht
+
+# 不配置 DNS 也能验证 Host 路由
+curl -H "Host: app.example.com" http://127.0.0.1:7777/
+```
+
+正式访问时，把 `app.example.com` 的 A 记录指向服务器，打开 `http://app.example.com:7777`。管理页在 `http://control.example.com:7777/`，用户名 `ht`，密码是 `token`。
+
+要点：
+
+- `server_host` 是保留 Host，不能和任何 `[[proxies]].domain` 相同，也不支持泛域名。
+- 公网部署应在前面加 TLS 终止层，把 443 反代到 `127.0.0.1:7777`，见[传输模式与 TLS](#传输模式与-tls)。Nginx 的 `server_name` 要同时包含 `server_host` 和所有访客域名。
+- 保持 `server_port = 7777` 即可，由 Nginx/Caddy 在 80/443 终止 TLS 后反代过来；直接把 `server_port` 改成 `80` 只会提供明文 HTTP，仅适合临时测试。
+
+### 场景二：两个节点（服务端 + 客户端）
 
 ```text
-ht [-c/--config ht.toml] [-b/--background]
+访客 ──> 服务端 ht（公网，control.example.com:443）
+                ^
+                │ 一条 wss 长连接，客户端主动拨出
+                │
+         客户端 ht（内网，app.example.com -> 127.0.0.1:3000）
 ```
 
-`-b/--background` 会把输出写入当前目录的 `ht.log`。角色完全由 `ht.toml` 是否包含 `[upstream]` 决定。
+服务端只做入口，客户端主动连接服务端，内网不需要开放任何入站端口。
+
+服务端 `ht.toml`：
+
+```toml
+name = "ingress"
+server_port = 7777
+bind_host = "0.0.0.0"
+server_host = "control.example.com"
+token = "把 openssl rand -hex 16 的输出填在这里（客户端用同一个）"
+```
+
+客户端 `ht.toml`：
+
+```toml
+name = "home"
+server_port = 0
+bind_host = "127.0.0.1"
+
+[[proxies]]
+name = "app"
+domain = "app.example.com"
+local_addr = "127.0.0.1:3000"
+
+[upstream]
+server = "wss://control.example.com:443"
+token = "与服务端 token 相同"
+mirror = true
+```
+
+先启动服务端，再启动客户端：
+
+```sh
+# 服务端
+./ht
+
+# 客户端
+./ht
+```
+
+把 `app.example.com` 的 A 记录指向服务端后访问 `https://app.example.com`。如果还没有配置 TLS，可先把客户端的 `server` 改成 `ws://control.example.com:7777`，用 `http://app.example.com:7777` 验证链路；`ws://` 是明文，仅适合测试或可信网络。
+
+要点：
+
+- 服务端的 `token` 与客户端的 `[upstream].token` 必须一致。
+- 客户端没有下游节点，因此省略顶层 `token`，监听器会自动复用 `[upstream].token`；`server_host` 也省略，默认 `127.0.0.1`。
+- 客户端 `server_port = 0` 使用临时端口，只供本机的 v4 回环连接使用，实际端口看启动日志。
+- 服务端不需要写 `[[proxies]]`，它按 `Host` 把请求转给已连接客户端声明的域名。
+- 没有域名时，把服务端的 `server_host` 和客户端的 `[upstream].server` 改成同一个 IP，例如 `ws://203.0.113.10:7777`，两边的主机名必须一致。
+- 记得在服务端防火墙放行 `7777`（以及 TLS 终止层的 `443`）。
+
+### 场景三：三个节点（服务端 + 中继 + 客户端）
+
+```text
+访客 ──> 服务端 ht（公网，control.example.com）
+                ^
+                │ wss
+                │
+          中继 A ht（a.lan:7777）
+                ^
+                │ ws（内网）或 wss（公网）
+                │
+          客户端 ht（app.example.com -> 127.0.0.1:3000）
+```
+
+适用于“客户端能访问 A，A 能访问公网，但客户端不能直接访问公网入口”的网络。三个节点运行同一个 `ht`，只是配置不同。
+
+服务端 `ht.toml` 与场景二相同：
+
+```toml
+name = "ingress"
+server_port = 7777
+bind_host = "0.0.0.0"
+server_host = "control.example.com"
+token = "入口密钥（中继 A 使用）"
+```
+
+中继 A `ht.toml`：
+
+```toml
+name = "relay-a"
+server_port = 7777
+bind_host = "0.0.0.0"
+server_host = "a.lan"
+token = "中继密钥（客户端使用）"
+
+[upstream]
+server = "wss://control.example.com:443"
+token = "入口密钥（与服务端 token 相同）"
+mirror = true
+```
+
+客户端 `ht.toml`：
+
+```toml
+name = "leaf"
+server_port = 0
+bind_host = "127.0.0.1"
+
+[[proxies]]
+name = "app"
+domain = "app.example.com"
+local_addr = "127.0.0.1:3000"
+
+[upstream]
+server = "ws://a.lan:7777"
+token = "中继密钥（与 A 的 token 相同）"
+mirror = true
+```
+
+启动顺序：服务端 -> 中继 A -> 客户端。
+
+要点：
+
+- 每一跳使用不同的 Token：入口只信任 A，A 只信任客户端。客户端省略顶层 `token` 时会复用中继 Token。
+- 上游节点的 `server_host` 必须等于下游 `[upstream].server` 里的主机名：服务端的 `control.example.com` 对应 A 的上游地址，A 的 `a.lan` 对应客户端的上游地址。主机名不一致会导致 v4 握手被拒绝。
+- A 的 `bind_host` 必须是客户端能访问到的地址；A 到入口、客户端到 A 之间还可以继续增加节点，每加一跳就多一份“上游配置 + 自己的监听 Token”。
+- 数据面是递归的：上游会话把访客转发到本机 `127.0.0.1:<server_port>`，本机再按 `Host` 路由一次。`Host` 和报文不改写，WebSocket 升级可以穿过整条链。
+- 只有一个域名时，可把客户端的 `[upstream]` 换成 `claim = "app.example.com"`，同时删掉 `mirror = true`。这样上层只看到一个域名，不暴露真实路由集合。
+
+### 验证与常见问题
+
+```sh
+# 入口是否已按 Host 路由（把地址改成入口所在机器）
+curl -i -H "Host: app.example.com" http://127.0.0.1:7777/
+
+# 管理 API（用户名 ht，密码为 token）
+curl -u ht:<token> -H "Host: control.example.com" \
+  http://127.0.0.1:7777/api/status
+```
+
+- `404 No tunnel for this host`：客户端还没连上，或域名没有出现在任何 `[[proxies]]` / `claim` 中。
+- v4 会话返回 `401`：服务端与客户端的 Token 不一致。
+- WebSocket 握手失败：`server_host` 与 `[upstream].server` 的主机名不一致，或 TLS 终止层没有转发 `Upgrade` / `Connection` 头。
+- 能连上但访问超时：检查 `local_addr` 是否从客户端所在机器可达；容器内的 `127.0.0.1` 指容器本身。
 
 ## 完整配置
 
@@ -149,7 +333,8 @@ export HT_PROXIES='[
 ```nginx
 server {
     listen 443 ssl;
-    server_name control.example.com;
+    # 必须同时包含 v4 会话入口和各节点的访客域名
+    server_name control.example.com app.example.com;
 
     ssl_certificate     /etc/letsencrypt/live/control.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/control.example.com/privkey.pem;
@@ -166,6 +351,8 @@ server {
     }
 }
 ```
+
+`server_name` 必须覆盖该入口的 `server_host`（供 v4 会话使用）和它服务的所有访客域名（如 `app.example.com`）；漏掉的 Host 会被 Nginx 交给默认 server。证书也要包含这些域名，泛域名证书可简化配置。
 
 **不要在入口上开启“HTTP 强制跳转 HTTPS”**：WebSocket 客户端不会跟随 301/308 重定向。公网部署必须让入口走 TLS，并在上游使用 `wss://`。
 
@@ -192,66 +379,15 @@ auth_header = "请替换为一个足够长的随机密钥"
 
 校验通过后，`X-HTTP-TUNNEL-TOKEN` 会在转发给后端之前被移除，后端看不到密钥。校验使用自定义头而不是 `Authorization`，不会和后端自己的登录鉴权冲突。
 
-## 多跳中继
+## 多跳细节
 
-只有一段网络能访问公网入口时，可以在每一跳运行一个 `ht`。每个进程都监听访客和下游节点，并可通过 `[upstream]` 把路由发布到上一跳。
-
-```text
-访客 -> 公网入口 ht (server_host control.example.com)
-      -> relay A ht (server_host a.lan, mirror = true)
-      -> relay B ht (server_host b.lan, mirror = true)
-      -> leaf ht (server_port = 0, [[proxies]] 指向本地服务)
-```
-
-入口的 `ht.toml`：
-
-```toml
-name = "ingress"
-server_port = 80
-bind_host = "0.0.0.0"
-server_host = "control.example.com"
-token = "入口与下游 A 共享的密钥"
-```
-
-relay A：
-
-```toml
-name = "relay-a"
-server_port = 7777
-bind_host = "0.0.0.0"
-server_host = "a.lan"
-token = "A 与下游 B 共享的密钥"
-
-[upstream]
-server = "wss://control.example.com:443"
-token = "入口与下游 A 共享的密钥"
-mirror = true
-```
-
-leaf（也可以把本地服务换成 `claim` 的精简模式）：
-
-```toml
-name = "leaf"
-server_port = 0
-bind_host = "127.0.0.1"
-server_host = "127.0.0.1"
-token = "B 与 leaf 共享的密钥"
-
-[[proxies]]
-name = "nas"
-domain = "nas.relay.example.com"
-local_addr = "127.0.0.1:80"
-
-[upstream]
-server = "ws://b.lan:9001"
-token = "B 与 leaf 共享的密钥"
-mirror = true
-```
+场景三展示了基本的三节点链路。链路可以继续向下扩展：每个进程只监听一个端口，只建立一条上游 v4 会话，并把本地 `[[proxies]]` 与下游会话声明的域名镜像（或用一个 `claim` 覆盖）到上一跳。
 
 - 数据面是递归的：上游会话把访客转发到本进程的 `127.0.0.1:<实际 server_port>`，本进程再按 `Host` 路由一次。`Host` 和报文不改写，因此 WebSocket 升级可以穿过整条链。
 - 关闭时先关闭上游会话（撤销路由），再 drain 进行中的访客，最后关闭下游会话。
 - 每个进程只监听一个端口，所有域名和访客流复用一条 v4 会话。
 - `max_mirrored_routes`（默认 256，`0` 关闭上限）限制单跳可通告的域名数。
+- 上游节点的 `server_host` 必须等于下游 `[upstream].server` 的主机名；不一致时 v4 握手会被拒绝。
 
 更多细节见 [docs/relay.md](./docs/relay.md)。
 

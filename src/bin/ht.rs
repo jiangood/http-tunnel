@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use http_tunnel::{load_config, run};
+use http_tunnel::{load_config, run, GeneratedConfigError};
 use std::{
     fs::OpenOptions,
     path::PathBuf,
@@ -84,7 +84,15 @@ async fn main() -> Result<()> {
     if cli.background && !cli.background_child {
         return launch_background(&cli.config);
     }
-    let config = load_config(&cli.config).await?;
+    let config = match load_config(&cli.config).await {
+        Ok(config) => config,
+        // Writing the example is the expected first run, not a failure.
+        Err(err) if err.downcast_ref::<GeneratedConfigError>().is_some() => {
+            println!("{err:#}");
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
     tokio::spawn(async move {

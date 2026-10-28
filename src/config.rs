@@ -23,6 +23,31 @@ pub const DEFAULT_MAX_SESSIONS: usize = 256;
 /// The default cap on the routes the process advertises to its next hop.
 pub const DEFAULT_MAX_MIRRORED_ROUTES: usize = 256;
 
+/// The error returned when the missing configuration file was replaced by the
+/// commented example.
+///
+/// It is a successful bootstrap rather than a failure: the command-line
+/// program prints the guidance and exits with status 0, while library callers
+/// can still tell it apart from a real load error.
+#[derive(Debug)]
+pub struct GeneratedConfigError {
+    message: String,
+}
+
+impl GeneratedConfigError {
+    fn new(message: String) -> Self {
+        Self { message }
+    }
+}
+
+impl std::fmt::Display for GeneratedConfigError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GeneratedConfigError {}
+
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
 #[derive(Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
@@ -324,11 +349,11 @@ impl Config {
     /// edit it before the first start.
     pub(crate) async fn bootstrap_example(path: &Path) -> anyhow::Error {
         match fs::write(path, DEFAULT_CONFIG).await {
-            Ok(()) => anyhow!(
-                "Generated {:?}. Set `server_host` and a strong `token`, add the `[upstream]` \
-                 settings for a leaf or relay, then restart ht.",
+            Ok(()) => anyhow::Error::new(GeneratedConfigError::new(format!(
+                "已生成 {:?}。请修改 `server_host` 和 `token`，客户端或中继再补充 \
+                 `[upstream]`，然后重新启动 ht。",
                 path
-            ),
+            ))),
             Err(e) => anyhow::Error::new(e)
                 .context(format!("Failed to generate default config {:?}", path)),
         }

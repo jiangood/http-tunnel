@@ -1,44 +1,18 @@
-## One universal process: `ht` always runs its embedded server (listener,
-## local proxies and downstream v4 sessions) and optionally dials one upstream.
-##
-## With `[upstream]`, this process is a relay: it advertises its routes on the
-## next hop and forwards the visitors it receives to its embedded listener.
-## Remove the `[upstream]` table to run a standalone ingress.
-##
-## For a leaf, use `server_port = 0` (an ephemeral listener is allowed with an
-## upstream) and `bind_host = "127.0.0.1"` when a local reverse proxy is the
-## only way visitors reach this process.
-##
-## Every setting also has an `HT_*` environment counterpart (HT_NAME,
-## HT_SERVER, HT_TOKEN, HT_PROXIES, HT_SERVER_PORT, ...) that wins over this
-## file. `HT_PROXIES` is a TOML array with the same shape as `[[proxies]]`.
+## ht 配置文件：保留 [upstream] 为客户端/中继，删除则为独立入口。
 
 name = "edge"
-## The listener port. `0` picks an ephemeral port and requires `[upstream]`.
 server_port = 7777
-## Optional: the IP address the listener binds. Defaults to `0.0.0.0`.
-# bind_host = "0.0.0.0"
-## The exact Host reserved for the v4 session endpoint and the management
-## page/API. It is required without `[upstream]` and defaults to `127.0.0.1`
-## with it. Open `http://<server_host>:<server_port>/` for the management page.
 server_host = "edge.lan"
-## The token shared by downstream peers. When omitted with `[upstream]`, the
-## upstream token is reused for the listener. It is also the management password.
 token = "replace-with-the-downstream-secret"
 
-## Local services served by this process. They are routed directly by an ingress
-## and mirrored (or covered by `claim`) by a leaf or relay.
+## 本进程代理的本地服务
 [[proxies]]
 name = "nas"
 domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
-# auth_header = "a-strong-per-service-secret"
 
-## The next hop towards the public ingress. Remove this table for a standalone
-## ingress. `mirror = true` publishes every local proxy and downstream route;
-## set `claim` instead to publish one exact or wildcard domain.
+## 下一跳；独立入口请删除本节
 [upstream]
 server = "wss://control.example.com:443"
 token = "replace-with-the-upstream-secret"
 mirror = true
-# claim = "*.edge.example.com"
