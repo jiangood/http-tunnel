@@ -1,6 +1,5 @@
-//! Client side of a protocol v4 session. A node (and, later, a client) keeps
-//! one session to its upstream and multiplexes every visitor of its routes over
-//! it.
+//! Upstream side of a protocol v4 session. A leaf or relay keeps one session to
+//! its next hop and multiplexes every visitor of its routes over it.
 
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
@@ -14,7 +13,7 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 use crate::config::MaskedString;
-use crate::constants::run_control_chan_backoff;
+use crate::constants::run_session_backoff;
 use crate::protocol_v4::{self as p4, Role, RouteAdvert, SessionFrame};
 use crate::transport::websocket::{connect_websocket_v4, BoxedIo};
 
@@ -47,12 +46,12 @@ enum StreamInput {
 }
 
 /// Run the session until the shutdown signal or a fatal error, reconnecting
-/// with the same backoff as a v3 control channel.
+/// with the same exponential backoff policy as the previous attempt.
 pub(crate) async fn run(
     mut args: SessionArgs,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let mut backoff = run_control_chan_backoff(args.retry_interval);
+    let mut backoff = run_session_backoff(args.retry_interval);
     loop {
         let session_shutdown = shutdown_rx.resubscribe();
         tokio::select! {

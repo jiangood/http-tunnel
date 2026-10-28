@@ -85,9 +85,9 @@ pub(crate) struct ServerState {
 
 /// The management state of a build with the administration API. Builds without
 /// the feature still pass `None` through the same signature.
-#[cfg(feature = "client-api")]
-pub(crate) type Management = Arc<crate::client::ManagementState>;
-#[cfg(not(feature = "client-api"))]
+#[cfg(feature = "management")]
+pub(crate) type Management = Arc<crate::management::ManagementState>;
+#[cfg(not(feature = "management"))]
 pub(crate) type Management = ();
 
 /// Run a server on an already-bound listener, publishing its routes through
@@ -117,7 +117,7 @@ impl ServerState {
         routes: watch::Sender<BTreeSet<String>>,
         proxies: Vec<ServerProxyEntry>,
     ) -> ServerState {
-        let max_sessions = limits.max_control_connections;
+        let max_sessions = limits.max_sessions;
         ServerState {
             token,
             server_host,
@@ -134,7 +134,7 @@ impl ServerState {
     }
 
     /// Replace the local service list and publish the new route set.
-    #[cfg_attr(not(feature = "client-api"), allow(dead_code))]
+    #[cfg_attr(not(feature = "management"), allow(dead_code))]
     pub(crate) async fn set_proxies(&self, proxies: Vec<ServerProxyEntry>) {
         *self.proxies.write().await = proxies;
         self.refresh_routes().await;

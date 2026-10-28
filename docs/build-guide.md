@@ -19,7 +19,7 @@ cargo build --release --bin ht
 | `server` | Embedded listener, HTTP routing, v4 session server |
 | `client` | v4 session client and upstream reconnection |
 | `node` | `server` + `client`; builds the `ht` binary |
-| `client-api` | Web management page and API (adds `axum`) |
+| `management` | Web management page and API (adds `axum`) |
 
 Build the universal binary with the API included (the default):
 

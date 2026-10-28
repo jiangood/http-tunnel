@@ -6,11 +6,10 @@
 
 **http-tunnel** 是一个基于 Rust 的 HTTP 反向隧道工具，可将内网服务通过公网服务器对外提供访问。它根据 HTTP `Host` 头路由请求，客户端与服务器之间的所有流量只使用 WebSocket（`ws://` / `wss://`）。
 
-从本版本开始，只有一个通用程序 `ht` 和一份配置文件 `ht.toml`。这个过程**总是**运行内嵌服务器（监听端口、本地代理、下游 v4 会话），并**可选地**通过 `[upstream]` 向上一跳建立一条 v4 会话：
+`ht` 只有一个通用程序和一份配置文件 `ht.toml`。这个过程**总是**运行内嵌服务器（监听端口、本地代理、下游 v4 会话），并**可选地**通过 `[upstream]` 向上一跳建立一条 v4 会话：
 
 - 没有 `[upstream]`：独立入口（ingress/server），直接服务访客和下游对等节点。
 - 有 `[upstream]`：同时充当 relay/leaf，既服务本地 `[[proxies]]`，也把路由通告给上一跳。
-- 没有 `server`/`client`/`node` 模式开关，也没有三个不同的程序。
 
 ## 功能
 
@@ -19,8 +18,8 @@
 - 本地服务统一写在 `[[proxies]]`，既可作为入口的直连代理，也可被 leaf/relay 通告到上一跳
 - 支持 TCP 地址和 Unix Socket
 - 可为转发规则开启入口校验，要求访客携带 `X-HTTP-TUNNEL-TOKEN`
-- 控制连接与数据连接的容量分开计数，避免流量突发挤掉控制通道
-- WebSocket ping/pong 保活，空闲数据通道不会被反向代理静默断开
+- 分开限制 v4 会话数和待握手升级数，避免慢握手挤占已有会话
+- WebSocket ping/pong 保活，空闲会话不会被反向代理静默断开
 - 握手前使用 `Authorization: Bearer` 校验共享 Token，未认证连接不占容量
 - 一条 v4 会话承载所有域名和访客流；多跳时一个进程一跳
 - 运行时管理页和 API 可增删本地 `[[proxies]]`，立即生效并写回 `ht.toml`
@@ -56,7 +55,7 @@ local_addr = "127.0.0.1:80"
 ht [-c/--config ht.toml] [-b/--background]
 ```
 
-`-b/--background` 会把输出写入当前目录的 `ht.log`。运行时不写入任何模式标志：角色完全由 `ht.toml` 是否包含 `[upstream]` 决定。
+`-b/--background` 会把输出写入当前目录的 `ht.log`。角色完全由 `ht.toml` 是否包含 `[upstream]` 决定。
 
 ## 完整配置
 
@@ -82,12 +81,12 @@ mirror = true                 # 未写 mirror 和 claim 时默认 true
 
 ### 监听器与上游
 
-- `server_port` 是唯一的 HTTP 入口端口：访客、下游对等节点、WebSocket 控制会话和管理页/API 共用它。
+- `server_port` 是唯一的 HTTP 入口端口：访客、下游 v4 会话和管理页/API 共用它。
 - `bind_host` 默认 `0.0.0.0`。有 `[upstream]` 时必须是 `0.0.0.0` 或回环地址，因为上游会话会把访客转发回本机的 `127.0.0.1:<实际 server_port>`。无上游时可以绑定任意单个 IP。
-- `server_host` 是保留给 WebSocket 控制端点和管理页/API 的精确 Host，不能是泛域名，也不能与任何 `[[proxies]]` 域名重叠。无 `[upstream]` 时必填；有 `[upstream]` 时默认 `127.0.0.1`。
+- `server_host` 是保留给 v4 会话入口和管理页/API 的精确 Host，不能是泛域名，也不能与任何 `[[proxies]]` 域名重叠。无 `[upstream]` 时必填；有 `[upstream]` 时默认 `127.0.0.1`。
 - `server_port = 0` 会绑定一个临时端口，并把实际端口用于上游会话的回环目标。只允许和 `[upstream]` 一起使用，否则重启后无法发现端口；此时管理页也使用这个临时端口。
 - `token` 是下游对等节点使用的监听 Token。有 `[upstream]` 时可以省略，此时复用 `[upstream].token`。建议每一跳使用不同的 Token，启动时会对相同 Token 给出警告。
-- `web_port` 已移除：管理页与 API 不再单独监听，而是和访客、控制会话共用 `server_port`，只在 `server_host` 上可达。浏览器打开 `http://<server_host>:<server_port>/`。
+- 管理页与 API 不单独监听，和访客、v4 会话共用 `server_port`，只在 `server_host` 上可达。浏览器打开 `http://<server_host>:<server_port>/`。
 
 ### 上游：mirror 与 claim
 
@@ -100,7 +99,7 @@ mirror = true                 # 未写 mirror 和 claim 时默认 true
 
 ### 环境变量
 
-每个配置项都有 `HT_*` 环境变量，环境变量优先于 `ht.toml`。旧的 `HTC_*` 名称仍可作为回退，`HT_*` 是规范名称。
+每个配置项都有 `HT_*` 环境变量，环境变量优先于 `ht.toml`。`HT_*` 是唯一支持的环境变量前缀。
 
 | 环境变量 | 对应 `ht.toml` | 说明 |
 | --- | --- | --- |
@@ -111,7 +110,7 @@ mirror = true                 # 未写 mirror 和 claim 时默认 true
 | `HT_PROXIES` | `[[proxies]]` | TOML 内联数组 |
 | `HT_SERVER_PORT` | `server_port` | 监听端口，`0` 表示临时端口 |
 | `HT_BIND_HOST` | `bind_host` | 监听地址 |
-| `HT_SERVER_HOST` | `server_host` | 控制端点与管理页的保留 Host |
+| `HT_SERVER_HOST` | `server_host` | v4 会话入口与管理页的保留 Host |
 | `HT_RETRY_INTERVAL` | `retry_interval` | 重连上一跳的间隔秒数 |
 | `HT_KEEPALIVE_INTERVAL` | `keepalive_interval` | WebSocket ping 间隔秒数 |
 
@@ -133,7 +132,7 @@ export HT_PROXIES='[
 - 未设置或值为空字符串的变量会被忽略。
 - `HT_PROXIES` 一旦设置就整体替换文件里的 `[[proxies]]`，不会合并；`HT_PROXIES='[]'` 表示不启用任何本地服务。
 - 环境变量只影响运行时配置，不会写回 `ht.toml`。
-- 本地服务来自 `HT_PROXIES` 时，网页和 `PUT`/`DELETE /api/tunnels/*` 都会被拒绝（`409`）；修改环境变量并重启 `ht` 后才会生效。
+- 本地服务来自 `HT_PROXIES` 时，网页和 `PUT`/`DELETE /api/proxies/*` 都会被拒绝（`409`）；修改环境变量并重启 `ht` 后才会生效。
 - `ht.toml` 不存在时，只要设置了任一 `HT_*`，进程就用默认值加环境变量启动，**不会**生成或写入 `ht.toml`。
 
 ## 传输模式与 TLS
@@ -191,7 +190,7 @@ local_addr = "unix:///var/run/docker.sock"
 auth_header = "请替换为一个足够长的随机密钥"
 ```
 
-校验通过后，`X-HTTP-TUNNEL-TOKEN` 会在转发给后端之前被移除，后端看不到密钥。校验使用自定义头而不是 `Authorization`，不会和后端自己的登录鉴权冲突。`[[tunnels]]` 仍可作为旧配置的 serde 别名接受，但新配置和文档统一使用 `[[proxies]]`。
+校验通过后，`X-HTTP-TUNNEL-TOKEN` 会在转发给后端之前被移除，后端看不到密钥。校验使用自定义头而不是 `Authorization`，不会和后端自己的登录鉴权冲突。
 
 ## 多跳中继
 
@@ -254,7 +253,7 @@ mirror = true
 - 每个进程只监听一个端口，所有域名和访客流复用一条 v4 会话。
 - `max_mirrored_routes`（默认 256，`0` 关闭上限）限制单跳可通告的域名数。
 
-更多细节见 [docs/node-mode.md](./docs/node-mode.md)。
+更多细节见 [docs/relay.md](./docs/relay.md)。
 
 ## 资源限制与保活
 
@@ -262,7 +261,7 @@ mirror = true
 # 已认证但尚未完成 v4 握手的升级数
 max_pending_handshakes = 256
 # v4 会话上限（每个下游进程 1 条）
-max_control_connections = 256
+max_sessions = 256
 # WebSocket ping 间隔（秒），0 关闭保活
 keepalive_interval = 15
 ```
@@ -275,20 +274,20 @@ keepalive_interval = 15
 
 ## Web 管理
 
-管理页面与 API 始终开启，和访客、控制会话共用 `server_port`；它们只在保留的 `server_host` 上可达，其他 Host 照常走代理。浏览器打开 `http://<server_host>:<server_port>/`，HTTP Basic 用户名填 `ht`，密码填 `token`。页面使用原生 HTML 表单，不包含 CSS 或 JavaScript。若 `server_host` 不是本机可解析的地址，可用 `curl -H "Host: <server_host>" http://127.0.0.1:<server_port>/` 访问。
+管理页面与 API 始终开启，和访客、v4 会话共用 `server_port`；它们只在保留的 `server_host` 上可达，其他 Host 照常走代理。浏览器打开 `http://<server_host>:<server_port>/`，HTTP Basic 用户名填 `ht`，密码填 `token`。页面使用原生 HTML 表单，不包含 CSS 或 JavaScript。若 `server_host` 不是本机可解析的地址，可用 `curl -H "Host: <server_host>" http://127.0.0.1:<server_port>/` 访问。
 
 `server_port = 0` 时管理入口也是临时端口，以启动日志中的实际端口为准。
 
-API 路径保持不变：
+管理 API：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/status` | 查看状态和本地服务数 |
-| GET | `/api/tunnels` | 列出本地 `[[proxies]]` |
-| PUT | `/api/tunnels/{name}` | 新增或更新本地服务 |
-| DELETE | `/api/tunnels/{name}` | 删除本地服务 |
+| GET | `/api/proxies` | 列出本地 `[[proxies]]` |
+| PUT | `/api/proxies/{name}` | 新增或更新本地服务 |
+| DELETE | `/api/proxies/{name}` | 删除本地服务 |
 
-修改会立即更新运行中的代理列表和路由 watch，并写回 `ht.toml`。详见 [docs/client-api.md](./docs/client-api.md)。
+修改会立即更新运行中的代理列表和路由 watch，并写回 `ht.toml`。详见 [docs/management-api.md](./docs/management-api.md)。
 
 ## Docker
 
@@ -339,16 +338,6 @@ services:
 - 镜像是基于 `scratch` 的静态镜像，没有 shell；用 `docker logs ht` 查看日志，不要把 `docker exec ... sh` 当作运维手段。静态 musl 二进制已内置 `wss` 所需的 WebPKI 根证书，不依赖基础镜像的 CA 包。
 - 镜像没有内置 `HEALTHCHECK`（`scratch` 里没有 shell/curl）：在 compose 或 Kubernetes 里对 `server_port` 做 TCP 检查即可；需要 HTTP 健康端点的话，后续再单独加一个只读 `/healthz`。
 - 镜像默认以 root 运行，方便首次生成和回写 `/app/ht.toml`；需要非 root 时用 `--user 65532:65532`，并保证挂载的配置目录对该 UID 可写。
-
-## 从旧版本迁移（历史说明）
-
-旧版本提供 `hts`、`htc`、`htn` 三个程序和三份配置。现在统一为 `ht` + `ht.toml`：
-
-1. 旧 `hts.toml` 的 `server_port`、`bind_host`、`server_host`、`token`、`[[proxies]]` 原样保留；删除程序名即可作为独立入口使用。
-2. 旧 `htc.toml` 的 `[[tunnels]]` 改名为 `[[proxies]]`（或保留旧名作为别名）；把顶层 `server` 移到 `[upstream].server`，补上 `[upstream].token`；`server_port` 建议设为 `0`，`bind_host = "127.0.0.1"`。管理页/API 现在与 `server_port` 共用端口，删除旧的 `web_port` / `web_host` 即可，访问地址为 `http://<server_host>:<server_port>/`。
-3. 旧 `htn.toml` 几乎就是新的 `ht.toml`：把 `[upstream]` 的 `mirror`/`claim` 规则保持不变即可。
-4. 环境变量从 `HTC_*` 迁移到 `HT_*`；旧名称仍可作为回退。
-5. 旧的三类镜像 `hts`/`htc`/`htn` 已合并为 `ht`；原来三个容器改用一个镜像，用各自的 `ht.toml` 区分入口、中继和叶子。
 
 ## 许可证
 

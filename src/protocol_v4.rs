@@ -1,20 +1,18 @@
 //! Protocol v4: one multiplexed session per peer.
 //!
-//! The v3 protocol is one WebSocket per control channel and one per data
-//! channel. v4 keeps a single session per peer and multiplexes route
-//! advertisements and visitor streams over it. The HTTP data plane is
-//! unchanged: a stream is still a raw byte pipe to a registered `local_addr`.
+//! A single WebSocket session per peer carries route advertisements and visitor
+//! streams. The HTTP data plane is unchanged: a stream is a raw byte pipe to a
+//! registered `local_addr`.
 //!
-//! v4 sessions use their own entry path (`/_http-tunnel/v4/connect`), so a v3
-//! server answers `404` instead of misparsing a v4 frame. v3 peers keep using
-//! the v1 path.
+//! v4 is the only protocol `ht` speaks. The entry path is
+//! `/_http-tunnel/v4/connect`; no other protocol is supported.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// The entry path of a v4 session, next to the v3 `.../v1/connect` path.
+/// The entry path of a v4 session.
 pub const V4_PATH: &str = "/_http-tunnel/v4/connect";
 /// The protocol version carried in `Hello`.
 pub const V4_VERSION: u16 = 4;
@@ -41,7 +39,7 @@ pub enum Role {
 /// One route in a snapshot or an update.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteAdvert {
-    /// Exact domain or `*.suffix` wildcard, normalized like a v3 domain.
+    /// Exact domain or `*.suffix` wildcard, normalized like every route.
     pub prefix: String,
     /// The node that first published the route.
     pub origin: String,

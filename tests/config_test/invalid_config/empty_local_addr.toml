@@ -2,7 +2,7 @@ name = "home"
 token = "secret"
 server_host = "control.example.com"
 
-[[tunnels]]
+[[proxies]]
 name = "nas"
 domain = "nas.example.com"
 local_addr = ""

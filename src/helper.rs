@@ -151,9 +151,8 @@ fn trim_ascii(mut s: &[u8]) -> &[u8] {
 
 /// Build a plain-text HTTP response that closes the connection.
 ///
-/// It's shared by the server-side entrypoint and the client, so that a `401` from
-/// a tunnel gate looks the same on both sides and the client builds without the
-/// `server` feature.
+/// It's shared by the server-side entrypoint and the upstream session, so that a
+/// `401` from a tunnel gate looks the same on both sides.
 pub(crate) fn response_with_headers(status: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
     let mut response = format!("HTTP/1.1 {}\r\n", status);
     for (name, value) in headers {

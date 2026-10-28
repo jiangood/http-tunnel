@@ -4,14 +4,11 @@
 //! over the file field by field, and `HT_PROXIES` replaces the local services of
 //! the file as a whole, so a container can be configured without a mounted file.
 //!
-//! The legacy `HTC_*` names are accepted as a fallback for seamless migration.
-//! `HT_*` is canonical and wins when both are set.
-//!
 //! A variable that is unset or blank is ignored. That lets a compose file pass
 //! `HT_TOKEN=` when the value is not known yet, without overriding the file.
 
 use crate::config::{Config, ConfigSource, MaskedString, ServerProxyEntry, UpstreamConfig};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -25,7 +22,7 @@ pub(crate) const ENV_TOKEN: &str = "HT_TOKEN";
 pub(crate) const ENV_SERVER_PORT: &str = "HT_SERVER_PORT";
 /// The IP address the listener binds.
 pub(crate) const ENV_BIND_HOST: &str = "HT_BIND_HOST";
-/// The Host reserved for the WebSocket control endpoint.
+/// The Host reserved for the v4 session endpoint.
 pub(crate) const ENV_SERVER_HOST: &str = "HT_SERVER_HOST";
 /// The WebSocket ping interval in secs.
 pub(crate) const ENV_KEEPALIVE_INTERVAL: &str = "HT_KEEPALIVE_INTERVAL";
@@ -35,22 +32,6 @@ pub(crate) const ENV_RETRY_INTERVAL: &str = "HT_RETRY_INTERVAL";
 pub(crate) const ENV_PROXIES: &str = "HT_PROXIES";
 /// The token of the next hop, when it differs from the listener token.
 pub(crate) const ENV_UPSTREAM_TOKEN: &str = "HT_UPSTREAM_TOKEN";
-
-/// The legacy names, kept as a fallback for existing deployments.
-const LEGACY_SERVER: &str = "HTC_SERVER";
-const LEGACY_NAME: &str = "HTC_NAME";
-const LEGACY_TOKEN: &str = "HTC_TOKEN";
-const LEGACY_HEARTBEAT_TIMEOUT: &str = "HTC_HEARTBEAT_TIMEOUT";
-const LEGACY_KEEPALIVE_INTERVAL: &str = "HTC_KEEPALIVE_INTERVAL";
-const LEGACY_RETRY_INTERVAL: &str = "HTC_RETRY_INTERVAL";
-const LEGACY_PROXIES: &str = "HTC_TUNNELS";
-
-/// The variables of the removed, separate management listener.
-///
-/// The management page and the API now share `server_port`, so silently
-/// ignoring these would leave a deployment believing its old setting still
-/// applied. A non-blank value is a startup error with the new rule.
-const REMOVED_WEB_VARS: &[&str] = &["HT_WEB_PORT", "HT_WEB_HOST", "HTC_WEB_PORT", "HTC_WEB_HOST"];
 
 /// The settings that the environment overrides.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -88,67 +69,53 @@ impl EnvConfig {
     {
         let mut env = EnvConfig::default();
 
-        // A value that was set for the removed listener must not be ignored
-        // silently: the management page would now be reachable on `server_port`.
-        for key in REMOVED_WEB_VARS {
-            if lookup(key)?.is_some_and(|value| !value.trim().is_empty()) {
-                bail!(
-                    "{} is no longer supported: the management page and the API share \
-                     `server_port` on the reserved `server_host`",
-                    key
-                );
-            }
-        }
-
-        if let Some((key, value)) = read_any(&lookup, &[ENV_SERVER, LEGACY_SERVER])? {
-            env.vars.push(key);
+        if let Some(value) = read(&lookup, ENV_SERVER)? {
+            env.vars.push(ENV_SERVER);
             env.server = Some(value);
         }
-        if let Some((key, value)) = read_any(&lookup, &[ENV_NAME, LEGACY_NAME])? {
-            env.vars.push(key);
+        if let Some(value) = read(&lookup, ENV_NAME)? {
+            env.vars.push(ENV_NAME);
             env.name = Some(value);
         }
-        if let Some((key, value)) = read_any(&lookup, &[ENV_TOKEN, LEGACY_TOKEN])? {
-            env.vars.push(key);
+        if let Some(value) = read(&lookup, ENV_TOKEN)? {
+            env.vars.push(ENV_TOKEN);
             env.token = Some(MaskedString::from(value));
         }
-        if let Some((key, value)) = read_any(&lookup, &[ENV_UPSTREAM_TOKEN])? {
-            env.vars.push(key);
+        if let Some(value) = read(&lookup, ENV_UPSTREAM_TOKEN)? {
+            env.vars.push(ENV_UPSTREAM_TOKEN);
             env.upstream_token = Some(MaskedString::from(value));
         }
-        if let Some((key, value)) = read_any(&lookup, &[ENV_SERVER_PORT])? {
-            env.vars.push(key);
-            env.server_port = Some(parse_number(key, &value, "a port number")?);
+        if let Some(value) = read(&lookup, ENV_SERVER_PORT)? {
+            env.vars.push(ENV_SERVER_PORT);
+            env.server_port = Some(parse_number(ENV_SERVER_PORT, &value, "a port number")?);
         }
-        if let Some((key, value)) = read_any(&lookup, &[ENV_BIND_HOST])? {
-            env.vars.push(key);
-            env.bind_host = Some(parse_ip(key, &value)?);
+        if let Some(value) = read(&lookup, ENV_BIND_HOST)? {
+            env.vars.push(ENV_BIND_HOST);
+            env.bind_host = Some(parse_ip(ENV_BIND_HOST, &value)?);
         }
-        if let Some((key, value)) = read_any(&lookup, &[ENV_SERVER_HOST])? {
-            env.vars.push(key);
+        if let Some(value) = read(&lookup, ENV_SERVER_HOST)? {
+            env.vars.push(ENV_SERVER_HOST);
             env.server_host = Some(value);
         }
-        if let Some((key, value)) = read_any(
-            &lookup,
-            &[ENV_KEEPALIVE_INTERVAL, LEGACY_KEEPALIVE_INTERVAL],
-        )? {
-            env.vars.push(key);
-            env.keepalive_interval = Some(parse_number(key, &value, "a number of seconds")?);
+        if let Some(value) = read(&lookup, ENV_KEEPALIVE_INTERVAL)? {
+            env.vars.push(ENV_KEEPALIVE_INTERVAL);
+            env.keepalive_interval = Some(parse_number(
+                ENV_KEEPALIVE_INTERVAL,
+                &value,
+                "a number of seconds",
+            )?);
         }
-        if let Some((key, value)) = read_any(&lookup, &[ENV_RETRY_INTERVAL, LEGACY_RETRY_INTERVAL])?
-        {
-            env.vars.push(key);
-            env.retry_interval = Some(parse_number(key, &value, "a number of seconds")?);
+        if let Some(value) = read(&lookup, ENV_RETRY_INTERVAL)? {
+            env.vars.push(ENV_RETRY_INTERVAL);
+            env.retry_interval = Some(parse_number(
+                ENV_RETRY_INTERVAL,
+                &value,
+                "a number of seconds",
+            )?);
         }
-        if let Some((key, value)) = read_any(&lookup, &[ENV_PROXIES, LEGACY_PROXIES])? {
-            env.vars.push(key);
-            env.proxies = Some(parse_proxies(key, &value)?);
-        }
-
-        // The legacy heartbeat timeout is accepted but no longer has its own
-        // field: the v4 session uses the WebSocket keepalive only.
-        if let Some((key, _)) = read_any(&lookup, &[LEGACY_HEARTBEAT_TIMEOUT])? {
-            env.vars.push(key);
+        if let Some(value) = read(&lookup, ENV_PROXIES)? {
+            env.vars.push(ENV_PROXIES);
+            env.proxies = Some(parse_proxies(ENV_PROXIES, &value)?);
         }
 
         Ok(env)
@@ -221,17 +188,12 @@ impl EnvConfig {
     }
 }
 
-/// Read the first non-blank variable among the canonical and legacy names.
-fn read_any<F>(lookup: &F, keys: &[&'static str]) -> Result<Option<(&'static str, String)>>
+/// Read a non-blank variable.
+fn read<F>(lookup: &F, key: &str) -> Result<Option<String>>
 where
     F: Fn(&str) -> Result<Option<String>>,
 {
-    for key in keys {
-        if let Some(value) = lookup(key)?.filter(|value| !value.trim().is_empty()) {
-            return Ok(Some((key, value)));
-        }
-    }
-    Ok(None)
+    lookup(key).map(|value| value.filter(|value| !value.trim().is_empty()))
 }
 
 /// Parse a numeric variable, naming it in the error.
@@ -269,8 +231,8 @@ fn parse_proxies(key: &str, raw: &str) -> Result<Vec<ServerProxyEntry>> {
 
 /// Load `ht.toml` and overlay the `HT_*` environment variables.
 ///
-/// A missing file without any `HT_*` keeps the historical bootstrap: the
-/// commented example is written and an error asks the user to edit it. A
+/// A missing file without any `HT_*` uses the first-run bootstrap: the commented
+/// example is written and an error asks the user to edit it. A
 /// missing file with `HT_*` starts from the defaults instead, so a container
 /// needs no mounted configuration. An environment-only configuration never
 /// writes `ht.toml`.
@@ -403,44 +365,6 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_names_are_a_fallback() -> Result<()> {
-        let parsed = env(&[
-            (LEGACY_SERVER, "ws://127.0.0.1:9100"),
-            (LEGACY_NAME, "old"),
-            (LEGACY_TOKEN, "secret"),
-            (
-                LEGACY_PROXIES,
-                r#"[{name="nas",domain="nas.test",local_addr="127.0.0.1:80"}]"#,
-            ),
-        ])?;
-        let mut config = Config::default();
-        parsed.apply(&mut config);
-        Config::validate(&mut config)?;
-        assert_eq!(config.name, "old");
-        assert_eq!(
-            config.upstream.as_ref().unwrap().server,
-            "ws://127.0.0.1:9100"
-        );
-        assert_eq!(config.proxies.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn test_canonical_names_win_over_legacy() -> Result<()> {
-        let parsed = env(&[
-            (LEGACY_NAME, "old"),
-            (ENV_NAME, "new"),
-            (LEGACY_TOKEN, "old-secret"),
-            (ENV_TOKEN, "new-secret"),
-        ])?;
-        let mut config = Config::default();
-        parsed.apply(&mut config);
-        assert_eq!(config.name, "new");
-        assert_eq!(&**config.token.as_ref().unwrap(), "new-secret");
-        Ok(())
-    }
-
-    #[test]
     fn test_blank_values_are_ignored() -> Result<()> {
         let parsed = env(&[(ENV_NAME, "  "), (ENV_TOKEN, ""), (ENV_PROXIES, "\n")])?;
         assert!(parsed.is_empty());
@@ -467,19 +391,6 @@ mod tests {
             .unwrap_err()
         );
         assert!(err.contains(ENV_PROXIES), "{}", err);
-    }
-
-    #[test]
-    fn test_removed_web_variables_are_rejected() -> Result<()> {
-        for &key in REMOVED_WEB_VARS {
-            let err = format!("{:#}", env(&[(key, "1")]).unwrap_err());
-            assert!(err.contains(key), "{}", err);
-            assert!(err.contains("server_port"), "{}", err);
-        }
-        // A blank value is ignored like every other variable.
-        let parsed = env(&[("HT_WEB_PORT", "  ")])?;
-        assert!(parsed.is_empty());
-        Ok(())
     }
 
     #[test]

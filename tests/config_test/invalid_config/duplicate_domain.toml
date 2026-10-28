@@ -2,12 +2,12 @@ name = "home"
 token = "secret"
 server_host = "control.example.com"
 
-[[tunnels]]
+[[proxies]]
 name = "nas"
 domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
 
-[[tunnels]]
+[[proxies]]
 name = "nas2"
 domain = "NAS.example.com"
 local_addr = "127.0.0.1:81"

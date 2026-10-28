@@ -46,27 +46,19 @@ pub async fn run_http_tunnel_server_with_limits(
 ) -> Result<()> {
     let mut config = ingress_config(server_port, server_host, token);
     config.max_pending_handshakes = limits.max_pending_handshakes;
-    config.max_control_connections = limits.max_control_connections;
+    config.max_sessions = limits.max_sessions;
     config.keepalive_interval = limits.keepalive_interval;
     http_tunnel::run(config, shutdown_rx).await
 }
 
 /// Run a universal process from its configuration file. The file carries the
 /// listener identity and local `[[proxies]]`, plus an optional `[upstream]`.
-pub async fn run_http_tunnel_client(
+pub async fn run_http_tunnel_from_config(
     config_path: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let config = http_tunnel::load_config(&PathBuf::from(config_path)).await?;
     http_tunnel::run(config, shutdown_rx).await
-}
-
-/// Kept as an alias while the tests describe a relay as a "node".
-pub async fn run_http_tunnel_node(
-    config_path: &str,
-    shutdown_rx: broadcast::Receiver<bool>,
-) -> Result<()> {
-    run_http_tunnel_client(config_path, shutdown_rx).await
 }
 
 pub mod tcp {

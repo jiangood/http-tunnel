@@ -142,8 +142,8 @@ async fn keepalive_tick(interval: &mut Option<time::Interval>) {
 ///
 /// Binary messages are concatenated into a byte stream in one direction; bytes
 /// read from the stream are emitted as binary messages in the other direction.
-/// Protocol pings keep an idle pooled data channel from being silently closed by
-/// a reverse proxy, and a peer that stops answering is detected within
+/// Protocol pings keep an idle session from being silently closed by a reverse
+/// proxy, and a peer that stops answering is detected within
 /// `keepalive_interval * 3`.
 pub(crate) async fn bridge_websocket_to_io<S, T>(
     ws: WebSocketStream<S>,
@@ -276,17 +276,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<S> {
 
 /// Accept a tunnel WebSocket on the HTTP listener and expose it as a byte stream.
 ///
-/// The stream is handed to the same protocol handler as any other connection.
 /// The returned `Conn` carries a liveness flag, which the bridge clears when the
-/// socket dies, so a pooled data channel is never handed to a visitor after it
-/// was silently dropped.
+/// socket dies, so a visitor is never handed a session that was silently
+/// dropped.
 pub(crate) async fn accept(
     prefix: Vec<u8>,
     stream: TcpStream,
     keepalive_interval: u64,
 ) -> Result<Conn> {
-    // This socket carries the whole tunnel for the rest of its life, so it has
-    // the same latency requirements as a control channel.
+    // This socket carries the whole session for the rest of its life, so it has
+    // the same latency requirements as the visitor path.
     if let Err(e) = stream.set_nodelay(true) {
         tracing::error!("Failed to set nodelay: {:#}", e);
     }
@@ -332,7 +331,7 @@ mod tests {
         });
 
         let (mut client, _) = client_async_with_config(
-            "ws://localhost/_http-tunnel/v1/connect",
+            "ws://localhost/_http-tunnel/v4/connect",
             client_io,
             Some(websocket_config()),
         )
@@ -361,7 +360,7 @@ mod tests {
         });
 
         let (mut client, _) = client_async_with_config(
-            "ws://localhost/_http-tunnel/v1/connect",
+            "ws://localhost/_http-tunnel/v4/connect",
             client_io,
             Some(websocket_config()),
         )
@@ -398,7 +397,7 @@ mod tests {
 
         // The client never reads, so it never answers the server's pings.
         let (_client, _) = client_async_with_config(
-            "ws://localhost/_http-tunnel/v1/connect",
+            "ws://localhost/_http-tunnel/v4/connect",
             client_io,
             Some(websocket_config()),
         )
@@ -431,7 +430,7 @@ mod tests {
             ..WebSocketConfig::default()
         };
         let (mut client, _) = client_async_with_config(
-            "ws://localhost/_http-tunnel/v1/connect",
+            "ws://localhost/_http-tunnel/v4/connect",
             client_io,
             Some(client_config),
         )

@@ -39,8 +39,8 @@ half-close, a reset reason, and a per-direction credit window.
 
 ## The process
 
-`ht` reads `ht.toml`, then overlays `HT_*` environment variables (`HTC_*` is
-accepted as a legacy fallback). Configuration validation normalizes domains,
+`ht` reads `ht.toml`, then overlays `HT_*` environment variables. Configuration
+validation normalizes domains,
 requires strong tokens, rejects duplicate routes, and rejects an upstream that
 points at the process itself.
 
@@ -99,6 +99,6 @@ the current route set on the new session.
 
 ## Protocol v4
 
-The frames, route advertisement, stream flow control, identity and the remaining
-work are described in [protocol-v4.md](./protocol-v4.md). v3 is not supported;
-every hop must run a v4-compatible `ht`.
+The frames, route advertisement, stream flow control and identity are described
+in [protocol-v4.md](./protocol-v4.md). v4 is the only protocol; every hop must
+run a v4-compatible `ht`.

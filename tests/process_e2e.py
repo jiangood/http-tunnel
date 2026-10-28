@@ -336,7 +336,7 @@ mirror = true
 
         # The proxies of the environment are read-only through the API
         api_req = urllib.request.Request(
-            f"http://127.0.0.1:{env_leaf_port}/api/tunnels/extra",
+            f"http://127.0.0.1:{env_leaf_port}/api/proxies/extra",
             method="PUT",
             data=b'{"domain":"extra.e2e.test","local_addr":"127.0.0.1:1"}',
             headers={

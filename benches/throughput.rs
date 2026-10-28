@@ -4,7 +4,7 @@
 //! are plain Rust: no external benchmarking crate is used, so the repository
 //! has no extra dev-dependency.
 //!
-//! Every scenario starts a full server + client + echo backend, warms the tunnel
+//! Every scenario starts a full ingress + relay + echo backend, warms the tunnel
 //! up, then measures. The numbers are wall-clock and are meant to be compared
 //! between revisions, not to be an absolute reference.
 
@@ -16,8 +16,7 @@ use common::{keep_alive_batch, run, short_connection_request, Harness, HTTP_ENTR
 
 /// Scenario 1 (G3): many small requests on keep-alive connections, then many
 /// short-lived connections. The first shows the request throughput, the second
-/// the per-connection setup cost, which is where the connection pool and the
-/// channel handshake show up.
+/// the per-connection setup cost, which is where stream setup shows up.
 pub fn small_requests() -> Duration {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {

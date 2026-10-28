@@ -13,8 +13,7 @@ visitor
   -> local service
 ```
 
-There is no mode flag and no separate binary. The role is selected only by the
-presence of `[upstream]`:
+The role is selected only by the presence of `[upstream]`:
 
 - **standalone ingress**: no `[upstream]`; listens for visitors and downstream
   peers.
@@ -46,7 +45,7 @@ mirror = true
 | --- | --- |
 | `server_port` | The one listener port for visitors, downstream peers, and the WebSocket endpoint. `0` picks an ephemeral port and requires `[upstream]`. |
 | `bind_host` | IP the listener binds. Defaults to `0.0.0.0`; with `[upstream]` it must be `0.0.0.0` or a loopback address, because visitors arrive from the upstream session on `127.0.0.1:<actual port>`. |
-| `server_host` | Exact Host reserved for the WebSocket control endpoint. Required without `[upstream]`; defaults to `127.0.0.1` with it. |
+| `server_host` | Exact Host reserved for the v4 session endpoint. Required without `[upstream]`; defaults to `127.0.0.1` with it. |
 | `token` | Token for downstream peers. May be omitted with `[upstream]`, in which case the upstream token is reused. |
 | `[[proxies]]` | Local services served by this process. They take precedence over downstream session routes. |
 | `[upstream]` | The next hop. Remove it to run as a standalone ingress. |
@@ -77,9 +76,8 @@ connects to `127.0.0.1:<actual server_port>`. The embedded listener reads the
 The `Host` header and the bytes are not rewritten, so WebSocket upgrades and any
 other protocol upgrade traverse the whole chain.
 
-Each hop uses one v4 session for every domain and every visitor stream. There is
-no per-domain control channel, no connection warm-up pool, and no separate
-application-layer heartbeat; WebSocket ping/pong provides keepalive.
+Each hop uses one v4 session for every domain and every visitor stream.
+WebSocket ping/pong provides keepalive.
 
 ## Validation and safety
 

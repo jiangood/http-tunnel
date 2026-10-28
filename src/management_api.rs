@@ -1,7 +1,7 @@
 //! Management API and minimal server-rendered web UI of the universal process.
 
-use crate::client::ManagementState;
 use crate::config::ServerProxyEntry;
+use crate::management::ManagementState;
 use anyhow::{Context, Result};
 use axum::extract::{Form, Path, State};
 use axum::http::header::AUTHORIZATION;
@@ -57,16 +57,16 @@ fn build_router(token: String, management: Arc<ManagementState>) -> Router {
 
     let api = Router::new()
         .route("/status", get(status))
-        .route("/tunnels", get(list_proxies))
-        .route("/tunnels/:name", put(put_proxy).delete(delete_proxy))
+        .route("/proxies", get(list_proxies))
+        .route("/proxies/:name", put(put_proxy).delete(delete_proxy))
         .route_layer(middleware::from_fn_with_state(token.clone(), api_auth));
 
     // The browser-native HTTP Basic login avoids shipping JavaScript or CSS.
     // Use username "ht" and the process token as the password.
     let web = Router::new()
         .route("/", get(web_index))
-        .route("/web/tunnels", post(web_put_proxy))
-        .route("/web/tunnels/:name/delete", post(web_delete_proxy))
+        .route("/web/proxies", post(web_put_proxy))
+        .route("/web/proxies/:name/delete", post(web_delete_proxy))
         .route_layer(middleware::from_fn_with_state(token, web_auth));
 
     Router::new().nest("/api", api).merge(web).with_state(state)
@@ -160,8 +160,6 @@ struct StatusView {
     remote: String,
     connected: bool,
     proxies: usize,
-    /// Kept for clients of the old client API
-    tunnels: usize,
 }
 
 #[derive(Deserialize)]
@@ -214,7 +212,6 @@ async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusView> {
         remote: state.management.server_addr().to_string(),
         connected: state.management.connected(),
         proxies,
-        tunnels: proxies,
     })
 }
 
@@ -286,7 +283,7 @@ async fn web_index(State(state): State<Arc<ApiState>>) -> Html<String> {
     if read_only {
         html.push_str("<p>本地服务由环境变量 <code>HT_PROXIES</code> 管理，网页与 API 不可修改；如需变更，请修改该环境变量并重启 ht。</p>");
     } else {
-        html.push_str("<form method=\"post\" action=\"/web/tunnels\"><p>名称：<input name=\"name\" required pattern=\"[A-Za-z0-9._-]+\"></p><p>域名：<input name=\"domain\" required></p><p>本地地址：<input name=\"local_addr\" required placeholder=\"127.0.0.1:8080 或 unix:///path.sock\"></p><button type=\"submit\">保存</button></form>");
+        html.push_str("<form method=\"post\" action=\"/web/proxies\"><p>名称：<input name=\"name\" required pattern=\"[A-Za-z0-9._-]+\"></p><p>域名：<input name=\"domain\" required></p><p>本地地址：<input name=\"local_addr\" required placeholder=\"127.0.0.1:8080 或 unix:///path.sock\"></p><button type=\"submit\">保存</button></form>");
     }
     html.push_str("<h2>本地服务列表</h2><table border=\"1\" cellpadding=\"6\"><tr><th>名称</th><th>域名</th><th>本地地址</th>");
     if !read_only {
@@ -298,7 +295,7 @@ async fn web_index(State(state): State<Arc<ApiState>>) -> Html<String> {
             String::new()
         } else {
             format!(
-                "<td><form method=\"post\" action=\"/web/tunnels/{}/delete\"><button type=\"submit\">删除</button></form></td>",
+                "<td><form method=\"post\" action=\"/web/proxies/{}/delete\"><button type=\"submit\">删除</button></form></td>",
                 escape_html(&proxy.name)
             )
         };
@@ -311,9 +308,9 @@ async fn web_index(State(state): State<Arc<ApiState>>) -> Html<String> {
         ));
     }
     if read_only {
-        html.push_str("</table><p>本地服务来自 HT_PROXIES，修改该环境变量并重启 ht 后才会生效。</p><p>管理 API 仍可通过 /api/status、/api/tunnels 使用。</p></body></html>");
+        html.push_str("</table><p>本地服务来自 HT_PROXIES，修改该环境变量并重启 ht 后才会生效。</p><p>管理 API 仍可通过 /api/status、/api/proxies 使用。</p></body></html>");
     } else {
-        html.push_str("</table><p>更新本地服务时填写相同名称即可。修改会立即生效并写入 ht.toml。</p><p>管理 API 仍可通过 /api/status、/api/tunnels 使用。</p></body></html>");
+        html.push_str("</table><p>更新本地服务时填写相同名称即可。修改会立即生效并写入 ht.toml。</p><p>管理 API 仍可通过 /api/status、/api/proxies 使用。</p></body></html>");
     }
     Html(html)
 }

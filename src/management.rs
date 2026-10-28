@@ -1,13 +1,12 @@
 //! Management state shared by the universal process and its web API.
 //!
-//! The process no longer has a separate "client mode": the API manages the
-//! local `[[proxies]]` of the same configuration that also drives the embedded
-//! listener. A change is persisted to `ht.toml`, validated, applied to the
-//! running server's proxy list, and published on the route watch so an upstream
-//! session mirrors it immediately.
+//! The API manages the local `[[proxies]]` of the same configuration that also
+//! drives the embedded listener. A change is persisted to `ht.toml`, validated,
+//! applied to the running server's proxy list, and published on the route watch
+//! so an upstream session mirrors it immediately.
 
-use crate::client_env::EnvConfig;
 use crate::config::{Config, ConfigSource, ServerProxyEntry};
+use crate::config_env::EnvConfig;
 use crate::server::ServerState;
 use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;
@@ -236,7 +235,7 @@ local_addr = "127.0.0.1:80"
         )?;
         let env = EnvConfig::from_lookup(|key| {
             Ok(match key {
-                crate::client_env::ENV_TOKEN => Some("env-token".to_string()),
+                crate::config_env::ENV_TOKEN => Some("env-token".to_string()),
                 _ => None,
             })
         })?;
@@ -276,7 +275,7 @@ local_addr = "127.0.0.1:80"
         ));
         let env = EnvConfig::from_lookup(|key| {
             Ok(match key {
-                crate::client_env::ENV_PROXIES => Some(
+                crate::config_env::ENV_PROXIES => Some(
                     r#"[{name="nas",domain="nas.example.com",local_addr="127.0.0.1:80"}]"#
                         .to_string(),
                 ),

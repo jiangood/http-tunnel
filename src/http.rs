@@ -92,7 +92,7 @@ async fn handle_visitor(
     management: Option<crate::server::Management>,
 ) -> Result<()> {
     // Builds without the administration API still carry the parameter.
-    #[cfg(not(feature = "client-api"))]
+    #[cfg(not(feature = "management"))]
     let _ = management;
 
     // Count the visitor as active from the moment it's accepted, so that a
@@ -146,9 +146,9 @@ async fn handle_visitor(
         }
 
         // Every other path on the reserved Host is the management interface.
-        #[cfg(feature = "client-api")]
+        #[cfg(feature = "management")]
         if let Some(management) = management {
-            if let Err(e) = crate::client_api::serve_connection(
+            if let Err(e) = crate::management_api::serve_connection(
                 prefetched,
                 stream,
                 management,
@@ -161,7 +161,7 @@ async fn handle_visitor(
             return Ok(());
         }
 
-        respond(&mut stream, "404 Not Found", "Unknown control endpoint\n").await;
+        respond(&mut stream, "404 Not Found", "Unknown session endpoint\n").await;
         return Ok(());
     }
 
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn test_parse_bearer_token() {
-        let head = b"GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\nAuthorization: Bearer secret-token\r\n\r\n";
+        let head = b"GET /_http-tunnel/v4/connect HTTP/1.1\r\nHost: control.test\r\nAuthorization: Bearer secret-token\r\n\r\n";
         assert_eq!(parse_bearer_token(head), Some(&b"secret-token"[..]));
 
         // The scheme is case-insensitive
@@ -599,19 +599,19 @@ mod tests {
     fn test_parse_request_path() {
         assert_eq!(
             parse_request_path(
-                b"GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\n\r\n"
+                b"GET /_http-tunnel/v4/connect HTTP/1.1\r\nHost: control.test\r\n\r\n"
             ),
-            Some("/_http-tunnel/v1/connect".to_string())
+            Some("/_http-tunnel/v4/connect".to_string())
         );
         assert_eq!(
             parse_request_path(
-                b"GET /_http-tunnel/v1/connect?x=1 HTTP/1.1\r\nHost: control.test\r\n\r\n"
+                b"GET /_http-tunnel/v4/connect?x=1 HTTP/1.1\r\nHost: control.test\r\n\r\n"
             ),
-            Some("/_http-tunnel/v1/connect".to_string())
+            Some("/_http-tunnel/v4/connect".to_string())
         );
         assert_eq!(
             parse_request_path(
-                b"POST /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\n\r\n"
+                b"POST /_http-tunnel/v4/connect HTTP/1.1\r\nHost: control.test\r\n\r\n"
             ),
             None
         );
@@ -620,10 +620,10 @@ mod tests {
     #[test]
     fn test_is_websocket_upgrade() {
         assert!(is_websocket_upgrade(
-            b"GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\r\n"
+            b"GET /_http-tunnel/v4/connect HTTP/1.1\r\nHost: control.test\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\r\n"
         ));
         assert!(!is_websocket_upgrade(
-            b"GET /_http-tunnel/v1/connect HTTP/1.1\r\nHost: control.test\r\nConnection: keep-alive\r\n\r\n"
+            b"GET /_http-tunnel/v4/connect HTTP/1.1\r\nHost: control.test\r\nConnection: keep-alive\r\n\r\n"
         ));
     }
 

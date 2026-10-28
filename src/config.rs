@@ -6,9 +6,6 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-/// Application-layer heartbeat timeout in secs
-const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 40;
-
 /// The interval between retries to connect to the upstream
 const DEFAULT_RETRY_INTERVAL_SECS: u64 = 1;
 
@@ -22,7 +19,7 @@ pub const DEFAULT_SERVER_PORT: u16 = 7777;
 /// The default number of unauthenticated WebSocket upgrades a server runs at once.
 pub const DEFAULT_MAX_PENDING_HANDSHAKES: usize = 256;
 /// The default number of v4 sessions a server accepts at once.
-pub const DEFAULT_MAX_CONTROL_CONNECTIONS: usize = 256;
+pub const DEFAULT_MAX_SESSIONS: usize = 256;
 /// The default cap on the routes the process advertises to its next hop.
 pub const DEFAULT_MAX_MIRRORED_ROUTES: usize = 256;
 
@@ -137,7 +134,7 @@ pub(crate) struct ConfigSource {
     /// The file baseline without the environment overlay
     pub(crate) persisted: Option<Box<Config>>,
     /// The environment settings that win over the file
-    pub(crate) env: crate::client_env::EnvConfig,
+    pub(crate) env: crate::config_env::EnvConfig,
     /// Whether the process started without a configuration file
     pub(crate) env_only: bool,
 }
@@ -161,7 +158,7 @@ pub struct Config {
     /// The IP address the HTTP entrypoint binds. Defaults to `0.0.0.0`.
     #[serde(default = "default_bind_host")]
     pub bind_host: String,
-    /// The exact Host reserved for WebSocket control/data connections. It is
+    /// The exact Host reserved for v4 sessions. It is
     /// required without `[upstream]`, and defaults to `127.0.0.1` with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_host: Option<String>,
@@ -169,17 +166,12 @@ pub struct Config {
     /// upstream token is used for the listener too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<MaskedString>,
-    /// Local services served by this process. `[[tunnels]]` is accepted as an
-    /// alias for configurations written for older clients.
-    #[serde(default, alias = "tunnels", skip_serializing_if = "Vec::is_empty")]
+    /// Local services served by this process.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxies: Vec<ServerProxyEntry>,
     /// The next hop. Remove this table to run as a standalone ingress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<UpstreamConfig>,
-    /// Application-layer heartbeat timeout of the upstream session, in secs.
-    /// `0` disables the test.
-    #[serde(default = "default_heartbeat_timeout")]
-    pub heartbeat_timeout: u64,
     /// The interval between retries to reach the upstream, in secs.
     #[serde(default = "default_retry_interval")]
     pub retry_interval: u64,
@@ -192,15 +184,11 @@ pub struct Config {
     #[serde(default = "default_max_pending_handshakes")]
     pub max_pending_handshakes: usize,
     /// The number of v4 sessions accepted at once.
-    #[serde(default = "default_max_control_connections")]
-    pub max_control_connections: usize,
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
     /// WebSocket ping interval in secs. `0` disables keepalive pings.
     #[serde(default = "default_keepalive_interval")]
     pub keepalive_interval: u64,
-    /// Deprecated: WebSocket sockets always use TCP_NODELAY. Accepted so that
-    /// configurations written for the TCP transport stay loadable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nodelay: Option<bool>,
     /// Load metadata, never written to TOML.
     #[serde(skip)]
     pub(crate) source: ConfigSource,
@@ -216,13 +204,11 @@ impl Default for Config {
             token: None,
             proxies: Vec::new(),
             upstream: None,
-            heartbeat_timeout: default_heartbeat_timeout(),
             retry_interval: default_retry_interval(),
             max_mirrored_routes: default_max_mirrored_routes(),
             max_pending_handshakes: default_max_pending_handshakes(),
-            max_control_connections: default_max_control_connections(),
+            max_sessions: default_max_sessions(),
             keepalive_interval: default_keepalive_interval(),
-            nodelay: None,
             source: ConfigSource::default(),
         }
     }
@@ -250,7 +236,7 @@ impl Config {
     pub fn server_limits(&self) -> ServerLimits {
         ServerLimits {
             max_pending_handshakes: self.max_pending_handshakes,
-            max_control_connections: self.max_control_connections,
+            max_sessions: self.max_sessions,
             keepalive_interval: self.keepalive_interval,
         }
     }
@@ -301,39 +287,7 @@ impl Config {
 
     /// Parse a configuration and normalize it.
     pub fn parse(s: &str) -> Result<Config> {
-        let mut config: Config = toml::from_str(s)
-            .map_err(|e| {
-                if has_setting_at_top_level(s, "remote") {
-                    anyhow!(
-                        "{}\nNote: `remote` is no longer supported. Set `[upstream].server = \
-                         \"wss://host:port\"` instead.",
-                        e
-                    )
-                } else if has_setting_at_top_level(s, "server") {
-                    anyhow!(
-                        "{}\nNote: the next hop belongs in the `[upstream]` table. Move \
-                         `server = ...` there.",
-                        e
-                    )
-                } else if has_setting(s, "http_port") || has_setting(s, "control_host") {
-                    anyhow!(
-                        "{}\nNote: `http_port` and `control_host` were renamed to \
-                         `server_port` and `server_host`.",
-                        e
-                    )
-                } else if has_setting_at_top_level(s, "web_port")
-                    || has_setting_at_top_level(s, "web_host")
-                {
-                    anyhow!(
-                        "{}\nNote: `web_port` and `web_host` were removed. The management page \
-                         and the API share `server_port` on the reserved `server_host`.",
-                        e
-                    )
-                } else {
-                    anyhow!("{}", e)
-                }
-            })
-            .with_context(|| "Failed to parse the config")?;
+        let mut config: Config = toml::from_str(s).with_context(|| "Failed to parse the config")?;
 
         Config::validate(&mut config)?;
 
@@ -417,7 +371,7 @@ impl Config {
             None if has_upstream => crate::helper::SERVER_HOST_FALLBACK.to_string(),
             None => bail!(
                 "`server_host` is required without `[upstream]`: it is the reserved Host of \
-                 the WebSocket control endpoint"
+                 the v4 session endpoint"
             ),
         };
         let normalized = crate::helper::normalize_domain(&server_host)
@@ -502,7 +456,7 @@ impl Config {
         match (upstream.claim.as_ref(), upstream.mirror) {
             (Some(_), Some(true)) => bail!(
                 "Set either `[upstream].claim` (one exact or wildcard domain) or \
-                 `mirror = true` (one control channel per route), not both"
+                 `mirror = true` (one session for every route), not both"
             ),
             (None, Some(false)) => bail!(
                 "Set `[upstream].claim` for one exact or wildcard domain, or `mirror = true` \
@@ -589,9 +543,6 @@ fn default_server_port() -> u16 {
 fn default_bind_host() -> String {
     crate::helper::DEFAULT_BIND_HOST.to_string()
 }
-fn default_heartbeat_timeout() -> u64 {
-    DEFAULT_HEARTBEAT_TIMEOUT_SECS
-}
 fn default_retry_interval() -> u64 {
     DEFAULT_RETRY_INTERVAL_SECS
 }
@@ -601,8 +552,8 @@ fn default_max_mirrored_routes() -> usize {
 fn default_max_pending_handshakes() -> usize {
     DEFAULT_MAX_PENDING_HANDSHAKES
 }
-fn default_max_control_connections() -> usize {
-    DEFAULT_MAX_CONTROL_CONNECTIONS
+fn default_max_sessions() -> usize {
+    DEFAULT_MAX_SESSIONS
 }
 fn default_keepalive_interval() -> u64 {
     DEFAULT_KEEPALIVE_INTERVAL_SECS
@@ -620,26 +571,6 @@ pub(crate) fn format_server_addr(host: &str, port: u16) -> String {
     } else {
         format!("{}:{}", host, port)
     }
-}
-
-/// Whether the TOML source declares a setting with the given key.
-fn has_setting(s: &str, key: &str) -> bool {
-    s.lines().any(|line| {
-        line.trim_start()
-            .strip_prefix(key)
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
-    })
-}
-
-/// Whether the TOML source declares a setting before the first table.
-fn has_setting_at_top_level(s: &str, key: &str) -> bool {
-    s.lines()
-        .map(str::trim_start)
-        .take_while(|line| !line.starts_with('['))
-        .any(|line| {
-            line.strip_prefix(key)
-                .is_some_and(|rest| rest.trim_start().starts_with('='))
-        })
 }
 
 /// Validate the `server` endpoint and store it in a canonical form.
@@ -663,7 +594,7 @@ fn split_server_url(server: &str) -> Option<(&str, &str)> {
 /// Parse a `ws://` or `wss://` endpoint into its scheme, host and port.
 ///
 /// The port is optional and defaults to 443 for `wss` and 80 for `ws`. The
-/// path, query and fragment are rejected because the control path is fixed by
+/// path, query and fragment are rejected because the session path is fixed by
 /// the protocol.
 fn parse_server_url(raw: &str) -> Result<(String, String, u16)> {
     let raw = raw.trim();
@@ -686,7 +617,7 @@ fn parse_server_url(raw: &str) -> Result<(String, String, u16)> {
     if rest.is_empty() {
         bail!("The `[upstream].server` host is missing");
     }
-    // A trailing slash is the root path and is harmless; the control path is
+    // A trailing slash is the root path and is harmless; the session path is
     // appended by the protocol itself.
     let rest = rest.strip_suffix('/').unwrap_or(rest);
     if rest.contains('/') || rest.contains('\\') || rest.contains('?') || rest.contains('#') {
@@ -849,7 +780,7 @@ fn normalize_bind_host(host: &mut String, field: &str) -> Result<std::net::IpAdd
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerLimits {
     pub max_pending_handshakes: usize,
-    pub max_control_connections: usize,
+    pub max_sessions: usize,
     pub keepalive_interval: u64,
 }
 
@@ -857,7 +788,7 @@ impl Default for ServerLimits {
     fn default() -> Self {
         ServerLimits {
             max_pending_handshakes: DEFAULT_MAX_PENDING_HANDSHAKES,
-            max_control_connections: DEFAULT_MAX_CONTROL_CONNECTIONS,
+            max_sessions: DEFAULT_MAX_SESSIONS,
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL_SECS,
         }
     }
@@ -865,7 +796,7 @@ impl Default for ServerLimits {
 
 impl ServerLimits {
     pub fn validate(&self) -> Result<()> {
-        if self.max_pending_handshakes == 0 || self.max_control_connections == 0 {
+        if self.max_pending_handshakes == 0 || self.max_sessions == 0 {
             bail!("The connection limits must be greater than 0");
         }
         Ok(())
@@ -1053,32 +984,6 @@ local_addr = "127.0.0.1:81"
     }
 
     #[test]
-    fn test_tunnels_is_an_alias_for_proxies() -> Result<()> {
-        let cfg = router(
-            "server_host = \"control.test\"\ntoken = \"secret\"\n\n[[tunnels]]\n\
-             name = \"nas\"\ndomain = \"nas.example.com\"\n\
-             local_addr = \"127.0.0.1:80\"\n",
-        );
-        assert_eq!(cfg.proxies.len(), 1);
-        assert_eq!(cfg.proxies[0].name, "nas");
-        Ok(())
-    }
-
-    #[test]
-    fn test_rejects_the_legacy_tunnels_table() {
-        // The old `[tunnels]` table (domain -> local_addr) is no longer accepted
-        let s = r#"
-server_host = "control.test"
-name = "home"
-token = "secret"
-
-[tunnels]
-"nas.example.com" = "127.0.0.1:80"
-"#;
-        assert!(Config::parse(s).is_err());
-    }
-
-    #[test]
     fn test_set_and_remove_proxy() -> Result<()> {
         let mut cfg = router("server_host = \"control.test\"\ntoken = \"secret\"\n");
 
@@ -1145,7 +1050,6 @@ token = "secret"
         assert_eq!(cfg.name, "ht");
         assert_eq!(cfg.server_port, DEFAULT_SERVER_PORT);
         assert_eq!(cfg.bind_host, "0.0.0.0");
-        assert_eq!(cfg.heartbeat_timeout, DEFAULT_HEARTBEAT_TIMEOUT_SECS);
         assert_eq!(cfg.retry_interval, DEFAULT_RETRY_INTERVAL_SECS);
         assert!(cfg.proxies.is_empty());
         Ok(())
@@ -1285,30 +1189,6 @@ local_addr = "127.0.0.1:80"
     }
 
     #[test]
-    fn test_parse_rejects_legacy_settings_with_a_hint() {
-        let legacy = r#"
-server = "wss://control.example.com:443"
-name = "home"
-token = "123"
-"#;
-        let err = format!("{:#}", Config::parse(legacy).unwrap_err());
-        assert!(err.contains("[upstream]"), "{}", err);
-
-        let legacy = "http_port = 8080\ncontrol_host = \"control.test\"\ntoken = \"secret\"\n";
-        let err = format!("{:#}", Config::parse(legacy).unwrap_err());
-        assert!(err.contains("renamed to"), "{}", err);
-
-        let removed = "server_host = \"control.test\"\ntoken = \"secret\"\nweb_port = 8610\n";
-        let err = format!("{:#}", Config::parse(removed).unwrap_err());
-        assert!(err.contains("share `server_port`"), "{}", err);
-
-        let removed =
-            "server_host = \"control.test\"\ntoken = \"secret\"\nweb_host = \"0.0.0.0\"\n";
-        let err = format!("{:#}", Config::parse(removed).unwrap_err());
-        assert!(err.contains("share `server_port`"), "{}", err);
-    }
-
-    #[test]
     fn test_config_roundtrip() -> Result<()> {
         let s = r#"
 name = "edge"
@@ -1364,7 +1244,6 @@ local_addr = "127.0.0.1:80"
 "#;
         let cfg = router(s);
         let dumped = cfg.to_toml()?;
-        assert!(!dumped.contains("nodelay"));
         assert!(!dumped.contains("upstream"));
         let reparsed = Config::parse(&dumped)?;
         assert_eq!(cfg, reparsed);
@@ -1471,7 +1350,7 @@ local_addr = "127.0.0.1:80"
         assert!(ServerLimits::default().validate().is_ok());
 
         let limits = ServerLimits {
-            max_control_connections: 0,
+            max_sessions: 0,
             ..ServerLimits::default()
         };
         assert!(limits.validate().is_err());

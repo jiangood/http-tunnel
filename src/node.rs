@@ -80,13 +80,13 @@ pub(crate) async fn run_router(
 
     // The management page and the API share the reserved `server_host` of the
     // listener, so they need no port of their own.
-    #[cfg(feature = "client-api")]
-    let management = Some(Arc::new(crate::client::ManagementState::new(
+    #[cfg(feature = "management")]
+    let management = Some(Arc::new(crate::management::ManagementState::new(
         config.clone(),
         state.clone(),
         connected.clone(),
     )));
-    #[cfg(not(feature = "client-api"))]
+    #[cfg(not(feature = "management"))]
     let management = None;
 
     // The router owns the shutdown of the embedded server, so that it can

@@ -1,5 +1,5 @@
-mod client_env;
 mod config;
+mod config_env;
 mod constants;
 mod helper;
 #[cfg(any(feature = "server", feature = "client"))]
@@ -26,21 +26,21 @@ mod session_server;
 #[cfg(feature = "client")]
 mod session_client;
 
-// The administration API manages the local proxies of the same universal
-// process. It needs an HTTP server, so it is a feature of its own.
-#[cfg(all(feature = "server", feature = "client-api"))]
-mod client;
+// The management page and API manage the local proxies of the same universal
+// process. They need an HTTP server, so they are a feature of their own.
+#[cfg(all(feature = "server", feature = "management"))]
+mod management;
 
-#[cfg(all(feature = "server", feature = "client-api"))]
-mod client_api;
+#[cfg(all(feature = "server", feature = "management"))]
+mod management_api;
 
 // The router is a server and a client in one process: it needs both roles.
 #[cfg(all(feature = "server", feature = "client"))]
 mod node;
 
-/// Load `ht.toml` and overlay the `HT_*` (and legacy `HTC_*`) environment.
+/// Load `ht.toml` and overlay the `HT_*` environment.
 pub async fn load_config(path: &Path) -> Result<Config> {
-    client_env::load(path).await
+    config_env::load(path).await
 }
 
 /// Run the universal process from an already-loaded configuration.

@@ -1,11 +1,9 @@
-server_port = 7777 # The listener port, shared by visitors and control sessions
+server_port = 7777 # The listener port, shared by visitors and v4 sessions
 bind_host = "127.0.0.1" # The address the listener binds
 server_host = "control.example.com" # The reserved Host of the WebSocket endpoint
 name = "edge" # The name of the process
 token = "use_a_secret_that_only_you_know" # The listener token for downstream peers
-heartbeat_timeout = 40 # The upstream heartbeat timeout. Set to 0 to disable the test
 retry_interval = 1 # The interval between retries to connect to the next hop
-nodelay = true # Deprecated; accepted for compatibility
 
 [[proxies]] # Each local service is a table with its own name, domain and local_addr
 name = "nas"

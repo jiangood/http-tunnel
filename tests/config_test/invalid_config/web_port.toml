@@ -1,3 +1,0 @@
-server_host = "control.example.com"
-token = "a-strong-secret"
-web_port = 8610

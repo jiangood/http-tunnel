@@ -17,8 +17,7 @@ server_host = "edge.lan"
 
 Open `http://<server_host>:<server_port>/`. Requests whose `Host` is not
 `server_host` keep following the normal proxy/v4 routing, so a business domain
-never reaches the management router. `HT_WEB_PORT`, `HT_WEB_HOST` and their
-`HTC_*` aliases were removed and are startup errors.
+never reaches the management router.
 
 The browser-native HTTP Basic login uses username `ht` and the listener `token`
 as the password. The page is plain HTML with no CSS or JavaScript.
@@ -30,20 +29,17 @@ The API uses a Bearer token, which is also the listener `token`:
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/api/status` | Name, transport, upstream, connectivity, proxy count |
-| GET | `/api/tunnels` | List local `[[proxies]]` as `name`/`domain`/`local_addr` |
-| PUT | `/api/tunnels/{name}` | Create or replace a local proxy |
-| DELETE | `/api/tunnels/{name}` | Delete a local proxy |
-
-The paths keep the historical name `tunnels`; the configuration and the storage
-section are `[[proxies]]`.
+| GET | `/api/proxies` | List local `[[proxies]]` as `name`/`domain`/`local_addr` |
+| PUT | `/api/proxies/{name}` | Create or replace a local proxy |
+| DELETE | `/api/proxies/{name}` | Delete a local proxy |
 
 ```sh
 curl -H "Host: edge.lan" -H "Authorization: Bearer $TOKEN" \
-  http://127.0.0.1:7777/api/tunnels
+  http://127.0.0.1:7777/api/proxies
 curl -X PUT -H "Host: edge.lan" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"domain":"nas.example.com","local_addr":"127.0.0.1:80"}' \
-  http://127.0.0.1:7777/api/tunnels/nas
+  http://127.0.0.1:7777/api/proxies/nas
 ```
 
 A change is validated locally, written atomically to `ht.toml`, applied to the
@@ -56,7 +52,7 @@ If `HT_PROXIES` is set, the local services come from the environment and are
 read-only at runtime:
 
 - The web form is hidden.
-- `PUT` and `DELETE /api/tunnels/*` return `409 Conflict`.
+- `PUT` and `DELETE /api/proxies/*` return `409 Conflict`.
 - Nothing is written to `ht.toml`.
 
 Scalar environment overrides (`HT_TOKEN`, `HT_SERVER`, ...) also win at runtime

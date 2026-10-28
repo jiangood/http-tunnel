@@ -20,18 +20,18 @@ use tokio::task::JoinHandle;
 pub const HTTP_ENTRY_PORT: u16 = 2334;
 pub const HTTP_ENTRY_ADDR: &str = "127.0.0.1:2334";
 pub const ECHO_SERVER_ADDR: &str = "127.0.0.1:18080";
-pub const CLIENT_NAME: &str = "bench";
-pub const CLIENT_TOKEN: &str = "bench_token";
+pub const LEAF_NAME: &str = "bench";
+pub const LEAF_TOKEN: &str = "bench_token";
 
 const ECHO_HOST: &str = "echo.test";
 const STARTUP: Duration = Duration::from_millis(2500);
 
 /// A running `http-tunnel` setup, kept alive until the harness is dropped.
 pub struct Harness {
-    pub client_shutdown: broadcast::Sender<bool>,
-    pub server_shutdown: broadcast::Sender<bool>,
-    client: JoinHandle<()>,
-    server: JoinHandle<()>,
+    pub leaf_shutdown: broadcast::Sender<bool>,
+    pub ingress_shutdown: broadcast::Sender<bool>,
+    leaf: JoinHandle<()>,
+    ingress: JoinHandle<()>,
     echo: JoinHandle<()>,
     config_guard: TempFile,
     stats: Arc<Stats>,
@@ -54,7 +54,7 @@ impl Drop for TempFile {
 }
 
 impl Harness {
-    /// Start the echo backend, the client and the server, and wait until the
+    /// Start the echo backend, the leaf and the ingress, and wait until the
     /// tunnel is up.
     pub async fn start() -> Result<Harness> {
         let stats = Arc::new(Stats::default());
@@ -74,50 +74,50 @@ impl Harness {
             std::env::temp_dir().join(format!("http-tunnel-bench-{}.toml", std::process::id()));
         let config = format!(
             "server_port = 0\nbind_host = \"127.0.0.1\"\nserver_host = \"127.0.0.1\"\n\
-             name = \"{CLIENT_NAME}\"\ntoken = \"{CLIENT_TOKEN}\"\n\n\
+             name = \"{LEAF_NAME}\"\ntoken = \"{LEAF_TOKEN}\"\n\n\
              [[proxies]]\nname = \"echo\"\ndomain = \"{ECHO_HOST}\"\n\
              local_addr = \"{ECHO_SERVER_ADDR}\"\n\n\
              [upstream]\nserver = \"ws://127.0.0.1:{HTTP_ENTRY_PORT}\"\n\
-             token = \"{CLIENT_TOKEN}\"\nmirror = true\n"
+             token = \"{LEAF_TOKEN}\"\nmirror = true\n"
         );
         std::fs::write(&config_path, config)?;
         let config_guard = TempFile(config_path.clone());
 
-        let (client_shutdown, client_rx) = broadcast::channel(1);
-        let (server_shutdown, server_rx) = broadcast::channel(1);
+        let (leaf_shutdown, leaf_rx) = broadcast::channel(1);
+        let (ingress_shutdown, ingress_rx) = broadcast::channel(1);
 
-        let client_config_path = config_path.clone();
-        let client = tokio::spawn(async move {
-            let config = match http_tunnel::load_config(&client_config_path).await {
+        let leaf_config_path = config_path.clone();
+        let leaf = tokio::spawn(async move {
+            let config = match http_tunnel::load_config(&leaf_config_path).await {
                 Ok(config) => config,
                 Err(e) => {
                     eprintln!("bench leaf config failed: {e:#}");
                     return;
                 }
             };
-            let _ = http_tunnel::run(config, client_rx).await;
+            let _ = http_tunnel::run(config, leaf_rx).await;
         });
         // Let the leaf retry at least once while the ingress comes up
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let server = {
+        let ingress = {
             tokio::spawn(async move {
                 let config = http_tunnel::Config::parse(&format!(
                     "server_port = {HTTP_ENTRY_PORT}\nbind_host = \"127.0.0.1\"\n\
-                     server_host = \"127.0.0.1\"\ntoken = \"{CLIENT_TOKEN}\"\n"
+                     server_host = \"127.0.0.1\"\ntoken = \"{LEAF_TOKEN}\"\n"
                 ))
                 .expect("the benchmark ingress config must be valid");
-                let _ = http_tunnel::run(config, server_rx).await;
+                let _ = http_tunnel::run(config, ingress_rx).await;
             })
         };
 
         tokio::time::sleep(STARTUP).await;
 
         Ok(Harness {
-            client_shutdown,
-            server_shutdown,
-            client,
-            server,
+            leaf_shutdown,
+            ingress_shutdown,
+            leaf,
+            ingress,
             echo,
             config_guard,
             stats,
@@ -128,12 +128,12 @@ impl Harness {
         self.stats.requests.load(Ordering::Relaxed)
     }
 
-    /// Stop the server and the client and wait for them
+    /// Stop the ingress and the leaf and wait for them
     pub async fn shutdown(self) {
-        let _ = self.server_shutdown.send(true);
-        let _ = self.client_shutdown.send(true);
-        let _ = self.server.await;
-        let _ = self.client.await;
+        let _ = self.ingress_shutdown.send(true);
+        let _ = self.leaf_shutdown.send(true);
+        let _ = self.ingress.await;
+        let _ = self.leaf.await;
         self.echo.abort();
         let _ = self.config_guard;
     }

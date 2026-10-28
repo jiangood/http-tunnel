@@ -1,5 +1,5 @@
 use anyhow::{Ok, Result};
-use common::run_http_tunnel_client;
+use common::run_http_tunnel_from_config;
 use rand::Rng;
 use std::time::{Duration, Instant};
 use tokio::{
@@ -21,8 +21,8 @@ const WS_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2336";
 const WS_HTTP_ENTRY_PORT: u16 = 2336;
 const WS_ECHO_SERVER_ADDR: &str = "127.0.0.1:8081";
 const SERVER_HOST: &str = "127.0.0.1";
-const CLIENT_NAME: &str = "home";
-const CLIENT_TOKEN: &str = "a_secret_token";
+const LEAF_NAME: &str = "home";
+const LEAF_TOKEN: &str = "a_secret_token";
 const ECHO_HOST: &str = "echo.test";
 const HITTER_NUM: usize = 4;
 
@@ -40,17 +40,17 @@ fn init() {
 /// The leaf always runs its own listener (an ephemeral loopback port is fine)
 /// and dials the given ingress through `[upstream]`. Its local services are
 /// declared with `[[proxies]]`.
-fn write_client_config(
+fn write_leaf_config(
     file: &str,
     name: &str,
     server_host: &str,
     server_port: u16,
     token: &str,
     listen_port: u16,
-    tunnels: &[(&str, &str)],
+    proxies: &[(&str, &str)],
 ) -> Result<String> {
     let mut proxies_toml = String::new();
-    for (domain, local_addr) in tunnels {
+    for (domain, local_addr) in proxies {
         // The local-service names are required. Use the first domain label as a
         // stable name for these integration tests; a wildcard domain uses the
         // label after `*.`.
@@ -89,12 +89,12 @@ async fn http_routing() -> Result<()> {
         }
     });
 
-    let client_config = write_client_config(
+    let client_config = write_leaf_config(
         "http_tunnel_routing_client.toml",
-        CLIENT_NAME,
+        LEAF_NAME,
         SERVER_HOST,
         HTTP_ENTRY_PORT,
-        CLIENT_TOKEN,
+        LEAF_TOKEN,
         0,
         &[(ECHO_HOST, ECHO_SERVER_ADDR)],
     )?;
@@ -105,7 +105,7 @@ async fn http_routing() -> Result<()> {
     // Start the client
     info!("start the client");
     let client = tokio::spawn(async move {
-        run_http_tunnel_client(&client_config, client_shutdown_rx)
+        run_http_tunnel_from_config(&client_config, client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -116,14 +116,9 @@ async fn http_routing() -> Result<()> {
     // Start the server
     info!("start the server");
     let server = tokio::spawn(async move {
-        run_http_tunnel_server(
-            HTTP_ENTRY_PORT,
-            SERVER_HOST,
-            CLIENT_TOKEN,
-            server_shutdown_rx,
-        )
-        .await
-        .unwrap();
+        run_http_tunnel_server(HTTP_ENTRY_PORT, SERVER_HOST, LEAF_TOKEN, server_shutdown_rx)
+            .await
+            .unwrap();
     });
     time::sleep(Duration::from_millis(2500)).await; // Wait for the client to retry
 
@@ -149,7 +144,7 @@ async fn http_routing() -> Result<()> {
     let client_shutdown_rx = client_shutdown_tx.subscribe();
     let client_config = std::env::temp_dir().join("http_tunnel_routing_client.toml");
     let client = tokio::spawn(async move {
-        run_http_tunnel_client(client_config.to_str().unwrap(), client_shutdown_rx)
+        run_http_tunnel_from_config(client_config.to_str().unwrap(), client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -158,9 +153,9 @@ async fn http_routing() -> Result<()> {
     info!("tunnel by Host");
     http_echo_hitter(HTTP_ENTRY_ADDR, ECHO_HOST).await.unwrap();
 
-    // The data channel pool only caches a few connections and a visitor consumes
-    // one, so more visitors than that only work if the pool is replenished.
-    info!("more visitors than the data channel pool");
+    // Every visitor is multiplexed over the same v4 session, so a burst must
+    // not depend on any pre-opened session.
+    info!("more concurrent visitors than a single stream");
     for i in 0..16 {
         let r = time::timeout(
             Duration::from_secs(5),
@@ -182,14 +177,9 @@ async fn http_routing() -> Result<()> {
     info!("restart the server");
     let server_shutdown_rx = server_shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
-        run_http_tunnel_server(
-            HTTP_ENTRY_PORT,
-            SERVER_HOST,
-            CLIENT_TOKEN,
-            server_shutdown_rx,
-        )
-        .await
-        .unwrap();
+        run_http_tunnel_server(HTTP_ENTRY_PORT, SERVER_HOST, LEAF_TOKEN, server_shutdown_rx)
+            .await
+            .unwrap();
     });
     time::sleep(Duration::from_millis(2500)).await; // Wait for the client to retry
 
@@ -311,7 +301,7 @@ async fn http_404_check(addr: &'static str, host: &'static str) -> Result<()> {
 
 /// Poll until the host is answered with a `404`, with a timeout. It fails if the
 /// request hangs, which is what happened before the handle of a disconnected
-/// control channel was removed from the map.
+/// session was removed from the route table.
 async fn wait_for_404(addr: &'static str, host: &'static str) -> Result<()> {
     let deadline = time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -339,16 +329,16 @@ async fn wait_for_404(addr: &'static str, host: &'static str) -> Result<()> {
     }
 }
 
-// ==== The client administration API test ====
+// ==== The management API test ====
 
-const CLIENT_API_ECHO_SERVER_ADDR: &str = "127.0.0.1:8093";
-const CLIENT_API_HTTP_ENTRY_PORT: u16 = 2464;
-const CLIENT_API_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2464";
-const CLIENT_API_ADDR: &str = "127.0.0.1:2465";
-const CLIENT_API_TOKEN: &str = "a_secret_token";
+const MANAGEMENT_ECHO_SERVER_ADDR: &str = "127.0.0.1:8093";
+const MANAGEMENT_HTTP_ENTRY_PORT: u16 = 2464;
+const MANAGEMENT_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2464";
+const MANAGEMENT_ADDR: &str = "127.0.0.1:2465";
+const MANAGEMENT_TOKEN: &str = "a_secret_token";
 
-/// A WebSocket transport carries the control channel and every data channel
-/// over the HTTP entrypoint, and reconnects after a server restart.
+/// A WebSocket session carries the routes and every visitor stream over the
+/// HTTP entrypoint, and reconnects after a server restart.
 #[tokio::test]
 async fn websocket_transport_routes_http() -> Result<()> {
     init();
@@ -359,12 +349,12 @@ async fn websocket_transport_routes_http() -> Result<()> {
         }
     });
 
-    let client_config = write_client_config(
+    let client_config = write_leaf_config(
         "http_tunnel_websocket_client.toml",
-        CLIENT_NAME,
+        LEAF_NAME,
         "127.0.0.1",
         WS_HTTP_ENTRY_PORT,
-        CLIENT_TOKEN,
+        LEAF_TOKEN,
         0,
         &[("echo-ws.test", WS_ECHO_SERVER_ADDR)],
     )?;
@@ -375,7 +365,7 @@ async fn websocket_transport_routes_http() -> Result<()> {
         common::run_http_tunnel_server(
             WS_HTTP_ENTRY_PORT,
             "127.0.0.1",
-            CLIENT_TOKEN,
+            LEAF_TOKEN,
             server_shutdown_rx,
         )
         .await
@@ -384,14 +374,14 @@ async fn websocket_transport_routes_http() -> Result<()> {
     wait_for_tcp(WS_HTTP_ENTRY_ADDR, Duration::from_secs(10)).await?;
 
     let client = tokio::spawn(async move {
-        run_http_tunnel_client(&client_config, client_shutdown_rx)
+        run_http_tunnel_from_config(&client_config, client_shutdown_rx)
             .await
             .unwrap();
     });
     wait_for_echo(WS_HTTP_ENTRY_ADDR, "echo-ws.test", Duration::from_secs(20)).await?;
 
-    // Restart the server while the client remains alive. The WebSocket control
-    // channel should close and the existing retry loop should register the tunnel again.
+    // Restart the server while the client remains alive. The v4 session should
+    // close and the existing retry loop should register the tunnel again.
     server_shutdown_tx.send(true)?;
     server.await?;
 
@@ -400,7 +390,7 @@ async fn websocket_transport_routes_http() -> Result<()> {
         common::run_http_tunnel_server(
             WS_HTTP_ENTRY_PORT,
             "127.0.0.1",
-            CLIENT_TOKEN,
+            LEAF_TOKEN,
             server2_shutdown_rx,
         )
         .await
@@ -415,14 +405,14 @@ async fn websocket_transport_routes_http() -> Result<()> {
     Ok(())
 }
 
-// ==== WebSocket transport on a separate entrypoint ====
+// ==== WebSocket-only entrypoint ====
 
 const WS_ONLY_HTTP_PORT: u16 = 2555;
 const WS_ONLY_HTTP_ADDR: &str = "127.0.0.1:2555";
 const WS_ONLY_ECHO_ADDR: &str = "127.0.0.1:2556";
 
 /// The WebSocket transport carries the whole tunnel through the HTTP
-/// entrypoint, so no extra control port exists.
+/// entrypoint, so no extra session port exists.
 #[tokio::test]
 async fn websocket_transport_works_without_a_tcp_listener() -> Result<()> {
     init();
@@ -433,12 +423,12 @@ async fn websocket_transport_works_without_a_tcp_listener() -> Result<()> {
         }
     });
 
-    let client_config = write_client_config(
+    let client_config = write_leaf_config(
         "http_tunnel_websocket_no_tcp.toml",
-        CLIENT_NAME,
+        LEAF_NAME,
         "127.0.0.1",
         WS_ONLY_HTTP_PORT,
-        CLIENT_TOKEN,
+        LEAF_TOKEN,
         0,
         &[("echo-ws-only.test", WS_ONLY_ECHO_ADDR)],
     )?;
@@ -449,7 +439,7 @@ async fn websocket_transport_works_without_a_tcp_listener() -> Result<()> {
         common::run_http_tunnel_server(
             WS_ONLY_HTTP_PORT,
             "127.0.0.1",
-            CLIENT_TOKEN,
+            LEAF_TOKEN,
             server_shutdown_rx,
         )
         .await
@@ -458,7 +448,7 @@ async fn websocket_transport_works_without_a_tcp_listener() -> Result<()> {
     wait_for_tcp(WS_ONLY_HTTP_ADDR, Duration::from_secs(10)).await?;
 
     let client = tokio::spawn(async move {
-        run_http_tunnel_client(&client_config, client_shutdown_rx)
+        run_http_tunnel_from_config(&client_config, client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -475,7 +465,7 @@ async fn websocket_transport_works_without_a_tcp_listener() -> Result<()> {
     Ok(())
 }
 
-// ==== WebSocket transport with an unavailable client-side target ====
+// ==== WebSocket transport with an unavailable leaf-side target ====
 
 const WS_FAILURE_HTTP_PORT: u16 = 2546;
 const WS_FAILURE_HTTP_ADDR: &str = "127.0.0.1:2546";
@@ -486,12 +476,12 @@ const WS_FAILURE_TARGET_ADDR: &str = "127.0.0.1:2547";
 #[tokio::test]
 async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
     init();
-    let client_config = write_client_config(
+    let client_config = write_leaf_config(
         "http_tunnel_websocket_unavailable_target.toml",
-        CLIENT_NAME,
+        LEAF_NAME,
         "127.0.0.1",
         WS_FAILURE_HTTP_PORT,
-        CLIENT_TOKEN,
+        LEAF_TOKEN,
         0,
         &[("unavailable-ws.test", WS_FAILURE_TARGET_ADDR)],
     )?;
@@ -501,7 +491,7 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
         run_http_tunnel_server(
             WS_FAILURE_HTTP_PORT,
             "127.0.0.1",
-            CLIENT_TOKEN,
+            LEAF_TOKEN,
             server_shutdown_rx,
         )
         .await
@@ -509,7 +499,7 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
     });
     wait_for_tcp(WS_FAILURE_HTTP_ADDR, Duration::from_secs(10)).await?;
     let client = tokio::spawn(async move {
-        run_http_tunnel_client(&client_config, client_shutdown_rx)
+        run_http_tunnel_from_config(&client_config, client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -538,26 +528,26 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
     Ok(())
 }
 
-/// A tunnel created, listed and deleted through the client administration API is
+/// A proxy created, listed and deleted through the management API is
 /// validated locally, written back to the client configuration file, and routed
 /// without a restart of either side.
-#[cfg(feature = "client-api")]
+#[cfg(feature = "management")]
 #[tokio::test]
-async fn client_api_manages_tunnels() -> Result<()> {
+async fn management_api_manages_proxies() -> Result<()> {
     init();
 
-    let config_path = write_client_config(
-        "http_tunnel_client_api_test.toml",
+    let config_path = write_leaf_config(
+        "http_tunnel_management_api_test.toml",
         "home",
         "127.0.0.1",
-        CLIENT_API_HTTP_ENTRY_PORT,
-        CLIENT_API_TOKEN,
+        MANAGEMENT_HTTP_ENTRY_PORT,
+        MANAGEMENT_TOKEN,
         2465,
         &[],
     )?;
 
     tokio::spawn(async move {
-        if let Err(e) = common::tcp::echo_server(CLIENT_API_ECHO_SERVER_ADDR).await {
+        if let Err(e) = common::tcp::echo_server(MANAGEMENT_ECHO_SERVER_ADDR).await {
             panic!("Failed to run the echo server for testing: {:?}", e);
         }
     });
@@ -567,9 +557,9 @@ async fn client_api_manages_tunnels() -> Result<()> {
 
     let server = tokio::spawn(async move {
         run_http_tunnel_server(
-            CLIENT_API_HTTP_ENTRY_PORT,
+            MANAGEMENT_HTTP_ENTRY_PORT,
             "127.0.0.1",
-            CLIENT_API_TOKEN,
+            MANAGEMENT_TOKEN,
             server_shutdown_rx,
         )
         .await
@@ -578,47 +568,47 @@ async fn client_api_manages_tunnels() -> Result<()> {
 
     let client_config = config_path.clone();
     let client = tokio::spawn(async move {
-        run_http_tunnel_client(&client_config, client_shutdown_rx)
+        run_http_tunnel_from_config(&client_config, client_shutdown_rx)
             .await
             .unwrap();
     });
 
     time::sleep(Duration::from_millis(2500)).await;
 
-    info!("the client API reports the client identity");
+    info!("the management API reports the process identity");
     let (status, body) = api_request(
-        CLIENT_API_ADDR,
+        MANAGEMENT_ADDR,
         "GET",
         "/api/status",
-        Some(CLIENT_API_TOKEN),
+        Some(MANAGEMENT_TOKEN),
         None,
     )
     .await?;
     assert_eq!(status, 200, "unexpected response: {}", body);
     assert!(body.contains("home"), "unexpected body: {}", body);
 
-    info!("the client API has no tunnel yet");
+    info!("the management API has no tunnel yet");
     let (status, body) = api_request(
-        CLIENT_API_ADDR,
+        MANAGEMENT_ADDR,
         "GET",
-        "/api/tunnels",
-        Some(CLIENT_API_TOKEN),
+        "/api/proxies",
+        Some(MANAGEMENT_TOKEN),
         None,
     )
     .await?;
     assert_eq!(status, 200, "unexpected response: {}", body);
     assert_eq!(body.trim(), "[]", "unexpected body: {}", body);
 
-    info!("the client API rejects a request without the token");
-    let (status, _) = api_request(CLIENT_API_ADDR, "GET", "/api/tunnels", None, None).await?;
+    info!("the management API rejects a request without the token");
+    let (status, _) = api_request(MANAGEMENT_ADDR, "GET", "/api/proxies", None, None).await?;
     assert_eq!(status, 401, "expected 401");
 
-    info!("add a tunnel through the client API");
+    info!("add a tunnel through the management API");
     let (status, body) = api_request(
-        CLIENT_API_ADDR,
+        MANAGEMENT_ADDR,
         "PUT",
-        "/api/tunnels/echo",
-        Some(CLIENT_API_TOKEN),
+        "/api/proxies/echo",
+        Some(MANAGEMENT_TOKEN),
         Some(r#"{"domain":"echo.test","local_addr":"127.0.0.1:8093"}"#),
     )
     .await?;
@@ -638,16 +628,16 @@ async fn client_api_manages_tunnels() -> Result<()> {
     // The client starts the tunnel
     time::sleep(Duration::from_millis(1500)).await;
     info!("the added tunnel is routed without a restart");
-    http_echo_hitter(CLIENT_API_HTTP_ENTRY_ADDR, "echo.test")
+    http_echo_hitter(MANAGEMENT_HTTP_ENTRY_ADDR, "echo.test")
         .await
         .unwrap();
 
-    info!("the client API now reports the client as connected");
+    info!("the management API now reports the client as connected");
     let (status, body) = api_request(
-        CLIENT_API_ADDR,
+        MANAGEMENT_ADDR,
         "GET",
         "/api/status",
-        Some(CLIENT_API_TOKEN),
+        Some(MANAGEMENT_TOKEN),
         None,
     )
     .await?;
@@ -658,12 +648,12 @@ async fn client_api_manages_tunnels() -> Result<()> {
         body
     );
 
-    info!("the client API lists the added tunnel");
+    info!("the management API lists the added tunnel");
     let (status, body) = api_request(
-        CLIENT_API_ADDR,
+        MANAGEMENT_ADDR,
         "GET",
-        "/api/tunnels",
-        Some(CLIENT_API_TOKEN),
+        "/api/proxies",
+        Some(MANAGEMENT_TOKEN),
         None,
     )
     .await?;
@@ -678,12 +668,12 @@ async fn client_api_manages_tunnels() -> Result<()> {
         written
     );
 
-    info!("delete the tunnel through the client API");
+    info!("delete the tunnel through the management API");
     let (status, body) = api_request(
-        CLIENT_API_ADDR,
+        MANAGEMENT_ADDR,
         "DELETE",
-        "/api/tunnels/echo",
-        Some(CLIENT_API_TOKEN),
+        "/api/proxies/echo",
+        Some(MANAGEMENT_TOKEN),
         None,
     )
     .await?;
@@ -691,16 +681,16 @@ async fn client_api_manages_tunnels() -> Result<()> {
 
     time::sleep(Duration::from_millis(500)).await;
     info!("the deleted tunnel is no longer routed");
-    http_404_check(CLIENT_API_HTTP_ENTRY_ADDR, "echo.test")
+    http_404_check(MANAGEMENT_HTTP_ENTRY_ADDR, "echo.test")
         .await
         .unwrap();
 
     info!("deleting an unknown tunnel is rejected with 404");
     let (status, body) = api_request(
-        CLIENT_API_ADDR,
+        MANAGEMENT_ADDR,
         "DELETE",
-        "/api/tunnels/unknown.test",
-        Some(CLIENT_API_TOKEN),
+        "/api/proxies/unknown.test",
+        Some(MANAGEMENT_TOKEN),
         None,
     )
     .await?;
@@ -724,7 +714,7 @@ const FATAL_HTTP_PORT: u16 = 2454;
 async fn client_exits_on_a_wrong_token() -> Result<()> {
     init();
 
-    let config_path = write_client_config(
+    let config_path = write_leaf_config(
         "http_tunnel_fatal_test.toml",
         "home",
         "127.0.0.1",
@@ -736,14 +726,9 @@ async fn client_exits_on_a_wrong_token() -> Result<()> {
 
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
     let server = tokio::spawn(async move {
-        run_http_tunnel_server(
-            FATAL_HTTP_PORT,
-            "127.0.0.1",
-            CLIENT_TOKEN,
-            server_shutdown_rx,
-        )
-        .await
-        .unwrap();
+        run_http_tunnel_server(FATAL_HTTP_PORT, "127.0.0.1", LEAF_TOKEN, server_shutdown_rx)
+            .await
+            .unwrap();
     });
 
     // Wait for the server to listen, so that the client reaches the handshake
@@ -753,7 +738,7 @@ async fn client_exits_on_a_wrong_token() -> Result<()> {
     let (_tx, rx) = broadcast::channel(1);
     let err = time::timeout(
         Duration::from_secs(5),
-        run_http_tunnel_client(&config_path, rx),
+        run_http_tunnel_from_config(&config_path, rx),
     )
     .await
     .expect("the client kept retrying on a wrong token")
@@ -789,7 +774,7 @@ async fn server_fails_when_server_port_cannot_be_bound() -> Result<()> {
         run_http_tunnel_server(
             OCCUPIED_HTTP_TEST_HTTP_PORT,
             "127.0.0.1",
-            CLIENT_TOKEN,
+            LEAF_TOKEN,
             shutdown_rx,
         ),
     )
@@ -888,7 +873,7 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
         run_http_tunnel_server_with_limits(
             WS_LIMIT_HTTP_PORT,
             "127.0.0.1",
-            CLIENT_TOKEN,
+            LEAF_TOKEN,
             limits,
             shutdown_rx,
         )
@@ -898,7 +883,7 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
     // Wait until the listener is bound before creating the connection burst.
     wait_for_tcp(WS_LIMIT_HTTP_ADDR, Duration::from_secs(10)).await?;
 
-    // Check control endpoint routing before consuming the connection budget.
+    // Check session endpoint routing before consuming the connection budget.
     for (request, expected_status) in [
         (
             "GET /wrong HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
@@ -944,7 +929,7 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
         let attempts = futures_util::future::join_all((0..WS_LIMIT).map(|_| async {
             time::timeout(
                 Duration::from_secs(8),
-                connect_async(websocket_request(&url, Some(CLIENT_TOKEN))),
+                connect_async(websocket_request(&url, Some(LEAF_TOKEN))),
             )
             .await
         }))
@@ -994,7 +979,7 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
 
         let excess = time::timeout(
             Duration::from_secs(3),
-            connect_async(websocket_request(&url, Some(CLIENT_TOKEN))),
+            connect_async(websocket_request(&url, Some(LEAF_TOKEN))),
         )
         .await;
         match excess {
@@ -1028,7 +1013,7 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
     drop(sockets);
     let mut recovered = false;
     for _ in 0..50 {
-        match connect_async(websocket_request(&url, Some(CLIENT_TOKEN))).await {
+        match connect_async(websocket_request(&url, Some(LEAF_TOKEN))).await {
             std::result::Result::Ok((socket, _)) => {
                 drop(socket);
                 recovered = true;
@@ -1047,7 +1032,7 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
     std::result::Result::Ok(())
 }
 
-// ==== Node mode: a multi-hop relay chain ====
+// ==== Multi-hop relay chain ====
 
 const CHAIN_ECHO_ADDR: &str = "127.0.0.1:2610";
 const CHAIN_INGRESS_PORT: u16 = 2611;
@@ -1145,7 +1130,7 @@ async fn node_chain_forwards_and_withdraws_routes() -> Result<()> {
     )?;
     let (node_a_shutdown_tx, node_a_shutdown_rx) = broadcast::channel(1);
     let node_a = tokio::spawn(async move {
-        common::run_http_tunnel_node(&node_a_config, node_a_shutdown_rx)
+        common::run_http_tunnel_from_config(&node_a_config, node_a_shutdown_rx)
             .await
             .unwrap();
     });
@@ -1166,7 +1151,7 @@ async fn node_chain_forwards_and_withdraws_routes() -> Result<()> {
     let (node_b_shutdown_tx, node_b_shutdown_rx) = broadcast::channel(1);
     let node_b_path = node_b_config.clone();
     let node_b = tokio::spawn(async move {
-        common::run_http_tunnel_node(&node_b_path, node_b_shutdown_rx)
+        common::run_http_tunnel_from_config(&node_b_path, node_b_shutdown_rx)
             .await
             .unwrap();
     });
@@ -1184,7 +1169,7 @@ async fn node_chain_forwards_and_withdraws_routes() -> Result<()> {
     let (node_b_shutdown_tx, node_b_shutdown_rx) = broadcast::channel(1);
     let node_b_path = node_b_config.clone();
     let node_b = tokio::spawn(async move {
-        common::run_http_tunnel_node(&node_b_path, node_b_shutdown_rx)
+        common::run_http_tunnel_from_config(&node_b_path, node_b_shutdown_rx)
             .await
             .unwrap();
     });
@@ -1198,7 +1183,7 @@ async fn node_chain_forwards_and_withdraws_routes() -> Result<()> {
     Ok(())
 }
 
-// ==== Node mode: fan-out under one relay ====
+// ==== Fan-out under one relay ====
 
 const FANOUT_ECHO_ADDR: &str = "127.0.0.1:2630";
 const FANOUT_INGRESS_PORT: u16 = 2631;
@@ -1248,7 +1233,7 @@ async fn node_fanout_publishes_two_downstream_domains() -> Result<()> {
     )?;
     let (node_a_shutdown_tx, node_a_shutdown_rx) = broadcast::channel(1);
     let node_a = tokio::spawn(async move {
-        common::run_http_tunnel_node(&node_a_config, node_a_shutdown_rx)
+        common::run_http_tunnel_from_config(&node_a_config, node_a_shutdown_rx)
             .await
             .unwrap();
     });
@@ -1285,7 +1270,7 @@ async fn node_fanout_publishes_two_downstream_domains() -> Result<()> {
         )?;
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
         let node = tokio::spawn(async move {
-            common::run_http_tunnel_node(&config, shutdown_rx)
+            common::run_http_tunnel_from_config(&config, shutdown_rx)
                 .await
                 .unwrap();
         });
@@ -1317,7 +1302,7 @@ async fn node_fanout_publishes_two_downstream_domains() -> Result<()> {
     Ok(())
 }
 
-// ==== Node mode: route mirroring (Stage 2) ====
+// ==== Route mirroring ====
 
 const MIRROR_ECHO_ADDR: &str = "127.0.0.1:2640";
 const MIRROR_INGRESS_PORT: u16 = 2641;
@@ -1369,7 +1354,7 @@ async fn node_mirror_withdraws_and_reclaims_routes() -> Result<()> {
     )?;
     let (node_shutdown_tx, node_shutdown_rx) = broadcast::channel(1);
     let node = tokio::spawn(async move {
-        common::run_http_tunnel_node(&node_config, node_shutdown_rx)
+        common::run_http_tunnel_from_config(&node_config, node_shutdown_rx)
             .await
             .unwrap();
     });
@@ -1385,7 +1370,7 @@ async fn node_mirror_withdraws_and_reclaims_routes() -> Result<()> {
 
     // The leaf client connects to the node after the node started, so the
     // routes are discovered dynamically and mirrored.
-    let leaf_config = write_client_config(
+    let leaf_config = write_leaf_config(
         "http_tunnel_mirror_leaf.toml",
         "mirror-leaf",
         "127.0.0.1",
@@ -1402,7 +1387,7 @@ async fn node_mirror_withdraws_and_reclaims_routes() -> Result<()> {
     let (leaf_shutdown_tx, leaf_shutdown_rx) = broadcast::channel(1);
     let leaf_path = leaf_config.clone();
     let leaf = tokio::spawn(async move {
-        run_http_tunnel_client(&leaf_path, leaf_shutdown_rx)
+        run_http_tunnel_from_config(&leaf_path, leaf_shutdown_rx)
             .await
             .unwrap();
     });
@@ -1445,7 +1430,7 @@ async fn node_mirror_withdraws_and_reclaims_routes() -> Result<()> {
     let (leaf_shutdown_tx, leaf_shutdown_rx) = broadcast::channel(1);
     let leaf_path = leaf_config.clone();
     let leaf = tokio::spawn(async move {
-        run_http_tunnel_client(&leaf_path, leaf_shutdown_rx)
+        run_http_tunnel_from_config(&leaf_path, leaf_shutdown_rx)
             .await
             .unwrap();
     });
@@ -1456,7 +1441,7 @@ async fn node_mirror_withdraws_and_reclaims_routes() -> Result<()> {
     )
     .await?;
 
-    info!("an ingress restart is followed by the mirrored tunnels");
+    info!("an ingress restart is followed by the mirrored proxies");
     ingress_shutdown_tx.send(true)?;
     let _ = tokio::join!(ingress);
     let (ingress_shutdown_tx, ingress_shutdown_rx) = broadcast::channel(1);
@@ -1485,7 +1470,7 @@ async fn node_mirror_withdraws_and_reclaims_routes() -> Result<()> {
     Ok(())
 }
 
-// ==== Node mode: route-mirroring churn ====
+// ==== Route-mirroring churn ====
 
 const CHURN_ECHO_ADDR: &str = "127.0.0.1:2650";
 const CHURN_INGRESS_PORT: u16 = 2651;
@@ -1532,13 +1517,13 @@ async fn node_mirror_churn_is_idempotent() -> Result<()> {
     )?;
     let (node_shutdown_tx, node_shutdown_rx) = broadcast::channel(1);
     let node = tokio::spawn(async move {
-        common::run_http_tunnel_node(&node_config, node_shutdown_rx)
+        common::run_http_tunnel_from_config(&node_config, node_shutdown_rx)
             .await
             .unwrap();
     });
     wait_for_tcp(CHURN_NODE_ADDR, Duration::from_secs(10)).await?;
 
-    let leaf_config = write_client_config(
+    let leaf_config = write_leaf_config(
         "http_tunnel_churn_leaf.toml",
         "churn-leaf",
         "127.0.0.1",
@@ -1552,7 +1537,7 @@ async fn node_mirror_churn_is_idempotent() -> Result<()> {
         let (leaf_shutdown_tx, leaf_shutdown_rx) = broadcast::channel(1);
         let leaf_path = leaf_config.clone();
         let leaf = tokio::spawn(async move {
-            run_http_tunnel_client(&leaf_path, leaf_shutdown_rx)
+            run_http_tunnel_from_config(&leaf_path, leaf_shutdown_rx)
                 .await
                 .unwrap();
         });
@@ -1571,7 +1556,7 @@ async fn node_mirror_churn_is_idempotent() -> Result<()> {
     Ok(())
 }
 
-// ==== Node mode: a WebSocket upgrade across the chain ====
+// ==== A WebSocket upgrade across the chain ====
 
 const CHAIN_WS_ECHO_ADDR: &str = "127.0.0.1:2620";
 const CHAIN_WS_INGRESS_PORT: u16 = 2621;
@@ -1639,7 +1624,7 @@ async fn node_chain_forwards_websocket_upgrades() -> Result<()> {
     )?;
     let (node_a_shutdown_tx, node_a_shutdown_rx) = broadcast::channel(1);
     let node_a = tokio::spawn(async move {
-        common::run_http_tunnel_node(&node_a_config, node_a_shutdown_rx)
+        common::run_http_tunnel_from_config(&node_a_config, node_a_shutdown_rx)
             .await
             .unwrap();
     });
@@ -1659,7 +1644,7 @@ async fn node_chain_forwards_websocket_upgrades() -> Result<()> {
     )?;
     let (node_b_shutdown_tx, node_b_shutdown_rx) = broadcast::channel(1);
     let node_b = tokio::spawn(async move {
-        common::run_http_tunnel_node(&node_b_config, node_b_shutdown_rx)
+        common::run_http_tunnel_from_config(&node_b_config, node_b_shutdown_rx)
             .await
             .unwrap();
     });
