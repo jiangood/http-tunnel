@@ -1,7 +1,7 @@
 [package]
 autobins = false
 name = "http-tunnel"
-version = "1.0.1"
+version = "2.0.0"
 edition = "2021"
 authors = ["Yujia Qiao <code@rapiz.me>", "jiangood"]
 description = "A secure, stable and high-performance HTTP reverse proxy for NAT traversal"
@@ -88,7 +88,7 @@ tokio-tungstenite = { version = "0.20", default-features = false, features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = { version = "0.6", optional = true }
-# Serves the management router on the existing `server_port` connection. It must
+# Serves the management router on the existing `listen_port` connection. It must
 # match the hyper version axum 0.6 uses, so that the `Router` implements the
 # `Service` the connection expects.
 hyper = { version = "0.14", features = ["server", "http1"], optional = true }
