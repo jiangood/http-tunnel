@@ -1,6 +1,6 @@
 name = "home"
 token = "secret"
-server_host = "control.example.com"
+control_host = "control.example.com"
 
 [[proxies]]
 name = "nas"

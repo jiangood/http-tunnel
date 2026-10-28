@@ -50,7 +50,7 @@ pub(crate) async fn serve_connection(
     Ok(())
 }
 
-/// The management router. It is mounted on the reserved `server_host` of the
+/// The management router. It is mounted on the reserved `control_host` of the
 /// main listener, not on a listener of its own.
 fn build_router(token: String, management: Arc<ManagementState>) -> Router {
     let state = Arc::new(ApiState { management });

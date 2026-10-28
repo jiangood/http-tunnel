@@ -20,7 +20,7 @@ const HTTP_ENTRY_PORT: u16 = 2334;
 const WS_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2336";
 const WS_HTTP_ENTRY_PORT: u16 = 2336;
 const WS_ECHO_SERVER_ADDR: &str = "127.0.0.1:8081";
-const SERVER_HOST: &str = "127.0.0.1";
+const CONTROL_HOST: &str = "127.0.0.1";
 const LEAF_NAME: &str = "home";
 const LEAF_TOKEN: &str = "a_secret_token";
 const ECHO_HOST: &str = "echo.test";
@@ -37,14 +37,14 @@ fn init() {
 
 /// Write a universal leaf configuration to a temporary file and return its path.
 ///
-/// The leaf always runs its own listener (an ephemeral loopback port is fine)
+/// The leaf always runs its own listener (an ephemeral port is fine)
 /// and dials the given ingress through `[upstream]`. Its local services are
 /// declared with `[[proxies]]`.
 fn write_leaf_config(
     file: &str,
     name: &str,
-    server_host: &str,
-    server_port: u16,
+    upstream_host: &str,
+    upstream_port: u16,
     token: &str,
     listen_port: u16,
     proxies: &[(&str, &str)],
@@ -64,13 +64,13 @@ fn write_leaf_config(
             name, domain, local_addr
         ));
     }
-    // The leaf listens on an ephemeral loopback port unless the test needs a
-    // fixed one to reach its management interface.
+    // The leaf listens on an ephemeral port unless the test needs a fixed one
+    // to reach its management interface.
     let content = format!(
-        "server_port = {}\nbind_host = \"127.0.0.1\"\nserver_host = \"127.0.0.1\"\n\
+        "listen_port = {}\ncontrol_host = \"127.0.0.1\"\n\
          name = \"{}\"\ntoken = \"{}\"\n{}\
-         \n[upstream]\nserver = \"ws://{}:{}\"\ntoken = \"{}\"\nmirror = true\n",
-        listen_port, name, token, proxies_toml, server_host, server_port, token
+         \n[upstream]\nurl = \"ws://{}:{}\"\ntoken = \"{}\"\nmirror = true\n",
+        listen_port, name, token, proxies_toml, upstream_host, upstream_port, token
     );
 
     let path = std::env::temp_dir().join(file);
@@ -92,7 +92,7 @@ async fn http_routing() -> Result<()> {
     let client_config = write_leaf_config(
         "http_tunnel_routing_client.toml",
         LEAF_NAME,
-        SERVER_HOST,
+        CONTROL_HOST,
         HTTP_ENTRY_PORT,
         LEAF_TOKEN,
         0,
@@ -116,9 +116,14 @@ async fn http_routing() -> Result<()> {
     // Start the server
     info!("start the server");
     let server = tokio::spawn(async move {
-        run_http_tunnel_server(HTTP_ENTRY_PORT, SERVER_HOST, LEAF_TOKEN, server_shutdown_rx)
-            .await
-            .unwrap();
+        run_http_tunnel_server(
+            HTTP_ENTRY_PORT,
+            CONTROL_HOST,
+            LEAF_TOKEN,
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
     });
     time::sleep(Duration::from_millis(2500)).await; // Wait for the client to retry
 
@@ -177,9 +182,14 @@ async fn http_routing() -> Result<()> {
     info!("restart the server");
     let server_shutdown_rx = server_shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
-        run_http_tunnel_server(HTTP_ENTRY_PORT, SERVER_HOST, LEAF_TOKEN, server_shutdown_rx)
-            .await
-            .unwrap();
+        run_http_tunnel_server(
+            HTTP_ENTRY_PORT,
+            CONTROL_HOST,
+            LEAF_TOKEN,
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
     });
     time::sleep(Duration::from_millis(2500)).await; // Wait for the client to retry
 
@@ -758,15 +768,15 @@ async fn client_exits_on_a_wrong_token() -> Result<()> {
 
 const OCCUPIED_HTTP_TEST_HTTP_PORT: u16 = 2476;
 
-/// A `server_port` that cannot be bound must fail startup with an error instead
+/// A `listen_port` that cannot be bound must fail startup with an error instead
 /// of leaving a server that looks healthy but serves no traffic.
 #[tokio::test]
-async fn server_fails_when_server_port_cannot_be_bound() -> Result<()> {
+async fn server_fails_when_listen_port_cannot_be_bound() -> Result<()> {
     init();
 
-    // Bind loopback, which is what the test server binds.
+    // Bind every interface, which is what the listener always does.
     let _occupied =
-        tokio::net::TcpListener::bind(("127.0.0.1", OCCUPIED_HTTP_TEST_HTTP_PORT)).await?;
+        tokio::net::TcpListener::bind(("0.0.0.0", OCCUPIED_HTTP_TEST_HTTP_PORT)).await?;
     let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
     let err = time::timeout(
@@ -779,11 +789,11 @@ async fn server_fails_when_server_port_cannot_be_bound() -> Result<()> {
         ),
     )
     .await
-    .expect("server startup hung on an unboundable server_port")
-    .expect_err("server must fail when server_port cannot be bound");
+    .expect("server startup hung on an unboundable listen_port")
+    .expect_err("server must fail when listen_port cannot be bound");
 
     assert!(
-        format!("{:#}", err).contains("server_port"),
+        format!("{:#}", err).contains("listen_port"),
         "unexpected error: {:#}",
         err
     );
@@ -1048,21 +1058,21 @@ const CHAIN_HOST: &str = "svc.relay.test";
 
 /// Write a node configuration to a temporary file and return its path.
 ///
-/// `upstream` is `(server, token, claim)`: a `None` claim means route mirroring,
+/// `upstream` is `(url, token, claim)`: a `None` claim means route mirroring,
 /// and `None` for the whole option makes the node an ingress. The node name
 /// doubles as the name announced on the upstream.
 fn write_node_config(
     file: &str,
     name: &str,
-    server_port: u16,
+    listen_port: u16,
     token: &str,
     upstream: Option<(&str, &str, Option<&str>)>,
     proxies: &[(&str, &str)],
 ) -> Result<String> {
     let mut content = format!(
-        "name = \"{}\"\nserver_port = {}\nserver_host = \"127.0.0.1\"\n\
-         bind_host = \"127.0.0.1\"\ntoken = \"{}\"\n",
-        name, server_port, token
+        "name = \"{}\"\nlisten_port = {}\ncontrol_host = \"127.0.0.1\"\n\
+         token = \"{}\"\n",
+        name, listen_port, token
     );
     for (domain, local_addr) in proxies {
         let proxy_name = domain.split('.').next().unwrap_or(domain);
@@ -1071,10 +1081,10 @@ fn write_node_config(
             proxy_name, domain, local_addr
         ));
     }
-    if let Some((server, upstream_token, claim)) = upstream {
+    if let Some((upstream_url, upstream_token, claim)) = upstream {
         content.push_str(&format!(
-            "\n[upstream]\nserver = \"{}\"\ntoken = \"{}\"\n",
-            server, upstream_token
+            "\n[upstream]\nurl = \"{}\"\ntoken = \"{}\"\n",
+            upstream_url, upstream_token
         ));
         match claim {
             Some(claim) => content.push_str(&format!("claim = \"{}\"\n", claim)),

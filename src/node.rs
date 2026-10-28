@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::helper::to_bind_addr;
+use crate::helper::{to_bind_addr, DEFAULT_BIND_HOST};
 use crate::protocol_v4::Role;
 use crate::server::{run_server_with_listener_and_state, ServerState};
 use crate::session_client::{self, RouteMap, RouteTarget, SessionArgs};
@@ -17,7 +17,7 @@ use crate::session_client::{self, RouteMap, RouteTarget, SessionArgs};
 /// v4 session.
 ///
 /// The data plane is recursive, so an upstream session forwards the visitors it
-/// receives to `127.0.0.1:<actual server_port>`, where the embedded server
+/// receives to `127.0.0.1:<actual listen_port>`, where the embedded server
 /// routes them by `Host` again. Without `[upstream]` the process is a
 /// standalone ingress. With `[upstream].mirror` it advertises every route of
 /// its downstream peers and its local `[[proxies]]`; with `[upstream].claim` it
@@ -28,10 +28,10 @@ pub(crate) async fn run_router(
 ) -> Result<()> {
     // Bind before starting the upstream session, so that the route is never
     // advertised before this process can serve the visitors it receives.
-    let bind_addr = to_bind_addr(&config.bind_host, config.server_port);
+    let bind_addr = to_bind_addr(DEFAULT_BIND_HOST, config.listen_port);
     let http_listener = TcpListener::bind(&bind_addr)
         .await
-        .with_context(|| format!("Failed to listen at `server_port` ({})", bind_addr))?;
+        .with_context(|| format!("Failed to listen at `listen_port` ({})", bind_addr))?;
     let actual_port = http_listener
         .local_addr()
         .context("Failed to read the bound listener address")?
@@ -56,8 +56,8 @@ pub(crate) async fn run_router(
     info!(
         name = %config.name,
         role = %role,
-        server_host = %config.server_host(),
-        server_port = actual_port,
+        control_host = %config.control_host(),
+        listen_port = actual_port,
         "ht starting"
     );
 
@@ -68,7 +68,7 @@ pub(crate) async fn run_router(
     let (routes, route_rx) = watch::channel(BTreeSet::new());
     let state = Arc::new(ServerState::new(
         token,
-        config.server_host().to_string(),
+        config.control_host().to_string(),
         config.server_limits(),
         routes,
         config.proxies.clone(),
@@ -78,7 +78,7 @@ pub(crate) async fn run_router(
     // A standalone ingress has no upstream to wait for and is always ready.
     let connected = Arc::new(AtomicBool::new(config.upstream.is_none()));
 
-    // The management page and the API share the reserved `server_host` of the
+    // The management page and the API share the reserved `control_host` of the
     // listener, so they need no port of their own.
     #[cfg(feature = "management")]
     let management = Some(Arc::new(crate::management::ManagementState::new(
@@ -162,7 +162,7 @@ async fn run_relay(
     let mut _claim_routes = None;
     let routes = if let Some(claim) = upstream.claim() {
         info!(
-            upstream = %upstream.server,
+            upstream = %upstream.url,
             claim,
             "Advertising one upstream route; visitors are forwarded to 127.0.0.1:{}",
             actual_port
@@ -175,7 +175,7 @@ async fn run_relay(
         rx
     } else {
         info!(
-            upstream = %upstream.server,
+            upstream = %upstream.url,
             "Advertising the mirrored routes; visitors are forwarded to 127.0.0.1:{}",
             actual_port
         );
@@ -186,7 +186,7 @@ async fn run_relay(
     let (session_stop_tx, session_stop_rx) = broadcast::channel::<bool>(1);
     let session_args = SessionArgs {
         server_addr: upstream
-            .server_addr()
+            .addr()
             .expect("the configuration validates the upstream address"),
         tls: upstream.tls(),
         token: upstream.token.clone(),
@@ -302,7 +302,7 @@ async fn ensure_upstream_is_not_self(config: &Config, actual_port: u16) -> Resul
             anyhow::bail!(
                 "The upstream `{}` resolves to {}, which is this process's own listener; \
                  configure the next hop instead of itself",
-                upstream.server,
+                upstream.url,
                 addr
             );
         }

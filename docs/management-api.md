@@ -8,15 +8,15 @@ same port. It manages the local `[[proxies]]` of the running process:
   `mirror`/`claim`.
 
 The management interface is always enabled and shares the reserved
-`server_host` of the main `server_port`; it has no listener or port of its own.
+`control_host` of the main `listen_port`; it has no listener or port of its own.
 
 ```toml
-server_port = 7777
-server_host = "edge.lan"
+listen_port = 7777
+control_host = "edge.lan"
 ```
 
-Open `http://<server_host>:<server_port>/`. Requests whose `Host` is not
-`server_host` keep following the normal proxy/v4 routing, so a business domain
+Open `http://<control_host>:<listen_port>/`. Requests whose `Host` is not
+`control_host` keep following the normal proxy/v4 routing, so a business domain
 never reaches the management router.
 
 The browser-native HTTP Basic login uses username `ht` and the listener `token`
@@ -55,6 +55,6 @@ read-only at runtime:
 - `PUT` and `DELETE /api/proxies/*` return `409 Conflict`.
 - Nothing is written to `ht.toml`.
 
-Scalar environment overrides (`HT_TOKEN`, `HT_SERVER`, ...) also win at runtime
+Scalar environment overrides (`HT_TOKEN`, `HT_UPSTREAM_URL`, ...) also win at runtime
 but are never persisted by an API change: the file baseline is saved, and the
 environment is reapplied to the effective configuration.

@@ -1,8 +1,8 @@
 ## ht 配置文件：保留 [upstream] 为客户端/中继，删除则为独立入口。
 
 name = "edge"
-server_port = 7777
-server_host = "edge.lan"
+listen_port = 7777
+control_host = "edge.lan"
 token = "replace-with-the-downstream-secret"
 
 ## 本进程代理的本地服务
@@ -13,6 +13,6 @@ local_addr = "127.0.0.1:80"
 
 ## 下一跳；独立入口请删除本节
 [upstream]
-server = "wss://control.example.com:443"
+url = "wss://control.example.com:443"
 token = "replace-with-the-upstream-secret"
 mirror = true

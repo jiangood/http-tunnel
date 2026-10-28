@@ -1,8 +1,9 @@
 //! Environment-variable configuration of the universal process.
 //!
-//! Every setting of `ht.toml` has an `HT_*` counterpart. The environment wins
-//! over the file field by field, and `HT_PROXIES` replaces the local services of
-//! the file as a whole, so a container can be configured without a mounted file.
+//! The common settings of `ht.toml` have an `HT_*` counterpart. The environment
+//! wins over the file field by field, and `HT_PROXIES` replaces the local
+//! services of the file as a whole, so a container can be configured without a
+//! mounted file.
 //!
 //! A variable that is unset or blank is ignored. That lets a compose file pass
 //! `HT_TOKEN=` when the value is not known yet, without overriding the file.
@@ -13,17 +14,15 @@ use serde::Deserialize;
 use std::path::Path;
 
 /// The WebSocket endpoint of the next hop, e.g. `wss://control.example.com:443`.
-pub(crate) const ENV_SERVER: &str = "HT_SERVER";
+pub(crate) const ENV_UPSTREAM_URL: &str = "HT_UPSTREAM_URL";
 /// The name of the process.
 pub(crate) const ENV_NAME: &str = "HT_NAME";
 /// The listener token shared with downstream peers.
 pub(crate) const ENV_TOKEN: &str = "HT_TOKEN";
 /// The listener port.
-pub(crate) const ENV_SERVER_PORT: &str = "HT_SERVER_PORT";
-/// The IP address the listener binds.
-pub(crate) const ENV_BIND_HOST: &str = "HT_BIND_HOST";
+pub(crate) const ENV_LISTEN_PORT: &str = "HT_LISTEN_PORT";
 /// The Host reserved for the v4 session endpoint.
-pub(crate) const ENV_SERVER_HOST: &str = "HT_SERVER_HOST";
+pub(crate) const ENV_CONTROL_HOST: &str = "HT_CONTROL_HOST";
 /// The WebSocket ping interval in secs.
 pub(crate) const ENV_KEEPALIVE_INTERVAL: &str = "HT_KEEPALIVE_INTERVAL";
 /// The interval between retries to connect to the next hop.
@@ -33,15 +32,26 @@ pub(crate) const ENV_PROXIES: &str = "HT_PROXIES";
 /// The token of the next hop, when it differs from the listener token.
 pub(crate) const ENV_UPSTREAM_TOKEN: &str = "HT_UPSTREAM_TOKEN";
 
+/// The variables renamed in 2.0, with their replacements. A stale deployment
+/// gets an explicit error instead of having the variable silently ignored.
+const LEGACY_ENV_VARS: &[(&str, &str)] = &[
+    ("HT_SERVER", ENV_UPSTREAM_URL),
+    ("HT_SERVER_PORT", ENV_LISTEN_PORT),
+    ("HT_SERVER_HOST", ENV_CONTROL_HOST),
+];
+
+/// The variables that no longer exist. The listener now always binds every
+/// interface, so an old value cannot be honored.
+const REMOVED_ENV_VARS: &[&str] = &["HT_BIND_HOST"];
+
 /// The settings that the environment overrides.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct EnvConfig {
-    server: Option<String>,
+    upstream_url: Option<String>,
     name: Option<String>,
     token: Option<MaskedString>,
-    server_port: Option<u16>,
-    bind_host: Option<String>,
-    server_host: Option<String>,
+    listen_port: Option<u16>,
+    control_host: Option<String>,
     keepalive_interval: Option<u64>,
     retry_interval: Option<u64>,
     proxies: Option<Vec<ServerProxyEntry>>,
@@ -69,9 +79,27 @@ impl EnvConfig {
     {
         let mut env = EnvConfig::default();
 
-        if let Some(value) = read(&lookup, ENV_SERVER)? {
-            env.vars.push(ENV_SERVER);
-            env.server = Some(value);
+        for (old, new) in LEGACY_ENV_VARS {
+            if read(&lookup, old)?.is_some() {
+                return Err(anyhow!(
+                    "The environment variable {} was renamed to {}; update it and restart",
+                    old,
+                    new
+                ));
+            }
+        }
+        for removed in REMOVED_ENV_VARS {
+            if read(&lookup, removed)?.is_some() {
+                return Err(anyhow!(
+                    "The environment variable {} was removed; the listener always binds 0.0.0.0",
+                    removed
+                ));
+            }
+        }
+
+        if let Some(value) = read(&lookup, ENV_UPSTREAM_URL)? {
+            env.vars.push(ENV_UPSTREAM_URL);
+            env.upstream_url = Some(value);
         }
         if let Some(value) = read(&lookup, ENV_NAME)? {
             env.vars.push(ENV_NAME);
@@ -85,17 +113,13 @@ impl EnvConfig {
             env.vars.push(ENV_UPSTREAM_TOKEN);
             env.upstream_token = Some(MaskedString::from(value));
         }
-        if let Some(value) = read(&lookup, ENV_SERVER_PORT)? {
-            env.vars.push(ENV_SERVER_PORT);
-            env.server_port = Some(parse_number(ENV_SERVER_PORT, &value, "a port number")?);
+        if let Some(value) = read(&lookup, ENV_LISTEN_PORT)? {
+            env.vars.push(ENV_LISTEN_PORT);
+            env.listen_port = Some(parse_number(ENV_LISTEN_PORT, &value, "a port number")?);
         }
-        if let Some(value) = read(&lookup, ENV_BIND_HOST)? {
-            env.vars.push(ENV_BIND_HOST);
-            env.bind_host = Some(parse_ip(ENV_BIND_HOST, &value)?);
-        }
-        if let Some(value) = read(&lookup, ENV_SERVER_HOST)? {
-            env.vars.push(ENV_SERVER_HOST);
-            env.server_host = Some(value);
+        if let Some(value) = read(&lookup, ENV_CONTROL_HOST)? {
+            env.vars.push(ENV_CONTROL_HOST);
+            env.control_host = Some(value);
         }
         if let Some(value) = read(&lookup, ENV_KEEPALIVE_INTERVAL)? {
             env.vars.push(ENV_KEEPALIVE_INTERVAL);
@@ -129,14 +153,11 @@ impl EnvConfig {
         if let Some(token) = &self.token {
             config.token = Some(token.clone());
         }
-        if let Some(server_port) = self.server_port {
-            config.server_port = server_port;
+        if let Some(listen_port) = self.listen_port {
+            config.listen_port = listen_port;
         }
-        if let Some(bind_host) = &self.bind_host {
-            config.bind_host = bind_host.clone();
-        }
-        if let Some(server_host) = &self.server_host {
-            config.server_host = Some(server_host.clone());
+        if let Some(control_host) = &self.control_host {
+            config.control_host = Some(control_host.clone());
         }
         if let Some(keepalive_interval) = self.keepalive_interval {
             config.keepalive_interval = keepalive_interval;
@@ -150,10 +171,10 @@ impl EnvConfig {
             config.proxies = proxies.clone();
         }
 
-        if let Some(server) = &self.server {
+        if let Some(url) = &self.upstream_url {
             let had_upstream = config.upstream.is_some();
             let upstream = config.upstream.get_or_insert_with(UpstreamConfig::default);
-            upstream.server = server.clone();
+            upstream.url = url.clone();
             if let Some(token) = &self.upstream_token {
                 upstream.token = token.clone();
             } else if !had_upstream {
@@ -204,14 +225,6 @@ where
     raw.trim()
         .parse::<T>()
         .map_err(|_| anyhow!("{} must be {}, got {:?}", key, expected, raw))
-}
-
-/// Parse an IP address variable and store it in canonical form.
-fn parse_ip(key: &str, raw: &str) -> Result<String> {
-    raw.trim()
-        .parse::<std::net::IpAddr>()
-        .map(|ip| ip.to_string())
-        .map_err(|_| anyhow!("{} must be an IP address, got {:?}", key, raw))
 }
 
 /// The `HT_PROXIES` value, wrapped so that the existing TOML parser reads it.
@@ -312,12 +325,11 @@ mod tests {
     #[test]
     fn test_reads_every_setting() -> Result<()> {
         let parsed = env(&[
-            (ENV_SERVER, "wss://control.example.com"),
+            (ENV_UPSTREAM_URL, "wss://control.example.com"),
             (ENV_NAME, "home"),
             (ENV_TOKEN, "secret"),
-            (ENV_SERVER_PORT, "7777"),
-            (ENV_BIND_HOST, "127.0.0.1"),
-            (ENV_SERVER_HOST, "control.example.com"),
+            (ENV_LISTEN_PORT, "7777"),
+            (ENV_CONTROL_HOST, "control.example.com"),
             (ENV_KEEPALIVE_INTERVAL, "5"),
             (ENV_RETRY_INTERVAL, "3"),
             (ENV_PROXIES, ENV_PROXY),
@@ -329,14 +341,13 @@ mod tests {
 
         // The canonical form is produced by the same validation as the file
         assert_eq!(
-            config.upstream.as_ref().unwrap().server,
+            config.upstream.as_ref().unwrap().url,
             "wss://control.example.com:443"
         );
         assert_eq!(config.name, "home");
         assert_eq!(&**config.token.as_ref().unwrap(), "secret");
-        assert_eq!(config.server_port, 7777);
-        assert_eq!(config.bind_host, "127.0.0.1");
-        assert_eq!(config.server_host(), "control.example.com");
+        assert_eq!(config.listen_port, 7777);
+        assert_eq!(config.control_host(), "control.example.com");
         assert_eq!(config.keepalive_interval, 5);
         assert_eq!(config.retry_interval, 3);
 
@@ -349,12 +360,11 @@ mod tests {
         assert_eq!(
             parsed.vars().to_vec(),
             vec![
-                ENV_SERVER,
+                ENV_UPSTREAM_URL,
                 ENV_NAME,
                 ENV_TOKEN,
-                ENV_SERVER_PORT,
-                ENV_BIND_HOST,
-                ENV_SERVER_HOST,
+                ENV_LISTEN_PORT,
+                ENV_CONTROL_HOST,
                 ENV_KEEPALIVE_INTERVAL,
                 ENV_RETRY_INTERVAL,
                 ENV_PROXIES,
@@ -371,6 +381,35 @@ mod tests {
         assert!(!parsed.proxies_managed());
         assert_eq!(parsed, EnvConfig::default());
         Ok(())
+    }
+
+    #[test]
+    fn test_legacy_variables_are_rejected() {
+        for &(old, new) in LEGACY_ENV_VARS {
+            let err = format!("{:#}", env(&[(old, "value")]).unwrap_err());
+            assert!(err.contains(old), "{}", err);
+            assert!(err.contains(new), "{}", err);
+        }
+    }
+
+    #[test]
+    fn test_blank_legacy_variables_are_ignored() -> Result<()> {
+        let parsed = env(&[
+            ("HT_SERVER", " "),
+            ("HT_SERVER_PORT", ""),
+            ("HT_SERVER_HOST", "\n"),
+        ])?;
+        assert!(parsed.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_removed_variables_are_rejected() {
+        for &removed in REMOVED_ENV_VARS {
+            let err = format!("{:#}", env(&[(removed, "127.0.0.1")]).unwrap_err());
+            assert!(err.contains(removed), "{}", err);
+            assert!(err.contains("removed"), "{}", err);
+        }
     }
 
     #[test]
@@ -397,7 +436,7 @@ mod tests {
     fn test_scalar_override_keeps_the_file_proxies() -> Result<()> {
         let mut config = Config::parse(
             r#"
-server_host = "control.example.com"
+control_host = "control.example.com"
 token = "file-token"
 
 [[proxies]]
@@ -422,7 +461,7 @@ local_addr = "127.0.0.1:80"
     fn test_proxies_replace_the_file_ones() -> Result<()> {
         let mut config = Config::parse(
             r#"
-server_host = "control.example.com"
+control_host = "control.example.com"
 token = "secret"
 
 [[proxies]]
@@ -451,7 +490,7 @@ local_addr = "127.0.0.1:80"
 
         let mut config = Config::parse(
             r#"
-server_host = "control.example.com"
+control_host = "control.example.com"
 token = "secret"
 
 [[proxies]]
@@ -475,7 +514,7 @@ local_addr = "127.0.0.1:80"
                 {name="b",domain="SAME.example.com",local_addr="127.0.0.1:81"}]"#,
         ] {
             let parsed = env(&[
-                (ENV_SERVER_HOST, "control.example.com"),
+                (ENV_CONTROL_HOST, "control.example.com"),
                 (ENV_TOKEN, "secret"),
                 (ENV_PROXIES, proxies),
             ])?;
@@ -491,7 +530,7 @@ local_addr = "127.0.0.1:80"
     async fn test_load_without_a_file_uses_the_environment() -> Result<()> {
         let path = temp_path("env-only");
         let env = env(&[
-            (ENV_SERVER, "ws://127.0.0.1:8080"),
+            (ENV_UPSTREAM_URL, "ws://127.0.0.1:8080"),
             (ENV_NAME, "home"),
             (ENV_TOKEN, "secret"),
             (ENV_PROXIES, ENV_PROXY),
@@ -532,7 +571,7 @@ local_addr = "127.0.0.1:80"
         std::fs::write(
             &path,
             r#"
-server_host = "control.example.com"
+control_host = "control.example.com"
 name = "file"
 token = "file-token"
 

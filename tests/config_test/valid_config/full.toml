@@ -1,6 +1,5 @@
-server_port = 7777 # The listener port, shared by visitors and v4 sessions
-bind_host = "127.0.0.1" # The address the listener binds
-server_host = "control.example.com" # The reserved Host of the WebSocket endpoint
+listen_port = 7777 # The listener port, shared by visitors and v4 sessions
+control_host = "control.example.com" # The reserved Host of the WebSocket endpoint
 name = "edge" # The name of the process
 token = "use_a_secret_that_only_you_know" # The listener token for downstream peers
 retry_interval = 1 # The interval between retries to connect to the next hop
@@ -21,6 +20,6 @@ domain = "www.example.com" # The same address can serve several domains
 local_addr = "127.0.0.1:80"
 
 [upstream] # Remove this table to run as a standalone ingress
-server = "wss://upper.example.com:443" # The next hop: server_host and server_port
+url = "wss://upper.example.com:443" # The next hop
 token = "use_a_different_secret_per_hop"
 mirror = true # Publish every local proxy and downstream route

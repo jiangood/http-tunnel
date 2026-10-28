@@ -50,9 +50,9 @@ impl ManagementState {
         persisted.source = ConfigSource::default();
 
         let name = config.name.clone();
-        let server_addr = config
-            .upstream_addr()
-            .unwrap_or_else(|| format!("{}:{}", config.bind_host, config.server_port));
+        let server_addr = config.upstream_addr().unwrap_or_else(|| {
+            crate::helper::to_bind_addr(crate::helper::DEFAULT_BIND_HOST, config.listen_port)
+        });
         let transport = if config.upstream.is_some() {
             config.transport_name().to_string()
         } else {
@@ -223,7 +223,7 @@ mod tests {
         ));
         let persisted = Config::parse(
             r#"
-server_host = "control.example.com"
+control_host = "control.example.com"
 name = "file"
 token = "file-token"
 
@@ -284,7 +284,7 @@ local_addr = "127.0.0.1:80"
         })?;
         let mut effective = Config::default();
         env.apply(&mut effective);
-        effective.server_host = Some("control.example.com".to_string());
+        effective.control_host = Some("control.example.com".to_string());
         effective.token = Some(MaskedString::from("secret"));
         Config::validate(&mut effective)?;
         effective.source.env = env;
@@ -312,7 +312,7 @@ local_addr = "127.0.0.1:80"
         ));
         let persisted = Config::parse(
             r#"
-server_host = "control.example.com"
+control_host = "control.example.com"
 name = "file"
 token = "file-token"
 

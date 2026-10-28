@@ -1,4 +1,4 @@
-use crate::config::{domain_overlaps_server_host, MaskedString, ServerLimits, ServerProxyEntry};
+use crate::config::{domain_overlaps_control_host, MaskedString, ServerLimits, ServerProxyEntry};
 use crate::session_server::V4SessionHandle;
 use anyhow::{anyhow, Context, Result};
 use std::collections::{BTreeSet, HashMap};
@@ -63,7 +63,7 @@ pub(crate) struct ServerState {
     // The shared token every peers authenticates with
     pub(crate) token: MaskedString,
     // Reserved HTTP Host for the WebSocket transport; never a business tunnel
-    pub(crate) server_host: String,
+    pub(crate) control_host: String,
     // The configurable capacity and keepalive settings
     pub(crate) limits: ServerLimits,
     // WebSocket upgrades that are still waiting for their session handshake
@@ -74,7 +74,7 @@ pub(crate) struct ServerState {
     pub(crate) v4_shutdown: broadcast::Sender<bool>,
     pub(crate) next_v4_session_id: AtomicU64,
     // The domains this server can advertise upstream: its downstream routes
-    // plus its local proxies, excluding `server_host`.
+    // plus its local proxies, excluding `control_host`.
     pub(crate) routes: watch::Sender<BTreeSet<String>>,
     // The local services served by this process. The administration API can
     // replace this list at runtime.
@@ -112,7 +112,7 @@ struct Server {
 impl ServerState {
     pub(crate) fn new(
         token: MaskedString,
-        server_host: String,
+        control_host: String,
         limits: ServerLimits,
         routes: watch::Sender<BTreeSet<String>>,
         proxies: Vec<ServerProxyEntry>,
@@ -120,7 +120,7 @@ impl ServerState {
         let max_sessions = limits.max_sessions;
         ServerState {
             token,
-            server_host,
+            control_host,
             pending_connections: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
             limits,
             v4_routes: RwLock::new(HashMap::new()),
@@ -148,7 +148,7 @@ impl ServerState {
         let mut routes: BTreeSet<String> = proxies
             .iter()
             .filter_map(|proxy| crate::helper::normalize_domain(&proxy.domain))
-            .filter(|domain| !domain_overlaps_server_host(domain, &self.server_host))
+            .filter(|domain| !domain_overlaps_control_host(domain, &self.control_host))
             .collect();
         routes.extend(v4_routes.keys().cloned());
         self.routes.send_modify(|current| *current = routes);

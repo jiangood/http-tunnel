@@ -198,9 +198,8 @@ def main():
     try:
         # Phase 1: a standalone ingress with one local proxy.
         (work / "ht.toml").write_text(f"""name = "e2e-ingress"
-server_port = {server_port}
-bind_host = "127.0.0.1"
-server_host = "127.0.0.1"
+listen_port = {server_port}
+control_host = "127.0.0.1"
 token = "{TOKEN}"
 
 [[proxies]]
@@ -213,14 +212,13 @@ auth_header = "{SERVER_AUTH}"
         processes.append(server)
         wait_for_port(server_port, server, "ht ingress listener")
 
-        # A leaf always runs its own listener (here an ephemeral loopback port)
+        # A leaf always runs its own listener (here an ephemeral port)
         # and dials the ingress. Its local services are [[proxies]].
         leaf_work = Path(tempfile.mkdtemp(prefix="http-tunnel-e2e-leaf-"))
         work_dirs.append(leaf_work)
         (leaf_work / "ht.toml").write_text(f"""name = "e2e-leaf"
-server_port = {leaf_port}
-bind_host = "127.0.0.1"
-server_host = "127.0.0.1"
+listen_port = {leaf_port}
+control_host = "127.0.0.1"
 token = "{TOKEN}"
 retry_interval = 1
 
@@ -231,7 +229,7 @@ local_addr = "127.0.0.1:{client_backend.server_port}"
 auth_header = "{CLIENT_AUTH}"
 
 [upstream]
-server = "ws://127.0.0.1:{server_port}"
+url = "ws://127.0.0.1:{server_port}"
 token = "{TOKEN}"
 mirror = true
 """)
@@ -303,12 +301,11 @@ mirror = true
         env = os.environ.copy()
         env.update(
             {
-                "HT_SERVER": f"ws://127.0.0.1:{server_port}",
+                "HT_UPSTREAM_URL": f"ws://127.0.0.1:{server_port}",
                 "HT_NAME": "e2e-env-leaf",
                 "HT_TOKEN": TOKEN,
-                "HT_SERVER_PORT": str(env_leaf_port),
-                "HT_BIND_HOST": "127.0.0.1",
-                "HT_SERVER_HOST": "127.0.0.1",
+                "HT_LISTEN_PORT": str(env_leaf_port),
+                "HT_CONTROL_HOST": "127.0.0.1",
                 "HT_RETRY_INTERVAL": "1",
                 "HT_PROXIES": (
                     f'[{{name="client-backend",domain="env-client.e2e.test",'
@@ -365,20 +362,18 @@ mirror = true
         chain_work = Path(tempfile.mkdtemp(prefix="http-tunnel-e2e-chain-"))
         work_dirs.extend([node_work, chain_work])
         (node_work / "ht.toml").write_text(f"""name = "e2e-relay"
-server_port = {node_port}
-server_host = "127.0.0.1"
-bind_host = "127.0.0.1"
+listen_port = {node_port}
+control_host = "127.0.0.1"
 token = "{NODE_TOKEN}"
 
 [upstream]
-server = "ws://127.0.0.1:{server_port}"
+url = "ws://127.0.0.1:{server_port}"
 token = "{TOKEN}"
 mirror = true
 """)
         (chain_work / "ht.toml").write_text(f"""name = "e2e-chain-leaf"
-server_port = 0
-server_host = "127.0.0.1"
-bind_host = "127.0.0.1"
+listen_port = 0
+control_host = "127.0.0.1"
 token = "{NODE_TOKEN}"
 retry_interval = 1
 
@@ -389,7 +384,7 @@ local_addr = "127.0.0.1:{client_backend.server_port}"
 auth_header = "{CLIENT_AUTH}"
 
 [upstream]
-server = "ws://127.0.0.1:{node_port}"
+url = "ws://127.0.0.1:{node_port}"
 token = "{NODE_TOKEN}"
 mirror = true
 """)

@@ -8,9 +8,9 @@ Socket. The same entry is used whether the process is an ingress, a relay or a
 leaf. It optionally carries an `auth_header` gate.
 
 ### Listener / embedded server
-Every `ht` process runs an embedded HTTP server. It listens on `server_port`,
+Every `ht` process runs an embedded HTTP server. It listens on `listen_port`,
 serves local proxies, routes visitors to downstream v4 sessions, and accepts v4
-sessions on the reserved `server_host`.
+sessions on the reserved `control_host`.
 
 ### Upstream
 The optional `[upstream]` table. When present, the process opens one v4 session
@@ -21,7 +21,7 @@ opened.
 ### Route
 A domain served by the process. The route watch is the union of local
 `[[proxies]]` and the prefixes claimed by downstream v4 sessions, excluding the
-reserved `server_host`.
+reserved `control_host`.
 
 ### Visitor
 Who visits a route through the public ingress.
@@ -46,7 +46,7 @@ points at the process itself.
 
 The process binds the listener before doing anything else. That guarantees the
 route is never advertised before the process can serve a visitor, and it resolves
-an ephemeral `server_port = 0` to the actual port used as the loopback target of
+an ephemeral `listen_port = 0` to the actual port used as the loopback target of
 the upstream session.
 
 The embedded server accepts visitors on one port. It reads the request line and
@@ -73,7 +73,7 @@ keepalive; there is no separate application heartbeat.
 ## Upstream session
 
 With `[upstream]`, the process converts its route watch into a `RouteMap` whose
-targets all point to `127.0.0.1:<actual server_port>`. This is true for both
+targets all point to `127.0.0.1:<actual listen_port>`. This is true for both
 `mirror` and `claim`; the difference is only what is advertised:
 
 - `mirror`: every route of the union above, sent as a snapshot and then diffed

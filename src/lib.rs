@@ -8,7 +8,7 @@ mod transport;
 
 pub use config::{
     Config, GeneratedConfigError, MaskedString, ServerLimits, ServerProxyEntry, UpstreamConfig,
-    DEFAULT_SERVER_PORT,
+    DEFAULT_LISTEN_PORT,
 };
 
 use anyhow::Result;

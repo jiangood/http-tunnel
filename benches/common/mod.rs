@@ -73,11 +73,11 @@ impl Harness {
         let config_path =
             std::env::temp_dir().join(format!("http-tunnel-bench-{}.toml", std::process::id()));
         let config = format!(
-            "server_port = 0\nbind_host = \"127.0.0.1\"\nserver_host = \"127.0.0.1\"\n\
+            "listen_port = 0\ncontrol_host = \"127.0.0.1\"\n\
              name = \"{LEAF_NAME}\"\ntoken = \"{LEAF_TOKEN}\"\n\n\
              [[proxies]]\nname = \"echo\"\ndomain = \"{ECHO_HOST}\"\n\
              local_addr = \"{ECHO_SERVER_ADDR}\"\n\n\
-             [upstream]\nserver = \"ws://127.0.0.1:{HTTP_ENTRY_PORT}\"\n\
+             [upstream]\nurl = \"ws://127.0.0.1:{HTTP_ENTRY_PORT}\"\n\
              token = \"{LEAF_TOKEN}\"\nmirror = true\n"
         );
         std::fs::write(&config_path, config)?;
@@ -103,8 +103,7 @@ impl Harness {
         let ingress = {
             tokio::spawn(async move {
                 let config = http_tunnel::Config::parse(&format!(
-                    "server_port = {HTTP_ENTRY_PORT}\nbind_host = \"127.0.0.1\"\n\
-                     server_host = \"127.0.0.1\"\ntoken = \"{LEAF_TOKEN}\"\n"
+                    "listen_port = {HTTP_ENTRY_PORT}\ncontrol_host = \"127.0.0.1\"\ntoken = \"{LEAF_TOKEN}\"\n"
                 ))
                 .expect("the benchmark ingress config must be valid");
                 let _ = http_tunnel::run(config, ingress_rx).await;

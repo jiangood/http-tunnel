@@ -128,7 +128,7 @@ async fn handle_visitor(
     // Reserve the configured server Host for the internal WebSocket transport
     // and the management page/API. Host is a routing key only; the token in the
     // `Authorization` header authenticates both.
-    if state.server_host == host {
+    if state.control_host == host {
         let path = parse_request_path(&prefetched).unwrap_or_default();
         if path == crate::protocol_v4::V4_PATH {
             let Some((conn, _pending_permit)) =

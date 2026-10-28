@@ -99,7 +99,7 @@ pub(crate) async fn accept(mut conn: Conn, state: Arc<ServerState>) -> Result<()
 
     let mut nonce = vec![0u8; 32];
     rand::thread_rng().fill_bytes(&mut nonce);
-    let server_id = state.server_host.clone();
+    let server_id = state.control_host.clone();
     p4::write_frame(
         &mut conn,
         &SessionFrame::Challenge {
@@ -334,7 +334,7 @@ async fn apply_routes(
             });
             continue;
         };
-        if crate::config::domain_overlaps_server_host(&prefix, &state.server_host) {
+        if crate::config::domain_overlaps_control_host(&prefix, &state.control_host) {
             rejected.push(RouteRejection {
                 prefix,
                 reason: RouteError::ReservedHost,

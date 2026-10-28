@@ -22,7 +22,7 @@ The session endpoint is:
 /_http-tunnel/v4/connect
 ```
 
-It is available only on the reserved `server_host` of the listener. There is no
+It is available only on the reserved `control_host` of the listener. There is no
 version preamble and no fallback: any other path on that Host is either the
 management interface or a `404`.
 
@@ -64,7 +64,7 @@ client                                            server
 - `role` is advisory for logging. Routing and authorization use the token and
   the advertised prefixes, not the role.
 - `proof = SHA-256(token || nonce || node_id || server_id)`. The server id is
-  its reserved `server_host`; the nonce is a fresh 32-byte random value per
+  its reserved `control_host`; the nonce is a fresh 32-byte random value per
   session.
 - A wrong version, an empty node id, a malformed frame or a bad proof ends the
   handshake with an `Error` frame.
@@ -124,7 +124,7 @@ Current rejection reasons:
 | Reason | Meaning |
 | --- | --- |
 | `InvalidPrefix` | The prefix is not a valid exact or `*.suffix` domain |
-| `ReservedHost` | The prefix overlaps the server's reserved `server_host` |
+| `ReservedHost` | The prefix overlaps the server's reserved `control_host` |
 | `TooManyRoutes` | The session would exceed `MAX_ROUTES_PER_SESSION` (256) |
 | `Conflict` | Another session already owns the prefix |
 

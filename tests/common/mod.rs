@@ -9,27 +9,24 @@ use tokio::{
 };
 
 /// Build a standalone ingress configuration for the test listeners.
-pub fn ingress_config(server_port: u16, server_host: &str, token: &str) -> Config {
+pub fn ingress_config(listen_port: u16, control_host: &str, token: &str) -> Config {
     let mut config = Config::default();
     config.name = "test-ingress".to_string();
-    config.server_port = server_port;
-    config.server_host = Some(server_host.to_string());
-    // Keep the test listeners on loopback: a wildcard listener triggers the
-    // Windows Firewall prompt for every test binary.
-    config.bind_host = "127.0.0.1".to_string();
+    config.listen_port = listen_port;
+    config.control_host = Some(control_host.to_string());
     config.token = Some(MaskedString::from(token));
     config
 }
 
 pub async fn run_http_tunnel_server(
-    server_port: u16,
-    server_host: &str,
+    listen_port: u16,
+    control_host: &str,
     token: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     run_http_tunnel_server_with_limits(
-        server_port,
-        server_host,
+        listen_port,
+        control_host,
         token,
         http_tunnel::ServerLimits::default(),
         shutdown_rx,
@@ -38,13 +35,13 @@ pub async fn run_http_tunnel_server(
 }
 
 pub async fn run_http_tunnel_server_with_limits(
-    server_port: u16,
-    server_host: &str,
+    listen_port: u16,
+    control_host: &str,
     token: &str,
     limits: http_tunnel::ServerLimits,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let mut config = ingress_config(server_port, server_host, token);
+    let mut config = ingress_config(listen_port, control_host, token);
     config.max_pending_handshakes = limits.max_pending_handshakes;
     config.max_sessions = limits.max_sessions;
     config.keepalive_interval = limits.keepalive_interval;

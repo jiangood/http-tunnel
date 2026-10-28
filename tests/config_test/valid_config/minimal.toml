@@ -1,6 +1,6 @@
 # The listener host is required without `[upstream]`. The process is a
 # standalone ingress here.
-server_host = "control.example.com"
+control_host = "control.example.com"
 name = "home"
 token = "use_a_secret_that_only_you_know"
 

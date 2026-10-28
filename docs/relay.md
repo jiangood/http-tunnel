@@ -24,9 +24,8 @@ The role is selected only by the presence of `[upstream]`:
 
 ```toml
 name = "relay-b"
-server_port = 9001
-bind_host = "0.0.0.0"
-server_host = "b.lan"
+listen_port = 9001
+control_host = "b.lan"
 token = "downstream-secret"
 
 [[proxies]]
@@ -35,7 +34,7 @@ domain = "local.b.relay.example.com"
 local_addr = "127.0.0.1:8080"
 
 [upstream]
-server = "ws://a.lan:7777"
+url = "ws://a.lan:7777"
 token = "upstream-secret"
 mirror = true
 # claim = "*.b.relay.example.com"
@@ -43,9 +42,8 @@ mirror = true
 
 | Setting | Meaning |
 | --- | --- |
-| `server_port` | The one listener port for visitors, downstream peers, and the WebSocket endpoint. `0` picks an ephemeral port and requires `[upstream]`. |
-| `bind_host` | IP the listener binds. Defaults to `0.0.0.0`; with `[upstream]` it must be `0.0.0.0` or a loopback address, because visitors arrive from the upstream session on `127.0.0.1:<actual port>`. |
-| `server_host` | Exact Host reserved for the v4 session endpoint. Required without `[upstream]`; defaults to `127.0.0.1` with it. |
+| `listen_port` | The one listener port for visitors, downstream peers, and the WebSocket endpoint. `0` picks an ephemeral port and requires `[upstream]`. |
+| `control_host` | Exact Host reserved for the v4 session endpoint. Required without `[upstream]`; defaults to `127.0.0.1` with it. |
 | `token` | Token for downstream peers. May be omitted with `[upstream]`, in which case the upstream token is reused. |
 | `[[proxies]]` | Local services served by this process. They take precedence over downstream session routes. |
 | `[upstream]` | The next hop. Remove it to run as a standalone ingress. |
@@ -56,13 +54,13 @@ mirror = true
 ## Route advertisement
 
 - `mirror = true` turns the embedded server's route watch into a set of routes
-  that all point back to `127.0.0.1:<actual server_port>`. The set is the union
+  that all point back to `127.0.0.1:<actual listen_port>`. The set is the union
   of local `[[proxies]]` and the routes claimed by downstream v4 sessions.
   Additions and removals are sent as v4 `Update` frames on the same session.
 - `claim = "..."` advertises exactly one exact or wildcard domain. The upper
   hops then see only that domain.
-- The claim must not overlap this process's `server_host` or the next hop's
-  `server_host` (the host of the upstream URL).
+- The claim must not overlap this process's `control_host` or the next hop's
+  `control_host` (the host of the upstream URL).
 - A local proxy inside a claimed subtree is intentional: the relay serves that
   domain itself and forwards the rest downstream.
 - Duplicate domains are rejected as `Conflict`. A rejected claim is logged and
@@ -71,7 +69,7 @@ mirror = true
 ## Data plane
 
 The data plane is recursive. The upstream session receives a visitor stream and
-connects to `127.0.0.1:<actual server_port>`. The embedded listener reads the
+connects to `127.0.0.1:<actual listen_port>`. The embedded listener reads the
 `Host` again and routes the visitor to a local proxy or a downstream session.
 The `Host` header and the bytes are not rewritten, so WebSocket upgrades and any
 other protocol upgrade traverse the whole chain.
@@ -83,12 +81,11 @@ WebSocket ping/pong provides keepalive.
 
 Startup validates before advertising anything:
 
-- `server_port = 0` is rejected without `[upstream]`.
-- With `[upstream]`, `bind_host` must be unspecified or loopback.
-- `server_host` is required without an upstream and must be an exact hostname.
+- `listen_port = 0` is rejected without `[upstream]`.
+- `control_host` is required without an upstream and must be an exact hostname.
 - Local proxy names and domains are unique after lowercasing; wildcard domains
-  must not overlap `server_host`.
-- `[upstream].server` must be a `ws://` or `wss://` URL without a path.
+  must not overlap `control_host`.
+- `[upstream].url` must be a `ws://` or `wss://` URL without a path.
 - The upstream token must be a strong non-placeholder secret.
 - `mirror` and `claim` are mutually exclusive; `mirror` defaults on.
 - The upstream must not point at this process's own listener. The literal
