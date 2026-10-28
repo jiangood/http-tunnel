@@ -74,7 +74,7 @@ impl Harness {
             std::env::temp_dir().join(format!("http-tunnel-bench-{}.toml", std::process::id()));
         let config = format!(
             "server_port = 0\nbind_host = \"127.0.0.1\"\nserver_host = \"127.0.0.1\"\n\
-             name = \"{CLIENT_NAME}\"\ntoken = \"{CLIENT_TOKEN}\"\nweb_port = 0\n\n\
+             name = \"{CLIENT_NAME}\"\ntoken = \"{CLIENT_TOKEN}\"\n\n\
              [[proxies]]\nname = \"echo\"\ndomain = \"{ECHO_HOST}\"\n\
              local_addr = \"{ECHO_SERVER_ADDR}\"\n\n\
              [upstream]\nserver = \"ws://127.0.0.1:{HTTP_ENTRY_PORT}\"\n\

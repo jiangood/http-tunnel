@@ -49,6 +49,7 @@ fn find_proxy<'a>(proxies: &'a [ServerProxyEntry], host: &str) -> Option<&'a Ser
 pub(crate) async fn serve(
     l: TcpListener,
     state: Arc<ServerState>,
+    management: Option<crate::server::Management>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     if let Ok(addr) = l.local_addr() {
@@ -61,11 +62,13 @@ pub(crate) async fn serve(
                 match ret {
                     Ok((stream, addr)) => {
                         let state = state.clone();
+                        let management = management.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_visitor(
                                 stream,
                                 addr,
                                 state,
+                                management,
                             ).await {
                                 debug!("Failed to route visitor {}: {:#}", addr, e);
                             }
@@ -86,7 +89,12 @@ async fn handle_visitor(
     mut stream: TcpStream,
     addr: SocketAddr,
     state: Arc<ServerState>,
+    management: Option<crate::server::Management>,
 ) -> Result<()> {
+    // Builds without the administration API still carry the parameter.
+    #[cfg(not(feature = "client-api"))]
+    let _ = management;
+
     // Count the visitor as active from the moment it's accepted, so that a
     // shutdown can wait for it instead of cutting it off.
     let activity = state.activity.guard();
@@ -117,26 +125,43 @@ async fn handle_visitor(
         Ok(Ok(header)) => header,
     };
 
-    // Reserve the configured server Host for the internal WebSocket transport.
-    // Host is a routing key only; the token in the `Authorization` header
-    // authenticates the upgrade before it can reserve any capacity.
+    // Reserve the configured server Host for the internal WebSocket transport
+    // and the management page/API. Host is a routing key only; the token in the
+    // `Authorization` header authenticates both.
     if state.server_host == host {
         let path = parse_request_path(&prefetched).unwrap_or_default();
-        if path != crate::protocol_v4::V4_PATH {
-            respond(&mut stream, "404 Not Found", "Unknown control endpoint\n").await;
+        if path == crate::protocol_v4::V4_PATH {
+            let Some((conn, _pending_permit)) =
+                accept_tunnel_websocket(prefetched, stream, &state, addr).await?
+            else {
+                return Ok(());
+            };
+            // This is a transport/session connection, not an in-flight visitor
+            // request. Do not include its lifetime in the visitor drain counter.
+            drop(activity);
+            if let Err(e) = crate::session_server::accept(conn, state).await {
+                debug!("Tunnel WebSocket connection closed: {:#}", e);
+            }
             return Ok(());
         }
-        let Some((conn, _pending_permit)) =
-            accept_tunnel_websocket(prefetched, stream, &state, addr).await?
-        else {
+
+        // Every other path on the reserved Host is the management interface.
+        #[cfg(feature = "client-api")]
+        if let Some(management) = management {
+            if let Err(e) = crate::client_api::serve_connection(
+                prefetched,
+                stream,
+                management,
+                state.token.to_string(),
+            )
+            .await
+            {
+                debug!("Management connection closed: {:#}", e);
+            }
             return Ok(());
-        };
-        // This is a transport/session connection, not an in-flight visitor
-        // request. Do not include its lifetime in the visitor drain counter.
-        drop(activity);
-        if let Err(e) = crate::session_server::accept(conn, state).await {
-            debug!("Tunnel WebSocket connection closed: {:#}", e);
         }
+
+        respond(&mut stream, "404 Not Found", "Unknown control endpoint\n").await;
         return Ok(());
     }
 

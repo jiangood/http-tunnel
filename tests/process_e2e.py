@@ -93,12 +93,12 @@ def check_web_management(port, read_only=False):
     print("PASS web management: Basic auth, plain HTML page, and existing Bearer API")
 
 
-def request(port, host, token=None):
+def request(port, host, token=None, path="/e2e"):
     headers = {"Host": host}
     if token is not None:
         headers["X-HTTP-TUNNEL-TOKEN"] = token
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/e2e",
+        f"http://127.0.0.1:{port}{path}",
         headers=headers,
     )
     with urllib.request.urlopen(req, timeout=5) as response:
@@ -188,9 +188,9 @@ def main():
     for server in (server_backend, client_backend):
         threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    server_port, web_port = free_port(), free_port()
-    while web_port == server_port:
-        web_port = free_port()
+    server_port, leaf_port = free_port(), free_port()
+    while leaf_port == server_port:
+        leaf_port = free_port()
 
     processes = []
     work = Path(tempfile.mkdtemp(prefix="http-tunnel-e2e-"))
@@ -218,12 +218,10 @@ auth_header = "{SERVER_AUTH}"
         leaf_work = Path(tempfile.mkdtemp(prefix="http-tunnel-e2e-leaf-"))
         work_dirs.append(leaf_work)
         (leaf_work / "ht.toml").write_text(f"""name = "e2e-leaf"
-server_port = 0
+server_port = {leaf_port}
 bind_host = "127.0.0.1"
 server_host = "127.0.0.1"
 token = "{TOKEN}"
-web_port = {web_port}
-web_host = "127.0.0.1"
 retry_interval = 1
 
 [[proxies]]
@@ -240,8 +238,16 @@ mirror = true
 
         leaf = start_ht(leaf_work, "leaf")
         processes.append(leaf)
-        wait_for_port(web_port, leaf, "ht leaf web management listener")
-        check_web_management(web_port)
+        wait_for_port(leaf_port, leaf, "ht leaf listener")
+        check_web_management(leaf_port)
+        # The management paths on a business Host must still reach the proxy,
+        # not the management router that the reserved Host owns.
+        status, body = request(leaf_port, "client.e2e.test", CLIENT_AUTH, "/api/status")
+        assert status == 200 and body["path"] == "/api/status", (
+            "a business Host must not be routed to the management API, "
+            f"got {body!r}"
+        )
+        print("PASS management: the reserved Host only, a business Host keeps proxying")
         body = wait_for_tunnel(server_port, leaf, "client.e2e.test", CLIENT_AUTH)
         assert body["tunnel_token"] is None, (
             "the token must be stripped before the backend, "
@@ -291,18 +297,18 @@ mirror = true
 
         env_work = Path(tempfile.mkdtemp(prefix="http-tunnel-e2e-env-"))
         work_dirs.append(env_work)
-        env_web_port = free_port()
+        env_leaf_port = free_port()
+        while env_leaf_port in (server_port, leaf_port):
+            env_leaf_port = free_port()
         env = os.environ.copy()
         env.update(
             {
                 "HT_SERVER": f"ws://127.0.0.1:{server_port}",
                 "HT_NAME": "e2e-env-leaf",
                 "HT_TOKEN": TOKEN,
-                "HT_SERVER_PORT": "0",
+                "HT_SERVER_PORT": str(env_leaf_port),
                 "HT_BIND_HOST": "127.0.0.1",
                 "HT_SERVER_HOST": "127.0.0.1",
-                "HT_WEB_PORT": str(env_web_port),
-                "HT_WEB_HOST": "127.0.0.1",
                 "HT_RETRY_INTERVAL": "1",
                 "HT_PROXIES": (
                     f'[{{name="client-backend",domain="env-client.e2e.test",'
@@ -317,11 +323,11 @@ mirror = true
             stderr=subprocess.STDOUT, text=True,
         )
         processes.append(leaf)
-        wait_for_port(env_web_port, leaf, "ht environment-only web listener")
+        wait_for_port(env_leaf_port, leaf, "ht environment-only listener")
         assert not (env_work / "ht.toml").exists(), (
             "an environment-only process must not write ht.toml"
         )
-        check_web_management(env_web_port, read_only=True)
+        check_web_management(env_leaf_port, read_only=True)
         body = wait_for_tunnel(server_port, leaf, "env-client.e2e.test", CLIENT_AUTH)
         assert body["tunnel_token"] is None, (
             "the token must be stripped before the backend, "
@@ -330,7 +336,7 @@ mirror = true
 
         # The proxies of the environment are read-only through the API
         api_req = urllib.request.Request(
-            f"http://127.0.0.1:{env_web_port}/api/tunnels/extra",
+            f"http://127.0.0.1:{env_leaf_port}/api/tunnels/extra",
             method="PUT",
             data=b'{"domain":"extra.e2e.test","local_addr":"127.0.0.1:1"}',
             headers={
@@ -353,7 +359,7 @@ mirror = true
 
         # Phase 3: a real ht relay mirrors a real ht leaf to the ingress.
         node_port = free_port()
-        while node_port in (server_port, web_port, env_web_port):
+        while node_port in (server_port, leaf_port, env_leaf_port):
             node_port = free_port()
         node_work = Path(tempfile.mkdtemp(prefix="http-tunnel-e2e-node-"))
         chain_work = Path(tempfile.mkdtemp(prefix="http-tunnel-e2e-chain-"))
@@ -374,7 +380,6 @@ server_port = 0
 server_host = "127.0.0.1"
 bind_host = "127.0.0.1"
 token = "{NODE_TOKEN}"
-web_port = 0
 retry_interval = 1
 
 [[proxies]]

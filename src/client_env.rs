@@ -11,7 +11,7 @@
 //! `HT_TOKEN=` when the value is not known yet, without overriding the file.
 
 use crate::config::{Config, ConfigSource, MaskedString, ServerProxyEntry, UpstreamConfig};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -27,10 +27,6 @@ pub(crate) const ENV_SERVER_PORT: &str = "HT_SERVER_PORT";
 pub(crate) const ENV_BIND_HOST: &str = "HT_BIND_HOST";
 /// The Host reserved for the WebSocket control endpoint.
 pub(crate) const ENV_SERVER_HOST: &str = "HT_SERVER_HOST";
-/// The port of the web management interface.
-pub(crate) const ENV_WEB_PORT: &str = "HT_WEB_PORT";
-/// The address the web management interface binds.
-pub(crate) const ENV_WEB_HOST: &str = "HT_WEB_HOST";
 /// The WebSocket ping interval in secs.
 pub(crate) const ENV_KEEPALIVE_INTERVAL: &str = "HT_KEEPALIVE_INTERVAL";
 /// The interval between retries to connect to the next hop.
@@ -44,12 +40,17 @@ pub(crate) const ENV_UPSTREAM_TOKEN: &str = "HT_UPSTREAM_TOKEN";
 const LEGACY_SERVER: &str = "HTC_SERVER";
 const LEGACY_NAME: &str = "HTC_NAME";
 const LEGACY_TOKEN: &str = "HTC_TOKEN";
-const LEGACY_WEB_PORT: &str = "HTC_WEB_PORT";
-const LEGACY_WEB_HOST: &str = "HTC_WEB_HOST";
 const LEGACY_HEARTBEAT_TIMEOUT: &str = "HTC_HEARTBEAT_TIMEOUT";
 const LEGACY_KEEPALIVE_INTERVAL: &str = "HTC_KEEPALIVE_INTERVAL";
 const LEGACY_RETRY_INTERVAL: &str = "HTC_RETRY_INTERVAL";
 const LEGACY_PROXIES: &str = "HTC_TUNNELS";
+
+/// The variables of the removed, separate management listener.
+///
+/// The management page and the API now share `server_port`, so silently
+/// ignoring these would leave a deployment believing its old setting still
+/// applied. A non-blank value is a startup error with the new rule.
+const REMOVED_WEB_VARS: &[&str] = &["HT_WEB_PORT", "HT_WEB_HOST", "HTC_WEB_PORT", "HTC_WEB_HOST"];
 
 /// The settings that the environment overrides.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -60,8 +61,6 @@ pub(crate) struct EnvConfig {
     server_port: Option<u16>,
     bind_host: Option<String>,
     server_host: Option<String>,
-    web_port: Option<u16>,
-    web_host: Option<String>,
     keepalive_interval: Option<u64>,
     retry_interval: Option<u64>,
     proxies: Option<Vec<ServerProxyEntry>>,
@@ -88,6 +87,18 @@ impl EnvConfig {
         F: Fn(&str) -> Result<Option<String>>,
     {
         let mut env = EnvConfig::default();
+
+        // A value that was set for the removed listener must not be ignored
+        // silently: the management page would now be reachable on `server_port`.
+        for key in REMOVED_WEB_VARS {
+            if lookup(key)?.is_some_and(|value| !value.trim().is_empty()) {
+                bail!(
+                    "{} is no longer supported: the management page and the API share \
+                     `server_port` on the reserved `server_host`",
+                    key
+                );
+            }
+        }
 
         if let Some((key, value)) = read_any(&lookup, &[ENV_SERVER, LEGACY_SERVER])? {
             env.vars.push(key);
@@ -116,14 +127,6 @@ impl EnvConfig {
         if let Some((key, value)) = read_any(&lookup, &[ENV_SERVER_HOST])? {
             env.vars.push(key);
             env.server_host = Some(value);
-        }
-        if let Some((key, value)) = read_any(&lookup, &[ENV_WEB_PORT, LEGACY_WEB_PORT])? {
-            env.vars.push(key);
-            env.web_port = Some(parse_number(key, &value, "a port number")?);
-        }
-        if let Some((key, value)) = read_any(&lookup, &[ENV_WEB_HOST, LEGACY_WEB_HOST])? {
-            env.vars.push(key);
-            env.web_host = Some(parse_ip(key, &value)?);
         }
         if let Some((key, value)) = read_any(
             &lookup,
@@ -167,12 +170,6 @@ impl EnvConfig {
         }
         if let Some(server_host) = &self.server_host {
             config.server_host = Some(server_host.clone());
-        }
-        if let Some(web_port) = self.web_port {
-            config.web_port = web_port;
-        }
-        if let Some(web_host) = &self.web_host {
-            config.web_host = Some(web_host.clone());
         }
         if let Some(keepalive_interval) = self.keepalive_interval {
             config.keepalive_interval = keepalive_interval;
@@ -356,11 +353,9 @@ mod tests {
             (ENV_SERVER, "wss://control.example.com"),
             (ENV_NAME, "home"),
             (ENV_TOKEN, "secret"),
-            (ENV_SERVER_PORT, "9000"),
+            (ENV_SERVER_PORT, "7777"),
             (ENV_BIND_HOST, "127.0.0.1"),
             (ENV_SERVER_HOST, "control.example.com"),
-            (ENV_WEB_PORT, "0"),
-            (ENV_WEB_HOST, "127.0.0.1"),
             (ENV_KEEPALIVE_INTERVAL, "5"),
             (ENV_RETRY_INTERVAL, "3"),
             (ENV_PROXIES, ENV_PROXY),
@@ -377,11 +372,9 @@ mod tests {
         );
         assert_eq!(config.name, "home");
         assert_eq!(&**config.token.as_ref().unwrap(), "secret");
-        assert_eq!(config.server_port, 9000);
+        assert_eq!(config.server_port, 7777);
         assert_eq!(config.bind_host, "127.0.0.1");
         assert_eq!(config.server_host(), "control.example.com");
-        assert_eq!(config.web_port, 0);
-        assert_eq!(config.web_host.as_deref(), Some("127.0.0.1"));
         assert_eq!(config.keepalive_interval, 5);
         assert_eq!(config.retry_interval, 3);
 
@@ -400,8 +393,6 @@ mod tests {
                 ENV_SERVER_PORT,
                 ENV_BIND_HOST,
                 ENV_SERVER_HOST,
-                ENV_WEB_PORT,
-                ENV_WEB_HOST,
                 ENV_KEEPALIVE_INTERVAL,
                 ENV_RETRY_INTERVAL,
                 ENV_PROXIES,
@@ -460,12 +451,6 @@ mod tests {
 
     #[test]
     fn test_invalid_values_name_the_variable() {
-        let err = format!("{:#}", env(&[(ENV_WEB_PORT, "abc")]).unwrap_err());
-        assert!(err.contains(ENV_WEB_PORT), "{}", err);
-
-        let err = format!("{:#}", env(&[(ENV_WEB_HOST, "localhost")]).unwrap_err());
-        assert!(err.contains(ENV_WEB_HOST), "{}", err);
-
         let err = format!("{:#}", env(&[(ENV_RETRY_INTERVAL, "-1")]).unwrap_err());
         assert!(err.contains(ENV_RETRY_INTERVAL), "{}", err);
 
@@ -482,6 +467,19 @@ mod tests {
             .unwrap_err()
         );
         assert!(err.contains(ENV_PROXIES), "{}", err);
+    }
+
+    #[test]
+    fn test_removed_web_variables_are_rejected() -> Result<()> {
+        for &key in REMOVED_WEB_VARS {
+            let err = format!("{:#}", env(&[(key, "1")]).unwrap_err());
+            assert!(err.contains(key), "{}", err);
+            assert!(err.contains("server_port"), "{}", err);
+        }
+        // A blank value is ignored like every other variable.
+        let parsed = env(&[("HT_WEB_PORT", "  ")])?;
+        assert!(parsed.is_empty());
+        Ok(())
     }
 
     #[test]

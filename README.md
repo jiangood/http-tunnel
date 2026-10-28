@@ -37,7 +37,7 @@
 
 ```toml
 name = "edge"
-server_port = 9000
+server_port = 7777
 bind_host = "0.0.0.0"
 server_host = "control.example.com"
 token = "把 openssl rand -hex 16 的输出填在这里"
@@ -62,12 +62,10 @@ ht [-c/--config ht.toml] [-b/--background]
 
 ```toml
 name = "edge"                 # 可选，默认 "ht"
-server_port = 9000            # 0 = 临时端口，仅在有 [upstream] 时允许
+server_port = 7777            # 0 = 临时端口，仅在有 [upstream] 时允许
 bind_host = "0.0.0.0"         # 默认 0.0.0.0
 server_host = "edge.lan"      # 可选；有 [upstream] 时默认 127.0.0.1，否则必填
 token = "downstream-secret"   # 监听端口的 Token；有 [upstream] 且省略时复用 upstream token
-web_port = 8610               # 0 或省略 = 关闭（默认 0，不默认监听 8610）
-# web_host = "127.0.0.1"
 
 [[proxies]]                   # 本进程直接服务的本地服务
 name = "nas"
@@ -84,12 +82,12 @@ mirror = true                 # 未写 mirror 和 claim 时默认 true
 
 ### 监听器与上游
 
-- `server_port` 是唯一的 HTTP 入口端口：访客、下游对等节点和 WebSocket 控制会话共用它。
+- `server_port` 是唯一的 HTTP 入口端口：访客、下游对等节点、WebSocket 控制会话和管理页/API 共用它。
 - `bind_host` 默认 `0.0.0.0`。有 `[upstream]` 时必须是 `0.0.0.0` 或回环地址，因为上游会话会把访客转发回本机的 `127.0.0.1:<实际 server_port>`。无上游时可以绑定任意单个 IP。
-- `server_host` 是保留给 WebSocket 控制端点的精确 Host，不能是泛域名，也不能与任何 `[[proxies]]` 域名重叠。无 `[upstream]` 时必填；有 `[upstream]` 时默认 `127.0.0.1`。
-- `server_port = 0` 会绑定一个临时端口，并把实际端口用于上游会话的回环目标。只允许和 `[upstream]` 一起使用，否则重启后无法发现端口。
+- `server_host` 是保留给 WebSocket 控制端点和管理页/API 的精确 Host，不能是泛域名，也不能与任何 `[[proxies]]` 域名重叠。无 `[upstream]` 时必填；有 `[upstream]` 时默认 `127.0.0.1`。
+- `server_port = 0` 会绑定一个临时端口，并把实际端口用于上游会话的回环目标。只允许和 `[upstream]` 一起使用，否则重启后无法发现端口；此时管理页也使用这个临时端口。
 - `token` 是下游对等节点使用的监听 Token。有 `[upstream]` 时可以省略，此时复用 `[upstream].token`。建议每一跳使用不同的 Token，启动时会对相同 Token 给出警告。
-- `web_port` 默认 `0`，即不监听管理端口。需要管理页时显式设置，例如 `web_port = 8610`。
+- `web_port` 已移除：管理页与 API 不再单独监听，而是和访客、控制会话共用 `server_port`，只在 `server_host` 上可达。浏览器打开 `http://<server_host>:<server_port>/`。
 
 ### 上游：mirror 与 claim
 
@@ -113,9 +111,7 @@ mirror = true                 # 未写 mirror 和 claim 时默认 true
 | `HT_PROXIES` | `[[proxies]]` | TOML 内联数组 |
 | `HT_SERVER_PORT` | `server_port` | 监听端口，`0` 表示临时端口 |
 | `HT_BIND_HOST` | `bind_host` | 监听地址 |
-| `HT_SERVER_HOST` | `server_host` | 控制端点保留 Host |
-| `HT_WEB_PORT` | `web_port` | 管理页端口，`0` 关闭 |
-| `HT_WEB_HOST` | `web_host` | 管理页监听地址 |
+| `HT_SERVER_HOST` | `server_host` | 控制端点与管理页的保留 Host |
 | `HT_RETRY_INTERVAL` | `retry_interval` | 重连上一跳的间隔秒数 |
 | `HT_KEEPALIVE_INTERVAL` | `keepalive_interval` | WebSocket ping 间隔秒数 |
 
@@ -125,7 +121,6 @@ mirror = true                 # 未写 mirror 和 claim 时默认 true
 export HT_SERVER=wss://control.example.com:443
 export HT_TOKEN=与上一跳相同的密钥
 export HT_NAME=home
-export HT_WEB_PORT=0
 export HT_PROXIES='[
   {name="nas", domain="nas.example.com", local_addr="127.0.0.1:80"},
   {name="docker", domain="docker.example.com", local_addr="unix:///var/run/docker.sock", auth_header="另一个密钥"}
@@ -148,7 +143,7 @@ export HT_PROXIES='[
 | 示例 | 含义 |
 | --- | --- |
 | `wss://control.example.com`（推荐） | TLS WebSocket，默认端口 443，公网部署必须使用 |
-| `ws://127.0.0.1:9000` | 明文 WebSocket，默认端口 80，仅适合可信网络或本地测试 |
+| `ws://127.0.0.1:7777` | 明文 WebSocket，默认端口 80，仅适合可信网络或本地测试 |
 
 `wss` 依赖可信的 TLS 终止层（Nginx、Caddy、云负载均衡或安全网关）提供服务端证书。`ht` 自身不申请证书。Nginx 终止 TLS 的示例（`proxy_read_timeout` 必须大于 `keepalive_interval`）：
 
@@ -161,7 +156,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/control.example.com/privkey.pem;
 
     location / {
-        proxy_pass http://127.0.0.1:9000;
+        proxy_pass http://127.0.0.1:7777;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -223,7 +218,7 @@ relay A：
 
 ```toml
 name = "relay-a"
-server_port = 9000
+server_port = 7777
 bind_host = "0.0.0.0"
 server_host = "a.lan"
 token = "A 与下游 B 共享的密钥"
@@ -280,7 +275,9 @@ keepalive_interval = 15
 
 ## Web 管理
 
-设置 `web_port` 后，管理页面与 API 共用一个端口。`web_host` 默认 `0.0.0.0`，设为 `127.0.0.1` 时只能从本机访问。浏览器打开 `http://地址:8610/`，HTTP Basic 用户名填 `ht`，密码填 `token`。页面使用原生 HTML 表单，不包含 CSS 或 JavaScript。
+管理页面与 API 始终开启，和访客、控制会话共用 `server_port`；它们只在保留的 `server_host` 上可达，其他 Host 照常走代理。浏览器打开 `http://<server_host>:<server_port>/`，HTTP Basic 用户名填 `ht`，密码填 `token`。页面使用原生 HTML 表单，不包含 CSS 或 JavaScript。若 `server_host` 不是本机可解析的地址，可用 `curl -H "Host: <server_host>" http://127.0.0.1:<server_port>/` 访问。
+
+`server_port = 0` 时管理入口也是临时端口，以启动日志中的实际端口为准。
 
 API 路径保持不变：
 
@@ -300,7 +297,7 @@ API 路径保持不变：
 ```sh
 docker run -d --name ht --restart unless-stopped \
   --stop-timeout 40 \
-  -p 9000:9000 \
+  -p 7777:7777 \
   -v "/opt/ht:/app/" \
   ghcr.io/jiangood/ht:latest
 ```
@@ -313,7 +310,6 @@ docker run -d --name ht --restart unless-stopped \
   -e HT_NAME=home \
   -e HT_SERVER=wss://control.example.com:443 \
   -e HT_TOKEN=与上一跳相同的密钥 \
-  -e HT_WEB_PORT=0 \
   -e HT_PROXIES='[{name="nas",domain="nas.example.com",local_addr="127.0.0.1:80"}]' \
   ghcr.io/jiangood/ht:latest
 ```
@@ -326,9 +322,9 @@ services:
     image: ghcr.io/jiangood/ht:latest
     restart: unless-stopped
     ports:
-      - "9000:9000"
+      - "7777:7777"
     volumes:
-      - ./ht.toml:/app/ht.toml
+      - ./data:/app
     stop_grace_period: 40s
 ```
 
@@ -336,10 +332,10 @@ services:
 
 - 一个镜像同时用于入口、中继和叶子：配置了 `[upstream]` 就向上游注册，没有就只做入口；不需要换镜像或换启动命令。
 - Docker 用 `SIGTERM` 停止容器，`ht` 会像处理 `SIGINT` 一样开始优雅关闭；默认最多 drain 30 秒，所以用 `--stop-timeout 40`，或 compose 的 `stop_grace_period: 40s`。否则 Docker 默认 10 秒后会 `SIGKILL`，在途访客会被截断。
-- 端口映射必须与 `ht.toml` 的 `server_port` 一致；需要管理页时再映射 `web_port`。
-- 需要 Web 管理页/API 时，挂载的 `/app` 必须可写（API 会回写 `ht.toml`）；只想只读运行就把 `web_port` 设为 `0`，或用 `HT_PROXIES` 让代理列表只读。
+- 端口映射必须与 `ht.toml` 的 `server_port` 一致；管理页/API 也在这个端口上，无需额外映射。
+- 需要 Web 管理页/API 时，挂载的 `/app` 必须可写（API 会用同目录临时文件原子回写 `ht.toml`）；请挂载整个目录（如 `./data:/app`），不要只挂载 `ht.toml` 单文件——单文件 bind mount 无法被 rename 覆盖，保存会失败。只想只读运行就用 `HT_PROXIES` 让代理列表只读。
 - `local_addr` 在容器内解析：`127.0.0.1:80` 指容器本身，不是宿主机。转发宿主机服务请用 `host.docker.internal:<端口>`，转发同一 compose 中的服务用服务名。
-- 容器内 `bind_host` / `web_host` 保持默认 `0.0.0.0`，否则 Docker 端口映射进不来。
+- 容器内 `bind_host` 保持默认 `0.0.0.0`，否则 Docker 端口映射进不来。
 - 镜像是基于 `scratch` 的静态镜像，没有 shell；用 `docker logs ht` 查看日志，不要把 `docker exec ... sh` 当作运维手段。静态 musl 二进制已内置 `wss` 所需的 WebPKI 根证书，不依赖基础镜像的 CA 包。
 - 镜像没有内置 `HEALTHCHECK`（`scratch` 里没有 shell/curl）：在 compose 或 Kubernetes 里对 `server_port` 做 TCP 检查即可；需要 HTTP 健康端点的话，后续再单独加一个只读 `/healthz`。
 - 镜像默认以 root 运行，方便首次生成和回写 `/app/ht.toml`；需要非 root 时用 `--user 65532:65532`，并保证挂载的配置目录对该 UID 可写。
@@ -349,7 +345,7 @@ services:
 旧版本提供 `hts`、`htc`、`htn` 三个程序和三份配置。现在统一为 `ht` + `ht.toml`：
 
 1. 旧 `hts.toml` 的 `server_port`、`bind_host`、`server_host`、`token`、`[[proxies]]` 原样保留；删除程序名即可作为独立入口使用。
-2. 旧 `htc.toml` 的 `[[tunnels]]` 改名为 `[[proxies]]`（或保留旧名作为别名）；把顶层 `server` 移到 `[upstream].server`，补上 `[upstream].token`；`server_port` 建议设为 `0`，`bind_host = "127.0.0.1"`。管理页/API 默认关闭（`web_port = 0`），需要时显式设置 `web_port = 8610`。
+2. 旧 `htc.toml` 的 `[[tunnels]]` 改名为 `[[proxies]]`（或保留旧名作为别名）；把顶层 `server` 移到 `[upstream].server`，补上 `[upstream].token`；`server_port` 建议设为 `0`，`bind_host = "127.0.0.1"`。管理页/API 现在与 `server_port` 共用端口，删除旧的 `web_port` / `web_host` 即可，访问地址为 `http://<server_host>:<server_port>/`。
 3. 旧 `htn.toml` 几乎就是新的 `ht.toml`：把 `[upstream]` 的 `mirror`/`claim` 规则保持不变即可。
 4. 环境变量从 `HTC_*` 迁移到 `HT_*`；旧名称仍可作为回退。
 5. 旧的三类镜像 `hts`/`htc`/`htn` 已合并为 `ht`；原来三个容器改用一个镜像，用各自的 `ht.toml` 区分入口、中继和叶子。

@@ -36,7 +36,7 @@ domain = "local.b.relay.example.com"
 local_addr = "127.0.0.1:8080"
 
 [upstream]
-server = "ws://a.lan:9000"
+server = "ws://a.lan:7777"
 token = "upstream-secret"
 mirror = true
 # claim = "*.b.relay.example.com"

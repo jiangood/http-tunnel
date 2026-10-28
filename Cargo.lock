@@ -625,6 +625,7 @@ dependencies = [
  "fdlimit",
  "futures-util",
  "hex",
+ "hyper",
  "lazy_static",
  "rand",
  "serde",

@@ -15,18 +15,16 @@
 
 name = "edge"
 ## The listener port. `0` picks an ephemeral port and requires `[upstream]`.
-server_port = 9000
+server_port = 7777
 ## Optional: the IP address the listener binds. Defaults to `0.0.0.0`.
 # bind_host = "0.0.0.0"
-## The exact Host reserved for WebSocket control/data connections. It is
-## required without `[upstream]` and defaults to `127.0.0.1` with it.
+## The exact Host reserved for the WebSocket control endpoint and the management
+## page/API. It is required without `[upstream]` and defaults to `127.0.0.1`
+## with it. Open `http://<server_host>:<server_port>/` for the management page.
 server_host = "edge.lan"
 ## The token shared by downstream peers. When omitted with `[upstream]`, the
-## upstream token is reused for the listener.
+## upstream token is reused for the listener. It is also the management password.
 token = "replace-with-the-downstream-secret"
-## Optional: the web management page and API. Disabled by default.
-# web_port = 8610
-# web_host = "127.0.0.1"
 
 ## Local services served by this process. They are routed directly by an ingress
 ## and mirrored (or covered by `claim`) by a leaf or relay.

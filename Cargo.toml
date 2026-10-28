@@ -42,7 +42,7 @@ client = []
 node = ["server", "client"]
 # The administration API of the client. Kept out of `client` so that a minimal
 # client build doesn't pull in an HTTP server
-client-api = ["dep:axum"]
+client-api = ["dep:axum", "dep:hyper"]
 
 # Feature to enable tokio-console. Disabled by default.
 # Don't enable it unless for debugging purposes.
@@ -90,6 +90,10 @@ tokio-tungstenite = { version = "0.20", default-features = false, features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = { version = "0.6", optional = true }
+# Serves the management router on the existing `server_port` connection. It must
+# match the hyper version axum 0.6 uses, so that the `Router` implements the
+# `Service` the connection expects.
+hyper = { version = "0.14", features = ["server", "http1"], optional = true }
 fdlimit = "0.2"
 console-subscriber = { version = "0.1", optional = true, features = [
     "parking_lot",

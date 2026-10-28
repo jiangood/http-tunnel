@@ -10,27 +10,49 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use hyper::service::Service as _;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tokio::net::TcpStream;
+use tracing::warn;
 
 struct ApiState {
     management: Arc<ManagementState>,
 }
 
-/// Run the web UI and the administration API on the same address.
-pub(crate) async fn serve(
-    host: &str,
-    port: u16,
-    token: String,
+/// Serve one management connection on an already accepted listener socket.
+///
+/// The server sniffs the first request head before it knows this is the reserved
+/// management Host; `PrefixedIo` replays those bytes so the router sees the
+/// request exactly as the peer sent it.
+pub(crate) async fn serve_connection(
+    prefetched: Vec<u8>,
+    stream: TcpStream,
     management: Arc<ManagementState>,
-    mut shutdown_rx: broadcast::Receiver<bool>,
+    token: String,
 ) -> Result<()> {
-    let addr: SocketAddr = crate::helper::to_bind_addr(host, port)
-        .parse()
-        .with_context(|| format!("`web_host` `{}` is not a valid bind address", host))?;
+    let router = build_router(token, management);
+    let service = hyper::service::service_fn(move |req| {
+        let mut router = router.clone();
+        async move { router.call(req).await }
+    });
+
+    let mut http = hyper::server::conn::Http::new();
+    // The page has no assets and the API calls are short-lived, so closing the
+    // connection after each response bounds the shutdown drain.
+    http.http1_keep_alive(false);
+    http.serve_connection(
+        crate::transport::websocket::PrefixedIo::new(prefetched, stream),
+        service,
+    )
+    .await
+    .context("The management connection failed")?;
+    Ok(())
+}
+
+/// The management router. It is mounted on the reserved `server_host` of the
+/// main listener, not on a listener of its own.
+fn build_router(token: String, management: Arc<ManagementState>) -> Router {
     let state = Arc::new(ApiState { management });
 
     let api = Router::new()
@@ -47,19 +69,7 @@ pub(crate) async fn serve(
         .route("/web/tunnels/:name/delete", post(web_delete_proxy))
         .route_layer(middleware::from_fn_with_state(token, web_auth));
 
-    let app = Router::new().nest("/api", api).merge(web).with_state(state);
-
-    info!("Web management listening at {}", addr);
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.recv().await;
-        })
-        .await
-        .with_context(|| "The web management server exited with an error")?;
-
-    info!("Web management shutdown");
-    Ok(())
+    Router::new().nest("/api", api).merge(web).with_state(state)
 }
 
 async fn api_auth<B>(

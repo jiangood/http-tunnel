@@ -17,7 +17,7 @@ const DEFAULT_RETRY_INTERVAL_SECS: u64 = 1;
 const DEFAULT_KEEPALIVE_INTERVAL_SECS: u64 = 15;
 
 /// The default listener port of the universal process.
-pub const DEFAULT_SERVER_PORT: u16 = 9000;
+pub const DEFAULT_SERVER_PORT: u16 = 7777;
 
 /// The default number of unauthenticated WebSocket upgrades a server runs at once.
 pub const DEFAULT_MAX_PENDING_HANDSHAKES: usize = 256;
@@ -83,7 +83,7 @@ pub struct ServerProxyEntry {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
-    /// The WebSocket endpoint of the next hop, e.g. `ws://a.lan:9000` or
+    /// The WebSocket endpoint of the next hop, e.g. `ws://a.lan:7777` or
     /// `wss://relay.example.com`.
     pub server: String,
     /// The shared token of the next hop.
@@ -169,12 +169,6 @@ pub struct Config {
     /// upstream token is used for the listener too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<MaskedString>,
-    /// The port of the web management page and API. `0` disables it.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub web_port: u16,
-    /// The address the web management page and API bind. Defaults to `0.0.0.0`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub web_host: Option<String>,
     /// Local services served by this process. `[[tunnels]]` is accepted as an
     /// alias for configurations written for older clients.
     #[serde(default, alias = "tunnels", skip_serializing_if = "Vec::is_empty")]
@@ -220,8 +214,6 @@ impl Default for Config {
             bind_host: default_bind_host(),
             server_host: None,
             token: None,
-            web_port: 0,
-            web_host: None,
             proxies: Vec::new(),
             upstream: None,
             heartbeat_timeout: default_heartbeat_timeout(),
@@ -237,13 +229,6 @@ impl Default for Config {
 }
 
 impl Config {
-    /// The address the web management page and API bind.
-    pub fn web_host(&self) -> &str {
-        self.web_host
-            .as_deref()
-            .unwrap_or(crate::helper::DEFAULT_BIND_HOST)
-    }
-
     /// The token the embedded listener authenticates downstream peers with.
     ///
     /// When the top-level `token` is omitted and `[upstream]` is present, the
@@ -336,6 +321,14 @@ impl Config {
                          `server_port` and `server_host`.",
                         e
                     )
+                } else if has_setting_at_top_level(s, "web_port")
+                    || has_setting_at_top_level(s, "web_host")
+                {
+                    anyhow!(
+                        "{}\nNote: `web_port` and `web_host` were removed. The management page \
+                         and the API share `server_port` on the reserved `server_host`.",
+                        e
+                    )
                 } else {
                     anyhow!("{}", e)
                 }
@@ -404,9 +397,6 @@ impl Config {
         config.name = name.to_string();
 
         let bind_host = normalize_bind_host(&mut config.bind_host, "bind_host")?;
-        if let Some(web_host) = config.web_host.as_mut() {
-            normalize_bind_host(web_host, "web_host")?;
-        }
 
         let has_upstream = config.upstream.is_some();
         if config.server_port == 0 && !has_upstream {
@@ -616,9 +606,6 @@ fn default_max_control_connections() -> usize {
 }
 fn default_keepalive_interval() -> u64 {
     DEFAULT_KEEPALIVE_INTERVAL_SECS
-}
-fn is_zero(value: &u16) -> bool {
-    *value == 0
 }
 
 /// Whether a token is one of the documented placeholders rather than a secret.
@@ -1158,7 +1145,6 @@ token = "secret"
         assert_eq!(cfg.name, "ht");
         assert_eq!(cfg.server_port, DEFAULT_SERVER_PORT);
         assert_eq!(cfg.bind_host, "0.0.0.0");
-        assert_eq!(cfg.web_port, 0);
         assert_eq!(cfg.heartbeat_timeout, DEFAULT_HEARTBEAT_TIMEOUT_SECS);
         assert_eq!(cfg.retry_interval, DEFAULT_RETRY_INTERVAL_SECS);
         assert!(cfg.proxies.is_empty());
@@ -1168,7 +1154,7 @@ token = "secret"
     #[test]
     fn test_token_falls_back_to_the_upstream_token() -> Result<()> {
         let cfg = router(
-            "server_host = \"control.test\"\n\n[upstream]\nserver = \"ws://a.test:9000\"\n\
+            "server_host = \"control.test\"\n\n[upstream]\nserver = \"ws://a.test:7777\"\n\
              token = \"upstream-secret\"\n",
         );
         assert!(cfg.token.is_none());
@@ -1311,17 +1297,25 @@ token = "123"
         let legacy = "http_port = 8080\ncontrol_host = \"control.test\"\ntoken = \"secret\"\n";
         let err = format!("{:#}", Config::parse(legacy).unwrap_err());
         assert!(err.contains("renamed to"), "{}", err);
+
+        let removed = "server_host = \"control.test\"\ntoken = \"secret\"\nweb_port = 8610\n";
+        let err = format!("{:#}", Config::parse(removed).unwrap_err());
+        assert!(err.contains("share `server_port`"), "{}", err);
+
+        let removed =
+            "server_host = \"control.test\"\ntoken = \"secret\"\nweb_host = \"0.0.0.0\"\n";
+        let err = format!("{:#}", Config::parse(removed).unwrap_err());
+        assert!(err.contains("share `server_port`"), "{}", err);
     }
 
     #[test]
     fn test_config_roundtrip() -> Result<()> {
         let s = r#"
 name = "edge"
-server_port = 9000
+server_port = 7777
 bind_host = "127.0.0.1"
 server_host = "control.test"
 token = "secret"
-web_port = 8611
 retry_interval = 2
 
 [[proxies]]
@@ -1335,7 +1329,7 @@ domain = "foo2.example.com"
 local_addr = "127.0.0.1:81"
 
 [upstream]
-server = "ws://a.test:9000"
+server = "ws://a.test:7777"
 token = "upstream-secret"
 claim = "*.edge.test"
 "#;
@@ -1423,7 +1417,7 @@ local_addr = "127.0.0.1:80"
         std::fs::write(
             &path,
             "server_port = 8080\ntoken = \"a_secret_token\"\n\n[upstream]\n\
-             server = \"ws://a.test:9000\"\ntoken = \"upstream-secret\"\n",
+             server = \"ws://a.test:7777\"\ntoken = \"upstream-secret\"\n",
         )?;
         let cfg = Config::from_file(&path).await?;
         assert_eq!(cfg.server_host(), "127.0.0.1");
@@ -1469,28 +1463,6 @@ local_addr = "127.0.0.1:80"
         }
 
         let _ = std::fs::remove_file(&path);
-        Ok(())
-    }
-
-    #[test]
-    fn test_web_host_defaults_to_all_interfaces_and_is_validated() -> Result<()> {
-        let default = router("server_host = \"control.test\"\ntoken = \"secret\"\n");
-        assert_eq!(default.web_host(), "0.0.0.0");
-
-        let loopback = router(
-            "server_host = \"control.test\"\ntoken = \"secret\"\nweb_host = \"127.0.0.1\"\n",
-        );
-        assert_eq!(loopback.web_host(), "127.0.0.1");
-
-        let err = Config::parse(
-            "server_host = \"control.test\"\ntoken = \"secret\"\nweb_host = \"localhost\"\n",
-        )
-        .expect_err("a host name must be rejected");
-        assert!(
-            format!("{:#}", err).contains("web_host"),
-            "unexpected error: {:#}",
-            err
-        );
         Ok(())
     }
 
@@ -1545,7 +1517,7 @@ local_addr = "127.0.0.1:80"
         cfg.upstream.as_mut().unwrap().token = MaskedString::from("upstream-secret");
         Config::validate(&mut cfg)?;
         assert_eq!(cfg.name, "edge");
-        assert_eq!(cfg.server_port, 9000);
+        assert_eq!(cfg.server_port, 7777);
         assert_eq!(cfg.proxies.len(), 1);
         // The commented standalone section is inactive
         assert_eq!(disabled_settings(example, "# [upstream]"), 0);
@@ -1565,7 +1537,7 @@ domain = "local.b.relay.example.com"
 local_addr = "127.0.0.1:8080"
 
 [upstream]
-server = "ws://a.lan:9000"
+server = "ws://a.lan:7777"
 token = "upstream-secret"
 claim = "*.b.relay.example.com"
 "#;
@@ -1577,7 +1549,7 @@ claim = "*.b.relay.example.com"
         assert_eq!(config.server_limits(), ServerLimits::default());
         assert_eq!(config.max_mirrored_routes, 256);
         // The upstream endpoint is canonicalized with an explicit port
-        assert_eq!(config.upstream.as_ref().unwrap().server, "ws://a.lan:9000");
+        assert_eq!(config.upstream.as_ref().unwrap().server, "ws://a.lan:7777");
         assert_eq!(
             config.upstream.as_ref().unwrap().claim(),
             Some("*.b.relay.example.com")
@@ -1585,7 +1557,7 @@ claim = "*.b.relay.example.com"
         assert!(!config.upstream.as_ref().unwrap().mirrors());
         assert_eq!(
             config.upstream.as_ref().unwrap().server_addr().unwrap(),
-            "a.lan:9000"
+            "a.lan:7777"
         );
         assert!(!config.upstream.as_ref().unwrap().tls());
         Ok(())
@@ -1648,7 +1620,7 @@ claim = "*.b.relay.example.com"
         // Loopback on another port is a legitimate first hop
         assert!(Config::parse(
             "name = \"b\"\nserver_port = 9001\nserver_host = \"b.lan\"\n\
-             token = \"downstream-secret\"\n\n[upstream]\nserver = \"ws://127.0.0.1:9000\"\n\
+             token = \"downstream-secret\"\n\n[upstream]\nserver = \"ws://127.0.0.1:7777\"\n\
              token = \"upstream-secret\"\nclaim = \"svc.a.lan\"\n"
         )
         .is_ok());
@@ -1686,7 +1658,7 @@ claim = "*.b.relay.example.com"
 
         assert!(Config::parse(
             "server_port = 0\nserver_host = \"leaf.lan\"\ntoken = \"downstream-secret\"\n\n\
-             [upstream]\nserver = \"ws://a.lan:9000\"\ntoken = \"upstream-secret\"\n"
+             [upstream]\nserver = \"ws://a.lan:7777\"\ntoken = \"upstream-secret\"\n"
         )
         .is_ok());
     }
@@ -1696,7 +1668,7 @@ claim = "*.b.relay.example.com"
         // The claim must not contain the reserved host of this process
         assert!(Config::parse(
             "name = \"b\"\nserver_port = 9001\nserver_host = \"b.lan\"\n\
-             token = \"downstream-secret\"\n\n[upstream]\nserver = \"ws://a.lan:9000\"\n\
+             token = \"downstream-secret\"\n\n[upstream]\nserver = \"ws://a.lan:7777\"\n\
              token = \"upstream-secret\"\nclaim = \"*.lan\"\n"
         )
         .is_err());
@@ -1704,7 +1676,7 @@ claim = "*.b.relay.example.com"
         // ... nor the server_host of the next hop, which is the URL host
         assert!(Config::parse(
             "name = \"b\"\nserver_port = 9001\nserver_host = \"b.lan\"\n\
-             token = \"downstream-secret\"\n\n[upstream]\nserver = \"ws://a.lan:9000\"\n\
+             token = \"downstream-secret\"\n\n[upstream]\nserver = \"ws://a.lan:7777\"\n\
              token = \"upstream-secret\"\nclaim = \"a.lan\"\n"
         )
         .is_err());
@@ -1730,7 +1702,7 @@ claim = "*.b.relay.example.com"
 
         // The upstream endpoint must be a WebSocket URL
         let mut config = router(LEAF_CONFIG);
-        config.upstream.as_mut().unwrap().server = "a.lan:9000".to_string();
+        config.upstream.as_mut().unwrap().server = "a.lan:7777".to_string();
         assert!(Config::validate(&mut config).is_err());
 
         // The claim is a domain, not a URL or an empty string

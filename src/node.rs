@@ -75,26 +75,32 @@ pub(crate) async fn run_router(
     ));
     state.refresh_routes().await;
 
+    // A standalone ingress has no upstream to wait for and is always ready.
+    let connected = Arc::new(AtomicBool::new(config.upstream.is_none()));
+
+    // The management page and the API share the reserved `server_host` of the
+    // listener, so they need no port of their own.
+    #[cfg(feature = "client-api")]
+    let management = Some(Arc::new(crate::client::ManagementState::new(
+        config.clone(),
+        state.clone(),
+        connected.clone(),
+    )));
+    #[cfg(not(feature = "client-api"))]
+    let management = None;
+
     // The router owns the shutdown of the embedded server, so that it can
     // close the upstream session before the server drains in-flight visitors.
     let (stop_tx, _) = broadcast::channel::<bool>(1);
     let server_task = tokio::spawn(run_server_with_listener_and_state(
         http_listener,
         state.clone(),
+        management,
         stop_tx.subscribe(),
     ));
-    // A standalone ingress has no upstream to wait for and is always ready.
-    let connected = Arc::new(AtomicBool::new(config.upstream.is_none()));
-    let web_task = spawn_web(
-        &config,
-        state.clone(),
-        connected.clone(),
-        stop_tx.subscribe(),
-    );
 
     let runtime = RouterRuntime {
         server_task,
-        web_task,
         stop_tx,
         shutdown_rx,
         connected,
@@ -109,7 +115,6 @@ pub(crate) async fn run_router(
 /// The tasks and channels the router has started and must shut down.
 struct RouterRuntime {
     server_task: JoinHandle<Result<()>>,
-    web_task: Option<JoinHandle<()>>,
     stop_tx: broadcast::Sender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
     connected: Arc<AtomicBool>,
@@ -129,9 +134,6 @@ async fn run_ingress(mut runtime: RouterRuntime) -> Result<()> {
         Some(res) => flatten_server(res),
         None => flatten_server(runtime.server_task.await),
     };
-    if let Some(web_task) = runtime.web_task {
-        let _ = web_task.await;
-    }
     server_result
 }
 
@@ -145,7 +147,6 @@ async fn run_relay(
 ) -> Result<()> {
     let RouterRuntime {
         mut server_task,
-        mut web_task,
         stop_tx,
         mut shutdown_rx,
         connected,
@@ -226,9 +227,6 @@ async fn run_relay(
         Some(res) => flatten_server(res),
         None => flatten_server(server_task.await),
     };
-    if let Some(web_task) = web_task.take() {
-        let _ = web_task.await;
-    }
 
     if let Some(err) = fatal_error {
         return Err(err);
@@ -268,53 +266,6 @@ fn mirrored_routes(
         }
     });
     rx
-}
-
-/// Spawn the web management interface when a port is configured.
-#[cfg(feature = "client-api")]
-fn spawn_web(
-    config: &Config,
-    server: Arc<ServerState>,
-    connected: Arc<AtomicBool>,
-    shutdown_rx: broadcast::Receiver<bool>,
-) -> Option<JoinHandle<()>> {
-    if config.web_port == 0 {
-        return None;
-    }
-    let management = Arc::new(crate::client::ManagementState::new(
-        config.clone(),
-        server,
-        connected,
-    ));
-    let host = config.web_host().to_string();
-    let port = config.web_port;
-    let token = String::from(
-        &**config
-            .listener_token()
-            .expect("validation requires a listener token"),
-    );
-    Some(tokio::spawn(async move {
-        if let Err(e) = crate::client_api::serve(&host, port, token, management, shutdown_rx).await
-        {
-            tracing::error!("{:#}", e);
-        }
-    }))
-}
-
-#[cfg(not(feature = "client-api"))]
-fn spawn_web(
-    config: &Config,
-    _server: Arc<ServerState>,
-    _connected: Arc<AtomicBool>,
-    _shutdown_rx: broadcast::Receiver<bool>,
-) -> Option<JoinHandle<()>> {
-    if config.web_port != 0 {
-        warn!(
-            "The web management interface is configured, but this build has no `client-api` \
-             feature. It is disabled"
-        );
-    }
-    None
 }
 
 /// Fail startup when the upstream endpoint is this process's own listener. The

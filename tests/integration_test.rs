@@ -46,7 +46,7 @@ fn write_client_config(
     server_host: &str,
     server_port: u16,
     token: &str,
-    web_port: Option<u16>,
+    listen_port: u16,
     tunnels: &[(&str, &str)],
 ) -> Result<String> {
     let mut proxies_toml = String::new();
@@ -64,17 +64,13 @@ fn write_client_config(
             name, domain, local_addr
         ));
     }
-    // Disable the web management port unless the test explicitly needs it; a
-    // default 8610 would make parallel processes collide.
-    let api = format!(
-        "web_port = {}\nweb_host = \"127.0.0.1\"\n",
-        web_port.unwrap_or(0)
-    );
+    // The leaf listens on an ephemeral loopback port unless the test needs a
+    // fixed one to reach its management interface.
     let content = format!(
-        "server_port = 0\nbind_host = \"127.0.0.1\"\nserver_host = \"127.0.0.1\"\n\
-         name = \"{}\"\ntoken = \"{}\"\n{}\n{}\
+        "server_port = {}\nbind_host = \"127.0.0.1\"\nserver_host = \"127.0.0.1\"\n\
+         name = \"{}\"\ntoken = \"{}\"\n{}\
          \n[upstream]\nserver = \"ws://{}:{}\"\ntoken = \"{}\"\nmirror = true\n",
-        name, token, api, proxies_toml, server_host, server_port, token
+        listen_port, name, token, proxies_toml, server_host, server_port, token
     );
 
     let path = std::env::temp_dir().join(file);
@@ -99,7 +95,7 @@ async fn http_routing() -> Result<()> {
         SERVER_HOST,
         HTTP_ENTRY_PORT,
         CLIENT_TOKEN,
-        None,
+        0,
         &[(ECHO_HOST, ECHO_SERVER_ADDR)],
     )?;
 
@@ -369,7 +365,7 @@ async fn websocket_transport_routes_http() -> Result<()> {
         "127.0.0.1",
         WS_HTTP_ENTRY_PORT,
         CLIENT_TOKEN,
-        Some(0),
+        0,
         &[("echo-ws.test", WS_ECHO_SERVER_ADDR)],
     )?;
     let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
@@ -443,7 +439,7 @@ async fn websocket_transport_works_without_a_tcp_listener() -> Result<()> {
         "127.0.0.1",
         WS_ONLY_HTTP_PORT,
         CLIENT_TOKEN,
-        Some(0),
+        0,
         &[("echo-ws-only.test", WS_ONLY_ECHO_ADDR)],
     )?;
     let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
@@ -496,7 +492,7 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
         "127.0.0.1",
         WS_FAILURE_HTTP_PORT,
         CLIENT_TOKEN,
-        Some(0),
+        0,
         &[("unavailable-ws.test", WS_FAILURE_TARGET_ADDR)],
     )?;
     let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
@@ -556,7 +552,7 @@ async fn client_api_manages_tunnels() -> Result<()> {
         "127.0.0.1",
         CLIENT_API_HTTP_ENTRY_PORT,
         CLIENT_API_TOKEN,
-        Some(2465),
+        2465,
         &[],
     )?;
 
@@ -734,7 +730,7 @@ async fn client_exits_on_a_wrong_token() -> Result<()> {
         "127.0.0.1",
         FATAL_HTTP_PORT,
         "wrong_token",
-        None,
+        0,
         &[("echo.test", "127.0.0.1:8092")],
     )?;
 
@@ -824,7 +820,7 @@ async fn api_request(
         .map(|t| format!("Authorization: Bearer {}\r\n", t))
         .unwrap_or_default();
     let request = format!(
-        "{} {} HTTP/1.1\r\nHost: admin\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "{} {} HTTP/1.1\r\nHost: 127.0.0.1\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         method,
         path,
         auth,
@@ -1395,7 +1391,7 @@ async fn node_mirror_withdraws_and_reclaims_routes() -> Result<()> {
         "127.0.0.1",
         MIRROR_NODE_PORT,
         MIRROR_NODE_TOKEN,
-        Some(0),
+        0,
         &[
             ("one.mirror.test", MIRROR_ECHO_ADDR),
             ("two.mirror.test", MIRROR_ECHO_ADDR),
@@ -1548,7 +1544,7 @@ async fn node_mirror_churn_is_idempotent() -> Result<()> {
         "127.0.0.1",
         CHURN_NODE_PORT,
         CHAIN_NODE_A_TOKEN,
-        Some(0),
+        0,
         &[(CHURN_HOST, CHURN_ECHO_ADDR)],
     )?;
 

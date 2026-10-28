@@ -83,19 +83,30 @@ pub(crate) struct ServerState {
     pub(crate) activity: ActivityTracker,
 }
 
+/// The management state of a build with the administration API. Builds without
+/// the feature still pass `None` through the same signature.
+#[cfg(feature = "client-api")]
+pub(crate) type Management = Arc<crate::client::ManagementState>;
+#[cfg(not(feature = "client-api"))]
+pub(crate) type Management = ();
+
 /// Run a server on an already-bound listener, publishing its routes through
 /// `routes`. A relay subscribes to that watch to advertise its downstream routes
 /// and local proxies to its next hop.
 pub(crate) async fn run_server_with_listener_and_state(
     http_listener: TcpListener,
     state: Arc<ServerState>,
+    management: Option<Management>,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    Server { state }.run(http_listener, shutdown_rx).await
+    Server { state, management }
+        .run(http_listener, shutdown_rx)
+        .await
 }
 
 struct Server {
     state: Arc<ServerState>,
+    management: Option<Management>,
 }
 
 impl ServerState {
@@ -153,6 +164,7 @@ impl Server {
         let mut http_task = tokio::spawn(crate::http::serve(
             http_listener,
             self.state.clone(),
+            self.management.clone(),
             shutdown_rx.resubscribe(),
         ));
         let mut http_task_done = false;

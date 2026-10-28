@@ -1,26 +1,27 @@
 # Web management and administration API
 
-The universal `ht` process can expose a small web page and a REST API on the
+The universal `ht` process exposes a small web page and a REST API on the
 same port. It manages the local `[[proxies]]` of the running process:
 
 - A standalone ingress serves them directly.
 - A leaf or relay also advertises them to its `[upstream]` according to
   `mirror`/`claim`.
 
-The management interface is disabled by default. Set `web_port` in `ht.toml` to
-enable it; `web_host` selects the bind address and defaults to `0.0.0.0`.
+The management interface is always enabled and shares the reserved
+`server_host` of the main `server_port`; it has no listener or port of its own.
 
 ```toml
-web_port = 8610
-web_host = "127.0.0.1"
+server_port = 7777
+server_host = "edge.lan"
 ```
 
-`HT_WEB_PORT` and `HT_WEB_HOST` override these values. `web_port = 0` disables
-the interface.
+Open `http://<server_host>:<server_port>/`. Requests whose `Host` is not
+`server_host` keep following the normal proxy/v4 routing, so a business domain
+never reaches the management router. `HT_WEB_PORT`, `HT_WEB_HOST` and their
+`HTC_*` aliases were removed and are startup errors.
 
-Open `http://<process address>:8610/`. The browser-native HTTP Basic login uses
-username `ht` and the listener `token` as the password. The page is plain HTML
-with no CSS or JavaScript.
+The browser-native HTTP Basic login uses username `ht` and the listener `token`
+as the password. The page is plain HTML with no CSS or JavaScript.
 
 ## API
 
@@ -37,11 +38,12 @@ The paths keep the historical name `tunnels`; the configuration and the storage
 section are `[[proxies]]`.
 
 ```sh
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8610/api/tunnels
-curl -X PUT -H "Authorization: Bearer $TOKEN" \
+curl -H "Host: edge.lan" -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:7777/api/tunnels
+curl -X PUT -H "Host: edge.lan" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"domain":"nas.example.com","local_addr":"127.0.0.1:80"}' \
-  http://127.0.0.1:8610/api/tunnels/nas
+  http://127.0.0.1:7777/api/tunnels/nas
 ```
 
 A change is validated locally, written atomically to `ht.toml`, applied to the
