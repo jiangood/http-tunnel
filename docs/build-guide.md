@@ -20,6 +20,13 @@ For example, to build `http-tunnel` as a client only:
 cargo build --release --no-default-features --features client
 ```
 
+The `node` feature builds the `htn` binary (one process per relay hop). It
+enables both the `server` and the `client` roles, because a node embeds both:
+
+```sh
+cargo build --release --no-default-features --features node
+```
+
 ## Minimalize the binary
 
 1. Build with the `minimal` profile

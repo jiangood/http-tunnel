@@ -1,0 +1,48 @@
+## A node is one process per relay hop: it listens for visitors and downstream
+## peers, publishes the routes below it on its upstream (route mirroring by
+## default, or one `claim`), and serves local `[[proxies]]`.
+## Remove the `[upstream]` table to run this file as a public ingress.
+##
+## The data plane is recursive: the upstream tunnel forwards visitors to
+## `127.0.0.1:<server_port>` on this node, which routes them by `Host` again.
+##
+## `token` is the secret of the downstream peers; `[upstream].token` is the
+## secret of the next hop. Use different values so that each hop has its own
+## trust boundary.
+
+name = "relay-b"
+## Required: there is no default port, and 0 is rejected
+server_port = 9001
+## Optional: the IP address the HTTP entrypoint binds. It defaults to `0.0.0.0`
+## and must cover the loopback interface, because the upstream tunnel forwards
+## visitors back to `127.0.0.1:<server_port>`. Use `127.0.0.1` only when a local
+## reverse proxy is the only way visitors and downstream peers reach this node.
+# bind_host = "0.0.0.0"
+## The exact Host reserved for WebSocket control/data connections
+server_host = "b.lan"
+token = "replace-with-the-downstream-secret"
+
+## Optional: local services served by this node itself. They take precedence
+## over the tunnels of the downstream clients, as on a server.
+# [[proxies]]
+# name = "local"
+# domain = "local.b.relay.example.com"
+# local_addr = "127.0.0.1:8080"
+
+## Optional: cap the number of mirrored routes; 0 disables the cap. Raise it
+## with the next hop's `max_control_connections` when mirroring many domains.
+# max_mirrored_routes = 256
+
+## The next hop towards the public ingress. Choose one of the two modes:
+##
+## `mirror = true` publishes every domain of the downstream clients and of the
+## local `[[proxies]]` on the next hop, one control channel per domain. The
+## upper hops then see the real domain set.
+##
+## `claim` publishes one exact or wildcard domain instead (the coarser Stage 1
+## relay); set only one of them.
+[upstream]
+server = "ws://a.lan:9000"
+token = "replace-with-the-upstream-secret"
+mirror = true
+# claim = "*.b.relay.example.com"

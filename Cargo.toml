@@ -9,7 +9,7 @@ license = "Apache-2.0"
 repository = "https://github.com/jiangood/http-tunnel"
 readme = "README.md"
 build = "build.rs"
-include = ["src/**/*", "LICENSE", "README.md", "build.rs"]
+include = ["src/**/*", "examples/**/*", "LICENSE", "README.md", "build.rs"]
 
 [lib]
 name = "http_tunnel"
@@ -25,6 +25,11 @@ name = "htc"
 path = "src/bin/htc.rs"
 required-features = ["client"]
 
+[[bin]]
+name = "htn"
+path = "src/bin/htn.rs"
+required-features = ["node"]
+
 # The benchmarks of the HTTP path. They are plain `harness = false` binaries, so
 # that no benchmarking crate is pulled in (see `benches/`).
 [[bench]]
@@ -36,12 +41,15 @@ default = [
     "server",
     "client",
     "client-api",
+    "node",
 ]
 
 # Run as a server
 server = []
 # Run as a client
 client = []
+# Run as a node (a server that also dials one upstream hop)
+node = ["server", "client"]
 # The administration API of the client. Kept out of `client` so that a minimal
 # client build doesn't pull in an HTTP server
 client-api = ["dep:axum"]

@@ -1,9 +1,8 @@
-transport = "wss" # The WebSocket scheme: wss (TLS, default) or ws (plain text)
-server_host = "control.example.com" # The control_host of the server
-server_port = 443 # The http_port of the server
+server = "wss://control.example.com:443" # The WebSocket endpoint: server_host and server_port
 name = "home" # The name of the client
 token = "use_a_secret_that_only_you_know" # The shared token of the server
 web_port = 8610 # The port of the client web management interface
+web_host = "127.0.0.1" # The address the client web management interface binds
 heartbeat_timeout = 40 # The application-layer heartbeat timeout. Set to 0 to disable the test
 retry_interval = 1 # The interval between retries to connect to the server
 nodelay = true # Whether to enable TCP_NODELAY for the tunnels

@@ -6,3 +6,6 @@ perf.data.old
 
 # Environment files, which hold the client token
 .env
+
+# IDE settings
+.idea/

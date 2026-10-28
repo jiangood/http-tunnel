@@ -73,7 +73,7 @@ impl Harness {
         let config_path =
             std::env::temp_dir().join(format!("http-tunnel-bench-{}.toml", std::process::id()));
         let config = format!(
-            "transport = \"ws\"\nname = \"{CLIENT_NAME}\"\nserver_host = \"127.0.0.1\"\nserver_port = {HTTP_ENTRY_PORT}\ntoken = \"{CLIENT_TOKEN}\"\n\n[[tunnels]]\nname = \"echo\"\ndomain = \"{ECHO_HOST}\"\nlocal_addr = \"{ECHO_SERVER_ADDR}\"\n"
+            "server = \"ws://127.0.0.1:{HTTP_ENTRY_PORT}\"\nname = \"{CLIENT_NAME}\"\ntoken = \"{CLIENT_TOKEN}\"\n\n[[tunnels]]\nname = \"echo\"\ndomain = \"{ECHO_HOST}\"\nlocal_addr = \"{ECHO_SERVER_ADDR}\"\n"
         );
         std::fs::write(&config_path, config)?;
         let config_guard = TempFile(config_path.clone());
@@ -94,8 +94,9 @@ impl Harness {
         let server = {
             tokio::spawn(async move {
                 let cmd = http_tunnel::Command::Server(http_tunnel::ServerArgs {
-                    http_port: HTTP_ENTRY_PORT,
-                    control_host: "127.0.0.1".to_string(),
+                    server_port: HTTP_ENTRY_PORT,
+                    server_host: "127.0.0.1".to_string(),
+                    bind_host: "127.0.0.1".to_string(),
                     token: CLIENT_TOKEN.to_string(),
                     proxies: Vec::new(),
                     limits: http_tunnel::ServerLimits::default(),

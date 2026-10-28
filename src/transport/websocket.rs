@@ -54,7 +54,7 @@ impl<T: AsyncRead + AsyncWrite> AsyncReadWrite for T {}
 
 pub(crate) type BoxedIo = Box<dyn AsyncReadWrite + Unpin + Send + Sync>;
 
-/// Connect to the control Host over WebSocket and expose it as a byte stream.
+/// Connect to the server host over WebSocket and expose it as a byte stream.
 /// The existing length-prefixed protocol therefore does not need to know about WS frames.
 ///
 /// `tls` selects `wss://` instead of `ws://`. The shared token is sent in the

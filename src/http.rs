@@ -173,10 +173,10 @@ async fn handle_visitor(
         Ok(Ok(header)) => header,
     };
 
-    // Reserve the configured control Host for the internal WebSocket transport.
+    // Reserve the configured server Host for the internal WebSocket transport.
     // Host is a routing key only; the token in the `Authorization` header
     // authenticates the upgrade before it can reserve any capacity.
-    if state.control_host == host {
+    if state.server_host == host {
         let path = parse_request_path(&prefetched).unwrap_or_default();
         if path != "/_http-tunnel/v1/connect" {
             respond(&mut stream, "404 Not Found", "Unknown control endpoint\n").await;
@@ -563,7 +563,7 @@ pub(crate) async fn respond_gateway_timeout(stream: &mut TcpStream) {
 /// present the expected `X-HTTP-TUNNEL-TOKEN`. It carries no `WWW-Authenticate`:
 /// that header describes an `Authorization` scheme, which this is not.
 pub(crate) fn unauthorized_response(failure: crate::helper::AuthFailure) -> Vec<u8> {
-    response("401 Unauthorized", failure.message())
+    crate::helper::unauthorized_response(failure)
 }
 
 /// Answer a visitor with a `401`, see [`unauthorized_response`].
@@ -579,21 +579,12 @@ pub(crate) async fn respond_unauthorized(
 /// the server, which writes a `504` from a stream wrapper when a tunnel closes
 /// without sending anything back.
 pub(crate) fn response(status: &str, body: &str) -> Vec<u8> {
-    response_with_headers(status, &[], body)
+    crate::helper::response_with_headers(status, &[], body)
 }
 
 /// Like [`response`], with extra headers in front of the standard ones.
 fn response_with_headers(status: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
-    let mut response = format!("HTTP/1.1 {}\r\n", status);
-    for (name, value) in headers {
-        response.push_str(&format!("{}: {}\r\n", name, value));
-    }
-    response.push_str(&format!(
-        "Content-Length: {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    ));
-    response.into_bytes()
+    crate::helper::response_with_headers(status, headers, body)
 }
 
 async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
@@ -612,7 +603,7 @@ async fn respond_unauthorized_bearer(stream: &mut TcpStream) {
     let _ = stream.flush().await;
 }
 
-/// The `426` sent when the control host is reached without a WebSocket upgrade.
+/// The `426` sent when the server host is reached without a WebSocket upgrade.
 /// RFC 7231 §6.5.15 requires the response to list the acceptable protocols in
 /// an `Upgrade` header.
 async fn respond_upgrade_required(stream: &mut TcpStream) {

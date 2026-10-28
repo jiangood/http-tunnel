@@ -55,8 +55,9 @@ async fn main() -> Result<()> {
     let config = ServerConfig::from_file(Path::new("hts.toml")).await?;
     let limits = (&config).into();
     let cmd = Command::Server(ServerArgs {
-        http_port: config.http_port,
-        control_host: config.control_host,
+        server_port: config.server_port,
+        server_host: config.server_host,
+        bind_host: config.bind_host,
         token: String::from(&*config.token),
         proxies: config.proxies,
         limits,

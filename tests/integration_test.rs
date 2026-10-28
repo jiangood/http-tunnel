@@ -50,8 +50,13 @@ fn write_client_config(
     let mut tunnels_toml = String::new();
     for (domain, local_addr) in tunnels {
         // Tunnel names are required by the current client config schema.
-        // Use the first domain label as a stable name for these integration tests.
-        let name = domain.split('.').next().unwrap_or(domain);
+        // Use the first domain label as a stable name for these integration
+        // tests; a wildcard domain uses the label after `*.`.
+        let name = domain
+            .trim_start_matches("*.")
+            .split('.')
+            .next()
+            .unwrap_or(domain);
         tunnels_toml.push_str(&format!(
             "\n[[tunnels]]\nname = \"{}\"\ndomain = \"{}\"\nlocal_addr = \"{}\"\n",
             name, domain, local_addr
@@ -61,8 +66,8 @@ fn write_client_config(
         .map(|p| format!("web_port = {}\n", p))
         .unwrap_or_default();
     let content = format!(
-        "transport = \"ws\"\nname = \"{}\"\nserver_host = \"{}\"\nserver_port = {}\ntoken = \"{}\"\n{}\n{}",
-        name, server_host, server_port, token, api, tunnels_toml
+        "server = \"ws://{}:{}\"\nname = \"{}\"\ntoken = \"{}\"\nweb_host = \"127.0.0.1\"\n{}\n{}",
+        server_host, server_port, name, token, api, tunnels_toml
     );
 
     let path = std::env::temp_dir().join(file);
@@ -763,15 +768,15 @@ async fn client_exits_on_a_wrong_token() -> Result<()> {
 
 const OCCUPIED_HTTP_TEST_HTTP_PORT: u16 = 2476;
 
-/// An `http_port` that cannot be bound must fail startup with an error instead
+/// A `server_port` that cannot be bound must fail startup with an error instead
 /// of leaving a server that looks healthy but serves no traffic.
 #[tokio::test]
-async fn server_fails_when_http_port_cannot_be_bound() -> Result<()> {
+async fn server_fails_when_server_port_cannot_be_bound() -> Result<()> {
     init();
 
-    // Bind the wildcard address, which is what the server binds.
+    // Bind loopback, which is what the test server binds.
     let _occupied =
-        tokio::net::TcpListener::bind(("0.0.0.0", OCCUPIED_HTTP_TEST_HTTP_PORT)).await?;
+        tokio::net::TcpListener::bind(("127.0.0.1", OCCUPIED_HTTP_TEST_HTTP_PORT)).await?;
     let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
     let err = time::timeout(
@@ -784,11 +789,11 @@ async fn server_fails_when_http_port_cannot_be_bound() -> Result<()> {
         ),
     )
     .await
-    .expect("server startup hung on an unboundable http_port")
-    .expect_err("server must fail when http_port cannot be bound");
+    .expect("server startup hung on an unboundable server_port")
+    .expect_err("server must fail when server_port cannot be bound");
 
     assert!(
-        format!("{:#}", err).contains("http_port"),
+        format!("{:#}", err).contains("server_port"),
         "unexpected error: {:#}",
         err
     );
@@ -1035,4 +1040,677 @@ async fn websocket_connection_limit_returns_503_and_recovers() -> Result<()> {
     shutdown_tx.send(true)?;
     server.await?;
     std::result::Result::Ok(())
+}
+
+// ==== Node mode: a multi-hop relay chain ====
+
+const CHAIN_ECHO_ADDR: &str = "127.0.0.1:2610";
+const CHAIN_INGRESS_PORT: u16 = 2611;
+const CHAIN_INGRESS_ADDR: &str = "127.0.0.1:2611";
+const CHAIN_NODE_A_PORT: u16 = 2612;
+const CHAIN_NODE_A_ADDR: &str = "127.0.0.1:2612";
+const CHAIN_NODE_B_PORT: u16 = 2613;
+const CHAIN_NODE_B_ADDR: &str = "127.0.0.1:2613";
+const CHAIN_INGRESS_TOKEN: &str = "chain-ingress-secret";
+const CHAIN_NODE_A_TOKEN: &str = "chain-node-a-secret";
+const CHAIN_NODE_B_TOKEN: &str = "chain-node-b-secret";
+const CHAIN_HOST: &str = "svc.relay.test";
+
+/// Write a node configuration to a temporary file and return its path.
+///
+/// `upstream` is `(server, token, claim)`: a `None` claim means route mirroring,
+/// and `None` for the whole option makes the node an ingress. The node name
+/// doubles as the name announced on the upstream.
+fn write_node_config(
+    file: &str,
+    name: &str,
+    server_port: u16,
+    token: &str,
+    upstream: Option<(&str, &str, Option<&str>)>,
+    proxies: &[(&str, &str)],
+) -> Result<String> {
+    let mut content = format!(
+        "name = \"{}\"\nserver_port = {}\nserver_host = \"127.0.0.1\"\n\
+         bind_host = \"127.0.0.1\"\ntoken = \"{}\"\n",
+        name, server_port, token
+    );
+    for (domain, local_addr) in proxies {
+        let proxy_name = domain.split('.').next().unwrap_or(domain);
+        content.push_str(&format!(
+            "\n[[proxies]]\nname = \"{}\"\ndomain = \"{}\"\nlocal_addr = \"{}\"\n",
+            proxy_name, domain, local_addr
+        ));
+    }
+    if let Some((server, upstream_token, claim)) = upstream {
+        content.push_str(&format!(
+            "\n[upstream]\nserver = \"{}\"\ntoken = \"{}\"\n",
+            server, upstream_token
+        ));
+        match claim {
+            Some(claim) => content.push_str(&format!("claim = \"{}\"\n", claim)),
+            None => content.push_str("mirror = true\n"),
+        }
+    }
+
+    let path = std::env::temp_dir().join(file);
+    std::fs::write(&path, content)?;
+    Ok(path.to_str().unwrap().to_string())
+}
+
+/// `hts` -> node A (wildcard claim) -> node B (exact claim + local proxy) ->
+/// echo service. A visitor to the public ingress reaches the service across
+/// three hops with one process per hop.
+///
+/// Stopping node B withdraws its route, so the ingress answers with `404`
+/// instead of hanging; restarting it claims the route again.
+#[tokio::test]
+async fn node_chain_forwards_and_withdraws_routes() -> Result<()> {
+    init();
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(CHAIN_ECHO_ADDR).await {
+            panic!("Failed to run the echo server for testing: {:?}", e);
+        }
+    });
+
+    let (ingress_shutdown_tx, ingress_shutdown_rx) = broadcast::channel(1);
+    let ingress = tokio::spawn(async move {
+        run_http_tunnel_server(
+            CHAIN_INGRESS_PORT,
+            "127.0.0.1",
+            CHAIN_INGRESS_TOKEN,
+            ingress_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_tcp(CHAIN_INGRESS_ADDR, Duration::from_secs(10)).await?;
+
+    let node_a_config = write_node_config(
+        "http_tunnel_node_a.toml",
+        "relay-a",
+        CHAIN_NODE_A_PORT,
+        CHAIN_NODE_A_TOKEN,
+        Some((
+            &format!("ws://{}", CHAIN_INGRESS_ADDR),
+            CHAIN_INGRESS_TOKEN,
+            Some("*.relay.test"),
+        )),
+        &[],
+    )?;
+    let (node_a_shutdown_tx, node_a_shutdown_rx) = broadcast::channel(1);
+    let node_a = tokio::spawn(async move {
+        common::run_http_tunnel_node(&node_a_config, node_a_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_tcp(CHAIN_NODE_A_ADDR, Duration::from_secs(10)).await?;
+
+    let node_b_config = write_node_config(
+        "http_tunnel_node_b.toml",
+        "relay-b",
+        CHAIN_NODE_B_PORT,
+        CHAIN_NODE_B_TOKEN,
+        Some((
+            &format!("ws://{}", CHAIN_NODE_A_ADDR),
+            CHAIN_NODE_A_TOKEN,
+            Some(CHAIN_HOST),
+        )),
+        &[(CHAIN_HOST, CHAIN_ECHO_ADDR)],
+    )?;
+    let (node_b_shutdown_tx, node_b_shutdown_rx) = broadcast::channel(1);
+    let node_b_path = node_b_config.clone();
+    let node_b = tokio::spawn(async move {
+        common::run_http_tunnel_node(&node_b_path, node_b_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_tcp(CHAIN_NODE_B_ADDR, Duration::from_secs(10)).await?;
+
+    info!("the three-hop chain serves the leaf domain");
+    wait_for_echo(CHAIN_INGRESS_ADDR, CHAIN_HOST, Duration::from_secs(20)).await?;
+
+    info!("stopping the leaf node withdraws its route");
+    node_b_shutdown_tx.send(true)?;
+    let _ = tokio::join!(node_b);
+    wait_for_404(CHAIN_INGRESS_ADDR, CHAIN_HOST).await?;
+
+    info!("restarting the leaf node claims its route again");
+    let (node_b_shutdown_tx, node_b_shutdown_rx) = broadcast::channel(1);
+    let node_b_path = node_b_config.clone();
+    let node_b = tokio::spawn(async move {
+        common::run_http_tunnel_node(&node_b_path, node_b_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_echo(CHAIN_INGRESS_ADDR, CHAIN_HOST, Duration::from_secs(20)).await?;
+
+    info!("shutdown the chain");
+    node_b_shutdown_tx.send(true)?;
+    node_a_shutdown_tx.send(true)?;
+    ingress_shutdown_tx.send(true)?;
+    let _ = tokio::join!(node_b, node_a, ingress);
+    Ok(())
+}
+
+// ==== Node mode: fan-out under one relay ====
+
+const FANOUT_ECHO_ADDR: &str = "127.0.0.1:2630";
+const FANOUT_INGRESS_PORT: u16 = 2631;
+const FANOUT_INGRESS_ADDR: &str = "127.0.0.1:2631";
+const FANOUT_NODE_A_PORT: u16 = 2632;
+const FANOUT_NODE_A_ADDR: &str = "127.0.0.1:2632";
+const FANOUT_NODE_B1_PORT: u16 = 2633;
+const FANOUT_NODE_B1_ADDR: &str = "127.0.0.1:2633";
+const FANOUT_NODE_B2_PORT: u16 = 2634;
+const FANOUT_NODE_B2_ADDR: &str = "127.0.0.1:2634";
+
+/// Two downstream nodes publish different domains under the same upstream
+/// node: no extra configuration is needed at the relay or the ingress.
+#[tokio::test]
+async fn node_fanout_publishes_two_downstream_domains() -> Result<()> {
+    init();
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(FANOUT_ECHO_ADDR).await {
+            panic!("Failed to run the echo server for testing: {:?}", e);
+        }
+    });
+
+    let (ingress_shutdown_tx, ingress_shutdown_rx) = broadcast::channel(1);
+    let ingress = tokio::spawn(async move {
+        run_http_tunnel_server(
+            FANOUT_INGRESS_PORT,
+            "127.0.0.1",
+            CHAIN_INGRESS_TOKEN,
+            ingress_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_tcp(FANOUT_INGRESS_ADDR, Duration::from_secs(10)).await?;
+
+    let node_a_config = write_node_config(
+        "http_tunnel_fanout_a.toml",
+        "fanout-a",
+        FANOUT_NODE_A_PORT,
+        CHAIN_NODE_A_TOKEN,
+        Some((
+            &format!("ws://{}", FANOUT_INGRESS_ADDR),
+            CHAIN_INGRESS_TOKEN,
+            Some("*.relay.test"),
+        )),
+        &[],
+    )?;
+    let (node_a_shutdown_tx, node_a_shutdown_rx) = broadcast::channel(1);
+    let node_a = tokio::spawn(async move {
+        common::run_http_tunnel_node(&node_a_config, node_a_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_tcp(FANOUT_NODE_A_ADDR, Duration::from_secs(10)).await?;
+
+    let mut leaves = Vec::new();
+    for (file, name, port, domain, addr) in [
+        (
+            "http_tunnel_fanout_b1.toml",
+            "fanout-b1",
+            FANOUT_NODE_B1_PORT,
+            "one.relay.test",
+            FANOUT_NODE_B1_ADDR,
+        ),
+        (
+            "http_tunnel_fanout_b2.toml",
+            "fanout-b2",
+            FANOUT_NODE_B2_PORT,
+            "two.relay.test",
+            FANOUT_NODE_B2_ADDR,
+        ),
+    ] {
+        let config = write_node_config(
+            file,
+            name,
+            port,
+            CHAIN_NODE_B_TOKEN,
+            Some((
+                &format!("ws://{}", FANOUT_NODE_A_ADDR),
+                CHAIN_NODE_A_TOKEN,
+                Some(domain),
+            )),
+            &[(domain, FANOUT_ECHO_ADDR)],
+        )?;
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let node = tokio::spawn(async move {
+            common::run_http_tunnel_node(&config, shutdown_rx)
+                .await
+                .unwrap();
+        });
+        wait_for_tcp(addr, Duration::from_secs(10)).await?;
+        leaves.push((shutdown_tx, node));
+    }
+
+    info!("both leaf domains are served through the same relay");
+    wait_for_echo(
+        FANOUT_INGRESS_ADDR,
+        "one.relay.test",
+        Duration::from_secs(20),
+    )
+    .await?;
+    wait_for_echo(
+        FANOUT_INGRESS_ADDR,
+        "two.relay.test",
+        Duration::from_secs(20),
+    )
+    .await?;
+
+    for (shutdown_tx, node) in leaves {
+        shutdown_tx.send(true)?;
+        let _ = tokio::join!(node);
+    }
+    node_a_shutdown_tx.send(true)?;
+    ingress_shutdown_tx.send(true)?;
+    let _ = tokio::join!(node_a, ingress);
+    Ok(())
+}
+
+// ==== Node mode: route mirroring (Stage 2) ====
+
+const MIRROR_ECHO_ADDR: &str = "127.0.0.1:2640";
+const MIRROR_INGRESS_PORT: u16 = 2641;
+const MIRROR_INGRESS_ADDR: &str = "127.0.0.1:2641";
+const MIRROR_NODE_PORT: u16 = 2642;
+const MIRROR_NODE_ADDR: &str = "127.0.0.1:2642";
+const MIRROR_INGRESS_TOKEN: &str = "mirror-ingress-secret";
+const MIRROR_NODE_TOKEN: &str = "mirror-node-secret";
+
+/// A node with `mirror = true` publishes the routes of its downstream clients
+/// as they appear and withdraws them when they disappear. The ingress sees the
+/// real domain set, so a stopped leaf is answered with `404` at the ingress
+/// instead of being forwarded into the relay.
+#[tokio::test]
+async fn node_mirror_withdraws_and_reclaims_routes() -> Result<()> {
+    init();
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(MIRROR_ECHO_ADDR).await {
+            panic!("Failed to run the echo server for testing: {:?}", e);
+        }
+    });
+
+    let (ingress_shutdown_tx, ingress_shutdown_rx) = broadcast::channel(1);
+    let ingress = tokio::spawn(async move {
+        run_http_tunnel_server(
+            MIRROR_INGRESS_PORT,
+            "127.0.0.1",
+            MIRROR_INGRESS_TOKEN,
+            ingress_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_tcp(MIRROR_INGRESS_ADDR, Duration::from_secs(10)).await?;
+
+    let node_config = write_node_config(
+        "http_tunnel_mirror_node.toml",
+        "mirror-relay",
+        MIRROR_NODE_PORT,
+        MIRROR_NODE_TOKEN,
+        Some((
+            &format!("ws://{}", MIRROR_INGRESS_ADDR),
+            MIRROR_INGRESS_TOKEN,
+            None,
+        )),
+        // A local proxy is part of the initial route set and is mirrored even
+        // before any downstream client connects.
+        &[("proxy.mirror.test", MIRROR_ECHO_ADDR)],
+    )?;
+    let (node_shutdown_tx, node_shutdown_rx) = broadcast::channel(1);
+    let node = tokio::spawn(async move {
+        common::run_http_tunnel_node(&node_config, node_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_tcp(MIRROR_NODE_ADDR, Duration::from_secs(10)).await?;
+
+    info!("the local proxy is mirrored from the start");
+    wait_for_echo(
+        MIRROR_INGRESS_ADDR,
+        "proxy.mirror.test",
+        Duration::from_secs(20),
+    )
+    .await?;
+
+    // The leaf client connects to the node after the node started, so the
+    // routes are discovered dynamically and mirrored.
+    let leaf_config = write_client_config(
+        "http_tunnel_mirror_leaf.toml",
+        "mirror-leaf",
+        "127.0.0.1",
+        MIRROR_NODE_PORT,
+        MIRROR_NODE_TOKEN,
+        Some(0),
+        &[
+            ("one.mirror.test", MIRROR_ECHO_ADDR),
+            ("two.mirror.test", MIRROR_ECHO_ADDR),
+            // A wildcard route is mirrored as a wildcard.
+            ("*.wild.mirror.test", MIRROR_ECHO_ADDR),
+        ],
+    )?;
+    let (leaf_shutdown_tx, leaf_shutdown_rx) = broadcast::channel(1);
+    let leaf_path = leaf_config.clone();
+    let leaf = tokio::spawn(async move {
+        run_http_tunnel_client(&leaf_path, leaf_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    info!("the mirror publishes both leaf domains to the ingress");
+    wait_for_echo(
+        MIRROR_INGRESS_ADDR,
+        "one.mirror.test",
+        Duration::from_secs(20),
+    )
+    .await?;
+    wait_for_echo(
+        MIRROR_INGRESS_ADDR,
+        "two.mirror.test",
+        Duration::from_secs(20),
+    )
+    .await?;
+    wait_for_echo(
+        MIRROR_INGRESS_ADDR,
+        "a.wild.mirror.test",
+        Duration::from_secs(20),
+    )
+    .await?;
+
+    info!("stopping the leaf withdraws both mirrored routes");
+    leaf_shutdown_tx.send(true)?;
+    let _ = tokio::join!(leaf);
+    wait_for_404(MIRROR_INGRESS_ADDR, "one.mirror.test").await?;
+    wait_for_404(MIRROR_INGRESS_ADDR, "two.mirror.test").await?;
+    wait_for_404(MIRROR_INGRESS_ADDR, "a.wild.mirror.test").await?;
+    // The proxy of the node itself was not withdrawn with the leaf.
+    wait_for_echo(
+        MIRROR_INGRESS_ADDR,
+        "proxy.mirror.test",
+        Duration::from_secs(20),
+    )
+    .await?;
+
+    info!("restarting the leaf mirrors the routes again");
+    let (leaf_shutdown_tx, leaf_shutdown_rx) = broadcast::channel(1);
+    let leaf_path = leaf_config.clone();
+    let leaf = tokio::spawn(async move {
+        run_http_tunnel_client(&leaf_path, leaf_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_echo(
+        MIRROR_INGRESS_ADDR,
+        "one.mirror.test",
+        Duration::from_secs(20),
+    )
+    .await?;
+
+    info!("an ingress restart is followed by the mirrored tunnels");
+    ingress_shutdown_tx.send(true)?;
+    let _ = tokio::join!(ingress);
+    let (ingress_shutdown_tx, ingress_shutdown_rx) = broadcast::channel(1);
+    let ingress = tokio::spawn(async move {
+        run_http_tunnel_server(
+            MIRROR_INGRESS_PORT,
+            "127.0.0.1",
+            MIRROR_INGRESS_TOKEN,
+            ingress_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_tcp(MIRROR_INGRESS_ADDR, Duration::from_secs(10)).await?;
+    wait_for_echo(
+        MIRROR_INGRESS_ADDR,
+        "one.mirror.test",
+        Duration::from_secs(20),
+    )
+    .await?;
+
+    leaf_shutdown_tx.send(true)?;
+    node_shutdown_tx.send(true)?;
+    ingress_shutdown_tx.send(true)?;
+    let _ = tokio::join!(leaf, node, ingress);
+    Ok(())
+}
+
+// ==== Node mode: route-mirroring churn ====
+
+const CHURN_ECHO_ADDR: &str = "127.0.0.1:2650";
+const CHURN_INGRESS_PORT: u16 = 2651;
+const CHURN_INGRESS_ADDR: &str = "127.0.0.1:2651";
+const CHURN_NODE_PORT: u16 = 2652;
+const CHURN_NODE_ADDR: &str = "127.0.0.1:2652";
+const CHURN_HOST: &str = "churn.mirror.test";
+
+/// Repeatedly connecting and disconnecting a leaf must neither leak a mirrored
+/// claim nor leave a stale route at the ingress.
+#[tokio::test]
+async fn node_mirror_churn_is_idempotent() -> Result<()> {
+    init();
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(CHURN_ECHO_ADDR).await {
+            panic!("Failed to run the echo server for testing: {:?}", e);
+        }
+    });
+
+    let (ingress_shutdown_tx, ingress_shutdown_rx) = broadcast::channel(1);
+    let ingress = tokio::spawn(async move {
+        run_http_tunnel_server(
+            CHURN_INGRESS_PORT,
+            "127.0.0.1",
+            CHAIN_INGRESS_TOKEN,
+            ingress_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_tcp(CHURN_INGRESS_ADDR, Duration::from_secs(10)).await?;
+
+    let node_config = write_node_config(
+        "http_tunnel_churn_node.toml",
+        "churn-relay",
+        CHURN_NODE_PORT,
+        CHAIN_NODE_A_TOKEN,
+        Some((
+            &format!("ws://{}", CHURN_INGRESS_ADDR),
+            CHAIN_INGRESS_TOKEN,
+            None,
+        )),
+        &[],
+    )?;
+    let (node_shutdown_tx, node_shutdown_rx) = broadcast::channel(1);
+    let node = tokio::spawn(async move {
+        common::run_http_tunnel_node(&node_config, node_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_tcp(CHURN_NODE_ADDR, Duration::from_secs(10)).await?;
+
+    let leaf_config = write_client_config(
+        "http_tunnel_churn_leaf.toml",
+        "churn-leaf",
+        "127.0.0.1",
+        CHURN_NODE_PORT,
+        CHAIN_NODE_A_TOKEN,
+        Some(0),
+        &[(CHURN_HOST, CHURN_ECHO_ADDR)],
+    )?;
+
+    for cycle in 1..=3 {
+        let (leaf_shutdown_tx, leaf_shutdown_rx) = broadcast::channel(1);
+        let leaf_path = leaf_config.clone();
+        let leaf = tokio::spawn(async move {
+            run_http_tunnel_client(&leaf_path, leaf_shutdown_rx)
+                .await
+                .unwrap();
+        });
+        info!("churn cycle {}: the mirrored route is claimed", cycle);
+        wait_for_echo(CHURN_INGRESS_ADDR, CHURN_HOST, Duration::from_secs(20)).await?;
+
+        leaf_shutdown_tx.send(true)?;
+        let _ = tokio::join!(leaf);
+        info!("churn cycle {}: the mirrored route is withdrawn", cycle);
+        wait_for_404(CHURN_INGRESS_ADDR, CHURN_HOST).await?;
+    }
+
+    node_shutdown_tx.send(true)?;
+    ingress_shutdown_tx.send(true)?;
+    let _ = tokio::join!(node, ingress);
+    Ok(())
+}
+
+// ==== Node mode: a WebSocket upgrade across the chain ====
+
+const CHAIN_WS_ECHO_ADDR: &str = "127.0.0.1:2620";
+const CHAIN_WS_INGRESS_PORT: u16 = 2621;
+const CHAIN_WS_INGRESS_ADDR: &str = "127.0.0.1:2621";
+const CHAIN_WS_NODE_A_PORT: u16 = 2622;
+const CHAIN_WS_NODE_A_ADDR: &str = "127.0.0.1:2622";
+const CHAIN_WS_NODE_B_PORT: u16 = 2623;
+const CHAIN_WS_NODE_B_ADDR: &str = "127.0.0.1:2623";
+const CHAIN_WS_HOST: &str = "ws.relay.test";
+
+/// A WebSocket echo service, the local target of the leaf node.
+async fn websocket_echo_server(addr: &'static str) {
+    use futures_util::{SinkExt, StreamExt};
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        tokio::spawn(async move {
+            let mut ws = match tokio_tungstenite::accept_async(stream).await {
+                std::result::Result::Ok(ws) => ws,
+                Err(_) => return,
+            };
+            while let Some(std::result::Result::Ok(message)) = ws.next().await {
+                if (message.is_text() || message.is_binary()) && ws.send(message).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+/// The upgrade of a visitor is opaque to every hop: the chain pipes the
+/// request and the `101` response through, then the WebSocket frames.
+#[tokio::test]
+async fn node_chain_forwards_websocket_upgrades() -> Result<()> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Message};
+
+    init();
+    tokio::spawn(websocket_echo_server(CHAIN_WS_ECHO_ADDR));
+
+    let (ingress_shutdown_tx, ingress_shutdown_rx) = broadcast::channel(1);
+    let ingress = tokio::spawn(async move {
+        run_http_tunnel_server(
+            CHAIN_WS_INGRESS_PORT,
+            "127.0.0.1",
+            CHAIN_INGRESS_TOKEN,
+            ingress_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_tcp(CHAIN_WS_INGRESS_ADDR, Duration::from_secs(10)).await?;
+
+    let node_a_config = write_node_config(
+        "http_tunnel_node_ws_a.toml",
+        "ws-relay-a",
+        CHAIN_WS_NODE_A_PORT,
+        CHAIN_NODE_A_TOKEN,
+        Some((
+            &format!("ws://{}", CHAIN_WS_INGRESS_ADDR),
+            CHAIN_INGRESS_TOKEN,
+            Some("*.relay.test"),
+        )),
+        &[],
+    )?;
+    let (node_a_shutdown_tx, node_a_shutdown_rx) = broadcast::channel(1);
+    let node_a = tokio::spawn(async move {
+        common::run_http_tunnel_node(&node_a_config, node_a_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_tcp(CHAIN_WS_NODE_A_ADDR, Duration::from_secs(10)).await?;
+
+    let node_b_config = write_node_config(
+        "http_tunnel_node_ws_b.toml",
+        "ws-relay-b",
+        CHAIN_WS_NODE_B_PORT,
+        CHAIN_NODE_B_TOKEN,
+        Some((
+            &format!("ws://{}", CHAIN_WS_NODE_A_ADDR),
+            CHAIN_NODE_A_TOKEN,
+            Some(CHAIN_WS_HOST),
+        )),
+        &[(CHAIN_WS_HOST, CHAIN_WS_ECHO_ADDR)],
+    )?;
+    let (node_b_shutdown_tx, node_b_shutdown_rx) = broadcast::channel(1);
+    let node_b = tokio::spawn(async move {
+        common::run_http_tunnel_node(&node_b_config, node_b_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_tcp(CHAIN_WS_NODE_B_ADDR, Duration::from_secs(10)).await?;
+
+    // Wait until node B has claimed its route on node A, and node A on the
+    // ingress. The leaf is a WebSocket-only service, so a successful upgrade is
+    // also the readiness check; a 404 from the ingress is retried.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (mut ws, response) = loop {
+        let mut request = format!("ws://{}/ws", CHAIN_WS_INGRESS_ADDR).into_client_request()?;
+        request
+            .headers_mut()
+            .insert("Host", HeaderValue::from_static(CHAIN_WS_HOST));
+
+        match time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        {
+            std::result::Result::Ok(std::result::Result::Ok(pair)) => break pair,
+            std::result::Result::Ok(std::result::Result::Err(e)) => {
+                debug!("the WebSocket upgrade through the chain failed: {}", e)
+            }
+            std::result::Result::Err(_) => {
+                debug!("the WebSocket upgrade through the chain timed out")
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("the WebSocket upgrade through the chain did not succeed in time");
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(response.status().as_u16(), 101);
+
+    ws.send(Message::Text("hello through three hops".to_string()))
+        .await?;
+    let echoed = time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("the echoed frame did not arrive")
+        .expect("the WebSocket closed before echoing")?;
+    assert_eq!(
+        echoed,
+        Message::Text("hello through three hops".to_string())
+    );
+
+    let _ = ws.close(None).await;
+    // Closing the visitor TCP connection lets the ingress end the relay, so the
+    // shutdown below does not wait for the drain timeout.
+    drop(ws);
+    time::sleep(Duration::from_millis(200)).await;
+
+    node_b_shutdown_tx.send(true)?;
+    node_a_shutdown_tx.send(true)?;
+    ingress_shutdown_tx.send(true)?;
+    let _ = tokio::join!(node_b, node_a, ingress);
+    Ok(())
 }

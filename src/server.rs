@@ -1,5 +1,5 @@
 use crate::cli::ServerArgs;
-use crate::config::{domain_overlaps_control_host, MaskedString, ServerLimits};
+use crate::config::{domain_overlaps_server_host, MaskedString, ServerLimits};
 use crate::helper::{to_bind_addr, write_and_flush};
 use crate::http::RoutingTable;
 use crate::multi_map::MultiMap;
@@ -10,13 +10,13 @@ use crate::transport::Conn;
 use anyhow::{anyhow, bail, Context, Result};
 
 use rand::RngCore;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, error, info, instrument, warn, Instrument, Span};
@@ -104,7 +104,7 @@ pub(crate) struct ServerState {
     // The shared token every client authenticates with
     pub(crate) token: MaskedString,
     // Reserved HTTP Host for the WebSocket transport; never a business tunnel.
-    pub(crate) control_host: String,
+    pub(crate) server_host: String,
     // The configurable capacity and keepalive settings
     pub(crate) limits: ServerLimits,
     // WebSocket upgrades that are still waiting for their protocol hello
@@ -117,6 +117,10 @@ pub(crate) struct ServerState {
     pub(crate) control_channels: RwLock<ControlChannelMap>,
     // `Host` -> TunnelDigest
     pub(crate) routing_table: RwLock<RoutingTable>,
+    // The domains this server can publish to an upstream node: the routes of
+    // its clients plus its local proxies, excluding `server_host`. A node
+    // mirrors this set to its next hop; `hts` has no receiver.
+    pub(crate) routes: watch::Sender<BTreeSet<String>>,
     // A monotonically increasing id, identifying a control channel connection
     next_conn_id: AtomicUsize,
     // The visitors that are currently being served
@@ -125,8 +129,38 @@ pub(crate) struct ServerState {
 
 // The entrypoint of running a server
 pub async fn run_server(args: ServerArgs, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    let mut server = Server::new(args);
-    server.run(shutdown_rx).await?;
+    // Bind the HTTP entrypoint before serving, so that a port that cannot be
+    // bound fails startup instead of being discovered on shutdown.
+    let bind_addr = to_bind_addr(&args.bind_host, args.server_port);
+    let http_listener = TcpListener::bind(&bind_addr)
+        .await
+        .with_context(|| format!("Failed to listen at `server_port` ({})", bind_addr))?;
+    run_server_with_listener(http_listener, args, shutdown_rx).await
+}
+
+/// Run a server on an already-bound listener. A node binds first, so that its
+/// upstream tunnel cannot claim a route before the listener that serves the
+/// visitors exists.
+pub(crate) async fn run_server_with_listener(
+    http_listener: TcpListener,
+    args: ServerArgs,
+    shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    let (routes, _) = watch::channel(BTreeSet::new());
+    run_server_with_listener_and_routes(http_listener, args, shutdown_rx, routes).await
+}
+
+/// Run a server on an already-bound listener, publishing its routes through
+/// `routes`. A node subscribes to that watch to mirror the domains of its
+/// downstream clients and local proxies to its next hop.
+pub(crate) async fn run_server_with_listener_and_routes(
+    http_listener: TcpListener,
+    args: ServerArgs,
+    shutdown_rx: broadcast::Receiver<bool>,
+    routes: watch::Sender<BTreeSet<String>>,
+) -> Result<()> {
+    let mut server = Server::new(args, routes);
+    server.run(http_listener, shutdown_rx).await?;
 
     Ok(())
 }
@@ -134,21 +168,26 @@ pub async fn run_server(args: ServerArgs, shutdown_rx: broadcast::Receiver<bool>
 // Server holds all states of running a server
 struct Server {
     state: Arc<ServerState>,
-    http_port: u16,
     proxies: Vec<crate::config::ServerProxyEntry>,
 }
 
 impl ServerState {
-    fn new(token: MaskedString, control_host: String, limits: ServerLimits) -> ServerState {
+    fn new(
+        token: MaskedString,
+        server_host: String,
+        limits: ServerLimits,
+        routes: watch::Sender<BTreeSet<String>>,
+    ) -> ServerState {
         ServerState {
             token,
-            control_host,
+            server_host,
             pending_connections: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
             control_connections: Arc::new(Semaphore::new(limits.max_control_connections)),
             data_connections: Arc::new(Semaphore::new(limits.max_data_connections)),
             limits,
             control_channels: RwLock::new(ControlChannelMap::new()),
             routing_table: RwLock::new(RoutingTable::default()),
+            routes,
             next_conn_id: AtomicUsize::new(0),
             activity: ActivityTracker::default(),
         }
@@ -157,29 +196,40 @@ impl ServerState {
 
 impl Server {
     // Create a server from the command line options
-    pub fn new(args: ServerArgs) -> Server {
+    pub fn new(args: ServerArgs, routes: watch::Sender<BTreeSet<String>>) -> Server {
+        // Local proxies are configured for the whole lifetime of the server, so
+        // they are part of the initial route set. The client routes are added
+        // and removed as the control channels come and go.
+        let initial: BTreeSet<String> = args
+            .proxies
+            .iter()
+            .filter_map(|proxy| crate::helper::normalize_domain(&proxy.domain))
+            .filter(|domain| !domain_overlaps_server_host(domain, &args.server_host))
+            .collect();
+        routes.send_modify(|routes| *routes = initial);
+
         let state = Arc::new(ServerState::new(
             MaskedString::from(args.token),
-            args.control_host,
+            args.server_host,
             args.limits,
+            routes,
         ));
 
         Server {
             state,
-            http_port: args.http_port,
             proxies: args.proxies,
         }
     }
 
     // The entry point of Server
-    pub async fn run(&mut self, mut shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-        // Bind the HTTP entrypoint before serving, so that a port that cannot
-        // be bound fails startup instead of being discovered on shutdown. It
-        // routes visitors by the `Host` header and carries the WebSocket
-        // control and data channels.
-        let http_listener = TcpListener::bind(to_bind_addr(self.http_port))
-            .await
-            .with_context(|| format!("Failed to listen at `http_port` ({})", self.http_port))?;
+    pub async fn run(
+        &mut self,
+        http_listener: TcpListener,
+        mut shutdown_rx: broadcast::Receiver<bool>,
+    ) -> Result<()> {
+        // The listener is already bound, so a port that cannot be bound fails
+        // startup before this task is spawned. It routes visitors by the `Host`
+        // header and carries the WebSocket control and data channels.
         let mut http_task = tokio::spawn(crate::http::serve(
             http_listener,
             self.state.clone(),
@@ -314,13 +364,13 @@ async fn do_control_channel_handshake(
         )
     })?;
     // Use the same wildcard-aware check as the server-side proxies: a
-    // wildcard tunnel that contains the control host can never serve it,
-    // because the control host is intercepted before routing.
-    if domain_overlaps_control_host(&domain, &state.control_host) {
+    // wildcard tunnel that contains the server host can never serve it,
+    // because the server host is intercepted before routing.
+    if domain_overlaps_server_host(&domain, &state.server_host) {
         bail!(
-            "The domain `{}` overlaps the reserved WebSocket control host `{}`",
+            "The domain `{}` overlaps the reserved WebSocket server host `{}`",
             domain,
-            state.control_host
+            state.server_host
         );
     }
 
@@ -398,6 +448,9 @@ async fn do_control_channel_handshake(
         let _ = ccs.insert(digest, session_key, handle);
     }
     state.routing_table.write().await.insert(&domain, digest);
+    state.routes.send_modify(|routes| {
+        routes.insert(domain.clone());
+    });
 
     // When the control channel is gone (the client crashed, was stopped, or lost its
     // connection), remove its handle and its route, so that the visitor of that host
@@ -412,6 +465,9 @@ async fn do_control_channel_handshake(
         if ccs.get1(&digest).map(|h| h.id) == Some(conn_id) {
             ccs.remove1(&digest);
             state.routing_table.write().await.remove(&domain);
+            state.routes.send_modify(|routes| {
+                routes.remove(&domain);
+            });
         }
     });
 

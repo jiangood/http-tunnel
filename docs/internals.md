@@ -5,12 +5,17 @@
 The entity that maps a domain to the traffic that needs to be forwarded
 
 ### Server
-The host that runs `http-tunnel` in the server mode. It reads `hts.toml` for its HTTP port, shared token,
-`control_host` and limits, and it learns the tunnels from the clients as they connect.
+The host that runs `http-tunnel` in the server mode. It reads `hts.toml` for its HTTP port and bind address,
+shared token, `server_host` and limits, and it learns the tunnels from the clients as they connect.
 
 ### Client
 The host behind the NAT that runs `http-tunnel` in the client mode. It declares its own tunnels in a
 configuration file: each tunnel maps a domain to a local service that needs to be exposed.
+
+### Node
+A relay hop that runs `htn`. It embeds a *server* (it listens for visitors and downstream peers) and
+one optional *client* tunnel (it claims one domain on the next hop). It is how a chain of isolated
+network segments is built with one process per hop; a node without `[upstream]` is an ingress.
 
 ### Visitor
 Who visits a *tunnel*, via the *server*
@@ -26,13 +31,14 @@ A data channel is a WebSocket connection between the *server* and the *client* t
 
 When `http-tunnel` starts in the client mode, it reads its configuration file: a list of *tunnels*, each an HTTP
 domain mapped to a `local_addr` on the client (a tunnel also carries a `name`, its identity within the client, which
-defaults to the domain). It opens one WebSocket to the server's `control_host:http_port` per tunnel. These
+defaults to the domain). Every setting also has an `HTC_*` environment counterpart that wins over the file, which
+lets a container run without a mounted `htc.toml`. It opens one WebSocket to the server's `server_host:server_port` per tunnel. These
 connections act as control channels: the upgrade carries the shared token in `Authorization: Bearer`, and the
 protocol then challenges the client by a nonce, so that the token is checked twice. Once the token
 is validated, the server registers the domain in its routing table — this is how the server learns the tunnels of
 its clients.
 
-The server also listens on `http_port` for HTTP visitors. When a visitor connects, the server reads the HTTP request line and the `Host` header, and looks up
+The server also listens on `bind_host:server_port` for HTTP visitors (`bind_host` defaults to `0.0.0.0`; `127.0.0.1` keeps it on loopback). When a visitor connects, the server reads the HTTP request line and the `Host` header, and looks up
 the tunnel that claims that domain. Then it asks the client for a data channel through the corresponding control
 channel, and hands the visitor over to the tunnel's connection pool. The client connects to the server to create a
 data channel, and the prefetched header bytes are replayed along with the rest of the connection. In this way, a
@@ -92,3 +98,22 @@ On shutdown, after the HTTP listener stops accepting, the server waits for the
 in-flight visitors (up to `DRAIN_TIMEOUT`, 30 seconds) before it tears the
 control channels down, so a graceful restart doesn't cut the flows off. The
 `ActivityTracker` counts the visitors that are still being served for that.
+
+A *node* composes the two roles in one process, so a chain does not need an
+`hts` and an `htc` per hop. Its upstream tunnel forwards visitors to
+`127.0.0.1:<server_port>`, where the embedded server routes them by `Host` again:
+the data plane is recursive because a data channel is a raw byte pipe and the
+`Host` header is never rewritten.
+
+A node has two upstream modes. With `claim` it opens one upstream control channel
+for that exact or wildcard domain. With `mirror = true` the embedded server
+publishes its routable set through a `watch` channel: the domains of its
+downstream clients plus its local `[[proxies]]`, minus the reserved
+`server_host`. A mirror task keeps one upstream control channel per domain and
+reconciles the set as clients connect and disconnect. Either way each upstream
+control channel claims exactly one domain, so the protocol does not change.
+
+On shutdown the node withdraws its upstream routes *before* the embedded server
+drains, so no new visitor is routed to it while the in-flight ones finish; only
+then are the downstream control channels dropped. `hts`, `htc` and `htn` of the
+same release can be mixed in one chain.

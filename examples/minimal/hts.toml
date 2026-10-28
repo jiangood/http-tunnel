@@ -1,0 +1,13 @@
+## http-tunnel server configuration
+##
+## Set `server_host` and a strong `token`, use the same token in htc.toml,
+## then start hts.
+server_port = 80
+## Optional: the IP address the HTTP entrypoint binds. It defaults to `0.0.0.0`
+## (all interfaces); set it to `127.0.0.1` behind a local reverse proxy.
+# bind_host = "127.0.0.1"
+## Required: the exact Host the clients use for the WebSocket tunnel. It must
+## resolve to this server and must not be a business domain or a wildcard.
+server_host = "control.example.com"
+## Required: a strong secret shared by all clients, e.g. openssl rand -hex 16
+token = "replace-with-a-long-random-secret"

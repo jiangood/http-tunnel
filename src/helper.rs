@@ -141,6 +141,31 @@ fn trim_ascii(mut s: &[u8]) -> &[u8] {
     s
 }
 
+/// Build a plain-text HTTP response that closes the connection.
+///
+/// It's shared by the server-side entrypoint and the client, so that a `401` from
+/// a tunnel gate looks the same on both sides and the client builds without the
+/// `server` feature.
+pub(crate) fn response_with_headers(status: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
+    let mut response = format!("HTTP/1.1 {}\r\n", status);
+    for (name, value) in headers {
+        response.push_str(&format!("{}: {}\r\n", name, value));
+    }
+    response.push_str(&format!(
+        "Content-Length: {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    ));
+    response.into_bytes()
+}
+
+/// The `401` sent when a tunnel sets `auth_header` and the visitor does not
+/// present the expected `X-HTTP-TUNNEL-TOKEN`. It carries no `WWW-Authenticate`:
+/// that header describes an `Authorization` scheme, which this is not.
+pub(crate) fn unauthorized_response(failure: AuthFailure) -> Vec<u8> {
+    response_with_headers("401 Unauthorized", &[], failure.message())
+}
+
 /// Compare two byte strings without an early exit, so that the comparison time
 /// does not reveal how many leading bytes of the secret matched.
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -161,10 +186,18 @@ pub fn feature_not_compile(feature: &str) -> ! {
     )
 }
 
-/// Format the socket address of a port. The host is always `0.0.0.0`, so that
-/// every listener binds to all interfaces.
-pub fn to_bind_addr(port: u16) -> String {
-    format!("0.0.0.0:{}", port)
+/// The default address a listener binds: all interfaces.
+pub const DEFAULT_BIND_HOST: &str = "0.0.0.0";
+
+/// Format the socket address of a listener. `host` is the IP address to bind:
+/// the default `0.0.0.0` exposes it on every interface, `127.0.0.1` keeps it on
+/// the loopback interface only.
+pub fn to_bind_addr(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
 }
 
 /// Normalize a domain coming from a `Host` header value, an absolute-form

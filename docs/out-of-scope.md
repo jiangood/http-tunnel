@@ -15,3 +15,14 @@
 - *`frp`'s STCP or other setup that requires visitors' side configuration*
 
   If that kind of setup is possible, then there are a lot more tools available. You may want to consider secure tunnels like wireguard or zerotier. `http-tunnel` primarily focuses on NAT traversal by forwarding, which doesn't require any setup for visitors.
+
+- *Mesh discovery and route advertisement*
+
+  A chain is configured explicitly, hop by hop: a downstream always dials its
+  upstream, and a node publishes one domain per control channel on the next hop.
+  Mirroring re-publishes the local route set with one v3 control channel per
+  domain; it is not a wire-level route advertisement, and prefixes are not
+  aggregated. There is no automatic peer discovery, no hop count and no loop
+  detection at the protocol level. A node validates that its upstream is not its
+  own listener, but general loop detection belongs to a future protocol version,
+  not to the HTTP-only data plane.

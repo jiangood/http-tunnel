@@ -11,7 +11,7 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
@@ -20,14 +20,17 @@ struct ApiState {
     client: Arc<ClientState>,
 }
 
-/// Run the web UI and the existing administration API on the same port.
+/// Run the web UI and the existing administration API on the same address.
 pub(crate) async fn serve(
+    host: &str,
     port: u16,
     token: String,
     client: Arc<ClientState>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    let addr: SocketAddr = crate::helper::to_bind_addr(host, port)
+        .parse()
+        .with_context(|| format!("`web_host` `{}` is not a valid bind address", host))?;
     let state = Arc::new(ApiState { client });
 
     let api = Router::new()
@@ -187,6 +190,9 @@ impl ApiError {
     fn from_reason(reason: String) -> ApiError {
         let status = if reason.contains("No such") {
             StatusCode::NOT_FOUND
+        } else if reason.contains("HTC_TUNNELS") {
+            // The tunnels come from the environment and cannot be changed
+            StatusCode::CONFLICT
         } else if reason.contains("Failed to") {
             StatusCode::INTERNAL_SERVER_ERROR
         } else {
@@ -264,31 +270,79 @@ async fn web_index(State(state): State<Arc<ApiState>>) -> Html<String> {
         "ws" => "WebSocket",
         other => other,
     };
+    let read_only = state.client.tunnels_managed();
     let tunnels = state.client.tunnels().await;
     let mut html = format!(
-        "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>http-tunnel 管理</title><body><h1>http-tunnel 客户端管理</h1><p>客户端：{}；服务端：{}；传输：{}；状态：{}；隧道数：{}</p><h2>新增或更新隧道</h2><form method=\"post\" action=\"/web/tunnels\"><p>名称：<input name=\"name\" required pattern=\"[A-Za-z0-9._-]+\"></p><p>域名：<input name=\"domain\" required></p><p>本地地址：<input name=\"local_addr\" required placeholder=\"127.0.0.1:8080 或 unix:///path.sock\"></p><button type=\"submit\">保存</button></form><h2>隧道列表</h2><table border=\"1\" cellpadding=\"6\"><tr><th>名称</th><th>域名</th><th>本地地址</th><th>操作</th></tr>",
+        "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>http-tunnel 管理</title><body><h1>http-tunnel 客户端管理</h1><p>客户端：{}；服务端：{}；传输：{}；状态：{}；隧道数：{}</p><h2>新增或更新隧道</h2>",
         escape_html(state.client.name()), escape_html(state.client.server_addr()), transport, connected, tunnels.len()
     );
+    if read_only {
+        html.push_str("<p>隧道由环境变量 <code>HTC_TUNNELS</code> 管理，网页与 API 不可修改；如需变更，请修改该环境变量并重启 htc。</p>");
+    } else {
+        html.push_str("<form method=\"post\" action=\"/web/tunnels\"><p>名称：<input name=\"name\" required pattern=\"[A-Za-z0-9._-]+\"></p><p>域名：<input name=\"domain\" required></p><p>本地地址：<input name=\"local_addr\" required placeholder=\"127.0.0.1:8080 或 unix:///path.sock\"></p><button type=\"submit\">保存</button></form>");
+    }
+    html.push_str("<h2>隧道列表</h2><table border=\"1\" cellpadding=\"6\"><tr><th>名称</th><th>域名</th><th>本地地址</th>");
+    if !read_only {
+        html.push_str("<th>操作</th>");
+    }
+    html.push_str("</tr>");
     for tunnel in tunnels {
+        let action = if read_only {
+            String::new()
+        } else {
+            format!(
+                "<td><form method=\"post\" action=\"/web/tunnels/{}/delete\"><button type=\"submit\">删除</button></form></td>",
+                escape_html(&tunnel.name)
+            )
+        };
         html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td><form method=\"post\" action=\"/web/tunnels/{}/delete\"><button type=\"submit\">删除</button></form></td></tr>",
-            escape_html(&tunnel.name), escape_html(&tunnel.domain), escape_html(&tunnel.local_addr), escape_html(&tunnel.name)
+            "<tr><td>{}</td><td>{}</td><td>{}</td>{}</tr>",
+            escape_html(&tunnel.name),
+            escape_html(&tunnel.domain),
+            escape_html(&tunnel.local_addr),
+            action
         ));
     }
-    html.push_str("</table><p>更新隧道时填写相同名称即可。修改会立即生效并写入 htc.toml。</p><p>原管理 API 仍可通过 /api/status、/api/tunnels 使用。</p></body></html>");
+    if read_only {
+        html.push_str("</table><p>隧道来自 HTC_TUNNELS，修改该环境变量并重启 htc 后才会生效。</p><p>原管理 API 仍可通过 /api/status、/api/tunnels 使用。</p></body></html>");
+    } else {
+        html.push_str("</table><p>更新隧道时填写相同名称即可。修改会立即生效并写入 htc.toml。</p><p>原管理 API 仍可通过 /api/status、/api/tunnels 使用。</p></body></html>");
+    }
     Html(html)
+}
+
+/// Render a failed web form operation, with `409` for the tunnels that the
+/// environment manages.
+fn web_error(title: &str, e: anyhow::Error) -> Response {
+    let reason = format!("{:#}", e);
+    let status = if reason.contains("HTC_TUNNELS") {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Html(format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>{}</title><p>{}：{}</p><p><a href=\"/\">返回</a></p>",
+            title,
+            title,
+            escape_html(&reason)
+        )),
+    )
+        .into_response()
 }
 
 async fn web_put_tunnel(
     State(state): State<Arc<ApiState>>,
     Form(body): Form<WebTunnelForm>,
 ) -> Response {
-    match state.client.put_tunnel(body.name, body.domain, body.local_addr).await {
+    match state
+        .client
+        .put_tunnel(body.name, body.domain, body.local_addr)
+        .await
+    {
         Ok(()) => Redirect::to("/").into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Html(format!("<!doctype html><meta charset=\"utf-8\"><title>保存失败</title><p>保存失败：{}</p><p><a href=\"/\">返回</a></p>", escape_html(&format!("{:#}", e)))),
-        ).into_response(),
+        Err(e) => web_error("保存失败", e),
     }
 }
 
@@ -298,10 +352,7 @@ async fn web_delete_tunnel(
 ) -> Response {
     match state.client.delete_tunnel(&name).await {
         Ok(()) => Redirect::to("/").into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Html(format!("<!doctype html><meta charset=\"utf-8\"><title>删除失败</title><p>删除失败：{}</p><p><a href=\"/\">返回</a></p>", escape_html(&format!("{:#}", e)))),
-        ).into_response(),
+        Err(e) => web_error("删除失败", e),
     }
 }
 

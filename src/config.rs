@@ -1,5 +1,4 @@
 use anyhow::{anyhow, bail, Context, Result};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
@@ -27,6 +26,9 @@ pub const DEFAULT_MAX_DATA_CONNECTIONS: usize = 2048;
 pub const DEFAULT_POOL_MIN: usize = 4;
 /// The default upper bound of the warm data channels of one tunnel.
 pub const DEFAULT_POOL_MAX: usize = 32;
+/// The default cap on the routes one node mirrors to its next hop. It matches
+/// the default control-channel limit of a server.
+pub const DEFAULT_MAX_MIRRORED_ROUTES: usize = 256;
 
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
@@ -102,18 +104,12 @@ pub struct TunnelEntry {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
-    /// The host of the server, e.g. `example.com`, `127.0.0.1` or `::1`. It must
-    /// be the `control_host` of the server.
+    /// The WebSocket endpoint of the server, e.g. `wss://control.example.com`
+    /// or `ws://127.0.0.1:8080`. The scheme selects TLS and the port defaults
+    /// to 443 for `wss` and 80 for `ws`. The host must be the `server_host`
+    /// of the server and the port its `server_port`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_host: Option<String>,
-    /// The port of the server HTTP entrypoint, i.e. its `http_port`. Named
-    /// `server_port` for compatibility with the earlier TCP transport.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_port: Option<u16>,
-    /// The WebSocket scheme: `wss` (the default, TLS) or `ws` (plain text,
-    /// only for trusted networks). The legacy value `websocket` means `ws`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transport: Option<String>,
+    pub server: Option<String>,
     /// The name of the client. It's used for logging and to warn when a domain
     /// changes hands
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +120,10 @@ pub struct ClientConfig {
     /// The port of the client web management page and API. Defaults to 8610, `0` disables it
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_port: Option<u16>,
+    /// The address the web management page and API bind. Defaults to `0.0.0.0`;
+    /// set it to `127.0.0.1` to keep it on this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_host: Option<String>,
     /// Application-layer heartbeat timeout in secs. 0 disables the test
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat_timeout: Option<u64>,
@@ -143,12 +143,18 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
-    /// The `host:port` address of the server, with an IPv6 host bracketed.
+    /// The address the web management page and API bind.
+    pub fn web_host(&self) -> &str {
+        self.web_host
+            .as_deref()
+            .unwrap_or(crate::helper::DEFAULT_BIND_HOST)
+    }
+
+    /// The `host:port` authority of the server, with an IPv6 host bracketed.
     pub fn server_addr(&self) -> Option<String> {
-        Some(format_server_addr(
-            self.server_host.as_deref()?,
-            self.server_port?,
-        ))
+        let server = self.server.as_deref()?;
+        let (_, authority) = split_server_url(server)?;
+        Some(authority.to_string())
     }
 
     /// The interval between two application-layer heartbeats expected from the
@@ -169,12 +175,12 @@ impl ClientConfig {
         self.nodelay.unwrap_or(true)
     }
 
-    /// The WebSocket scheme, `wss` unless `ws` is configured explicitly.
+    /// The WebSocket scheme, `wss` unless `server` says `ws`.
     pub fn transport_name(&self) -> &str {
-        match self.transport.as_deref() {
-            Some("ws") => "ws",
-            _ => "wss",
-        }
+        self.server
+            .as_deref()
+            .and_then(|server| split_server_url(server).map(|(scheme, _)| scheme))
+            .unwrap_or("wss")
     }
 
     /// Whether the WebSocket connection uses TLS. TLS is the default.
@@ -246,8 +252,8 @@ impl ClientConfig {
             .map_err(|e| {
                 if has_legacy_remote(s) {
                     anyhow!(
-                        "{}\nNote: `remote` is no longer supported. Set `server_host` and \
-                         `server_port` instead.",
+                        "{}\nNote: `remote` is no longer supported. Set `server = \
+                         \"wss://host:port\"` instead.",
                         e
                     )
                 } else if s.contains("http_port")
@@ -260,6 +266,13 @@ impl ClientConfig {
                         "{}\nNote: `http-tunnel` no longer takes a server configuration file. \
                          Configure the server in `hts.toml`; client routes belong in \
                          the `[[tunnels]]` array of `htc.toml`.",
+                        e
+                    )
+                } else if has_legacy_server_settings(s) {
+                    anyhow!(
+                        "{}\nNote: `transport`, `server_host` and `server_port` are no longer \
+                         supported. Set `server = \"wss://host:port\"` instead (use `ws://` only \
+                         on a trusted network).",
                         e
                     )
                 } else {
@@ -276,45 +289,44 @@ impl ClientConfig {
     /// Read the fixed client config. If it is missing, create a commented
     /// example and ask the user to edit it before starting.
     pub async fn from_file(path: &Path) -> Result<ClientConfig> {
-        match fs::read_to_string(path).await {
-            Ok(s) => ClientConfig::parse(&s)
+        match ClientConfig::read(path).await? {
+            Some(s) => ClientConfig::parse(&s)
                 .with_context(|| format!("The configuration {:?} is invalid", path)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let example = client_config_example();
-                fs::write(path, example)
-                    .await
-                    .with_context(|| format!("Failed to generate default config {:?}", path))?;
-                bail!(
-                    "Generated {:?}. Edit it with your server address, shared token and tunnel settings, then restart htc.",
-                    path
-                );
-            }
+            None => Err(ClientConfig::bootstrap_example(path).await),
+        }
+    }
+
+    /// Read the configuration file, `None` when it does not exist.
+    pub async fn read(path: &Path) -> Result<Option<String>> {
+        match fs::read_to_string(path).await {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("Failed to read the config {:?}", path)),
         }
     }
 
-    /// Validate a configuration and normalize it in place: lowercase the tunnel
-    /// domains, validate required names, and reject empty, malformed or
-    /// duplicated definitions.
-    pub fn validate(config: &mut ClientConfig) -> Result<()> {
-        if let Some(transport) = config.transport.as_mut() {
-            *transport = transport.trim().to_ascii_lowercase();
-            // `websocket` is the name used before `ws`/`wss` existed. It always
-            // meant a plain WebSocket, so it is an alias for `ws`.
-            if transport == "websocket" {
-                *transport = "ws".to_string();
-            }
-            if transport == "tcp" {
-                bail!(
-                    "The TCP transport has been removed; use the WebSocket transport \
-                     (`transport = \"wss\"`, or `\"ws\"` on a trusted network)"
-                );
-            }
-            if transport != "ws" && transport != "wss" {
-                bail!("Unsupported transport; expected ws or wss");
-            }
+    /// Write the commented example and return the error that asks the user to
+    /// edit it before the first start.
+    pub(crate) async fn bootstrap_example(path: &Path) -> anyhow::Error {
+        match fs::write(path, DEFAULT_CLIENT_CONFIG).await {
+            Ok(()) => anyhow!(
+                "Generated {:?}. Edit it with your server address, shared token and tunnel settings, then restart htc.",
+                path
+            ),
+            Err(e) => anyhow::Error::new(e)
+                .context(format!("Failed to generate default config {:?}", path)),
         }
-        validate_server_address(config)?;
+    }
+
+    /// Validate a configuration and normalize it in place: validate and
+    /// canonicalize the WebSocket endpoint, lowercase the tunnel domains,
+    /// validate required names, and reject empty, malformed or duplicated
+    /// definitions.
+    pub fn validate(config: &mut ClientConfig) -> Result<()> {
+        normalize_server(config)?;
+        if let Some(web_host) = config.web_host.as_mut() {
+            normalize_bind_host(web_host, "web_host")?;
+        }
         let mut names: BTreeMap<String, ()> = BTreeMap::new();
         let mut domains: BTreeMap<String, ()> = BTreeMap::new();
         let mut entries: Vec<TunnelEntry> = Vec::new();
@@ -388,77 +400,162 @@ pub(crate) fn format_server_addr(host: &str, port: u16) -> String {
     }
 }
 
+/// Whether the TOML source declares a top-level setting with the given key.
+fn has_setting(s: &str, key: &str) -> bool {
+    s.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    })
+}
+
 /// Whether the TOML source still declares the removed top-level `remote` key.
 fn has_legacy_remote(s: &str) -> bool {
-    s.lines().any(|line| {
-        line.trim_start()
-            .strip_prefix("remote")
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
-    })
+    has_setting(s, "remote")
 }
 
-/// Whether an hts.toml still declares the removed TCP listener port.
-fn has_legacy_server_port(s: &str) -> bool {
-    s.lines().any(|line| {
-        line.trim_start()
-            .strip_prefix("server_port")
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
-    })
+/// Whether the TOML source still declares any of the settings that `server`
+/// replaced.
+fn has_legacy_server_settings(s: &str) -> bool {
+    has_setting(s, "transport") || has_setting(s, "server_host") || has_setting(s, "server_port")
 }
 
-/// Validate and normalize the address of the server.
+/// Validate the `server` endpoint and store it in a canonical form.
 ///
-/// The host and the port are optional together: a partial configuration is
-/// accepted by the parser, but an address with only one of the two is always a
-/// mistake. `resolve_identity` rejects a completely missing address at startup.
-fn validate_server_address(config: &mut ClientConfig) -> Result<()> {
-    match (config.server_host.as_mut(), config.server_port) {
-        (None, None) => Ok(()),
-        (Some(_), None) => bail!("The server port is missing. Set `server_port`"),
-        (None, Some(_)) => bail!("The server host is missing. Set `server_host`"),
-        (Some(host), Some(port)) => {
-            if port == 0 {
-                bail!("The `server_port` must not be 0");
-            }
-            *host = normalize_server_host(host)?;
-            Ok(())
-        }
+/// The canonical form is a lowercase scheme, a host and an explicit, validated
+/// port, so the rest of the client can split it without parsing again.
+fn normalize_server(config: &mut ClientConfig) -> Result<()> {
+    if let Some(server) = config.server.as_mut() {
+        *server = canonical_server_url(server)?.0;
     }
+    Ok(())
+}
+
+/// Validate a `ws://` or `wss://` endpoint and return it in canonical form with
+/// an explicit port, together with the normalized host and the port.
+fn canonical_server_url(raw: &str) -> Result<(String, String, u16)> {
+    let (scheme, host, port) = parse_server_url(raw)?;
+    Ok((
+        format!("{}://{}", scheme, format_server_addr(&host, port)),
+        host,
+        port,
+    ))
+}
+
+/// Split a canonical `scheme://host:port` endpoint into its scheme and authority.
+fn split_server_url(server: &str) -> Option<(&str, &str)> {
+    server.split_once("://")
+}
+
+/// Parse a `ws://` or `wss://` endpoint into its scheme, host and port.
+///
+/// The port is optional and defaults to 443 for `wss` and 80 for `ws`. The
+/// path, query and fragment are rejected because the control path is fixed by
+/// the protocol.
+fn parse_server_url(raw: &str) -> Result<(String, String, u16)> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("The `server` setting must not be empty");
+    }
+    let (scheme, rest) = raw.split_once("://").ok_or_else(|| {
+        anyhow!(
+            "The `server` setting must be a WebSocket URL such as \
+             \"wss://control.example.com\""
+        )
+    })?;
+    let scheme = scheme.trim().to_ascii_lowercase();
+    if scheme != "ws" && scheme != "wss" {
+        bail!(
+            "The `server` scheme must be `ws` or `wss`, not `{}`",
+            scheme
+        );
+    }
+    if rest.is_empty() {
+        bail!("The `server` host is missing");
+    }
+    // A trailing slash is the root path and is harmless; the control path is
+    // appended by the protocol itself.
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    if rest.contains('/') || rest.contains('\\') || rest.contains('?') || rest.contains('#') {
+        bail!(
+            "The `server` setting must contain only a host and an optional port, \
+             without a path, query or fragment"
+        );
+    }
+
+    let default_port = if scheme == "wss" { 443 } else { 80 };
+    let (host, port) = if let Some(rest) = rest.strip_prefix('[') {
+        let (host, tail) = rest
+            .split_once(']')
+            .ok_or_else(|| anyhow!("The `server` host `{}` is not a valid IPv6 address", raw))?;
+        let port = if tail.is_empty() {
+            default_port
+        } else if let Some(port) = tail.strip_prefix(':') {
+            port.parse::<u16>()
+                .map_err(|_| anyhow!("The `server` port `{}` is not a valid port", port))?
+        } else {
+            bail!("The `server` host `{}` is invalid", raw);
+        };
+        (format!("[{}]", host), port)
+    } else {
+        match rest.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => {
+                let port = port
+                    .parse::<u16>()
+                    .map_err(|_| anyhow!("The `server` port `{}` is not a valid port", port))?;
+                (host.to_string(), port)
+            }
+            Some(_) => {
+                bail!("The IPv6 host of `server` must be bracketed, e.g. \"wss://[::1]:443\"")
+            }
+            None => (rest.to_string(), default_port),
+        }
+    };
+    let host = normalize_server_host(&host)?;
+    if port == 0 {
+        bail!("The `server` port must not be 0");
+    }
+    Ok((scheme, host, port))
 }
 
 /// Normalize and validate a server host.
 ///
-/// A host is a DNS name, an IPv4 address or an IPv6 address. The port lives in
-/// `server_port`, so a `host:port` value is rejected with a hint. IPv6 literals
-/// may be written with or without brackets.
+/// A host is a DNS name, an IPv4 address or an IPv6 address. The port belongs to
+/// `server`, so a `host:port` value is rejected with a hint. IPv6 literals may be
+/// written with or without brackets.
 fn normalize_server_host(raw: &str) -> Result<String> {
     let host = raw.trim();
     if host.is_empty() {
-        bail!("The `server_host` must not be empty");
+        bail!("The `server` host must not be empty");
     }
     if host.contains("://") {
-        bail!("The `server_host` must not include a scheme; set `server_port` separately");
+        bail!("The `server` host must not include a scheme; put the scheme in `server`");
     }
     if host.chars().any(|c| c.is_whitespace()) {
-        bail!("The `server_host` must not contain whitespace");
+        bail!("The `server` host must not contain whitespace");
     }
-    if host.contains('/') || host.contains('\\') || host.contains('?') || host.contains('#') {
-        bail!("The `server_host` `{}` is not a valid host", raw);
+    if host.contains('/')
+        || host.contains('\\')
+        || host.contains('?')
+        || host.contains('#')
+        || host.contains('@')
+    {
+        bail!("The server host `{}` is not a valid host", raw);
     }
 
     if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
         inner
             .parse::<std::net::Ipv6Addr>()
-            .map_err(|_| anyhow!("The `server_host` `{}` is not a valid IPv6 address", raw))?;
+            .map_err(|_| anyhow!("The server host `{}` is not a valid IPv6 address", raw))?;
         return Ok(inner.to_string());
     }
     if host.contains('[') || host.contains(']') {
-        bail!("The `server_host` `{}` is not a valid host", raw);
+        bail!("The server host `{}` is not a valid host", raw);
     }
     if host.contains(':') {
         host.parse::<std::net::Ipv6Addr>().map_err(|_| {
             anyhow!(
-                "The `server_host` `{}` must not include a port; set `server_port` instead",
+                "The server host `{}` must not include a port; put the port in `server` instead",
                 raw
             )
         })?;
@@ -489,109 +586,24 @@ fn validate_name(name: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
-/// Generate a strong random shared token: 128 bits, lowercase hex encoded
-fn generate_token() -> String {
-    let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
-}
-
-/// The commented example written when htc.toml is missing.
+/// The example written when htc.toml is missing.
 ///
-/// It shows two tunnels: a plain TCP one and a Docker socket one. The token is
-/// left as a placeholder because it must match the one of the server.
-fn client_config_example() -> String {
-    r#"## http-tunnel client configuration
-##
-## Comment convention:
-##   ##  documentation, leave it as it is
-##   #   a disabled setting, remove the single # to enable it
-##
-## Set these values before starting htc.
-##
-## The client only speaks WebSocket. `server_host` must be the `control_host`
-## of hts.toml and `server_port` must be its `http_port`.
-## `transport = "wss"` is TLS (the default and the only choice for the public
-## Internet). Use `transport = "ws"` only on a trusted network.
-transport = "wss"
-server_host = "control.example.com"
-server_port = 443
-name = "home"
-token = "replace-with-the-same-secret-as-hts"
-web_port = 8610
-heartbeat_timeout = 40
-keepalive_interval = 15
-retry_interval = 1
+/// `examples/minimal/htc.toml` is the single source of truth: it is embedded at
+/// compile time, so the shipped binary needs no example directory at runtime.
+/// The tests in this module keep the example a valid configuration.
+pub(crate) const DEFAULT_CLIENT_CONFIG: &str = include_str!("../examples/minimal/htc.toml");
 
-## Add one [[tunnels]] block per service to expose.
-##
-## Example 1, a plain TCP service.
-## Uncomment the block below to enable it.
-# [[tunnels]]
-# name = "nas"
-# domain = "nas.example.com"
-# local_addr = "127.0.0.1:80"
-
-## Example 2, a Docker API reachable over a Unix socket.
-## Uncomment the block below to enable it.
-## auth_header is optional; when set, requests need X-HTTP-TUNNEL-TOKEN: <secret> or get 401.
-# [[tunnels]]
-# name = "docker-api"
-# domain = "docker.example.com"
-# local_addr = "unix:///var/run/docker.sock"
-# auth_header = "replace-with-a-long-secret"
-"#
-    .to_string()
-}
-
-/// The commented example written when hts.toml is missing.
+/// The example written when hts.toml is missing.
 ///
-/// The shared token is generated when the file is first created.
-fn server_config_example(token: &str) -> String {
-    format!(
-        r#"## http-tunnel server configuration
-##
-## Comment convention:
-##   ##  documentation, leave it as it is
-##   #   a disabled setting, remove the single # to enable it
-##
-## The shared token is generated for you. Set the same token in htc.toml.
-http_port = 80
-token = "{token}"
-## Required: the exact Host the clients use for the WebSocket tunnel. It must
-## resolve to this server and must not be a business domain or a wildcard.
-control_host = "control.example.com"
-## Optional limits. The defaults keep the control and data channels separate,
-## so a burst of visitor traffic can never starve a client's control channel.
-# max_pending_handshakes = 256
-# max_control_connections = 256
-# max_data_connections = 2048
-# pool_min = 4
-# pool_max = 32
-# keepalive_interval = 15
+/// The shared token is a placeholder on purpose: it must be strong and match the
+/// one in htc.toml, which only the operator can decide.
+pub(crate) const DEFAULT_SERVER_CONFIG: &str = include_str!("../examples/minimal/hts.toml");
 
-## Optional direct reverse-proxy routes to services running on this server.
-##
-## Example 1, a plain TCP service.
-## Uncomment the block below to enable it.
-# [[proxies]]
-# name = "grafana"
-# domain = "grafana.example.com"
-# local_addr = "127.0.0.1:3000"
-
-## Example 2, a Docker API reachable over a Unix socket. The path is resolved
-## on this host, so inside a container the socket must be mounted, e.g.
-## -v /var/run/docker.sock:/var/run/docker.sock
-## Uncomment the block below to enable it.
-## auth_header is optional; when set, requests need X-HTTP-TUNNEL-TOKEN: <secret> or get 401.
-# [[proxies]]
-# name = "docker-api"
-# domain = "docker.example.com"
-# local_addr = "unix:///var/run/docker.sock"
-# auth_header = "replace-with-a-long-secret"
-"#
-    )
-}
+/// The example written when htn.toml is missing.
+///
+/// Both tokens are placeholders on purpose: a node has a token for its
+/// downstream peers and a different one for its upstream hop.
+pub(crate) const DEFAULT_NODE_CONFIG: &str = include_str!("../examples/minimal/htn.toml");
 
 #[cfg(test)]
 mod tests {
@@ -622,41 +634,39 @@ mod tests {
     }
 
     #[test]
-    fn test_transport_validation() -> Result<()> {
-        // `websocket` is the legacy spelling of `ws`
-        let config = ClientConfig::parse("transport = \"WebSocket\"\n")?;
-        assert_eq!(config.transport.as_deref(), Some("ws"));
-        assert_eq!(config.transport_name(), "ws");
-        assert!(!config.tls());
+    fn test_server_url_validation() -> Result<()> {
+        let ws = ClientConfig::parse("server = \"ws://example.com\"\n")?;
+        assert_eq!(ws.server.as_deref(), Some("ws://example.com:80"));
+        assert_eq!(ws.transport_name(), "ws");
+        assert!(!ws.tls());
 
-        assert!(ClientConfig::parse("transport = \"udp\"\n").is_err());
-        assert!(ClientConfig::parse("transport = \"tls\"\n").is_err());
+        assert!(ClientConfig::parse("server = \"udp://example.com\"\n").is_err());
+        assert!(ClientConfig::parse("server = \"tls://example.com\"\n").is_err());
+        assert!(ClientConfig::parse("server = \"example.com:443\"\n").is_err());
 
-        // The TCP transport is gone and must be reported clearly
-        let err = format!(
-            "{:#}",
-            ClientConfig::parse("transport = \"tcp\"\n").unwrap_err()
-        );
-        assert!(err.contains("TCP transport has been removed"), "{}", err);
-
-        // TLS is the default
+        // TLS is the default, and the address is required at startup
         let default = ClientConfig::parse("")?;
         assert_eq!(default.transport_name(), "wss");
+        assert_eq!(default.server, None);
         assert!(default.tls());
         Ok(())
     }
 
     #[test]
     fn test_ws_and_wss_transports() -> Result<()> {
-        let ws = ClientConfig::parse("transport = \"WS\"\n")?;
-        assert_eq!(ws.transport.as_deref(), Some("ws"));
+        let ws = ClientConfig::parse("server = \"WS://example.com\"\n")?;
+        assert_eq!(ws.server.as_deref(), Some("ws://example.com:80"));
         assert_eq!(ws.transport_name(), "ws");
         assert!(!ws.tls());
 
-        let wss = ClientConfig::parse("transport = \"wss\"\n")?;
-        assert_eq!(wss.transport.as_deref(), Some("wss"));
+        let wss = ClientConfig::parse("server = \"wss://example.com\"\n")?;
+        assert_eq!(wss.server.as_deref(), Some("wss://example.com:443"));
         assert_eq!(wss.transport_name(), "wss");
         assert!(wss.tls());
+
+        // A trailing root slash is accepted and normalized away
+        let slash = ClientConfig::parse("server = \"wss://example.com/\"\n")?;
+        assert_eq!(slash.server.as_deref(), Some("wss://example.com:443"));
 
         assert_eq!(ws.keepalive_interval(), DEFAULT_KEEPALIVE_INTERVAL_SECS);
         let off = ClientConfig::parse("keepalive_interval = 0\n")?;
@@ -666,37 +676,52 @@ mod tests {
 
     #[test]
     fn test_server_addr() -> Result<()> {
-        let cfg = ClientConfig::parse("server_host = \"example.com\"\nserver_port = 2333\n")?;
+        let cfg = ClientConfig::parse("server = \"wss://example.com:2333\"\n")?;
         assert_eq!(cfg.server_addr().as_deref(), Some("example.com:2333"));
 
-        let cfg = ClientConfig::parse("server_host = \"::1\"\nserver_port = 2333\n")?;
-        assert_eq!(cfg.server_host.as_deref(), Some("::1"));
+        let cfg = ClientConfig::parse("server = \"wss://[::1]:2333\"\n")?;
         assert_eq!(cfg.server_addr().as_deref(), Some("[::1]:2333"));
 
-        // Brackets are accepted and normalized away
-        let cfg = ClientConfig::parse("server_host = \"[::1]\"\nserver_port = 2333\n")?;
-        assert_eq!(cfg.server_host.as_deref(), Some("::1"));
+        // An omitted port defaults to the scheme
+        let cfg = ClientConfig::parse("server = \"wss://[::1]\"\n")?;
+        assert_eq!(cfg.server_addr().as_deref(), Some("[::1]:443"));
+        let cfg = ClientConfig::parse("server = \"ws://[::1]\"\n")?;
+        assert_eq!(cfg.server_addr().as_deref(), Some("[::1]:80"));
         Ok(())
     }
 
     #[test]
-    fn test_rejects_a_partial_server_address() {
-        assert!(ClientConfig::parse("server_host = \"example.com\"\n").is_err());
-        assert!(ClientConfig::parse("server_port = 2333\n").is_err());
-        let err = format!(
-            "{:#}",
-            ClientConfig::parse("server_host = \"example.com\"\n").unwrap_err()
-        );
-        assert!(err.contains("server_port"), "{}", err);
+    fn test_rejects_the_legacy_server_settings() {
+        for source in [
+            "transport = \"ws\"\nserver_host = \"example.com\"\nserver_port = 2333\n",
+            "transport = \"tcp\"\n",
+            "server_host = \"example.com\"\n",
+            "server_port = 2333\n",
+            "server = \"wss://example.com\"\nserver_host = \"example.com\"\n\
+             server_port = 443\n",
+        ] {
+            let err = format!("{:#}", ClientConfig::parse(source).unwrap_err());
+            assert!(
+                err.contains("no longer supported"),
+                "{} did not report the migration: {}",
+                source,
+                err
+            );
+            assert!(err.contains("server = \"wss://host:port\""), "{}", err);
+        }
     }
 
     #[test]
     fn test_rejects_an_invalid_server_address() {
         for source in [
-            "server_host = \"example.com:2333\"\nserver_port = 2333\n",
-            "server_host = \"tcp://example.com\"\nserver_port = 2333\n",
-            "server_host = \"\"\nserver_port = 2333\n",
-            "server_host = \"example.com\"\nserver_port = 0\n",
+            "server = \"example.com:2333\"\n",
+            "server = \"tcp://example.com\"\n",
+            "server = \"\"\n",
+            "server = \"wss://\"\n",
+            "server = \"wss://example.com:0\"\n",
+            "server = \"wss://example.com/path\"\n",
+            "server = \"wss://::1:443\"\n",
+            "server = \"wss://user@example.com\"\n",
         ] {
             assert!(ClientConfig::parse(source).is_err(), "{} is valid", source);
         }
@@ -708,16 +733,14 @@ mod tests {
             "{:#}",
             ClientConfig::parse("remote = \"example.com:2333\"\n").unwrap_err()
         );
-        assert!(err.contains("server_host"), "{}", err);
-        assert!(err.contains("server_port"), "{}", err);
+        assert!(err.contains("server"), "{}", err);
     }
 
     #[test]
-    fn test_server_port_does_not_trigger_the_server_config_hint() {
+    fn test_server_setting_does_not_trigger_the_server_config_hint() {
         let err = format!(
             "{:#}",
-            ClientConfig::parse("server_host = \"example.com\"\nserver_port = 2333\nunknown = 1\n")
-                .unwrap_err()
+            ClientConfig::parse("server = \"wss://example.com:2333\"\nunknown = 1\n").unwrap_err()
         );
         assert!(
             !err.contains("no longer takes a server configuration"),
@@ -731,8 +754,28 @@ mod tests {
         let paths = get_all_example_config()?;
         assert!(!paths.is_empty());
         for p in paths {
-            let s = fs::read_to_string(p)?;
-            ClientConfig::parse(&s)?;
+            let s = fs::read_to_string(&p)?;
+            // A server, a node and a client example are different schemas.
+            let is_server = p.file_name().is_some_and(|name| name == "hts.toml");
+            let is_node = p.file_name().is_some_and(|name| name == "htn.toml");
+            if is_server {
+                let config: ServerConfig = toml::from_str(&s)?;
+                assert_eq!(config.server_host, "control.example.com");
+                assert!(config.proxies.is_empty(), "{:?}", p);
+            } else if is_node {
+                let mut config: NodeConfig = toml::from_str(&s)?;
+                // The shipped template carries placeholder tokens, so the
+                // strict validation must reject it until it is edited.
+                assert!(config.validate(&p).is_err(), "{:?} is valid", p);
+                config.token = MaskedString::from("downstream-test-token");
+                config.upstream.as_mut().unwrap().token = MaskedString::from("upstream-test-token");
+                config.validate(&p)?;
+                assert_eq!(config.server_host, "b.lan");
+                assert!(config.upstream.as_ref().unwrap().mirror);
+                assert!(config.upstream.as_ref().unwrap().claim().is_none());
+            } else {
+                ClientConfig::parse(&s)?;
+            }
         }
         Ok(())
     }
@@ -762,8 +805,7 @@ mod tests {
     #[test]
     fn test_resolved_tunnels() -> Result<()> {
         let s = r#"
-server_host = "example.com"
-server_port = 2333
+server = "wss://example.com:2333"
 name = "home"
 token = "123"
 heartbeat_timeout = 20
@@ -999,8 +1041,7 @@ token = "123"
     #[test]
     fn test_config_roundtrip() -> Result<()> {
         let s = r#"
-server_host = "example.com"
-server_port = 2333
+server = "wss://example.com:2333"
 name = "home"
 token = "123"
 web_port = 8611
@@ -1065,78 +1106,126 @@ local_addr = "127.0.0.1:80"
     }
 
     #[test]
-    fn test_generate_token_is_strong_and_random() {
-        let a = generate_token();
-        let b = generate_token();
-        assert_eq!(a.len(), 32);
-        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(a, b);
-        assert_ne!(a, "replace-with-a-long-random-secret");
-    }
-
-    #[test]
-    fn test_domain_cannot_overlap_control_host() {
-        assert!(domain_overlaps_control_host(
+    fn test_domain_cannot_overlap_server_host() {
+        assert!(domain_overlaps_server_host(
             "control.example.com",
             "control.example.com"
         ));
-        assert!(domain_overlaps_control_host(
+        assert!(domain_overlaps_server_host(
             "*.example.com",
             "control.example.com"
         ));
-        assert!(!domain_overlaps_control_host(
-            "*.example.com",
-            "example.com"
-        ));
-        assert!(!domain_overlaps_control_host(
+        assert!(!domain_overlaps_server_host("*.example.com", "example.com"));
+        assert!(!domain_overlaps_server_host(
             "*.other.test",
             "control.example.com"
         ));
     }
 
     #[tokio::test]
-    async fn test_server_config_requires_control_host() -> Result<()> {
+    async fn test_server_config_requires_server_host() -> Result<()> {
         let path = std::env::temp_dir().join(format!(
-            "http-tunnel-control-host-{}.toml",
+            "http-tunnel-server-host-{}.toml",
             std::process::id()
         ));
 
         // The WebSocket endpoint is routed by Host, so a server without one
         // would accept no client at all.
-        std::fs::write(&path, "http_port = 8080\ntoken = \"a_secret_token\"\n")?;
+        std::fs::write(&path, "server_port = 8080\ntoken = \"a_secret_token\"\n")?;
         let err = ServerConfig::from_file(&path)
             .await
-            .expect_err("a missing control_host must be rejected");
+            .expect_err("a missing server_host must be rejected");
         assert!(
-            format!("{:#}", err).contains("control_host"),
+            format!("{:#}", err).contains("server_host"),
             "unexpected error: {:#}",
             err
         );
 
-        // The removed TCP listener is reported with a migration hint.
-        std::fs::write(
-            &path,
-            "server_port = 2333\nhttp_port = 8080\n\
-             control_host = \"control.example.com\"\ntoken = \"a_secret_token\"\n",
-        )?;
-        let err = ServerConfig::from_file(&path)
-            .await
-            .expect_err("the removed server_port must be rejected");
-        assert!(
-            format!("{:#}", err).contains("TCP transport has been removed"),
-            "unexpected error: {:#}",
-            err
-        );
-
+        // The previous names are reported with a rename hint.
         std::fs::write(
             &path,
             "http_port = 8080\n\
              control_host = \"control.example.com\"\ntoken = \"a_secret_token\"\n",
         )?;
+        let err = ServerConfig::from_file(&path)
+            .await
+            .expect_err("the renamed settings must be rejected");
+        assert!(
+            format!("{:#}", err).contains("renamed to `server_port`"),
+            "unexpected error: {:#}",
+            err
+        );
+
+        std::fs::write(
+            &path,
+            "server_port = 8080\n\
+             server_host = \"control.example.com\"\ntoken = \"a_secret_token\"\n",
+        )?;
         let cfg = ServerConfig::from_file(&path).await?;
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(cfg.control_host, "control.example.com");
+        assert_eq!(cfg.server_host, "control.example.com");
         assert_eq!(ServerLimits::from(&cfg), ServerLimits::default());
+
+        // The generated template must not start with its placeholder token
+        std::fs::write(&path, DEFAULT_SERVER_CONFIG)?;
+        let err = ServerConfig::from_file(&path)
+            .await
+            .expect_err("the placeholder token must be rejected");
+        assert!(format!("{:#}", err).contains("token"), "{:#}", err);
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bind_host_defaults_to_all_interfaces_and_is_validated() -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("http-tunnel-bind-host-{}.toml", std::process::id()));
+        let base = "server_port = 8080\nserver_host = \"control.example.com\"\n\
+                    token = \"a_secret_token\"\n";
+
+        // Existing configurations keep binding every interface
+        std::fs::write(&path, base)?;
+        let config = ServerConfig::from_file(&path).await?;
+        assert_eq!(config.bind_host, "0.0.0.0");
+
+        // A loopback (or IPv6) address is accepted and canonicalized
+        std::fs::write(&path, format!("{}bind_host = \"::1\"\n", base))?;
+        let config = ServerConfig::from_file(&path).await?;
+        assert_eq!(config.bind_host, "::1");
+
+        for invalid in ["localhost", "0.0.0.0:80", "  "] {
+            std::fs::write(&path, format!("{}bind_host = {:?}\n", base, invalid))?;
+            let err = ServerConfig::from_file(&path)
+                .await
+                .expect_err("a non-IP bind_host must be rejected");
+            assert!(
+                format!("{:#}", err).contains("bind_host"),
+                "unexpected error: {:#}",
+                err
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_web_host_defaults_to_all_interfaces_and_is_validated() -> Result<()> {
+        let default = ClientConfig::parse("server = \"ws://127.0.0.1:8080\"\n")?;
+        assert_eq!(default.web_host(), "0.0.0.0");
+
+        let loopback =
+            ClientConfig::parse("server = \"ws://127.0.0.1:8080\"\nweb_host = \"127.0.0.1\"\n")?;
+        assert_eq!(loopback.web_host(), "127.0.0.1");
+
+        let err =
+            ClientConfig::parse("server = \"ws://127.0.0.1:8080\"\nweb_host = \"localhost\"\n")
+                .expect_err("a host name must be rejected");
+        assert!(
+            format!("{:#}", err).contains("web_host"),
+            "unexpected error: {:#}",
+            err
+        );
         Ok(())
     }
 
@@ -1194,69 +1283,275 @@ local_addr = "127.0.0.1:80"
 
     #[test]
     fn test_server_config_example_is_valid() -> Result<()> {
-        let token = generate_token();
-        let example = server_config_example(&token);
-        // The generated example must be a valid server configuration
-        let cfg: ServerConfig = toml::from_str(&example)?;
-        assert_eq!(String::from(&*cfg.token), token);
-        assert!(cfg.proxies.is_empty());
-        // A plain and a Docker socket proxy example are both disabled
-        assert_eq!(disabled_settings(&example, "# [[proxies]]"), 2);
-        assert!(example.contains("unix:///var/run/docker.sock"));
-        assert_comment_convention(&example);
-        // The header documentation stays on one line: a wrapped comment reads
-        // like a second setting and misleads whoever edits the file.
+        let example = DEFAULT_SERVER_CONFIG;
+        // The template must be a valid server configuration
+        let cfg: ServerConfig = toml::from_str(example)?;
+        // The token stays a placeholder until the operator picks a strong one
         assert_eq!(
-            example
-                .lines()
-                .filter(|l| l.contains("X-HTTP-TUNNEL-TOKEN"))
-                .count(),
-            1
+            String::from(&*cfg.token),
+            "replace-with-a-long-random-secret"
         );
-        // Only the Docker example documents the optional `auth_header`
-        let (plain, docker) = example
-            .split_once("## Example 2")
-            .expect("the Docker proxy example is present");
-        assert!(!plain.contains("auth_header"), "{}", plain);
-        assert!(docker.contains("auth_header"), "{}", docker);
+        assert!(cfg.proxies.is_empty());
+        assert_comment_convention(example);
         Ok(())
     }
 
     #[test]
     fn test_client_config_example_is_valid() -> Result<()> {
-        let example = client_config_example();
-        // The commented tunnels are inactive, so the example parses as-is
-        let cfg = ClientConfig::parse(&example)?;
+        let example = DEFAULT_CLIENT_CONFIG;
+        // The commented tunnel is inactive, so the example parses as-is
+        let cfg = ClientConfig::parse(example)?;
         assert!(cfg.tunnels.is_empty());
-        // A plain and a Docker socket tunnel example are both disabled
-        assert_eq!(disabled_settings(&example, "# [[tunnels]]"), 2);
-        assert!(example.contains("unix:///var/run/docker.sock"));
-        assert_comment_convention(&example);
-        // The header documentation stays on one line: a wrapped comment reads
-        // like a second setting and misleads whoever edits the file.
+        // The tunnel template is disabled with a single `#`
+        assert_eq!(disabled_settings(example, "# [[tunnels]]"), 1);
+        assert_comment_convention(example);
+        Ok(())
+    }
+
+    const NODE_CONFIG: &str = r#"
+name = "relay-b"
+server_port = 9001
+server_host = "b.lan"
+token = "downstream-secret"
+
+[[proxies]]
+name = "local"
+domain = "local.b.relay.example.com"
+local_addr = "127.0.0.1:8080"
+
+[upstream]
+server = "ws://a.lan:9000"
+token = "upstream-secret"
+claim = "*.b.relay.example.com"
+"#;
+
+    fn node_config(source: &str) -> NodeConfig {
+        toml::from_str(source).expect("the test source should be a valid node TOML")
+    }
+
+    fn validate_node(config: &mut NodeConfig) -> Result<()> {
+        config.validate(Path::new("htn.toml"))
+    }
+
+    #[test]
+    fn test_node_config_is_valid() -> Result<()> {
+        let mut config = node_config(NODE_CONFIG);
+        validate_node(&mut config)?;
+        assert_eq!(config.name, "relay-b");
+        assert_eq!(config.server_limits(), ServerLimits::default());
+        assert_eq!(config.max_mirrored_routes, 256);
+        // The upstream endpoint is canonicalized with an explicit port
+        assert_eq!(config.upstream.as_ref().unwrap().server, "ws://a.lan:9000");
         assert_eq!(
-            example
-                .lines()
-                .filter(|l| l.contains("X-HTTP-TUNNEL-TOKEN"))
-                .count(),
-            1
+            config.upstream.as_ref().unwrap().claim(),
+            Some("*.b.relay.example.com")
         );
-        // Only the Docker tunnel documents the optional `auth_header`
-        let (plain, docker) = example
-            .split_once("## Example 2")
-            .expect("the Docker tunnel example is present");
-        assert!(!plain.contains("auth_header"), "{}", plain);
-        assert!(docker.contains("auth_header"), "{}", docker);
+        assert!(!config.upstream.as_ref().unwrap().mirror);
+        assert_eq!(
+            config.upstream.as_ref().unwrap().server_addr().unwrap(),
+            "a.lan:9000"
+        );
+        assert!(!config.upstream.as_ref().unwrap().tls());
+
+        // An omitted port defaults to the scheme, as for a client
+        let mut config = node_config(
+            "name = \"relay\"\nserver_port = 9001\nserver_host = \"b.lan\"\n\
+             token = \"downstream-secret\"\n\n[upstream]\nserver = \"wss://a.lan\"\n\
+             token = \"upstream-secret\"\nclaim = \"svc.b.relay.example.com\"\n",
+        );
+        validate_node(&mut config)?;
+        assert_eq!(config.upstream.as_ref().unwrap().server, "wss://a.lan:443");
+        assert!(config.upstream.as_ref().unwrap().tls());
+        Ok(())
+    }
+
+    #[test]
+    fn test_node_without_upstream_is_an_ingress() -> Result<()> {
+        let mut config = node_config(
+            "name = \"ingress\"\nserver_port = 9001\nserver_host = \"ingress.lan\"\n\
+             token = \"downstream-secret\"\n",
+        );
+        validate_node(&mut config)?;
+        assert!(config.upstream.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_node_rejects_an_upstream_pointing_at_itself() {
+        // The reserved host on the node's own port is a self-loop
+        let mut config = node_config(
+            "name = \"b\"\nserver_port = 9001\nserver_host = \"b.lan\"\n\
+             token = \"downstream-secret\"\n\n[upstream]\nserver = \"ws://b.lan:9001\"\n\
+             token = \"upstream-secret\"\nclaim = \"svc.a.lan\"\n",
+        );
+        assert!(validate_node(&mut config).is_err());
+
+        // A loopback endpoint on the node's own port is a self-loop, even when
+        // the host name differs from the reserved one
+        for server in [
+            "ws://127.0.0.1:9001",
+            "ws://localhost:9001",
+            "ws://[::1]:9001",
+        ] {
+            let mut config = node_config(&format!(
+                "name = \"b\"\nserver_port = 9001\nserver_host = \"b.lan\"\n\
+                 token = \"downstream-secret\"\n\n[upstream]\nserver = \"{}\"\n\
+                 token = \"upstream-secret\"\nclaim = \"svc.a.lan\"\n",
+                server
+            ));
+            assert!(
+                validate_node(&mut config).is_err(),
+                "{} was accepted",
+                server
+            );
+        }
+
+        // Loopback on another port is a legitimate first hop
+        let mut config = node_config(
+            "name = \"b\"\nserver_port = 9001\nserver_host = \"b.lan\"\n\
+             token = \"downstream-secret\"\n\n[upstream]\nserver = \"ws://127.0.0.1:9000\"\n\
+             token = \"upstream-secret\"\nclaim = \"svc.a.lan\"\n",
+        );
+        assert!(validate_node(&mut config).is_ok());
+    }
+
+    #[test]
+    fn test_node_bind_host_must_cover_loopback() {
+        // The upstream tunnel forwards visitors back to `127.0.0.1`, so a
+        // listener on another single interface could not serve them.
+        let mut config = node_config(NODE_CONFIG);
+        config.bind_host = "192.0.2.10".to_string();
+        let err =
+            validate_node(&mut config).expect_err("a non-loopback bind_host must be rejected");
+        assert!(
+            format!("{:#}", err).contains("bind_host"),
+            "unexpected error: {:#}",
+            err
+        );
+
+        for host in ["127.0.0.1", "0.0.0.0", "::1"] {
+            let mut config = node_config(NODE_CONFIG);
+            config.bind_host = host.to_string();
+            assert!(validate_node(&mut config).is_ok(), "{} was rejected", host);
+        }
+    }
+
+    #[test]
+    fn test_node_rejects_an_overlapping_claim() -> Result<()> {
+        // The claim must not contain the reserved host of this node
+        let mut config = node_config(
+            "name = \"b\"\nserver_port = 9001\nserver_host = \"b.lan\"\n\
+             token = \"downstream-secret\"\n\n[upstream]\nserver = \"ws://a.lan:9000\"\n\
+             token = \"upstream-secret\"\nclaim = \"*.lan\"\n",
+        );
+        assert!(validate_node(&mut config).is_err());
+
+        // ... nor the server_host of the next hop, which is the URL host
+        let mut config = node_config(
+            "name = \"b\"\nserver_port = 9001\nserver_host = \"b.lan\"\n\
+             token = \"downstream-secret\"\n\n[upstream]\nserver = \"ws://a.lan:9000\"\n\
+             token = \"upstream-secret\"\nclaim = \"a.lan\"\n",
+        );
+        assert!(validate_node(&mut config).is_err());
+
+        // A local proxy inside the claimed subtree is intentional: the node
+        // serves that domain itself and relays the rest downstream.
+        let mut config = node_config(NODE_CONFIG);
+        validate_node(&mut config)?;
+        assert_eq!(
+            config.upstream.as_ref().unwrap().claim(),
+            Some("*.b.relay.example.com")
+        );
+        assert_eq!(config.proxies[0].domain, "local.b.relay.example.com");
+        Ok(())
+    }
+
+    #[test]
+    fn test_node_rejects_invalid_settings() {
+        // A port of 0 cannot be the loopback target of the upstream tunnel
+        let mut config = node_config(NODE_CONFIG);
+        config.server_port = 0;
+        assert!(validate_node(&mut config).is_err());
+
+        // An empty name is not a useful next-hop identifier
+        let mut config = node_config(NODE_CONFIG);
+        config.name = "  ".to_string();
+        assert!(validate_node(&mut config).is_err());
+
+        // Both tokens are required, and the placeholders of the template are
+        // not secrets
+        let mut config = node_config(NODE_CONFIG);
+        config.token = MaskedString::from("");
+        assert!(validate_node(&mut config).is_err());
+        let mut config = node_config(NODE_CONFIG);
+        config.token = MaskedString::from("replace-with-a-long-random-secret");
+        assert!(validate_node(&mut config).is_err());
+        let mut config = node_config(NODE_CONFIG);
+        config.upstream.as_mut().unwrap().token = MaskedString::from("");
+        assert!(validate_node(&mut config).is_err());
+
+        // The upstream endpoint must be a WebSocket URL
+        let mut config = node_config(NODE_CONFIG);
+        config.upstream.as_mut().unwrap().server = "a.lan:9000".to_string();
+        assert!(validate_node(&mut config).is_err());
+
+        // The claim is a domain, not a URL or an empty string
+        let mut config = node_config(NODE_CONFIG);
+        config.upstream.as_mut().unwrap().claim = Some("http://a.lan".to_string());
+        assert!(validate_node(&mut config).is_err());
+
+        // Exactly one of `claim` and `mirror` must be set
+        let mut config = node_config(NODE_CONFIG);
+        config.upstream.as_mut().unwrap().mirror = true;
+        assert!(validate_node(&mut config).is_err());
+        let mut config = node_config(NODE_CONFIG);
+        config.upstream.as_mut().unwrap().claim = None;
+        assert!(validate_node(&mut config).is_err());
+    }
+
+    #[test]
+    fn test_node_mirror_config_is_valid() -> Result<()> {
+        let mut config = node_config(
+            "name = \"b\"\nserver_port = 9001\nserver_host = \"b.lan\"\n\
+             token = \"downstream-secret\"\nmax_mirrored_routes = 0\n\n\
+             [upstream]\nserver = \"wss://a.lan\"\n\
+             token = \"upstream-secret\"\nmirror = true\n",
+        );
+        validate_node(&mut config)?;
+        let upstream = config.upstream.as_ref().unwrap();
+        assert!(upstream.mirror);
+        assert!(upstream.claim().is_none());
+        assert_eq!(upstream.server, "wss://a.lan:443");
+        // 0 disables the mirror cap
+        assert_eq!(config.max_mirrored_routes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_node_example_matches_the_documented_placeholders() -> Result<()> {
+        let example = DEFAULT_NODE_CONFIG;
+        let mut config: NodeConfig = toml::from_str(example)?;
+        // The template is not runnable until the operator sets the tokens
+        assert!(validate_node(&mut config).is_err());
+        config.token = MaskedString::from("downstream-secret");
+        config.upstream.as_mut().unwrap().token = MaskedString::from("upstream-secret");
+        validate_node(&mut config)?;
+        assert_eq!(config.server_port, 9001);
+        assert_eq!(config.server_host, "b.lan");
+        assert!(config.upstream.as_ref().unwrap().mirror);
+        assert!(config.upstream.as_ref().unwrap().claim().is_none());
+        // The template follows the `##` documentation convention
+        assert_comment_convention(example);
         Ok(())
     }
 }
 
 /// Whether a tunnel domain (exact or wildcard) would overlap the reserved
-/// `control_host`. A wildcard overlaps every host below its suffix.
-pub(crate) fn domain_overlaps_control_host(domain: &str, control_host: &str) -> bool {
-    domain == control_host
+/// `server_host`. A wildcard overlaps every host below its suffix.
+pub(crate) fn domain_overlaps_server_host(domain: &str, server_host: &str) -> bool {
+    domain == server_host
         || domain.strip_prefix("*.").is_some_and(|suffix| {
-            control_host.len() > suffix.len() && control_host.ends_with(&format!(".{}", suffix))
+            server_host.len() > suffix.len() && server_host.ends_with(&format!(".{}", suffix))
         })
 }
 
@@ -1268,12 +1563,16 @@ pub struct ServerConfig {
     #[serde(default)]
     pub proxies: Vec<ServerProxyEntry>,
     /// Public HTTP entrypoint. It also carries the WebSocket tunnel endpoint.
-    #[serde(default = "default_http_port")]
-    pub http_port: u16,
+    #[serde(default = "default_server_port")]
+    pub server_port: u16,
+    /// The IP address the HTTP entrypoint binds. Defaults to `0.0.0.0` (all
+    /// interfaces); set it to `127.0.0.1` to serve through a local reverse proxy.
+    #[serde(default = "default_bind_host")]
+    pub bind_host: String,
     /// Shared secret required by every client.
     pub token: MaskedString,
     /// The exact Host reserved for the WebSocket control/data connections.
-    pub control_host: String,
+    pub server_host: String,
     /// The number of authenticated WebSocket upgrades that may wait for their
     /// `ClientHello` at the same time.
     #[serde(default = "default_max_pending_handshakes")]
@@ -1360,8 +1659,11 @@ pub struct ServerProxyEntry {
     pub auth_header: Option<MaskedString>,
 }
 
-fn default_http_port() -> u16 {
+fn default_server_port() -> u16 {
     80
+}
+fn default_bind_host() -> String {
+    crate::helper::DEFAULT_BIND_HOST.to_string()
 }
 fn default_max_pending_handshakes() -> usize {
     DEFAULT_MAX_PENDING_HANDSHAKES
@@ -1387,67 +1689,390 @@ impl ServerConfig {
         match fs::read_to_string(path).await {
             Ok(s) => {
                 let mut config: Self = toml::from_str(&s).with_context(|| {
-                    let hint = if has_legacy_server_port(&s) {
-                        "\nNote: the TCP transport has been removed. Remove `server_port` from \
-                         hts.toml and set `control_host` to the Host the clients use."
+                    let hint = if has_setting(&s, "http_port") || has_setting(&s, "control_host") {
+                        "\nNote: `http_port` and `control_host` were renamed to `server_port` \
+                         and `server_host`. `server_port` is now the HTTP entry port, so drop the \
+                         old TCP listener port of the same name."
                     } else {
                         ""
                     };
                     format!("The configuration {:?} is invalid{}", path, hint)
                 })?;
-                let normalized = crate::helper::normalize_domain(&config.control_host)
-                    .ok_or_else(|| anyhow!("Invalid control_host"))?;
-                if normalized.starts_with("*.") {
-                    bail!("control_host must be an exact hostname, not a wildcard");
-                }
-                config.control_host = normalized;
-                ServerLimits::from(&config).validate()?;
-                let mut domains = BTreeMap::new();
-                for proxy in &config.proxies {
-                    if proxy.name.trim().is_empty() || proxy.local_addr.trim().is_empty() {
-                        bail!("Each [[proxies]] entry needs non-empty name and local_addr");
-                    }
-                    if proxy
-                        .auth_header
-                        .as_ref()
-                        .is_some_and(|v| v.contains('\r') || v.contains('\n'))
-                    {
-                        bail!(
-                            "The `auth_header` of proxy `{}` must not contain line breaks",
-                            proxy.name
-                        );
-                    }
-                    let domain = crate::helper::normalize_domain(&proxy.domain)
-                        .ok_or_else(|| anyhow!("Invalid proxy domain `{}`", proxy.domain))?;
-                    if domain_overlaps_control_host(&domain, &config.control_host) {
-                        bail!(
-                            "Proxy domain `{}` overlaps the reserved control_host `{}`",
-                            domain,
-                            config.control_host
-                        );
-                    }
-                    if domains.insert(domain.clone(), ()).is_some() {
-                        bail!("Proxy domain `{}` is configured more than once", domain);
-                    }
-                }
-                if config.token.is_empty() || &*config.token == "replace-with-a-long-random-secret"
-                {
-                    bail!("Set a strong, non-placeholder shared token in {:?}", path);
-                }
+                normalize_bind_host(&mut config.bind_host, "bind_host")?;
+                let limits = ServerLimits::from(&config);
+                validate_server_settings(
+                    &mut config.server_host,
+                    &config.token,
+                    &config.proxies,
+                    &limits,
+                    path,
+                )?;
                 Ok(config)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let token = generate_token();
-                let example = server_config_example(&token);
-                fs::write(path, example)
+                fs::write(path, DEFAULT_SERVER_CONFIG)
                     .await
                     .with_context(|| format!("Failed to generate default config {:?}", path))?;
                 bail!(
-                    "Generated {:?} with the shared token {:?}. Set the same token in htc.toml, then run hts again.",
-                    path, token
+                    "Generated {:?}. Set `server_host` and a strong `token` (e.g. the output of \
+                     `openssl rand -hex 16`), use the same token in htc.toml, then run hts again.",
+                    path
                 );
             }
             Err(e) => Err(e).with_context(|| format!("Failed to read the config {:?}", path)),
         }
     }
+}
+
+/// The settings of a node, loaded exclusively from the fixed htn.toml file.
+///
+/// A node is a server that also dials one upstream hop. It listens for visitors
+/// and downstream peers, claims one domain (exact or wildcard) on the upstream,
+/// and can serve local `[[proxies]]`. Without `[upstream]` it is an ingress, the
+/// same role as `hts`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NodeConfig {
+    /// The name of the node. It's announced as the client name of the upstream
+    /// control channel, so an upper hop can name the next hop in its logs.
+    pub name: String,
+    /// The HTTP entrypoint. It carries visitors, peers and the WebSocket
+    /// endpoint. It's required (there is no default port) and must not be 0,
+    /// because the upstream tunnel forwards visitors back to it on loopback.
+    pub server_port: u16,
+    /// The IP address the HTTP entrypoint binds. Defaults to `0.0.0.0`. It must
+    /// cover the loopback interface, because the upstream tunnel forwards
+    /// visitors back to `127.0.0.1:<server_port>`.
+    #[serde(default = "default_bind_host")]
+    pub bind_host: String,
+    /// The exact Host reserved for the WebSocket control/data connections.
+    pub server_host: String,
+    /// The shared secret required by the downstream clients and nodes.
+    pub token: MaskedString,
+    /// Local services served by this node itself. They take precedence over
+    /// the tunnels of the downstream clients, as on a server.
+    #[serde(default)]
+    pub proxies: Vec<ServerProxyEntry>,
+    /// The next hop towards the public ingress. Remove the table to run this
+    /// node as an ingress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<UpstreamConfig>,
+    /// Application-layer heartbeat timeout of the upstream control channel, in
+    /// secs. `0` disables the test.
+    #[serde(default = "default_heartbeat_timeout")]
+    pub heartbeat_timeout: u64,
+    /// The interval between retries to reach the upstream, in secs.
+    #[serde(default = "default_client_retry_interval")]
+    pub retry_interval: u64,
+    /// The maximum number of routes mirrored to the next hop. `0` disables the
+    /// cap. Raise it together with the next hop's `max_control_connections`.
+    #[serde(default = "default_max_mirrored_routes")]
+    pub max_mirrored_routes: usize,
+    /// The number of authenticated WebSocket upgrades that may wait for their
+    /// `ClientHello` at the same time.
+    #[serde(default = "default_max_pending_handshakes")]
+    pub max_pending_handshakes: usize,
+    /// The number of control channels accepted at once.
+    #[serde(default = "default_max_control_connections")]
+    pub max_control_connections: usize,
+    /// The number of data channels accepted at once.
+    #[serde(default = "default_max_data_connections")]
+    pub max_data_connections: usize,
+    /// The base number of warm data channels kept per tunnel.
+    #[serde(default = "default_pool_min")]
+    pub pool_min: usize,
+    /// The upper bound of the warm data channels of one tunnel.
+    #[serde(default = "default_pool_max")]
+    pub pool_max: usize,
+    /// WebSocket ping interval in secs. `0` disables the keepalive pings of the
+    /// embedded server and of the upstream tunnel.
+    #[serde(default = "default_keepalive_interval")]
+    pub keepalive_interval: u64,
+}
+
+/// The next hop of a node: the server or node it dials and claims domains on.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamConfig {
+    /// The WebSocket endpoint of the next hop, e.g. `ws://a.lan:9000` or
+    /// `wss://relay.example.com`.
+    pub server: String,
+    /// The shared token of the next hop. It's recommended to make it different
+    /// from the downstream `token`, so that each hop has its own trust boundary.
+    pub token: MaskedString,
+    /// Claim one exact or wildcard domain on the next hop. This is the Stage 1
+    /// relay: the upper hops see only this domain. It must not overlap
+    /// `server_host`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<String>,
+    /// Mirror the domains of the downstream clients and local `[[proxies]]` to
+    /// the next hop, one control channel per domain. It must not be combined
+    /// with `claim`.
+    #[serde(default)]
+    pub mirror: bool,
+}
+
+impl UpstreamConfig {
+    /// The domain claimed on the next hop when the node is a Stage 1 relay.
+    pub fn claim(&self) -> Option<&str> {
+        self.claim.as_deref()
+    }
+
+    /// The `host:port` authority of the next hop, with an IPv6 host bracketed.
+    pub fn server_addr(&self) -> Option<String> {
+        let (_, authority) = split_server_url(&self.server)?;
+        Some(authority.to_string())
+    }
+
+    /// Whether the upstream WebSocket connection uses TLS.
+    pub fn tls(&self) -> bool {
+        self.server.starts_with("wss://")
+    }
+
+    /// The normalized host and port of the next hop.
+    pub(crate) fn host_port(&self) -> Result<(String, u16)> {
+        parse_server_url(&self.server).map(|(_, host, port)| (host, port))
+    }
+}
+
+impl NodeConfig {
+    /// Read the fixed node config. If it is missing, write the commented example
+    /// and ask the user to edit it before starting.
+    pub async fn from_file(path: &Path) -> Result<Self> {
+        match fs::read_to_string(path).await {
+            Ok(s) => {
+                let mut config: Self = toml::from_str(&s)
+                    .with_context(|| format!("The configuration {:?} is invalid", path))?;
+                config.validate(path)?;
+                Ok(config)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::write(path, DEFAULT_NODE_CONFIG)
+                    .await
+                    .with_context(|| format!("Failed to generate default config {:?}", path))?;
+                bail!(
+                    "Generated {:?}. Set `name`, `server_host`, a strong `token` and the \
+                     `[upstream]` settings, then run htn again.",
+                    path
+                );
+            }
+            Err(e) => Err(e).with_context(|| format!("Failed to read the config {:?}", path)),
+        }
+    }
+
+    /// The runtime limits of the embedded server.
+    pub fn server_limits(&self) -> ServerLimits {
+        ServerLimits {
+            max_pending_handshakes: self.max_pending_handshakes,
+            max_control_connections: self.max_control_connections,
+            max_data_connections: self.max_data_connections,
+            pool_min: self.pool_min,
+            pool_max: self.pool_max,
+            keepalive_interval: self.keepalive_interval,
+        }
+    }
+
+    /// Validate a node configuration and normalize it in place.
+    ///
+    /// The rules keep a node from becoming an accidental open relay or a
+    /// self-loop: the tokens must be set, the local routes must not overlap the
+    /// reserved `server_host`, and the upstream must not point back at this
+    /// node's own listener. A node with no `[upstream]` is a valid ingress.
+    pub fn validate(&mut self, path: &Path) -> Result<()> {
+        if self.server_port == 0 {
+            bail!(
+                "`server_port` must not be 0 in {:?}: the upstream tunnel forwards visitors \
+                 back to `127.0.0.1:<server_port>`",
+                path
+            );
+        }
+        let bind_host = normalize_bind_host(&mut self.bind_host, "bind_host")?;
+        if !(bind_host.is_loopback() || bind_host.is_unspecified()) {
+            bail!(
+                "`bind_host` in {:?} must be `0.0.0.0` or a loopback address: the upstream \
+                 tunnel forwards visitors to `127.0.0.1:<server_port>`",
+                path
+            );
+        }
+        let limits = self.server_limits();
+        validate_server_settings(
+            &mut self.server_host,
+            &self.token,
+            &self.proxies,
+            &limits,
+            path,
+        )?;
+        if &*self.token == "replace-with-the-downstream-secret" {
+            bail!("Set a strong, non-placeholder `token` in {:?}", path);
+        }
+
+        let name = self.name.trim();
+        if name.is_empty() {
+            bail!("Set a non-empty node `name` in {:?}", path);
+        }
+        if name.contains('\r') || name.contains('\n') {
+            bail!("The node `name` must not contain line breaks");
+        }
+        self.name = name.to_string();
+
+        let Some(upstream) = self.upstream.as_mut() else {
+            return Ok(());
+        };
+
+        let (server, host, port) = canonical_server_url(&upstream.server)?;
+        upstream.server = server;
+        if upstream.token.is_empty() || &*upstream.token == "replace-with-the-upstream-secret" {
+            bail!("Set a strong, non-placeholder `[upstream].token` for the next hop");
+        }
+
+        match (upstream.mirror, upstream.claim.take()) {
+            (true, Some(_)) => bail!(
+                "Set either `[upstream].claim` (one exact or wildcard domain) or \
+                 `mirror = true` (one control channel per downstream domain), not both"
+            ),
+            (false, None) => bail!(
+                "Set `[upstream].claim` for one exact or wildcard domain, or `mirror = true` \
+                 to mirror the domains of the downstream clients"
+            ),
+            (true, None) => {}
+            (false, Some(claim)) => {
+                let claim = crate::helper::normalize_domain(&claim)
+                    .ok_or_else(|| anyhow!("The `[upstream].claim` `{}` is invalid", claim))?;
+                if domain_overlaps_server_host(&claim, &self.server_host) {
+                    bail!(
+                        "The `[upstream].claim` `{}` overlaps the reserved server_host `{}`",
+                        claim,
+                        self.server_host
+                    );
+                }
+                // The host of the upstream URL is the `server_host` of the next
+                // hop, because the WebSocket client sends it as the `Host`
+                // header. A claim covering it can never be registered there.
+                let upstream_host = if host.contains(':') && !host.starts_with('[') {
+                    format!("[{}]", host)
+                } else {
+                    host.clone()
+                };
+                let upstream_host = upstream_host.to_ascii_lowercase();
+                if domain_overlaps_server_host(&claim, &upstream_host) {
+                    bail!(
+                        "The `[upstream].claim` `{}` overlaps the next hop's server_host `{}`",
+                        claim,
+                        upstream_host
+                    );
+                }
+                // A local proxy under the claim is intentional: this node can
+                // serve a few domains of its own subtree and relay the rest
+                // downstream.
+                upstream.claim = Some(claim);
+            }
+        }
+
+        // A same-port endpoint with the reserved host or a loopback/unspecified
+        // address dials this node's own listener: the visitor would be routed
+        // back into the uphill tunnel forever. Names that resolve to loopback
+        // are caught again at startup (see `node::ensure_upstream_is_not_self`).
+        if port == self.server_port
+            && (host.eq_ignore_ascii_case(&self.server_host) || is_local_host(&host))
+        {
+            bail!(
+                "`[upstream].server` points at this node's own listener ({}:{}); a node must \
+                 dial its next hop, not itself",
+                host,
+                port
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// Whether a host is the local machine in the forms that cannot be a remote
+/// hop when the port is the node's own: `localhost`, a loopback address or the
+/// unspecified address.
+fn is_local_host(host: &str) -> bool {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback() || ip.is_unspecified())
+            .unwrap_or(false)
+}
+
+/// Parse and canonicalize an IP address that a listener binds. A host name is
+/// rejected: binding would resolve it at listen time, hiding a typo until the
+/// listener fails to start.
+fn normalize_bind_host(host: &mut String, field: &str) -> Result<std::net::IpAddr> {
+    let ip = host.trim().parse::<std::net::IpAddr>().map_err(|_| {
+        anyhow!(
+            "`{}` must be an IP address such as `0.0.0.0` or `127.0.0.1`, got `{}`",
+            field,
+            host
+        )
+    })?;
+    *host = ip.to_string();
+    Ok(ip)
+}
+
+/// Validate the settings an `hts.toml` and an `htn.toml` share: the reserved
+/// host, the limits, the local proxies and the shared token.
+fn validate_server_settings(
+    server_host: &mut String,
+    token: &MaskedString,
+    proxies: &[ServerProxyEntry],
+    limits: &ServerLimits,
+    path: &Path,
+) -> Result<()> {
+    let normalized = crate::helper::normalize_domain(server_host)
+        .ok_or_else(|| anyhow!("Invalid server_host"))?;
+    if normalized.starts_with("*.") {
+        bail!("server_host must be an exact hostname, not a wildcard");
+    }
+    *server_host = normalized;
+    limits.validate()?;
+    let mut domains = BTreeMap::new();
+    for proxy in proxies {
+        if proxy.name.trim().is_empty() || proxy.local_addr.trim().is_empty() {
+            bail!("Each [[proxies]] entry needs non-empty name and local_addr");
+        }
+        if proxy
+            .auth_header
+            .as_ref()
+            .is_some_and(|v| v.contains('\r') || v.contains('\n'))
+        {
+            bail!(
+                "The `auth_header` of proxy `{}` must not contain line breaks",
+                proxy.name
+            );
+        }
+        let domain = crate::helper::normalize_domain(&proxy.domain)
+            .ok_or_else(|| anyhow!("Invalid proxy domain `{}`", proxy.domain))?;
+        if domain_overlaps_server_host(&domain, server_host) {
+            bail!(
+                "Proxy domain `{}` overlaps the reserved server_host `{}`",
+                domain,
+                server_host
+            );
+        }
+        if domains.insert(domain.clone(), ()).is_some() {
+            bail!("Proxy domain `{}` is configured more than once", domain);
+        }
+    }
+    if token.is_empty() || &**token == "replace-with-a-long-random-secret" {
+        bail!("Set a strong, non-placeholder shared token in {:?}", path);
+    }
+    Ok(())
+}
+
+fn default_heartbeat_timeout() -> u64 {
+    DEFAULT_HEARTBEAT_TIMEOUT_SECS
+}
+fn default_client_retry_interval() -> u64 {
+    DEFAULT_CLIENT_RETRY_INTERVAL_SECS
+}
+fn default_max_mirrored_routes() -> usize {
+    DEFAULT_MAX_MIRRORED_ROUTES
 }
