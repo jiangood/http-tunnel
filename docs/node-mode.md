@@ -274,3 +274,9 @@ leaf removes the route from B, A and the ingress in turn.
 To hide the domains instead, replace `mirror = true` with
 `claim = "*.relay.example.com"` on A and `claim = "*.b.relay.example.com"` on B,
 and use `nas.b.relay.example.com` as the leaf domain.
+
+## Protocol v4
+
+Stages 1 and 2 stay on protocol v3. A multiplexed v4 session, batch route
+advertisement, node identity/ACL and hop limits are proposed in
+[protocol-v4.md](./protocol-v4.md); v3 peers keep working during a migration.
