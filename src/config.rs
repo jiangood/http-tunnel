@@ -20,8 +20,6 @@ pub const DEFAULT_LISTEN_PORT: u16 = 7777;
 pub const DEFAULT_MAX_PENDING_HANDSHAKES: usize = 256;
 /// The default number of v4 sessions a server accepts at once.
 pub const DEFAULT_MAX_SESSIONS: usize = 256;
-/// The default cap on the routes the process advertises to its next hop.
-pub const DEFAULT_MAX_MIRRORED_ROUTES: usize = 256;
 
 /// The error returned when the missing configuration file was replaced by the
 /// commented example.
@@ -81,8 +79,8 @@ impl From<String> for MaskedString {
 /// A local service served by the process itself.
 ///
 /// The same entry serves as a server-side proxy of an ingress and as a local
-/// service of a leaf or relay. A process with `[upstream]` advertises these
-/// domains to its next hop (by mirroring, unless a single `claim` is set).
+/// service of a leaf or relay. A process with `[upstream]` mirrors these
+/// domains to its next hop.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ServerProxyEntry {
@@ -101,7 +99,7 @@ pub struct ServerProxyEntry {
 ///
 /// Without this table the process is a standalone ingress: it only runs its
 /// embedded server. With it, the process also dials the next hop with one v4
-/// session and advertises either one `claim` or a mirror of its route set.
+/// session and mirrors its route set there.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
@@ -110,27 +108,9 @@ pub struct UpstreamConfig {
     pub url: String,
     /// The shared token of the next hop.
     pub token: MaskedString,
-    /// Claim one exact or wildcard domain on the next hop. This is the coarse
-    /// relay mode: the upper hops see only this domain.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claim: Option<String>,
-    /// Mirror the local `[[proxies]]` and the routes of downstream sessions to
-    /// the next hop. It is the default when neither `mirror` nor `claim` is set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mirror: Option<bool>,
 }
 
 impl UpstreamConfig {
-    /// The domain claimed on the next hop, when this process is a coarse relay.
-    pub fn claim(&self) -> Option<&str> {
-        self.claim.as_deref()
-    }
-
-    /// Whether the route set of the process is mirrored to the next hop.
-    pub fn mirrors(&self) -> bool {
-        self.claim.is_none() && self.mirror != Some(false)
-    }
-
     /// The `host:port` authority of the next hop, with an IPv6 host bracketed.
     pub fn addr(&self) -> Option<String> {
         let (_, authority) = split_upstream_url(&self.url)?;
@@ -198,10 +178,6 @@ pub struct Config {
     /// The interval between retries to reach the upstream, in secs.
     #[serde(default = "default_retry_interval")]
     pub retry_interval: u64,
-    /// The maximum number of routes mirrored to the next hop. `0` disables the
-    /// cap.
-    #[serde(default = "default_max_mirrored_routes")]
-    pub max_mirrored_routes: usize,
     /// The number of authenticated WebSocket upgrades that may wait for their
     /// `ClientHello` at the same time.
     #[serde(default = "default_max_pending_handshakes")]
@@ -227,7 +203,6 @@ impl Default for Config {
             proxies: Vec::new(),
             upstream: None,
             retry_interval: default_retry_interval(),
-            max_mirrored_routes: default_max_mirrored_routes(),
             max_pending_handshakes: default_max_pending_handshakes(),
             max_sessions: default_max_sessions(),
             keepalive_interval: default_keepalive_interval(),
@@ -494,49 +469,6 @@ impl Config {
             bail!("Set a strong, non-placeholder `[upstream].token` for the next hop");
         }
 
-        match (upstream.claim.as_ref(), upstream.mirror) {
-            (Some(_), Some(true)) => bail!(
-                "Set either `[upstream].claim` (one exact or wildcard domain) or \
-                 `mirror = true` (one session for every route), not both"
-            ),
-            (None, Some(false)) => bail!(
-                "Set `[upstream].claim` for one exact or wildcard domain, or `mirror = true` \
-                 to mirror the routes of this process"
-            ),
-            (None, None) => upstream.mirror = Some(true),
-            (Some(_), None) => upstream.mirror = Some(false),
-            (Some(_), Some(false)) | (None, Some(true)) => {}
-        }
-
-        if let Some(claim) = upstream.claim.take() {
-            let claim = crate::helper::normalize_domain(&claim)
-                .ok_or_else(|| anyhow!("The `[upstream].claim` `{}` is invalid", claim))?;
-            if domain_overlaps_control_host(&claim, &control_host) {
-                bail!(
-                    "The `[upstream].claim` `{}` overlaps the reserved control_host `{}`",
-                    claim,
-                    control_host
-                );
-            }
-            // The host of the upstream URL is the `control_host` of the next hop,
-            // because the WebSocket client sends it as the `Host` header. A
-            // claim covering it can never be registered there.
-            let upstream_host = if host.contains(':') && !host.starts_with('[') {
-                format!("[{}]", host)
-            } else {
-                host.clone()
-            };
-            let upstream_host = upstream_host.to_ascii_lowercase();
-            if domain_overlaps_control_host(&claim, &upstream_host) {
-                bail!(
-                    "The `[upstream].claim` `{}` overlaps the next hop's control_host `{}`",
-                    claim,
-                    upstream_host
-                );
-            }
-            upstream.claim = Some(claim);
-        }
-
         // A same-port endpoint with the reserved host or a loopback/unspecified
         // address dials this process's own listener. A port of 0 is resolved at
         // startup, after the listener has picked the actual port.
@@ -584,9 +516,6 @@ fn default_listen_port() -> u16 {
 fn default_retry_interval() -> u64 {
     DEFAULT_RETRY_INTERVAL_SECS
 }
-fn default_max_mirrored_routes() -> usize {
-    DEFAULT_MAX_MIRRORED_ROUTES
-}
 fn default_max_pending_handshakes() -> usize {
     DEFAULT_MAX_PENDING_HANDSHAKES
 }
@@ -620,6 +549,22 @@ fn legacy_config_hint(source: &str) -> Option<String> {
         .is_some_and(|upstream| upstream.contains_key("server"))
     {
         hints.push("`[upstream].server` -> `[upstream].url`".to_string());
+    }
+    if let Some(upstream) = table.get("upstream").and_then(toml::Value::as_table) {
+        for removed in ["mirror", "claim"] {
+            if upstream.contains_key(removed) {
+                hints.push(format!(
+                    "`[upstream].{}` was removed; a process with `[upstream]` always mirrors \
+                     its routes",
+                    removed
+                ));
+            }
+        }
+    }
+    if table.contains_key("max_mirrored_routes") {
+        hints.push(
+            "`max_mirrored_routes` was removed; every route is mirrored without a cap".to_string(),
+        );
     }
     if hints.is_empty() {
         None
@@ -1005,8 +950,6 @@ mod tests {
             config.upstream.as_mut().unwrap().token = MaskedString::from("upstream-test-token");
             Config::validate(&mut config)?;
             assert_eq!(config.name, "edge");
-            assert!(config.upstream.as_ref().unwrap().mirrors());
-            assert!(config.upstream.as_ref().unwrap().claim().is_none());
         }
         Ok(())
     }
@@ -1334,7 +1277,6 @@ local_addr = "127.0.0.1:81"
 [upstream]
 url = "ws://a.test:7777"
 token = "upstream-secret"
-claim = "*.edge.test"
 "#;
         let cfg = router(s);
         let dumped = cfg.to_toml()?;
@@ -1530,7 +1472,6 @@ local_addr = "127.0.0.1:8080"
 [upstream]
 url = "ws://a.lan:7777"
 token = "upstream-secret"
-claim = "*.b.relay.example.com"
 "#;
 
     #[test]
@@ -1538,14 +1479,8 @@ claim = "*.b.relay.example.com"
         let config = router(LEAF_CONFIG);
         assert_eq!(config.name, "relay-b");
         assert_eq!(config.server_limits(), ServerLimits::default());
-        assert_eq!(config.max_mirrored_routes, 256);
         // The upstream endpoint is canonicalized with an explicit port
         assert_eq!(config.upstream.as_ref().unwrap().url, "ws://a.lan:7777");
-        assert_eq!(
-            config.upstream.as_ref().unwrap().claim(),
-            Some("*.b.relay.example.com")
-        );
-        assert!(!config.upstream.as_ref().unwrap().mirrors());
         assert_eq!(
             config.upstream.as_ref().unwrap().addr().unwrap(),
             "a.lan:7777"
@@ -1555,15 +1490,13 @@ claim = "*.b.relay.example.com"
     }
 
     #[test]
-    fn test_upstream_mirror_defaults_on() -> Result<()> {
+    fn test_upstream_url_gets_its_defaults() -> Result<()> {
         let config = router(
             "name = \"b\"\nlisten_port = 9001\ncontrol_host = \"b.lan\"\n\
              token = \"downstream-secret\"\n\n[upstream]\nurl = \"wss://a.lan\"\n\
              token = \"upstream-secret\"\n",
         );
         let upstream = config.upstream.as_ref().unwrap();
-        assert!(upstream.mirrors());
-        assert_eq!(upstream.mirror, Some(true));
         assert_eq!(upstream.url, "wss://a.lan:443");
         assert!(upstream.tls());
         Ok(())
@@ -1584,7 +1517,7 @@ claim = "*.b.relay.example.com"
         let mut config: Config = toml::from_str(
             "name = \"b\"\nlisten_port = 9001\ncontrol_host = \"b.lan\"\n\
              token = \"downstream-secret\"\n\n[upstream]\nurl = \"ws://b.lan:9001\"\n\
-             token = \"upstream-secret\"\nclaim = \"svc.a.lan\"\n",
+             token = \"upstream-secret\"\n",
         )
         .unwrap();
         assert!(Config::validate(&mut config).is_err());
@@ -1597,7 +1530,7 @@ claim = "*.b.relay.example.com"
             let mut config: Config = toml::from_str(&format!(
                 "name = \"b\"\nlisten_port = 9001\ncontrol_host = \"b.lan\"\n\
                  token = \"downstream-secret\"\n\n[upstream]\nurl = \"{}\"\n\
-                 token = \"upstream-secret\"\nclaim = \"svc.a.lan\"\n",
+                 token = \"upstream-secret\"\n",
                 url
             ))
             .unwrap();
@@ -1612,7 +1545,7 @@ claim = "*.b.relay.example.com"
         assert!(Config::parse(
             "name = \"b\"\nlisten_port = 9001\ncontrol_host = \"b.lan\"\n\
              token = \"downstream-secret\"\n\n[upstream]\nurl = \"ws://127.0.0.1:7777\"\n\
-             token = \"upstream-secret\"\nclaim = \"svc.a.lan\"\n"
+             token = \"upstream-secret\"\n"
         )
         .is_ok());
     }
@@ -1629,25 +1562,6 @@ claim = "*.b.relay.example.com"
              [upstream]\nurl = \"ws://a.lan:7777\"\ntoken = \"upstream-secret\"\n"
         )
         .is_ok());
-    }
-
-    #[test]
-    fn test_rejects_an_overlapping_claim() {
-        // The claim must not contain the reserved host of this process
-        assert!(Config::parse(
-            "name = \"b\"\nlisten_port = 9001\ncontrol_host = \"b.lan\"\n\
-             token = \"downstream-secret\"\n\n[upstream]\nurl = \"ws://a.lan:7777\"\n\
-             token = \"upstream-secret\"\nclaim = \"*.lan\"\n"
-        )
-        .is_err());
-
-        // ... nor the control_host of the next hop, which is the URL host
-        assert!(Config::parse(
-            "name = \"b\"\nlisten_port = 9001\ncontrol_host = \"b.lan\"\n\
-             token = \"downstream-secret\"\n\n[upstream]\nurl = \"ws://a.lan:7777\"\n\
-             token = \"upstream-secret\"\nclaim = \"a.lan\"\n"
-        )
-        .is_err());
     }
 
     #[test]
@@ -1672,35 +1586,39 @@ claim = "*.b.relay.example.com"
         let mut config = router(LEAF_CONFIG);
         config.upstream.as_mut().unwrap().url = "a.lan:7777".to_string();
         assert!(Config::validate(&mut config).is_err());
-
-        // The claim is a domain, not a URL or an empty string
-        let mut config = router(LEAF_CONFIG);
-        config.upstream.as_mut().unwrap().claim = Some("http://a.lan".to_string());
-        assert!(Config::validate(&mut config).is_err());
-
-        // Exactly one of `claim` and `mirror` must be set
-        let mut config = router(LEAF_CONFIG);
-        config.upstream.as_mut().unwrap().mirror = Some(true);
-        assert!(Config::validate(&mut config).is_err());
-        let mut config = router(LEAF_CONFIG);
-        config.upstream.as_mut().unwrap().claim = None;
-        config.upstream.as_mut().unwrap().mirror = Some(false);
-        assert!(Config::validate(&mut config).is_err());
     }
 
     #[test]
-    fn test_mirror_config_is_valid() -> Result<()> {
-        let config = router(
-            "name = \"b\"\nlisten_port = 9001\ncontrol_host = \"b.lan\"\n\
-             token = \"downstream-secret\"\nmax_mirrored_routes = 0\n\n\
-             [upstream]\nurl = \"wss://a.lan\"\n\
-             token = \"upstream-secret\"\nmirror = true\n",
+    fn test_rejects_removed_upstream_keys() {
+        // Route advertisement always mirrors the local and downstream routes.
+        // The old switches are gone, and a stale configuration must not start
+        // with a silently different topology.
+        for stale in [
+            "mirror = true",
+            "mirror = false",
+            "claim = \"*.b.relay.example.com\"",
+        ] {
+            let s = format!(
+                "name = \"b\"\nlisten_port = 9001\ncontrol_host = \"b.lan\"\n\
+                 token = \"downstream-secret\"\n\n[upstream]\nurl = \"ws://a.lan:7777\"\n\
+                 token = \"upstream-secret\"\n{}\n",
+                stale
+            );
+            let err = format!("{:#}", Config::parse(&s).unwrap_err());
+            assert!(err.contains("legacy keys"), "{}: {}", stale, err);
+            assert!(err.contains("always mirrors"), "{}: {}", stale, err);
+        }
+
+        let err = format!(
+            "{:#}",
+            Config::parse(
+                "name = \"b\"\nlisten_port = 9001\ncontrol_host = \"b.lan\"\n\
+                 token = \"downstream-secret\"\nmax_mirrored_routes = 0\n\n\
+                 [upstream]\nurl = \"ws://a.lan:7777\"\ntoken = \"upstream-secret\"\n",
+            )
+            .unwrap_err()
         );
-        let upstream = config.upstream.as_ref().unwrap();
-        assert!(upstream.mirrors());
-        assert!(upstream.claim().is_none());
-        assert_eq!(upstream.url, "wss://a.lan:443");
-        assert_eq!(config.max_mirrored_routes, 0);
-        Ok(())
+        assert!(err.contains("max_mirrored_routes"), "{}", err);
+        assert!(err.contains("without a cap"), "{}", err);
     }
 }

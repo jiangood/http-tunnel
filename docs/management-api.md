@@ -4,8 +4,7 @@ The universal `ht` process exposes a small web page and a REST API on the
 same port. It manages the local `[[proxies]]` of the running process:
 
 - A standalone ingress serves them directly.
-- A leaf or relay also advertises them to its `[upstream]` according to
-  `mirror`/`claim`.
+- A leaf or relay also mirrors them to its `[upstream]`.
 
 The management interface is always enabled and shares the reserved
 `control_host` of the main `listen_port`; it has no listener or port of its own.

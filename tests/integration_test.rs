@@ -69,7 +69,7 @@ fn write_leaf_config(
     let content = format!(
         "listen_port = {}\ncontrol_host = \"127.0.0.1\"\n\
          name = \"{}\"\ntoken = \"{}\"\n{}\
-         \n[upstream]\nurl = \"ws://{}:{}\"\ntoken = \"{}\"\nmirror = true\n",
+         \n[upstream]\nurl = \"ws://{}:{}\"\ntoken = \"{}\"\n",
         listen_port, name, token, proxies_toml, upstream_host, upstream_port, token
     );
 
@@ -1058,15 +1058,14 @@ const CHAIN_HOST: &str = "svc.relay.test";
 
 /// Write a node configuration to a temporary file and return its path.
 ///
-/// `upstream` is `(url, token, claim)`: a `None` claim means route mirroring,
-/// and `None` for the whole option makes the node an ingress. The node name
-/// doubles as the name announced on the upstream.
+/// `upstream` is `(url, token)`: `None` makes the node an ingress. The node
+/// name doubles as the name announced on the upstream.
 fn write_node_config(
     file: &str,
     name: &str,
     listen_port: u16,
     token: &str,
-    upstream: Option<(&str, &str, Option<&str>)>,
+    upstream: Option<(&str, &str)>,
     proxies: &[(&str, &str)],
 ) -> Result<String> {
     let mut content = format!(
@@ -1081,15 +1080,11 @@ fn write_node_config(
             proxy_name, domain, local_addr
         ));
     }
-    if let Some((upstream_url, upstream_token, claim)) = upstream {
+    if let Some((upstream_url, upstream_token)) = upstream {
         content.push_str(&format!(
             "\n[upstream]\nurl = \"{}\"\ntoken = \"{}\"\n",
             upstream_url, upstream_token
         ));
-        match claim {
-            Some(claim) => content.push_str(&format!("claim = \"{}\"\n", claim)),
-            None => content.push_str("mirror = true\n"),
-        }
     }
 
     let path = std::env::temp_dir().join(file);
@@ -1097,7 +1092,7 @@ fn write_node_config(
     Ok(path.to_str().unwrap().to_string())
 }
 
-/// `ht` ingress -> node A (wildcard claim) -> node B (exact claim + local proxy)
+/// `ht` ingress -> node A (mirrors downstream routes) -> node B (local proxy)
 /// -> echo service. A visitor to the public ingress reaches the service across
 /// three hops with one process per hop.
 ///
@@ -1131,11 +1126,7 @@ async fn node_chain_forwards_and_withdraws_routes() -> Result<()> {
         "relay-a",
         CHAIN_NODE_A_PORT,
         CHAIN_NODE_A_TOKEN,
-        Some((
-            &format!("ws://{}", CHAIN_INGRESS_ADDR),
-            CHAIN_INGRESS_TOKEN,
-            Some("*.relay.test"),
-        )),
+        Some((&format!("ws://{}", CHAIN_INGRESS_ADDR), CHAIN_INGRESS_TOKEN)),
         &[],
     )?;
     let (node_a_shutdown_tx, node_a_shutdown_rx) = broadcast::channel(1);
@@ -1151,11 +1142,7 @@ async fn node_chain_forwards_and_withdraws_routes() -> Result<()> {
         "relay-b",
         CHAIN_NODE_B_PORT,
         CHAIN_NODE_B_TOKEN,
-        Some((
-            &format!("ws://{}", CHAIN_NODE_A_ADDR),
-            CHAIN_NODE_A_TOKEN,
-            Some(CHAIN_HOST),
-        )),
+        Some((&format!("ws://{}", CHAIN_NODE_A_ADDR), CHAIN_NODE_A_TOKEN)),
         &[(CHAIN_HOST, CHAIN_ECHO_ADDR)],
     )?;
     let (node_b_shutdown_tx, node_b_shutdown_rx) = broadcast::channel(1);
@@ -1237,7 +1224,6 @@ async fn node_fanout_publishes_two_downstream_domains() -> Result<()> {
         Some((
             &format!("ws://{}", FANOUT_INGRESS_ADDR),
             CHAIN_INGRESS_TOKEN,
-            Some("*.relay.test"),
         )),
         &[],
     )?;
@@ -1271,11 +1257,7 @@ async fn node_fanout_publishes_two_downstream_domains() -> Result<()> {
             name,
             port,
             CHAIN_NODE_B_TOKEN,
-            Some((
-                &format!("ws://{}", FANOUT_NODE_A_ADDR),
-                CHAIN_NODE_A_TOKEN,
-                Some(domain),
-            )),
+            Some((&format!("ws://{}", FANOUT_NODE_A_ADDR), CHAIN_NODE_A_TOKEN)),
             &[(domain, FANOUT_ECHO_ADDR)],
         )?;
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
@@ -1322,7 +1304,7 @@ const MIRROR_NODE_ADDR: &str = "127.0.0.1:2642";
 const MIRROR_INGRESS_TOKEN: &str = "mirror-ingress-secret";
 const MIRROR_NODE_TOKEN: &str = "mirror-node-secret";
 
-/// A node with `mirror = true` publishes the routes of its downstream clients
+/// A node with `[upstream]` publishes the routes of its downstream clients
 /// as they appear and withdraws them when they disappear. The ingress sees the
 /// real domain set, so a stopped leaf is answered with `404` at the ingress
 /// instead of being forwarded into the relay.
@@ -1356,7 +1338,6 @@ async fn node_mirror_withdraws_and_reclaims_routes() -> Result<()> {
         Some((
             &format!("ws://{}", MIRROR_INGRESS_ADDR),
             MIRROR_INGRESS_TOKEN,
-            None,
         )),
         // A local proxy is part of the initial route set and is mirrored even
         // before any downstream client connects.
@@ -1518,11 +1499,7 @@ async fn node_mirror_churn_is_idempotent() -> Result<()> {
         "churn-relay",
         CHURN_NODE_PORT,
         CHAIN_NODE_A_TOKEN,
-        Some((
-            &format!("ws://{}", CHURN_INGRESS_ADDR),
-            CHAIN_INGRESS_TOKEN,
-            None,
-        )),
+        Some((&format!("ws://{}", CHURN_INGRESS_ADDR), CHAIN_INGRESS_TOKEN)),
         &[],
     )?;
     let (node_shutdown_tx, node_shutdown_rx) = broadcast::channel(1);
@@ -1628,7 +1605,6 @@ async fn node_chain_forwards_websocket_upgrades() -> Result<()> {
         Some((
             &format!("ws://{}", CHAIN_WS_INGRESS_ADDR),
             CHAIN_INGRESS_TOKEN,
-            Some("*.relay.test"),
         )),
         &[],
     )?;
@@ -1648,7 +1624,6 @@ async fn node_chain_forwards_websocket_upgrades() -> Result<()> {
         Some((
             &format!("ws://{}", CHAIN_WS_NODE_A_ADDR),
             CHAIN_NODE_A_TOKEN,
-            Some(CHAIN_WS_HOST),
         )),
         &[(CHAIN_WS_HOST, CHAIN_WS_ECHO_ADDR)],
     )?;

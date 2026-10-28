@@ -12,7 +12,7 @@ domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
 
 ## 下一跳；独立入口请删除本节
+## 有 [upstream] 时，本进程的本地服务与下游路由总是镜像给下一跳。
 [upstream]
 url = "wss://control.example.com:443"
 token = "replace-with-the-upstream-secret"
-mirror = true

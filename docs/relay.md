@@ -7,8 +7,8 @@ with the same `ht.toml` schema everywhere.
 ```text
 visitor
   -> ingress ht       no [upstream], serves visitors directly
-  -> relay A ht       [upstream] -> ingress, mirror or claim
-  -> relay B ht       [upstream] -> relay A, mirror or claim
+  -> relay A ht       [upstream] -> ingress, mirrors routes
+  -> relay B ht       [upstream] -> relay A, mirrors routes
   -> leaf ht          [upstream] -> relay B, local [[proxies]]
   -> local service
 ```
@@ -36,8 +36,6 @@ local_addr = "127.0.0.1:8080"
 [upstream]
 url = "ws://a.lan:7777"
 token = "upstream-secret"
-mirror = true
-# claim = "*.b.relay.example.com"
 ```
 
 | Setting | Meaning |
@@ -47,23 +45,17 @@ mirror = true
 | `token` | Token for downstream peers. May be omitted with `[upstream]`, in which case the upstream token is reused. |
 | `[[proxies]]` | Local services served by this process. They take precedence over downstream session routes. |
 | `[upstream]` | The next hop. Remove it to run as a standalone ingress. |
-| `mirror` | Publish the local proxies and downstream routes on the next hop. Default when neither `mirror` nor `claim` is set. |
-| `claim` | Publish one exact or wildcard domain instead. Mutually exclusive with `mirror = true`. |
-| `max_mirrored_routes` | Cap on mirrored routes; `0` disables the cap. Default `256`. |
 
 ## Route advertisement
 
-- `mirror = true` turns the embedded server's route watch into a set of routes
-  that all point back to `127.0.0.1:<actual listen_port>`. The set is the union
-  of local `[[proxies]]` and the routes claimed by downstream v4 sessions.
-  Additions and removals are sent as v4 `Update` frames on the same session.
-- `claim = "..."` advertises exactly one exact or wildcard domain. The upper
-  hops then see only that domain.
-- The claim must not overlap this process's `control_host` or the next hop's
-  `control_host` (the host of the upstream URL).
-- A local proxy inside a claimed subtree is intentional: the relay serves that
-  domain itself and forwards the rest downstream.
-- Duplicate domains are rejected as `Conflict`. A rejected claim is logged and
+- The embedded server's route watch becomes a set of routes that all point back
+  to `127.0.0.1:<actual listen_port>`. The set is the union of local
+  `[[proxies]]` and the routes claimed by downstream v4 sessions. Additions and
+  removals are sent as v4 `Update` frames on the same session.
+- There is no switch: a process with `[upstream]` always mirrors its route set.
+  The old `mirror`, `claim` and `max_mirrored_routes` keys are rejected with a
+  migration hint, so an upgrade cannot silently change the advertised topology.
+- Duplicate domains are rejected as `Conflict`. A rejected route is logged and
   does not stop the process.
 
 ## Data plane
@@ -87,7 +79,6 @@ Startup validates before advertising anything:
   must not overlap `control_host`.
 - `[upstream].url` must be a `ws://` or `wss://` URL without a path.
 - The upstream token must be a strong non-placeholder secret.
-- `mirror` and `claim` are mutually exclusive; `mirror` defaults on.
 - The upstream must not point at this process's own listener. The literal
   reserved host, loopback/unspecified addresses, and same-port endpoints are
   rejected at configuration time; a DNS name resolving back to the local machine

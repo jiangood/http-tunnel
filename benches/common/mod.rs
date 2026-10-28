@@ -78,7 +78,7 @@ impl Harness {
              [[proxies]]\nname = \"echo\"\ndomain = \"{ECHO_HOST}\"\n\
              local_addr = \"{ECHO_SERVER_ADDR}\"\n\n\
              [upstream]\nurl = \"ws://127.0.0.1:{HTTP_ENTRY_PORT}\"\n\
-             token = \"{LEAF_TOKEN}\"\nmirror = true\n"
+             token = \"{LEAF_TOKEN}\"\n"
         );
         std::fs::write(&config_path, config)?;
         let config_guard = TempFile(config_path.clone());

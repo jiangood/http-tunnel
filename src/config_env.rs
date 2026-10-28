@@ -183,9 +183,6 @@ impl EnvConfig {
                     upstream.token = token.clone();
                 }
             }
-            if upstream.mirror.is_none() && upstream.claim.is_none() {
-                upstream.mirror = Some(true);
-            }
         } else if let Some(token) = &self.upstream_token {
             if let Some(upstream) = config.upstream.as_mut() {
                 upstream.token = token.clone();

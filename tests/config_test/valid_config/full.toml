@@ -22,4 +22,3 @@ local_addr = "127.0.0.1:80"
 [upstream] # Remove this table to run as a standalone ingress
 url = "wss://upper.example.com:443" # The next hop
 token = "use_a_different_secret_per_hop"
-mirror = true # Publish every local proxy and downstream route

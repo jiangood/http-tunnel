@@ -19,9 +19,8 @@ use crate::session_client::{self, RouteMap, RouteTarget, SessionArgs};
 /// The data plane is recursive, so an upstream session forwards the visitors it
 /// receives to `127.0.0.1:<actual listen_port>`, where the embedded server
 /// routes them by `Host` again. Without `[upstream]` the process is a
-/// standalone ingress. With `[upstream].mirror` it advertises every route of
-/// its downstream peers and its local `[[proxies]]`; with `[upstream].claim` it
-/// advertises one exact or wildcard domain.
+/// standalone ingress. With `[upstream]` it advertises every route of its
+/// downstream peers and its local `[[proxies]]`.
 pub(crate) async fn run_router(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -157,30 +156,12 @@ async fn run_relay(
         auth_header: None,
     };
 
-    // Keep the claim route watch's sender alive for the whole session; a
-    // dropped sender makes the session believe its route source is gone.
-    let mut _claim_routes = None;
-    let routes = if let Some(claim) = upstream.claim() {
-        info!(
-            upstream = %upstream.url,
-            claim,
-            "Advertising one upstream route; visitors are forwarded to 127.0.0.1:{}",
-            actual_port
-        );
-        let (tx, rx) = watch::channel(RouteMap::new());
-        let mut map = RouteMap::new();
-        map.insert(claim.to_string(), local_target);
-        tx.send_replace(map);
-        _claim_routes = Some(tx);
-        rx
-    } else {
-        info!(
-            upstream = %upstream.url,
-            "Advertising the mirrored routes; visitors are forwarded to 127.0.0.1:{}",
-            actual_port
-        );
-        mirrored_routes(route_rx, local_target, config.max_mirrored_routes)
-    };
+    info!(
+        upstream = %upstream.url,
+        "Advertising the mirrored routes; visitors are forwarded to 127.0.0.1:{}",
+        actual_port
+    );
+    let routes = mirrored_routes(route_rx, local_target);
 
     let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel::<anyhow::Error>();
     let (session_stop_tx, session_stop_rx) = broadcast::channel::<bool>(1);
@@ -243,20 +224,13 @@ async fn run_relay(
 fn mirrored_routes(
     mut route_rx: watch::Receiver<BTreeSet<String>>,
     target: RouteTarget,
-    max_routes: usize,
 ) -> watch::Receiver<RouteMap> {
     let (tx, rx) = watch::channel(RouteMap::new());
-    let limit = if max_routes == 0 {
-        usize::MAX
-    } else {
-        max_routes
-    };
     tokio::spawn(async move {
         loop {
             let map: RouteMap = route_rx
                 .borrow_and_update()
                 .iter()
-                .take(limit)
                 .map(|domain| (domain.clone(), target.clone()))
                 .collect();
             tx.send_replace(map);

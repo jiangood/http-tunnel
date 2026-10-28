@@ -14,9 +14,8 @@ sessions on the reserved `control_host`.
 
 ### Upstream
 The optional `[upstream]` table. When present, the process opens one v4 session
-to the next hop and advertises either its full route set (`mirror`) or one
-`claim`. When absent, the process is a standalone ingress and no session is
-opened.
+to the next hop and mirrors its route set there. When absent, the process is a
+standalone ingress and no session is opened.
 
 ### Route
 A domain served by the process. The route watch is the union of local
@@ -73,12 +72,9 @@ keepalive; there is no separate application heartbeat.
 ## Upstream session
 
 With `[upstream]`, the process converts its route watch into a `RouteMap` whose
-targets all point to `127.0.0.1:<actual listen_port>`. This is true for both
-`mirror` and `claim`; the difference is only what is advertised:
-
-- `mirror`: every route of the union above, sent as a snapshot and then diffed
-  as `Update` frames.
-- `claim`: one exact or wildcard prefix.
+targets all point to `127.0.0.1:<actual listen_port>`. Every route of the union
+above is advertised: a snapshot first, then diffs as `Update` frames. There is
+no per-process switch and no cap.
 
 When the upstream session receives an `OpenStream`, it connects to the loopback
 target. The embedded listener routes the request by `Host` again. The data plane

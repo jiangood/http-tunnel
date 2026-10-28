@@ -231,7 +231,6 @@ auth_header = "{CLIENT_AUTH}"
 [upstream]
 url = "ws://127.0.0.1:{server_port}"
 token = "{TOKEN}"
-mirror = true
 """)
 
         leaf = start_ht(leaf_work, "leaf")
@@ -369,7 +368,6 @@ token = "{NODE_TOKEN}"
 [upstream]
 url = "ws://127.0.0.1:{server_port}"
 token = "{TOKEN}"
-mirror = true
 """)
         (chain_work / "ht.toml").write_text(f"""name = "e2e-chain-leaf"
 listen_port = 0
@@ -386,7 +384,6 @@ auth_header = "{CLIENT_AUTH}"
 [upstream]
 url = "ws://127.0.0.1:{node_port}"
 token = "{NODE_TOKEN}"
-mirror = true
 """)
 
         node = start_ht(node_work, "relay")
