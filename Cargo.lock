@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "http-tunnel"
-version = "2.2.1"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "atty",
