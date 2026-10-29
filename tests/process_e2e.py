@@ -77,20 +77,38 @@ def check_web_management(port, read_only=False):
         page = response.read().decode()
         assert response.status == 200
         assert "http-tunnel 管理" in page
+        # The page is a static shell: the server only hands it the token, and
+        # the browser renders everything from /api.
+        assert f'name="ht-token" content="{TOKEN}"' in page, "the page must receive the API token"
+        assert "<script" in page.lower(), "the page must render itself in the browser"
+        assert "/api/status" in page
         if read_only:
             assert "HT_PROXIES" in page, "the page must explain that the environment manages the proxies"
-            assert "<form" not in page.lower(), "the proxy form must be hidden"
-        else:
-            assert "<form" in page
-        assert "<script" not in page.lower()
-        assert "<style" not in page.lower()
+
+    # The API is Bearer-only, and the page is Basic-only: neither credential
+    # opens the other resource.
+    basic_api = urllib.request.Request(
+        base + "api/status", headers={"Authorization": f"Basic {credentials}"}
+    )
+    try:
+        urllib.request.urlopen(basic_api, timeout=3)
+        raise AssertionError("the API must not accept HTTP Basic")
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 401, f"expected 401 for Basic on the API, got {exc.code}"
+
+    bearer_page = urllib.request.Request(base, headers={"Authorization": f"Bearer {TOKEN}"})
+    try:
+        urllib.request.urlopen(bearer_page, timeout=3)
+        raise AssertionError("the page must not accept a Bearer token")
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 401, f"expected 401 for Bearer on the page, got {exc.code}"
 
     api_req = urllib.request.Request(
         base + "api/status", headers={"Authorization": f"Bearer {TOKEN}"}
     )
     with urllib.request.urlopen(api_req, timeout=3) as response:
         assert response.status == 200
-    print("PASS web management: Basic auth, plain HTML page, and existing Bearer API")
+    print("PASS web management: Basic-only page, Bearer-only API, token handed to the page")
 
 
 def request(port, host, token=None, path="/e2e"):
