@@ -26,6 +26,10 @@ pub(crate) const REQUEST_ID_HEADER: &str = "x-http-tunnel-request-id";
 /// usually a configuration or ownership question, so the log shows what the
 /// server currently serves instead of only how many entries it has.
 const MAX_LOGGED_HOSTS: usize = 20;
+/// How many characters of the request target and `User-Agent` a `404` log
+/// prints. Enough to recognize a health check or a real page, short enough to
+/// keep one request on one line.
+const MAX_LOGGED_TARGET: usize = 120;
 
 /// A short random id that follows one visitor request through the process, the
 /// logs, the response and every downstream v4 hop. It is not a secret; it only
@@ -332,6 +336,16 @@ async fn handle_visitor(
     // stale proxy, a node that advertises something else)?
     let (known_total, known_hosts) = state.known_hosts(MAX_LOGGED_HOSTS).await;
     let (sessions_connected, sessions_max) = state.session_count();
+    // Who is asking matters as much as what is missing: a periodic `GET /` with
+    // a health-check user agent is a monitor, while a browser-shaped request to
+    // a real path is a person who was sent to the wrong place.
+    let (method, target) =
+        parse_request_line(&prefetched).unwrap_or_else(|| ("?".to_string(), "?".to_string()));
+    let method = truncate_for_log(&method, MAX_LOGGED_TARGET);
+    let target = truncate_for_log(&target, MAX_LOGGED_TARGET);
+    let user_agent = header_for_log(&prefetched, "user-agent")
+        .map(|value| truncate_for_log(&value, MAX_LOGGED_TARGET))
+        .unwrap_or_default();
     let recent = state.recent_withdrawal(&host).await;
     let reason = match &recent {
         Some((prefix, session_id, age)) => {
@@ -339,6 +353,9 @@ async fn handle_visitor(
                 request_id = %request_id,
                 peer = %addr,
                 host = %host,
+                method = %method,
+                target = %target,
+                user_agent = %user_agent,
                 local_proxies,
                 v4_routes,
                 v4_sessions = %format!("{}/{}", sessions_connected, sessions_max),
@@ -360,6 +377,9 @@ async fn handle_visitor(
                 request_id = %request_id,
                 peer = %addr,
                 host = %host,
+                method = %method,
+                target = %target,
+                user_agent = %user_agent,
                 local_proxies,
                 v4_routes,
                 v4_sessions = %format!("{}/{}", sessions_connected, sessions_max),
@@ -518,6 +538,47 @@ fn parse_request_path(head: &[u8]) -> Option<String> {
         return None;
     }
     Some(target.split('?').next()?.to_string())
+}
+
+/// The method and request-target of the request line, for diagnostics. It never
+/// affects routing, so a request line that is not valid UTF-8 simply yields
+/// `None` instead of a rejection.
+fn parse_request_line(head: &[u8]) -> Option<(String, String)> {
+    let line = head.split(|&b| b == b'\n').next().map(strip_cr)?;
+    let line = std::str::from_utf8(line).ok()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    let target = parts.next()?;
+    Some((method.to_string(), target.to_string()))
+}
+
+/// A request header value for the logs, decoded lossily so that a stray byte
+/// can never stop a `404` from being explained.
+fn header_for_log(head: &[u8], name: &str) -> Option<String> {
+    for raw in head.split(|&b| b == b'\n').skip(1) {
+        let line = strip_cr(raw);
+        if line.is_empty() {
+            break;
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        if !trim_ascii(&line[..colon]).eq_ignore_ascii_case(name.as_bytes()) {
+            continue;
+        }
+        return Some(String::from_utf8_lossy(trim_ascii(&line[colon + 1..])).into_owned());
+    }
+    None
+}
+
+/// Cut a log field at `limit` characters, on a character boundary.
+fn truncate_for_log(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(limit).collect();
+    out.push('…');
+    out
 }
 
 /// The token of an `Authorization: Bearer <token>` header, if the request has
@@ -855,6 +916,40 @@ mod tests {
         // A non-UTF-8 byte in a header other than `Host` must not break routing
         let head = b"GET / HTTP/1.1\r\nHost: ok.test\r\nX-Bin: \xff\xfe\r\n\r\n";
         assert_eq!(parse_host(head).unwrap(), "ok.test");
+    }
+
+    #[test]
+    fn test_parse_request_line_for_logs() {
+        let head = b"POST /wp-login.php?x=1 HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        let (method, target) = parse_request_line(head).unwrap();
+        assert_eq!(method, "POST");
+        assert_eq!(target, "/wp-login.php?x=1");
+
+        // A request line that is not UTF-8 is only missing diagnostics
+        assert!(parse_request_line(b"\xff\xfe / HTTP/1.1\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn test_header_for_log_is_lossy_and_case_insensitive() {
+        let head = b"GET / HTTP/1.1\r\nuser-agent: SafeLine-Health/1.0\r\n\r\n";
+        assert_eq!(
+            header_for_log(head, "User-Agent").unwrap(),
+            "SafeLine-Health/1.0"
+        );
+
+        let head = b"GET / HTTP/1.1\r\nUser-Agent: \xffbot\r\n\r\n";
+        assert!(header_for_log(head, "user-agent").unwrap().ends_with("bot"));
+
+        let head = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n";
+        assert!(header_for_log(head, "user-agent").is_none());
+    }
+
+    #[test]
+    fn test_truncate_for_log_keeps_char_boundaries() {
+        assert_eq!(truncate_for_log("short", 10), "short");
+        assert_eq!(truncate_for_log("abcdef", 3), "abc…");
+        // A multi-byte character is never split
+        assert_eq!(truncate_for_log("域名域名", 2), "域名…");
     }
 
     #[test]

@@ -351,16 +351,18 @@ docker logs ht 2>&1 | grep 0123456789abcdef
 
 如果这种响应只在**并发升高时**出现、过一段时间又消失，优先检查前置层是否把不同 `Host` 的请求复用到同一条到 `ht` 的 keep-alive 连接（见上一节的注意事项）。
 
-`404` 的日志会带上**当时的路由表内容**，可以直接看出“表里有什么、缺什么”，不用再去翻变更历史：
+`404` 的日志会带上**当时的路由表内容**和**请求本身**，可以直接看出“谁在请求、表里有什么、缺什么”，不用再去翻变更历史：
 
 ```
 INFO http_tunnel::http: No route matches the host; answered 404
      request_id=a472f3bb090d3ee3 host=safeline.example.com
+     method=GET target=/ user_agent=SafeLine-Health/1.0
      local_proxies=1 v4_routes=1 v4_sessions=1/256
      known_hosts_total=2
      known_hosts=["app.example.com (local:web)", "svc.example.com (v4:3)"]
 ```
 
+- `method`/`target`/`user_agent`：能区分“真人访问了错误地址”和“某个服务的周期性健康检查/扫描”，后者通常只请求 `/`。
 - `known_hosts_total=0` 且 `v4_sessions=0/…`：没有任何下游节点在线。
 - `known_hosts` 里没有该域名：`ht` 上根本没有这条路由，检查 `[[proxies]]`、`HT_PROXIES` 和前置代理的转发目标。
 - `v4_sessions` 有值但没有该域名：节点在线，但它广告的是别的域名（配置或冲突）。
