@@ -22,6 +22,10 @@ const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 /// operator can tell its errors apart from those of a front proxy or of a
 /// local service.
 pub(crate) const REQUEST_ID_HEADER: &str = "x-http-tunnel-request-id";
+/// How many entries of the route table a `404` log prints. A missing host is
+/// usually a configuration or ownership question, so the log shows what the
+/// server currently serves instead of only how many entries it has.
+const MAX_LOGGED_HOSTS: usize = 20;
 
 /// A short random id that follows one visitor request through the process, the
 /// logs, the response and every downstream v4 hop. It is not a secret; it only
@@ -323,6 +327,11 @@ async fn handle_visitor(
         let routes = state.v4_routes.read().await.len();
         (proxies, routes)
     };
+    // The host is genuinely absent, so show the operator what is present: is
+    // the table empty, or does it serve a different set of domains (a typo, a
+    // stale proxy, a node that advertises something else)?
+    let (known_total, known_hosts) = state.known_hosts(MAX_LOGGED_HOSTS).await;
+    let (sessions_connected, sessions_max) = state.session_count();
     let recent = state.recent_withdrawal(&host).await;
     let reason = match &recent {
         Some((prefix, session_id, age)) => {
@@ -332,6 +341,9 @@ async fn handle_visitor(
                 host = %host,
                 local_proxies,
                 v4_routes,
+                v4_sessions = %format!("{}/{}", sessions_connected, sessions_max),
+                known_hosts_total = known_total,
+                known_hosts = ?known_hosts,
                 withdrawn_prefix = %prefix,
                 withdrawn_session_id = session_id,
                 withdrawn_secs_ago = age.as_secs(),
@@ -350,6 +362,9 @@ async fn handle_visitor(
                 host = %host,
                 local_proxies,
                 v4_routes,
+                v4_sessions = %format!("{}/{}", sessions_connected, sessions_max),
+                known_hosts_total = known_total,
+                known_hosts = ?known_hosts,
                 "No route matches the host; answered 404"
             );
             format!("No tunnel for this host: {}", host)

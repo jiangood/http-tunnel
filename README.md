@@ -351,6 +351,21 @@ docker logs ht 2>&1 | grep 0123456789abcdef
 
 如果这种响应只在**并发升高时**出现、过一段时间又消失，优先检查前置层是否把不同 `Host` 的请求复用到同一条到 `ht` 的 keep-alive 连接（见上一节的注意事项）。
 
+`404` 的日志会带上**当时的路由表内容**，可以直接看出“表里有什么、缺什么”，不用再去翻变更历史：
+
+```
+INFO http_tunnel::http: No route matches the host; answered 404
+     request_id=a472f3bb090d3ee3 host=safeline.example.com
+     local_proxies=1 v4_routes=1 v4_sessions=1/256
+     known_hosts_total=2
+     known_hosts=["app.example.com (local:web)", "svc.example.com (v4:3)"]
+```
+
+- `known_hosts_total=0` 且 `v4_sessions=0/…`：没有任何下游节点在线。
+- `known_hosts` 里没有该域名：`ht` 上根本没有这条路由，检查 `[[proxies]]`、`HT_PROXIES` 和前置代理的转发目标。
+- `v4_sessions` 有值但没有该域名：节点在线，但它广告的是别的域名（配置或冲突）。
+- 同一行还出现 `withdrawn_prefix`：这条路由刚刚被撤销，通常是所属隧道在重连。
+
 默认日志级别是 `info`，只记录路由失败（`404`/`502`/`504` 等）和会话事件。要看每个访客的路由决策（匹配到哪个服务、转发到哪个地址、v4 流的开启与结束），用 `RUST_LOG` 提高级别，无需重新编译：
 
 ```sh

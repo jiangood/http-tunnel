@@ -63,6 +63,19 @@ impl RouteSnapshot {
             ),
         }
     }
+
+    /// A compact rendering for the `404` log, where the whole table is printed
+    /// next to the host that could not be routed.
+    fn describe_missing_route(&self) -> String {
+        match self.owner {
+            "local" => format!(
+                "{} (local:{})",
+                self.domain,
+                self.name.as_deref().unwrap_or("?")
+            ),
+            _ => format!("{} (v4:{})", self.domain, self.session_id.unwrap_or(0)),
+        }
+    }
 }
 
 /// Tracks the visitor connections that are still being served, so that a
@@ -122,6 +135,9 @@ pub(crate) struct ServerState {
     // v4 sessions
     pub(crate) v4_routes: RwLock<HashMap<String, V4SessionHandle>>,
     pub(crate) v4_sessions: Arc<Semaphore>,
+    // The total number of v4 sessions the server admits, so that a `404` can
+    // say whether any leaf is connected at all.
+    pub(crate) max_v4_sessions: usize,
     pub(crate) v4_shutdown: broadcast::Sender<bool>,
     pub(crate) next_v4_session_id: AtomicU64,
     // The domains this server can advertise upstream: its downstream routes
@@ -178,6 +194,7 @@ impl ServerState {
             limits,
             v4_routes: RwLock::new(HashMap::new()),
             v4_sessions: Arc::new(Semaphore::new(max_sessions)),
+            max_v4_sessions: max_sessions,
             v4_shutdown: broadcast::channel(1).0,
             next_v4_session_id: AtomicU64::new(0),
             routes,
@@ -249,6 +266,30 @@ impl ServerState {
         }
         table.sort_by(|a, b| a.domain.cmp(&b.domain).then(a.owner.cmp(b.owner)));
         table
+    }
+
+    /// Up to `limit` entries of the effective route table, rendered compactly,
+    /// together with the number of entries. A `404` uses it to show which hosts
+    /// the server *does* serve at that moment, instead of only a count.
+    pub(crate) async fn known_hosts(&self, limit: usize) -> (usize, Vec<String>) {
+        let table = self.routes_snapshot().await;
+        let total = table.len();
+        let hosts = table
+            .iter()
+            .take(limit)
+            .map(RouteSnapshot::describe_missing_route)
+            .collect();
+        (total, hosts)
+    }
+
+    /// How many v4 sessions are connected right now, and the configured limit.
+    /// A `404` with no session at all means the leaf is down; a `404` with a
+    /// session but no matching route means the leaf advertises something else.
+    pub(crate) fn session_count(&self) -> (usize, usize) {
+        let connected = self
+            .max_v4_sessions
+            .saturating_sub(self.v4_sessions.available_permits());
+        (connected, self.max_v4_sessions)
     }
 
     /// Remember that a v4 session stopped owning `prefix`, so a visitor that
