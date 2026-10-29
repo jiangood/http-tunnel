@@ -688,6 +688,32 @@ async fn management_api_manages_proxies() -> Result<()> {
     assert_eq!(status, 200, "unexpected response: {}", body);
     assert!(body.contains("echo.test"), "unexpected body: {}", body);
 
+    info!("the management API reports the effective route table");
+    let (status, body) = api_request(
+        MANAGEMENT_ADDR,
+        "GET",
+        "/api/routes",
+        Some(MANAGEMENT_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(
+        body.contains("\"domain\":\"echo.test\""),
+        "unexpected body: {}",
+        body
+    );
+    assert!(
+        body.contains("\"owner\":\"local\""),
+        "unexpected body: {}",
+        body
+    );
+    assert!(
+        body.contains("\"name\":\"echo\""),
+        "unexpected body: {}",
+        body
+    );
+
     info!("the client wrote the change back to its config");
     let written = std::fs::read_to_string(&config_path)?;
     assert!(

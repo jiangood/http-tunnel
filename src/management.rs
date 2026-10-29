@@ -105,6 +105,12 @@ impl ManagementState {
         proxies
     }
 
+    /// The effective routing table: local services plus the routes claimed by
+    /// v4 sessions, as seen by `GET /api/routes`.
+    pub(crate) async fn routes(&self) -> Vec<crate::server::RouteSnapshot> {
+        self.server.routes_snapshot().await
+    }
+
     /// Apply a change to the persisted configuration, save it, and recompute the
     /// effective configuration with the environment overlay.
     ///

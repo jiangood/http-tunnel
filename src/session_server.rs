@@ -23,6 +23,7 @@ const STREAM_BUFFER: usize = p4::INITIAL_WINDOW as usize;
 #[derive(Clone)]
 pub(crate) struct V4SessionHandle {
     pub(crate) session_id: u64,
+    pub(crate) node_id: String,
     tx: mpsc::Sender<SessionCommand>,
 }
 
@@ -165,7 +166,7 @@ async fn run_session(
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
             if let Err(err) = p4::write_frame(&mut writer, &frame).await {
-                debug!("v4 session write failed: {:#}", err);
+                warn!(session_id, "v4 session write failed: {:#}", err);
                 break;
             }
         }
@@ -174,6 +175,7 @@ async fn run_session(
     let (open_tx, mut open_rx) = mpsc::channel::<SessionCommand>(64);
     let handle = V4SessionHandle {
         session_id,
+        node_id: node_id.clone(),
         tx: open_tx,
     };
     let (closed_tx, mut closed_rx) = mpsc::unbounded_channel::<u32>();
@@ -238,7 +240,7 @@ async fn run_session(
                         }
                     }
                     Err(err) => {
-                        debug!(session_id, "v4 session closed: {:#}", err);
+                        warn!(session_id, "v4 session closed: {:#}", err);
                         break;
                     }
                 }
@@ -304,8 +306,12 @@ async fn run_session(
 
     // Withdraw every route owned by this session, unless a newer session has
     // already taken it over.
+    let had_routes = !owned.is_empty();
     for prefix in owned.drain() {
         remove_route(&state, session_id, &prefix).await;
+    }
+    if had_routes {
+        state.refresh_routes().await;
     }
     drop(streams);
     drop(out_tx);
@@ -326,6 +332,7 @@ async fn apply_routes(
 ) -> RouteAck {
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
+    let mut changed = false;
 
     for prefix in remove {
         let Some(prefix) = p4::normalize_prefix(&prefix) else {
@@ -333,6 +340,7 @@ async fn apply_routes(
         };
         if owned.remove(&prefix) {
             remove_route(state, handle.session_id, &prefix).await;
+            changed = true;
         }
     }
 
@@ -358,6 +366,7 @@ async fn apply_routes(
             });
             continue;
         }
+        let already_owned = owned.contains(&prefix);
         {
             let mut routes = state.v4_routes.write().await;
             if routes
@@ -372,11 +381,31 @@ async fn apply_routes(
             }
             routes.insert(prefix.clone(), handle.clone());
         }
+        state.forget_withdrawal(&prefix).await;
+        if !already_owned {
+            info!(
+                session_id = handle.session_id,
+                domain = %prefix,
+                "v4 route advertised"
+            );
+            changed = true;
+        }
         owned.insert(prefix.clone());
         accepted.push(prefix);
     }
 
-    state.refresh_routes().await;
+    for rejection in &rejected {
+        warn!(
+            session_id = handle.session_id,
+            domain = %rejection.prefix,
+            reason = ?rejection.reason,
+            "Rejected a route advertised by the v4 session"
+        );
+    }
+
+    if changed {
+        state.refresh_routes().await;
+    }
 
     (generation, accepted, rejected)
 }
@@ -395,7 +424,12 @@ async fn remove_route(state: &ServerState, session_id: u64, prefix: &str) {
         }
     };
     if removed {
-        state.refresh_routes().await;
+        state.remember_withdrawal(prefix, session_id).await;
+        info!(
+            session_id,
+            domain = %prefix,
+            "v4 route withdrawn"
+        );
     }
 }
 

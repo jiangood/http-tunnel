@@ -59,6 +59,7 @@ fn build_router(token: String, management: Arc<ManagementState>) -> Router {
         .route("/status", get(status))
         .route("/proxies", get(list_proxies))
         .route("/proxies/:name", put(put_proxy).delete(delete_proxy))
+        .route("/routes", get(list_routes))
         .route_layer(middleware::from_fn_with_state(token.clone(), api_auth));
 
     // The browser-native HTTP Basic login avoids shipping JavaScript or CSS.
@@ -324,6 +325,14 @@ async fn list_proxies(State(state): State<Arc<ApiState>>) -> Json<Vec<ProxyView>
             .map(proxy_view)
             .collect(),
     )
+}
+
+/// The effective routing table: local services and the domains claimed by v4
+/// sessions, including the owning node and session id.
+async fn list_routes(
+    State(state): State<Arc<ApiState>>,
+) -> Json<Vec<crate::server::RouteSnapshot>> {
+    Json(state.management.routes().await)
 }
 
 async fn put_proxy(

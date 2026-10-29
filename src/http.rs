@@ -167,7 +167,12 @@ async fn handle_visitor(
             // request. Do not include its lifetime in the visitor drain counter.
             drop(activity);
             if let Err(e) = crate::session_server::accept(conn, state).await {
-                debug!("Tunnel WebSocket connection closed: {:#}", e);
+                warn!(
+                    request_id = %request_id,
+                    peer = %addr,
+                    "Tunnel session failed: {:#}",
+                    e
+                );
             }
             return Ok(());
         }
@@ -313,19 +318,44 @@ async fn handle_visitor(
         }
     }
 
-    info!(
-        request_id = %request_id,
-        peer = %addr,
-        host = %host,
-        "No route matches the host; answered 404"
-    );
-    respond_error(
-        &mut stream,
-        &request_id,
-        "404 Not Found",
-        &format!("No tunnel for this host: {}", host),
-    )
-    .await;
+    let (local_proxies, v4_routes) = {
+        let proxies = state.proxies.read().await.len();
+        let routes = state.v4_routes.read().await.len();
+        (proxies, routes)
+    };
+    let recent = state.recent_withdrawal(&host).await;
+    let reason = match &recent {
+        Some((prefix, session_id, age)) => {
+            info!(
+                request_id = %request_id,
+                peer = %addr,
+                host = %host,
+                local_proxies,
+                v4_routes,
+                withdrawn_prefix = %prefix,
+                withdrawn_session_id = session_id,
+                withdrawn_secs_ago = age.as_secs(),
+                "No route matches the host; its route was withdrawn recently"
+            );
+            format!(
+                "No tunnel for this host: {}\nThe route was withdrawn {}s ago; the owning tunnel is probably reconnecting",
+                host,
+                age.as_secs()
+            )
+        }
+        None => {
+            info!(
+                request_id = %request_id,
+                peer = %addr,
+                host = %host,
+                local_proxies,
+                v4_routes,
+                "No route matches the host; answered 404"
+            );
+            format!("No tunnel for this host: {}", host)
+        }
+    };
+    respond_error(&mut stream, &request_id, "404 Not Found", &reason).await;
     Ok(())
 }
 

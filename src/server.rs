@@ -1,6 +1,7 @@
 use crate::config::{domain_overlaps_control_host, MaskedString, ServerLimits, ServerProxyEntry};
 use crate::session_server::V4SessionHandle;
 use anyhow::{anyhow, Context, Result};
+use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -13,6 +14,56 @@ use tracing::{info, warn};
 
 const DRAIN_TIMEOUT: u64 = 30;
 const COPY_BUF_SIZE: usize = 64 * 1024;
+/// How long a withdrawn v4 route is remembered, so that a visitor that arrives
+/// just after the withdrawal gets an explanation instead of a bare `404`.
+const RECENT_WITHDRAWAL_TTL: Duration = Duration::from_secs(300);
+/// The maximum number of withdrawn routes kept for that explanation.
+const MAX_RECENT_WITHDRAWALS: usize = 1024;
+
+/// A route that a v4 session stopped owning recently. It is only diagnostic:
+/// it never changes routing, it lets the `404` say that the host used to exist
+/// and which session owned it.
+pub(crate) struct RecentWithdrawal {
+    pub(crate) at: Instant,
+    pub(crate) session_id: u64,
+}
+
+/// One entry of the effective routing table: a local proxy or a route claimed
+/// by a v4 session. It is used by the route-table log and `GET /api/routes`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct RouteSnapshot {
+    pub(crate) domain: String,
+    /// `local` or `v4`
+    pub(crate) owner: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) node: Option<String>,
+}
+
+impl RouteSnapshot {
+    /// A one-line rendering for the route-table log.
+    fn describe(&self) -> String {
+        match self.owner {
+            "local" => format!(
+                "{} -> local:{} ({})",
+                self.domain,
+                self.name.as_deref().unwrap_or("?"),
+                self.target.as_deref().unwrap_or("?")
+            ),
+            _ => format!(
+                "{} -> v4:{} ({})",
+                self.domain,
+                self.session_id.unwrap_or(0),
+                self.node.as_deref().unwrap_or("?")
+            ),
+        }
+    }
+}
 
 /// Tracks the visitor connections that are still being served, so that a
 /// shutdown can drain them instead of cutting them off.
@@ -81,6 +132,8 @@ pub(crate) struct ServerState {
     pub(crate) proxies: RwLock<Vec<ServerProxyEntry>>,
     // The visitors that are currently being served
     pub(crate) activity: ActivityTracker,
+    // Routes that a v4 session stopped owning recently, for `404` diagnostics
+    pub(crate) recent_withdrawals: RwLock<HashMap<String, RecentWithdrawal>>,
 }
 
 /// The management state of a build with the administration API. Builds without
@@ -130,6 +183,7 @@ impl ServerState {
             routes,
             proxies: RwLock::new(proxies),
             activity: ActivityTracker::default(),
+            recent_withdrawals: RwLock::new(HashMap::new()),
         }
     }
 
@@ -142,16 +196,133 @@ impl ServerState {
 
     /// Recompute the advertised route set as the union of the local proxy
     /// domains and the domains claimed by downstream sessions.
+    ///
+    /// The effective table is logged at `info` on every change, so the log
+    /// shows exactly which service a domain resolves to at that moment.
     pub(crate) async fn refresh_routes(&self) {
+        let snapshot = self.routes_snapshot().await;
+        let routes: BTreeSet<String> = snapshot.iter().map(|route| route.domain.clone()).collect();
+        self.routes.send_modify(|current| *current = routes);
+        let table: Vec<String> = snapshot.iter().map(RouteSnapshot::describe).collect();
+        info!(
+            routes = table.len(),
+            table = ?table,
+            "The route table changed"
+        );
+    }
+
+    /// A snapshot of the effective routing table, sorted by domain. Local
+    /// proxies and v4 routes can carry the same domain; the local proxy wins,
+    /// but both entries stay visible for diagnosis.
+    pub(crate) async fn routes_snapshot(&self) -> Vec<RouteSnapshot> {
         let proxies = self.proxies.read().await;
         let v4_routes = self.v4_routes.read().await;
-        let mut routes: BTreeSet<String> = proxies
-            .iter()
-            .filter_map(|proxy| crate::helper::normalize_domain(&proxy.domain))
-            .filter(|domain| !domain_overlaps_control_host(domain, &self.control_host))
-            .collect();
-        routes.extend(v4_routes.keys().cloned());
-        self.routes.send_modify(|current| *current = routes);
+        let mut table = Vec::with_capacity(proxies.len() + v4_routes.len());
+        for proxy in proxies.iter() {
+            let Some(domain) = crate::helper::normalize_domain(&proxy.domain) else {
+                continue;
+            };
+            if domain_overlaps_control_host(&domain, &self.control_host) {
+                continue;
+            }
+            table.push(RouteSnapshot {
+                domain,
+                owner: "local",
+                name: Some(proxy.name.clone()),
+                target: Some(proxy.local_addr.clone()),
+                session_id: None,
+                node: None,
+            });
+        }
+        for (domain, handle) in v4_routes.iter() {
+            if domain_overlaps_control_host(domain, &self.control_host) {
+                continue;
+            }
+            table.push(RouteSnapshot {
+                domain: domain.clone(),
+                owner: "v4",
+                name: None,
+                target: None,
+                session_id: Some(handle.session_id),
+                node: Some(handle.node_id.clone()),
+            });
+        }
+        table.sort_by(|a, b| a.domain.cmp(&b.domain).then(a.owner.cmp(b.owner)));
+        table
+    }
+
+    /// Remember that a v4 session stopped owning `prefix`, so a visitor that
+    /// lands in the gap can be told that its route was withdrawn instead of
+    /// seeing a bare `404`.
+    pub(crate) async fn remember_withdrawal(&self, prefix: &str, session_id: u64) {
+        let now = Instant::now();
+        let mut recent = self.recent_withdrawals.write().await;
+        recent.retain(|_, withdrawal| now.duration_since(withdrawal.at) < RECENT_WITHDRAWAL_TTL);
+        if recent.len() >= MAX_RECENT_WITHDRAWALS {
+            if let Some(oldest) = recent
+                .iter()
+                .min_by_key(|(_, withdrawal)| withdrawal.at)
+                .map(|(prefix, _)| prefix.clone())
+            {
+                recent.remove(&oldest);
+            }
+        }
+        recent.insert(
+            prefix.to_string(),
+            RecentWithdrawal {
+                at: now,
+                session_id,
+            },
+        );
+    }
+
+    /// Forget a withdrawal once a route for the same prefix is advertised again.
+    pub(crate) async fn forget_withdrawal(&self, prefix: &str) {
+        self.recent_withdrawals.write().await.remove(prefix);
+    }
+
+    /// The most recent withdrawal that would have matched `host`, with its
+    /// owning session and age, if it is still inside the diagnostic window.
+    pub(crate) async fn recent_withdrawal(&self, host: &str) -> Option<(String, u64, Duration)> {
+        let now = Instant::now();
+        let recent = self.recent_withdrawals.read().await;
+        let mut best: Option<(&String, &RecentWithdrawal, usize)> = None;
+        for (prefix, withdrawal) in recent.iter() {
+            if now.duration_since(withdrawal.at) >= RECENT_WITHDRAWAL_TTL {
+                continue;
+            }
+            let score = match prefix.strip_prefix("*.") {
+                Some(suffix) => {
+                    let dot = format!(".{}", suffix);
+                    if host.len() > dot.len() && host.ends_with(&dot) {
+                        dot.len()
+                    } else {
+                        continue;
+                    }
+                }
+                None => {
+                    if prefix == host {
+                        usize::MAX
+                    } else {
+                        continue;
+                    }
+                }
+            };
+            if best
+                .as_ref()
+                .map(|(_, _, current)| score > *current)
+                .unwrap_or(true)
+            {
+                best = Some((prefix, withdrawal, score));
+            }
+        }
+        best.map(|(prefix, withdrawal, _)| {
+            (
+                prefix.clone(),
+                withdrawal.session_id,
+                now.duration_since(withdrawal.at),
+            )
+        })
     }
 }
 

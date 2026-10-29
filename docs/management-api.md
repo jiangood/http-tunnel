@@ -29,8 +29,28 @@ The API uses a Bearer token, which is also the listener `token`:
 | --- | --- | --- |
 | GET | `/api/status` | Name, transport, upstream, connectivity, proxy count |
 | GET | `/api/proxies` | List local `[[proxies]]` as `name`/`domain`/`local_addr` |
+| GET | `/api/routes` | The effective routing table, including v4 owners |
 | PUT | `/api/proxies/{name}` | Create or replace a local proxy |
 | DELETE | `/api/proxies/{name}` | Delete a local proxy |
+
+`GET /api/routes` shows the table the visitor path actually uses. A local
+service and a downstream session can claim the same domain; the local service
+wins, but both entries are listed:
+
+```json
+[
+  {"domain":"app.example.com","owner":"local","name":"app","target":"127.0.0.1:3000"},
+  {"domain":"svc.example.com","owner":"v4","session_id":3,"node":"home"}
+]
+```
+
+The same table is logged at `info` whenever it changes:
+
+```
+INFO http_tunnel::server: The route table changed routes=2
+     table=["app.example.com -> local:app (127.0.0.1:3000)",
+            "svc.example.com -> v4:3 (home)"]
+```
 
 ```sh
 curl -H "Host: edge.lan" -H "Authorization: Bearer $TOKEN" \

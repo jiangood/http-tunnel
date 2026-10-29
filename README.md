@@ -262,6 +262,15 @@ server {
 
 `server_name` 和证书必须覆盖 `control_host` 与该入口服务的所有访客域名。**不要在入口上开启“HTTP 强制跳转 HTTPS”**：WebSocket 客户端不会跟随 301/308 重定向。
 
+> **不要把一个到 `ht` 的 keep-alive 连接复用于多个域名。**
+> `ht` 只读取一条连接上**第一个**请求的 `Host` 来选后端，之后整条连接原样透传（这样才能透明支持 WebSocket）。
+> 如果 Nginx 的 `upstream { keepalive N; }`、Caddy 的连接池或云负载均衡把不同 `Host` 的请求复用到同一条到 `ht` 的连接，后续请求会被送到第一个域名对应的本地服务，表现为**并发升高后偶发 404，且响应来自后端、不带 `x-http-tunnel-request-id`**；负载降下来、连接池回收后又恢复正常。
+>
+> 处理方式（任选其一）：
+> - 每个域名使用独立的 `upstream` 块（不要共用同一个 `upstream` 的 keepalive 池）；
+> - 关闭到 `ht` 的 upstream keep-alive（去掉 `keepalive N`，或用 `proxy_http_version 1.0` + `proxy_set_header Connection close`）；
+> - 让前端负载均衡为每个域名使用独立的 target group / 后端连接池。
+
 ## 转发配置
 
 所有本地服务都使用 `[[proxies]]`：
@@ -308,6 +317,7 @@ keepalive_interval = 15
 | --- | --- | --- |
 | GET | `/api/status` | 查看状态和本地服务数 |
 | GET | `/api/proxies` | 列出本地 `[[proxies]]` |
+| GET | `/api/routes` | 查看当前生效的路由表（本地服务 + 下游 v4 路由及其所属节点） |
 | PUT | `/api/proxies/{name}` | 新增或更新本地服务 |
 | DELETE | `/api/proxies/{name}` | 删除本地服务 |
 
@@ -338,6 +348,8 @@ docker logs ht 2>&1 | grep 0123456789abcdef
 | `504` | 隧道在超时前没有返回任何响应 |
 
 管理 API 的错误是 JSON：`{"error":"...","request_id":"..."}`；未知的 `/api/*` 路径还会在 `error` 中写明方法和路径。**`ht` 不会返回 `{"message":"page not found"}`**：如果看到这种响应，且响应头里没有 `x-http-tunnel-request-id`，说明它来自前置反向代理、CDN、托管平台或本地服务，而不是 `ht`。
+
+如果这种响应只在**并发升高时**出现、过一段时间又消失，优先检查前置层是否把不同 `Host` 的请求复用到同一条到 `ht` 的 keep-alive 连接（见上一节的注意事项）。
 
 默认日志级别是 `info`，只记录路由失败（`404`/`502`/`504` 等）和会话事件。要看每个访客的路由决策（匹配到哪个服务、转发到哪个地址、v4 流的开启与结束），用 `RUST_LOG` 提高级别，无需重新编译：
 
