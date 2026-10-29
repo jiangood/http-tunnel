@@ -22,7 +22,9 @@ The page itself is protected by the browser-native HTTP Basic login: username
 `ht`, password = the listener `token`. It is the only Basic-authenticated
 resource. It is a single HTML document with an inline stylesheet and script and
 no external dependency; it renders nothing on the server and reads all of its
-data from `/api` with the Bearer token it is handed after login.
+data from `/api` with the Bearer token it is handed after login. It shows the
+status, the local services with their source, the effective route table and the
+`HT_*` variables that are set, and it adds or edits a service in a dialog.
 
 ## API
 
@@ -30,8 +32,8 @@ Every API call uses a Bearer token, which is also the listener `token`:
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/status` | Name, transport, upstream, connectivity, proxy count, version, config path, uptime |
-| GET | `/api/proxies` | List local `[[proxies]]` as `name`/`domain`/`local_addr` |
+| GET | `/api/status` | Name, transport, upstream, connectivity, proxy count, version, config path, uptime, the `HT_*` variables that are set |
+| GET | `/api/proxies` | List local `[[proxies]]` as `name`/`domain`/`local_addr`/`source` |
 | GET | `/api/routes` | The effective routing table, including v4 owners |
 | PUT | `/api/proxies/{name}` | Create or replace a local proxy |
 | DELETE | `/api/proxies/{name}` | Delete a local proxy |
@@ -88,8 +90,8 @@ presence of `x-http-tunnel-request-id`.
 If `HT_PROXIES` is set, the local services come from the environment and are
 read-only at runtime:
 
-- `/api/status` reports `"proxies_managed": true`, and the page hides the form
-  and the delete buttons.
+- `/api/status` reports `"proxies_managed": true` and lists `HT_PROXIES` among
+  the set variables; the page hides the add, edit and delete actions.
 - `PUT` and `DELETE /api/proxies/*` return `409 Conflict`.
 - Nothing is written to `ht.toml`.
 

@@ -32,6 +32,19 @@ pub(crate) const ENV_PROXIES: &str = "HT_PROXIES";
 /// The token of the next hop, when it differs from the listener token.
 pub(crate) const ENV_UPSTREAM_TOKEN: &str = "HT_UPSTREAM_TOKEN";
 
+/// Every variable the process reads, in the order the page lists them.
+pub(crate) const KNOWN_ENV_VARS: &[&str] = &[
+    ENV_UPSTREAM_URL,
+    ENV_UPSTREAM_TOKEN,
+    ENV_NAME,
+    ENV_TOKEN,
+    ENV_LISTEN_PORT,
+    ENV_CONTROL_HOST,
+    ENV_KEEPALIVE_INTERVAL,
+    ENV_RETRY_INTERVAL,
+    ENV_PROXIES,
+];
+
 /// The variables renamed in 2.0, with their replacements. A stale deployment
 /// gets an explicit error instead of having the variable silently ignored.
 const LEGACY_ENV_VARS: &[(&str, &str)] = &[
@@ -198,6 +211,15 @@ impl EnvConfig {
     /// The names of the variables that were set, without their values.
     pub(crate) fn vars(&self) -> &[&'static str] {
         &self.vars
+    }
+
+    /// Every known variable with whether the environment sets it, for the
+    /// management page. Values are never included, so a token cannot leak.
+    pub(crate) fn describe(&self) -> Vec<(&'static str, bool)> {
+        KNOWN_ENV_VARS
+            .iter()
+            .map(|name| (*name, self.vars.contains(name)))
+            .collect()
     }
 
     /// Whether the environment overrides no setting at all.
@@ -368,6 +390,24 @@ mod tests {
             ]
         );
         assert!(parsed.proxies_managed());
+        Ok(())
+    }
+
+    #[test]
+    fn test_describe_marks_the_set_variables_without_values() -> Result<()> {
+        let parsed = env(&[(ENV_TOKEN, "secret"), (ENV_PROXIES, "[]")])?;
+        let described = parsed.describe();
+        assert_eq!(described.len(), KNOWN_ENV_VARS.len());
+
+        let set: Vec<_> = described
+            .iter()
+            .filter(|(_, set)| *set)
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(set, vec![ENV_TOKEN, ENV_PROXIES]);
+
+        // The page only learns which variables are set, never their values
+        assert!(!format!("{:?}", described).contains("secret"));
         Ok(())
     }
 

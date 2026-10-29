@@ -215,14 +215,24 @@ struct ProxyView {
     name: String,
     domain: String,
     local_addr: String,
+    /// `file` when the proxy comes from `ht.toml`, `env` when `HT_PROXIES`
+    /// replaces the whole list
+    source: &'static str,
 }
 
-fn proxy_view(proxy: &ServerProxyEntry) -> ProxyView {
+fn proxy_view(proxy: &ServerProxyEntry, source: &'static str) -> ProxyView {
     ProxyView {
         name: proxy.name.clone(),
         domain: proxy.domain.clone(),
         local_addr: proxy.local_addr.clone(),
+        source,
     }
+}
+
+#[derive(Serialize)]
+struct EnvVarView {
+    name: &'static str,
+    set: bool,
 }
 
 #[derive(Serialize)]
@@ -238,6 +248,8 @@ struct StatusView {
     version: &'static str,
     config_path: String,
     uptime_seconds: u64,
+    /// Every known `HT_*` variable with whether it is set; values are omitted
+    env_vars: Vec<EnvVarView>,
 }
 
 #[derive(Deserialize)]
@@ -315,17 +327,28 @@ async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusView> {
         version: env!("CARGO_PKG_VERSION"),
         config_path: state.management.config_path().display().to_string(),
         uptime_seconds: state.management.uptime(),
+        env_vars: state
+            .management
+            .env_vars()
+            .into_iter()
+            .map(|(name, set)| EnvVarView { name, set })
+            .collect(),
     })
 }
 
 async fn list_proxies(State(state): State<Arc<ApiState>>) -> Json<Vec<ProxyView>> {
+    let source = if state.management.proxies_managed() {
+        "env"
+    } else {
+        "file"
+    };
     Json(
         state
             .management
             .proxies()
             .await
             .iter()
-            .map(proxy_view)
+            .map(|proxy| proxy_view(proxy, source))
             .collect(),
     )
 }
@@ -356,7 +379,7 @@ async fn put_proxy(
         .into_iter()
         .find(|proxy| proxy.name == name)
     {
-        Some(proxy) => Ok((StatusCode::CREATED, Json(proxy_view(&proxy))).into_response()),
+        Some(proxy) => Ok((StatusCode::CREATED, Json(proxy_view(&proxy, "file"))).into_response()),
         None => Ok(StatusCode::CREATED.into_response()),
     }
 }

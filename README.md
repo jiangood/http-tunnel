@@ -311,12 +311,12 @@ keepalive_interval = 15
 
 ## Web 管理
 
-管理页面与 API 始终开启，和访客、v4 会话共用 `listen_port`，只在保留的 `control_host` 上可达。浏览器打开 `http://<control_host>:<listen_port>/`，HTTP Basic 用户名填 `ht`，密码填 `token`；页面是一个内联 CSS/JS 的单页控制台，本身不做服务端渲染，所有数据都通过 `/api/*`（Bearer token）获取，可查看状态、本地服务、路由表和接口列表，并在页面上增删本地服务。`control_host` 不是本机可解析的地址时，可用 `curl -H "Host: <control_host>" http://127.0.0.1:<listen_port>/` 访问；`listen_port = 0` 时管理页也用临时端口，以启动日志为准。
+管理页面与 API 始终开启，和访客、v4 会话共用 `listen_port`，只在保留的 `control_host` 上可达。浏览器打开 `http://<control_host>:<listen_port>/`，HTTP Basic 用户名填 `ht`，密码填 `token`；页面是一个内联 CSS/JS 的单页控制台，本身不做服务端渲染，所有数据都通过 `/api/*`（Bearer token）获取，可查看状态、本地服务（含来源）、路由表、已设置的环境变量和接口列表，并在弹出框中新增或编辑本地服务。`control_host` 不是本机可解析的地址时，可用 `curl -H "Host: <control_host>" http://127.0.0.1:<listen_port>/` 访问；`listen_port = 0` 时管理页也用临时端口，以启动日志为准。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/status` | 查看状态、本地服务数、版本、配置文件与运行时长 |
-| GET | `/api/proxies` | 列出本地 `[[proxies]]` |
+| GET | `/api/status` | 查看状态、本地服务数、版本、配置文件、运行时长与环境变量覆盖情况 |
+| GET | `/api/proxies` | 列出本地 `[[proxies]]` 及其来源（`ht.toml` / `HT_PROXIES`） |
 | GET | `/api/routes` | 查看当前生效的路由表（本地服务 + 下游 v4 路由及其所属节点） |
 | PUT | `/api/proxies/{name}` | 新增或更新本地服务 |
 | DELETE | `/api/proxies/{name}` | 删除本地服务 |

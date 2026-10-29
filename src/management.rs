@@ -112,6 +112,11 @@ impl ManagementState {
         self.started.elapsed().as_secs()
     }
 
+    /// The `HT_*` variables the environment sets, with their values omitted
+    pub(crate) fn env_vars(&self) -> Vec<(&'static str, bool)> {
+        self.env.describe()
+    }
+
     /// The local services the process is serving, sorted by name
     pub(crate) async fn proxies(&self) -> Vec<ServerProxyEntry> {
         let mut proxies = self.config.read().await.proxies.clone();

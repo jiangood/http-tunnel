@@ -55,6 +55,7 @@
   }
 }
 html{-webkit-text-size-adjust:100%}
+[hidden]{display:none !important}
 body{margin:0;background-color:var(--bg);background-image:var(--bg-glow);background-repeat:no-repeat;background-attachment:fixed;color:var(--fg);font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
 .wrap{max-width:1000px;margin:0 auto;padding:40px 20px 64px}
 .top{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}
@@ -105,11 +106,23 @@ th.right,td.right{text-align:right}
 .tag.method-post{background:var(--accent-soft);color:var(--accent)}
 .tag.method-delete{background:var(--bad-soft);color:var(--bad)}
 .empty{margin:0;color:var(--muted);font-size:14px}
-.notice{margin:0;padding:12px 14px;border-radius:10px;background:var(--warn-soft);color:var(--warn);font-size:13.5px;line-height:1.7}
+.notice{margin:0 0 14px;padding:12px 14px;border-radius:10px;background:var(--warn-soft);color:var(--warn);font-size:13.5px;line-height:1.7}
 code{font-family:var(--mono);font-size:.9em;padding:1px 6px;border-radius:6px;background:var(--accent-soft);color:var(--accent)}
 .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);max-width:min(90vw,560px);padding:11px 18px;border-radius:12px;background:#101828;color:#fff;font-size:14px;box-shadow:0 12px 32px -12px rgba(0,0,0,.5);z-index:10}
 .toast.error{background:#b42318}
 footer{margin-top:22px;text-align:center;color:var(--muted);font-size:12px}
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.card-head h2{margin:0}
+.row-actions{display:inline-flex;gap:6px}
+dialog.modal{width:min(620px,calc(100vw - 28px));padding:0;border:1px solid var(--line);border-radius:16px;background:var(--card);color:var(--fg);box-shadow:0 24px 64px -24px rgba(16,24,40,.45)}
+dialog.modal::backdrop{background:rgba(16,24,40,.45)}
+dialog.modal form{padding:20px 22px}
+.modal-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}
+.modal-head h2{margin:0;font-size:16px}
+.modal-foot{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
+.btn.icon{padding:6px 10px;font-size:13px;line-height:1}
+input[readonly]{background:var(--input);color:var(--muted)}
+.tag.env{background:var(--warn-soft);color:var(--warn)}
 @media (max-width:640px){.wrap{padding:24px 14px 44px}.grid{grid-template-columns:1fr}.card{padding:16px;border-radius:14px}.meta{grid-template-columns:1fr 1fr;padding:16px}}
 </style>
 </head>
@@ -138,32 +151,11 @@ footer{margin-top:22px;text-align:center;color:var(--muted);font-size:12px}
   </section>
 
   <section class="card">
-    <h2>新增或更新本地服务</h2>
+    <div class="card-head">
+      <h2>本地服务列表<span class="count" id="proxy-count">0</span></h2>
+      <button class="btn primary small" id="add-proxy" type="button">新增服务</button>
+    </div>
     <p class="notice" id="read-only" hidden>本地服务由环境变量 <code>HT_PROXIES</code> 管理，网页与 API 不可修改；如需变更，请修改该环境变量并重启 ht。</p>
-    <form id="proxy-form" autocomplete="off">
-      <div class="grid">
-        <fieldset>
-          <legend>基本</legend>
-          <label>名称<input name="name" required pattern="[A-Za-z0-9._\-]+" placeholder="例如 web"></label>
-        </fieldset>
-        <fieldset>
-          <legend>域名</legend>
-          <label>对外域名<input name="domain" required placeholder="例如 app.example.com"></label>
-        </fieldset>
-        <fieldset class="span2">
-          <legend>本地地址</legend>
-          <label>转发目标<input name="local_addr" required placeholder="127.0.0.1:8080 或 unix:///path.sock"></label>
-        </fieldset>
-      </div>
-      <div class="actions">
-        <button class="btn primary" type="submit" id="save">保存</button>
-        <span class="hint">更新已有服务时填写相同名称即可，修改会立即生效并写入 ht.toml。</span>
-      </div>
-    </form>
-  </section>
-
-  <section class="card">
-    <h2>本地服务列表<span class="count" id="proxy-count">0</span></h2>
     <div class="table-wrap">
       <table>
         <thead>
@@ -171,11 +163,12 @@ footer{margin-top:22px;text-align:center;color:var(--muted);font-size:12px}
             <th>名称</th>
             <th>域名</th>
             <th>本地地址</th>
+            <th>来源</th>
             <th class="right" id="op-head">操作</th>
           </tr>
         </thead>
         <tbody id="proxy-body">
-          <tr><td colspan="4" class="empty">加载中…</td></tr>
+          <tr><td colspan="5" class="empty">加载中…</td></tr>
         </tbody>
       </table>
     </div>
@@ -202,6 +195,21 @@ footer{margin-top:22px;text-align:center;color:var(--muted);font-size:12px}
   </section>
 
   <section class="card">
+    <h2>环境变量<span class="count" id="env-count">0</span></h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>变量</th><th>状态</th><th>说明</th></tr>
+        </thead>
+        <tbody id="env-body">
+          <tr><td colspan="3" class="empty">加载中…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="hint">环境变量逐项覆盖 <code>ht.toml</code>，<code>HT_PROXIES</code> 整体替换 <code>[[proxies]]</code>；修改后需重启 ht。这里只显示是否设置，不显示取值。</p>
+  </section>
+
+  <section class="card">
     <h2>接口列表</h2>
     <div class="table-wrap">
       <table>
@@ -209,8 +217,8 @@ footer{margin-top:22px;text-align:center;color:var(--muted);font-size:12px}
           <tr><th>方法</th><th>路径</th><th>认证</th><th>说明</th></tr>
         </thead>
         <tbody>
-          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/status</td><td class="muted">Bearer</td><td class="muted">进程状态：名称、传输、上游、连通性、服务数、版本、配置文件、运行时长</td></tr>
-          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/proxies</td><td class="muted">Bearer</td><td class="muted">列出本地服务</td></tr>
+          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/status</td><td class="muted">Bearer</td><td class="muted">进程状态：名称、传输、上游、连通性、服务数、版本、配置文件、运行时长、环境变量</td></tr>
+          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/proxies</td><td class="muted">Bearer</td><td class="muted">列出本地服务及其来源</td></tr>
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/routes</td><td class="muted">Bearer</td><td class="muted">生效中的路由表，包含 v4 会话</td></tr>
           <tr><td><span class="tag method-put">PUT</span></td><td class="mono">/api/proxies/{name}</td><td class="muted">Bearer</td><td class="muted">新增或替换本地服务，请求体 <code>{"domain":"…","local_addr":"…"}</code></td></tr>
           <tr><td><span class="tag method-delete">DELETE</span></td><td class="mono">/api/proxies/{name}</td><td class="muted">Bearer</td><td class="muted">删除本地服务</td></tr>
@@ -225,6 +233,34 @@ footer{margin-top:22px;text-align:center;color:var(--muted);font-size:12px}
 </div>
 
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<dialog class="modal" id="proxy-dialog" aria-labelledby="dialog-title">
+  <form id="proxy-form" autocomplete="off">
+    <div class="modal-head">
+      <h2 id="dialog-title">新增本地服务</h2>
+      <button class="btn small icon" type="button" id="dialog-close" aria-label="关闭">✕</button>
+    </div>
+    <div class="grid">
+      <fieldset>
+        <legend>基本</legend>
+        <label>名称<input name="name" required pattern="[A-Za-z0-9._\-]+" placeholder="例如 web"></label>
+      </fieldset>
+      <fieldset>
+        <legend>域名</legend>
+        <label>对外域名<input name="domain" required placeholder="例如 app.example.com"></label>
+      </fieldset>
+      <fieldset class="span2">
+        <legend>本地地址</legend>
+        <label>转发目标<input name="local_addr" required placeholder="127.0.0.1:8080 或 unix:///path.sock"></label>
+      </fieldset>
+    </div>
+    <p class="hint" id="dialog-hint">名称只允许字母、数字、点、下划线和短横线。</p>
+    <div class="modal-foot">
+      <button class="btn" type="button" id="dialog-cancel">取消</button>
+      <button class="btn primary" type="submit" id="save">保存</button>
+    </div>
+  </form>
+</dialog>
 
 <script>
 (function () {
@@ -249,6 +285,19 @@ footer{margin-top:22px;text-align:center;color:var(--muted);font-size:12px}
 
   var readOnly = false;
   var toastTimer = null;
+  var proxiesCache = [];
+
+  var ENV_DOCS = {
+    HT_UPSTREAM_URL: "下一跳 WebSocket 地址",
+    HT_UPSTREAM_TOKEN: "下一跳 token，可与监听 token 不同",
+    HT_NAME: "进程名称",
+    HT_TOKEN: "监听 token，同时是页面 Basic 密码",
+    HT_LISTEN_PORT: "监听端口",
+    HT_CONTROL_HOST: "管理面保留的 Host",
+    HT_KEEPALIVE_INTERVAL: "WebSocket ping 间隔（秒）",
+    HT_RETRY_INTERVAL: "重连下一跳的间隔（秒）",
+    HT_PROXIES: "本地服务列表，整体替换 [[proxies]]"
+  };
 
   function toast(message, kind) {
     var box = $("toast");
@@ -314,24 +363,47 @@ footer{margin-top:22px;text-align:center;color:var(--muted);font-size:12px}
     $("pill-text").textContent = status.connected ? "已连接" : "未连接";
 
     $("read-only").hidden = !readOnly;
-    $("proxy-form").hidden = readOnly;
+    $("add-proxy").hidden = readOnly;
     $("op-head").hidden = readOnly;
+    renderEnv(status.env_vars || []);
+  }
+
+  function renderEnv(vars) {
+    $("env-count").textContent = vars.filter(function (item) { return item.set; }).length;
+    $("env-body").innerHTML = vars.map(function (item) {
+      var state = item.set
+        ? '<span class="tag local">已覆盖</span>'
+        : '<span class="muted">未设置</span>';
+      return "<tr>" +
+        '<td class="mono strong">' + esc(item.name) + "</td>" +
+        "<td>" + state + "</td>" +
+        '<td class="muted">' + esc(ENV_DOCS[item.name] || "") + "</td>" +
+        "</tr>";
+    }).join("");
   }
 
   function renderProxies(proxies) {
+    proxiesCache = proxies;
     $("proxy-count").textContent = proxies.length;
     var body = $("proxy-body");
     if (!proxies.length) {
-      body.innerHTML = '<tr><td colspan="' + (readOnly ? 3 : 4) + '" class="empty">还没有本地服务。</td></tr>';
+      body.innerHTML = '<tr><td colspan="' + (readOnly ? 4 : 5) + '" class="empty">还没有本地服务。</td></tr>';
       return;
     }
     body.innerHTML = proxies.map(function (proxy) {
+      var source = proxy.source === "env"
+        ? '<span class="tag env">HT_PROXIES</span>'
+        : '<span class="tag">ht.toml</span>';
       var action = readOnly ? "" :
-        '<td class="right"><button class="btn danger small" type="button" data-delete="' + esc(proxy.name) + '">删除</button></td>';
+        '<td class="right"><div class="row-actions">' +
+          '<button class="btn small" type="button" data-edit="' + esc(proxy.name) + '">编辑</button>' +
+          '<button class="btn danger small" type="button" data-delete="' + esc(proxy.name) + '">删除</button>' +
+        "</div></td>";
       return "<tr>" +
         '<td class="strong">' + esc(proxy.name) + "</td>" +
         '<td class="mono">' + esc(proxy.domain) + "</td>" +
         '<td class="mono muted">' + esc(proxy.local_addr) + "</td>" +
+        "<td>" + source + "</td>" +
         action +
         "</tr>";
     }).join("");
@@ -375,9 +447,43 @@ footer{margin-top:22px;text-align:center;color:var(--muted);font-size:12px}
 
   $("refresh").addEventListener("click", function () { loadAll(false); });
 
-  $("proxy-form").addEventListener("submit", function (event) {
+  var dialog = $("proxy-dialog");
+  var form = $("proxy-form");
+  var editing = null;
+
+  function openDialog(proxy) {
+    editing = proxy ? proxy.name : null;
+    form.reset();
+    form.elements.name.readOnly = !!proxy;
+    form.elements.name.value = proxy ? proxy.name : "";
+    form.elements.domain.value = proxy ? proxy.domain : "";
+    form.elements.local_addr.value = proxy ? proxy.local_addr : "";
+    $("dialog-title").textContent = proxy ? "编辑本地服务" : "新增本地服务";
+    $("dialog-hint").textContent = proxy
+      ? "名称不可修改；如需改名，请删除后重建。保存后立即生效并写入 ht.toml。"
+      : "名称只允许字母、数字、点、下划线和短横线；保存后立即生效并写入 ht.toml。";
+    if (!dialog.open) { dialog.showModal(); }
+    (proxy ? form.elements.domain : form.elements.name).focus();
+  }
+
+  function closeDialog() {
+    if (dialog.open) { dialog.close(); }
+  }
+
+  $("add-proxy").addEventListener("click", function () { openDialog(null); });
+  $("dialog-close").addEventListener("click", closeDialog);
+  $("dialog-cancel").addEventListener("click", closeDialog);
+  dialog.addEventListener("click", function (event) {
+    if (event.target === dialog) { closeDialog(); }
+  });
+  dialog.addEventListener("close", function () {
+    editing = null;
+    form.reset();
+    form.elements.name.readOnly = false;
+  });
+
+  form.addEventListener("submit", function (event) {
     event.preventDefault();
-    var form = event.currentTarget;
     var fields = new FormData(form);
     var name = String(fields.get("name") || "").trim();
     var domain = String(fields.get("domain") || "").trim();
@@ -390,8 +496,8 @@ footer{margin-top:22px;text-align:center;color:var(--muted);font-size:12px}
       method: "PUT",
       body: JSON.stringify({ domain: domain, local_addr: localAddr })
     }).then(function () {
-      toast("已保存 " + name);
-      form.reset();
+      toast((editing ? "已更新 " : "已新增 ") + name);
+      closeDialog();
       return loadAll(true);
     }).catch(function (error) {
       toast(error.message, "error");
@@ -401,6 +507,14 @@ footer{margin-top:22px;text-align:center;color:var(--muted);font-size:12px}
   });
 
   $("proxy-body").addEventListener("click", function (event) {
+    var edit = event.target.closest("[data-edit]");
+    if (edit) {
+      var editingName = edit.getAttribute("data-edit");
+      var proxy = proxiesCache.find(function (item) { return item.name === editingName; });
+      if (proxy) { openDialog(proxy); }
+      return;
+    }
+
     var button = event.target.closest("[data-delete]");
     if (!button) { return; }
     var name = button.getAttribute("data-delete");
