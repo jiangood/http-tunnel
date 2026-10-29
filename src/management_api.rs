@@ -3,12 +3,12 @@
 use crate::config::ServerProxyEntry;
 use crate::management::ManagementState;
 use anyhow::{Context, Result};
-use axum::extract::{Form, Path, State};
+use axum::extract::{Path, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::{get, post, put};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, put};
 use axum::{Json, Router};
 use hyper::service::Service as _;
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,9 @@ use tracing::warn;
 
 struct ApiState {
     management: Arc<ManagementState>,
+    /// The listener token. The page receives it because it is only served after
+    /// HTTP Basic authentication with the same token.
+    token: String,
 }
 
 /// Serve one management connection on an already accepted listener socket.
@@ -53,7 +56,10 @@ pub(crate) async fn serve_connection(
 /// The management router. It is mounted on the reserved `control_host` of the
 /// main listener, not on a listener of its own.
 fn build_router(token: String, management: Arc<ManagementState>) -> Router {
-    let state = Arc::new(ApiState { management });
+    let state = Arc::new(ApiState {
+        management,
+        token: token.clone(),
+    });
 
     let api = Router::new()
         .route("/status", get(status))
@@ -62,12 +68,10 @@ fn build_router(token: String, management: Arc<ManagementState>) -> Router {
         .route("/routes", get(list_routes))
         .route_layer(middleware::from_fn_with_state(token.clone(), api_auth));
 
-    // The browser-native HTTP Basic login avoids shipping JavaScript or CSS.
-    // Use username "ht" and the process token as the password.
+    // Only the page itself is authenticated with HTTP Basic. Everything it
+    // shows comes from `/api` with the Bearer token it was handed.
     let web = Router::new()
         .route("/", get(web_index))
-        .route("/web/proxies", post(web_put_proxy))
-        .route("/web/proxies/:name/delete", post(web_delete_proxy))
         .route_layer(middleware::from_fn_with_state(token, web_auth));
 
     Router::new()
@@ -103,14 +107,10 @@ async fn not_found(method: Method, uri: Uri) -> Response {
     } else {
         (
             StatusCode::NOT_FOUND,
-            Html(format!(
-                "<!doctype html><meta charset=\"utf-8\"><title>404</title>\
-                 <p>没有这个管理页面：{} {}</p>\
-                 <p>Request ID: {}</p>\
-                 <p><a href=\"/\">返回管理首页</a></p>",
-                method,
-                escape_html(&path),
-                request_id
+            Html(error_page(
+                "页面不存在",
+                &format!("没有这个管理页面：{} {}", method, path),
+                &request_id,
             )),
         )
             .into_response()
@@ -232,17 +232,16 @@ struct StatusView {
     remote: String,
     connected: bool,
     proxies: usize,
+    /// Whether `HT_PROXIES` owns the local services, in which case the page
+    /// hides the form instead of letting every submit fail with `409`
+    proxies_managed: bool,
+    version: &'static str,
+    config_path: String,
+    uptime_seconds: u64,
 }
 
 #[derive(Deserialize)]
 struct PutProxy {
-    domain: String,
-    local_addr: String,
-}
-
-#[derive(Deserialize)]
-struct WebProxyForm {
-    name: String,
     domain: String,
     local_addr: String,
 }
@@ -312,6 +311,10 @@ async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusView> {
         remote: state.management.server_addr().to_string(),
         connected: state.management.connected(),
         proxies,
+        proxies_managed: state.management.proxies_managed(),
+        version: env!("CARGO_PKG_VERSION"),
+        config_path: state.management.config_path().display().to_string(),
+        uptime_seconds: state.management.uptime(),
     })
 }
 
@@ -370,114 +373,62 @@ async fn delete_proxy(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The management console. Its shell is static: the browser calls `/api/*`
+/// with the Bearer token it is handed here and renders everything itself, so no
+/// data is interpolated into HTML on the server.
 async fn web_index(State(state): State<Arc<ApiState>>) -> Html<String> {
-    let connected = if state.management.connected() {
-        "已连接"
-    } else {
-        "未连接"
-    };
-    let transport = match state.management.transport() {
-        "wss" => "WebSocket（TLS）",
-        "ws" => "WebSocket",
-        "ingress" => "独立入口（无上游）",
-        other => other,
-    };
-    let read_only = state.management.proxies_managed();
-    let proxies = state.management.proxies().await;
-    let mut html = format!(
-        "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>http-tunnel 管理</title><body><h1>http-tunnel 管理</h1><p>名称：{}；上游：{}；传输：{}；状态：{}；本地服务数：{}</p><h2>新增或更新本地服务</h2>",
-        escape_html(state.management.name()), escape_html(state.management.server_addr()), transport, connected, proxies.len()
-    );
-    if read_only {
-        html.push_str("<p>本地服务由环境变量 <code>HT_PROXIES</code> 管理，网页与 API 不可修改；如需变更，请修改该环境变量并重启 ht。</p>");
-    } else {
-        html.push_str("<form method=\"post\" action=\"/web/proxies\"><p>名称：<input name=\"name\" required pattern=\"[A-Za-z0-9._-]+\"></p><p>域名：<input name=\"domain\" required></p><p>本地地址：<input name=\"local_addr\" required placeholder=\"127.0.0.1:8080 或 unix:///path.sock\"></p><button type=\"submit\">保存</button></form>");
-    }
-    html.push_str("<h2>本地服务列表</h2><table border=\"1\" cellpadding=\"6\"><tr><th>名称</th><th>域名</th><th>本地地址</th>");
-    if !read_only {
-        html.push_str("<th>操作</th>");
-    }
-    html.push_str("</tr>");
-    for proxy in proxies {
-        let action = if read_only {
-            String::new()
-        } else {
-            format!(
-                "<td><form method=\"post\" action=\"/web/proxies/{}/delete\"><button type=\"submit\">删除</button></form></td>",
-                escape_html(&proxy.name)
-            )
-        };
-        html.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td>{}</tr>",
-            escape_html(&proxy.name),
-            escape_html(&proxy.domain),
-            escape_html(&proxy.local_addr),
-            action
-        ));
-    }
-    if read_only {
-        html.push_str("</table><p>本地服务来自 HT_PROXIES，修改该环境变量并重启 ht 后才会生效。</p><p>管理 API 仍可通过 /api/status、/api/proxies 使用。</p></body></html>");
-    } else {
-        html.push_str("</table><p>更新本地服务时填写相同名称即可。修改会立即生效并写入 ht.toml。</p><p>管理 API 仍可通过 /api/status、/api/proxies 使用。</p></body></html>");
-    }
-    Html(html)
+    // The page is the only Basic-authenticated resource. Handing it the token
+    // lets every data call use the same Bearer API as `curl`; whoever can read
+    // the page already authenticated with that token as the password.
+    Html(MANAGEMENT_PAGE.replace("__HT_TOKEN__", &escape_html(&state.token)))
 }
 
-/// Render a failed web form operation, with `409` for the proxies that the
-/// environment manages.
-fn web_error(title: &str, e: anyhow::Error) -> Response {
-    let reason = format!("{:#}", e);
-    let status = if reason.contains("HT_PROXIES") {
-        StatusCode::CONFLICT
-    } else {
-        StatusCode::BAD_REQUEST
-    };
-    let request_id = crate::http::new_request_id();
-    warn!(
-        request_id = %request_id,
-        status = status.as_u16(),
-        error = %reason,
-        "Management web request failed"
-    );
-    let mut response = (
-        status,
-        Html(format!(
-            "<!doctype html><meta charset=\"utf-8\"><title>{}</title><p>{}：{}</p>\
-             <p>Request ID: {}</p><p><a href=\"/\">返回</a></p>",
-            title,
-            title,
-            escape_html(&reason),
-            request_id
-        )),
+/// The console page, embedded at compile time so the binary stays
+/// self-contained and the page needs no build step and no CDN.
+const MANAGEMENT_PAGE: &str = include_str!("management_page.html");
+
+/// A standalone error page for a path the console does not know. Unlike the
+/// console itself it is rendered on the server, because it must work even when
+/// the page's script cannot run.
+fn error_page(title: &str, detail: &str, request_id: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>{}</title><style>{}</style></head><body>\
+         <div class=\"wrap\"><section class=\"card\">\
+         <h1>{}</h1><p class=\"reason\">{}</p>\
+         <p class=\"hint\">Request ID: <code>{}</code></p>\
+         <div class=\"actions\"><a class=\"btn\" href=\"/\">返回管理首页</a></div>\
+         </section></div></body></html>",
+        escape_html(title),
+        ERROR_CSS,
+        escape_html(title),
+        escape_html(detail),
+        escape_html(request_id)
     )
-        .into_response();
-    insert_request_id_header(&mut response, &request_id);
-    response
 }
 
-async fn web_put_proxy(
-    State(state): State<Arc<ApiState>>,
-    Form(body): Form<WebProxyForm>,
-) -> Response {
-    match state
-        .management
-        .put_proxy(body.name, body.domain, body.local_addr)
-        .await
-    {
-        Ok(()) => Redirect::to("/").into_response(),
-        Err(e) => web_error("保存失败", e),
-    }
-}
-
-async fn web_delete_proxy(
-    State(state): State<Arc<ApiState>>,
-    Path(name): Path<String>,
-) -> Response {
-    match state.management.delete_proxy(&name).await {
-        Ok(()) => Redirect::to("/").into_response(),
-        Err(e) => web_error("删除失败", e),
-    }
-}
+/// The stylesheet of [`error_page`], in the same visual language as the console.
+const ERROR_CSS: &str = r#"*,*::before,*::after{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;background:#f4f6fb;color:#101828;font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{width:100%;max-width:560px}
+.card{background:#fff;border:1px solid #e4e7ec;border-radius:16px;padding:24px;box-shadow:0 1px 2px rgba(16,24,40,.05),0 12px 28px -18px rgba(16,24,40,.35)}
+h1{margin:0 0 12px;font-size:18px;line-height:1.4}
+.reason{margin:0;padding:12px 14px;border-radius:10px;background:#fef3f2;color:#b42318;font-size:14px;overflow-wrap:anywhere}
+.hint{margin:14px 0 0;color:#667085;font-size:13px}
+.actions{margin-top:18px}
+.btn{display:inline-flex;align-items:center;padding:9px 18px;border:1px solid #e4e7ec;border-radius:10px;background:#fff;color:#101828;font-size:14px;font-weight:600;text-decoration:none}
+.btn:hover{border-color:#4f46e5;color:#4f46e5}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em;padding:1px 6px;border-radius:6px;background:#eef2ff;color:#4f46e5}
+@media (prefers-color-scheme:dark){
+body{background:#0b1020;color:#e6e9f0}
+.card{background:#121a2e;border-color:#232d47}
+.reason{background:#33191a;color:#fda29b}
+.hint{color:#98a2b3}
+.btn{background:#121a2e;border-color:#232d47;color:#e6e9f0}
+.btn:hover{border-color:#a5b4fc;color:#a5b4fc}
+code{background:#1d2750;color:#a5b4fc}
+}"#;
 
 fn escape_html(value: &str) -> String {
     value

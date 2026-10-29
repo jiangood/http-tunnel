@@ -9,9 +9,10 @@ use crate::config::{Config, ConfigSource, ServerProxyEntry};
 use crate::config_env::EnvConfig;
 use crate::server::ServerState;
 use anyhow::{anyhow, bail, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -28,6 +29,8 @@ pub(crate) struct ManagementState {
     name: String,
     server_addr: String,
     transport: String,
+    /// When the management state was created, for the uptime of the console
+    started: Instant,
 }
 
 impl ManagementState {
@@ -69,6 +72,7 @@ impl ManagementState {
             name,
             server_addr,
             transport,
+            started: Instant::now(),
         }
     }
 
@@ -96,6 +100,16 @@ impl ManagementState {
     /// through the API
     pub(crate) fn proxies_managed(&self) -> bool {
         self.env.proxies_managed()
+    }
+
+    /// The configuration file the API writes back to
+    pub(crate) fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
+    /// Seconds since the process started, shown by the management page
+    pub(crate) fn uptime(&self) -> u64 {
+        self.started.elapsed().as_secs()
     }
 
     /// The local services the process is serving, sorted by name

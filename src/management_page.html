@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="ht-token" content="__HT_TOKEN__">
+<title>http-tunnel 管理</title>
+<style>
+*,*::before,*::after{box-sizing:border-box}
+:root{
+  color-scheme:light dark;
+  --bg:#f4f6fb;
+  --bg-glow:radial-gradient(1100px 520px at 50% -12%,#e4e9ff 0%,rgba(244,246,251,0) 62%);
+  --card:#ffffff;
+  --input:#fbfcfe;
+  --fg:#101828;
+  --muted:#667085;
+  --line:#e4e7ec;
+  --thead:#f8fafc;
+  --hover:#f5f7ff;
+  --accent:#4f46e5;
+  --accent-solid:#4f46e5;
+  --accent-soft:#eef2ff;
+  --ring:rgba(79,70,229,.16);
+  --ok:#067647;
+  --ok-soft:#ecfdf3;
+  --bad:#b42318;
+  --bad-soft:#fef3f2;
+  --warn:#92400e;
+  --warn-soft:#fffaeb;
+  --shadow:0 1px 2px rgba(16,24,40,.05),0 12px 28px -18px rgba(16,24,40,.35);
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0b1020;
+    --bg-glow:radial-gradient(1100px 520px at 50% -12%,#1b2650 0%,rgba(11,16,32,0) 62%);
+    --card:#121a2e;
+    --input:#0e1628;
+    --fg:#e6e9f0;
+    --muted:#98a2b3;
+    --line:#232d47;
+    --thead:#16203a;
+    --hover:#1a2440;
+    --accent:#a5b4fc;
+    --accent-soft:#1d2750;
+    --ring:rgba(129,140,248,.28);
+    --ok:#75e0a7;
+    --ok-soft:#0d2a20;
+    --bad:#fda29b;
+    --bad-soft:#33191a;
+    --warn:#fdb022;
+    --warn-soft:#2b2210;
+    --shadow:0 1px 2px rgba(0,0,0,.45),0 16px 36px -22px rgba(0,0,0,.9);
+  }
+}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background-color:var(--bg);background-image:var(--bg-glow);background-repeat:no-repeat;background-attachment:fixed;color:var(--fg);font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1000px;margin:0 auto;padding:40px 20px 64px}
+.top{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+h1{font-size:22px;line-height:1.3;margin:0;letter-spacing:-.01em}
+.sub{margin:4px 0 0;color:var(--muted);font-size:13px}
+.top-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;font-size:13px;font-weight:600;white-space:nowrap;background:var(--ok-soft);color:var(--ok)}
+.pill i{width:8px;height:8px;border-radius:50%;background:currentColor}
+.pill.off{background:var(--bad-soft);color:var(--bad)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px 22px;box-shadow:var(--shadow);margin-bottom:16px}
+.card h2{display:flex;align-items:center;gap:10px;font-size:15px;line-height:1.4;margin:0 0 14px}
+.count{font-size:12px;font-weight:600;color:var(--accent);background:var(--accent-soft);border-radius:999px;padding:1px 9px}
+.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px 22px;padding:18px 22px}
+.meta .k{display:block;font-size:11px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
+.meta .v{display:block;margin-top:3px;font-weight:600;overflow-wrap:anywhere}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px 16px}
+.grid .span2{grid-column:1/-1}
+fieldset{min-width:0;margin:0;padding:12px 14px 14px;border:1px solid var(--line);border-radius:12px;background:var(--input)}
+legend{padding:0 6px;font-size:12px;font-weight:600;letter-spacing:.06em;color:var(--muted)}
+fieldset label{display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:600;color:var(--muted)}
+input{width:100%;padding:9px 12px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);font:inherit;font-weight:400;transition:border-color .15s,box-shadow .15s}
+input::placeholder{color:var(--muted);opacity:.75}
+input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--ring)}
+.actions{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:18px}
+.hint{color:var(--muted);font-size:13px;margin:14px 0 0}
+.btn{display:inline-flex;align-items:center;justify-content:center;padding:9px 18px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);font:inherit;font-size:14px;font-weight:600;text-decoration:none;cursor:pointer;transition:background .15s,border-color .15s,color .15s,transform .05s}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+.btn:active{transform:translateY(1px)}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+.btn.primary{background:var(--accent-solid);border-color:var(--accent-solid);color:#fff}
+.btn.primary:hover{background:#4338ca;border-color:#4338ca;color:#fff}
+.btn.danger{background:var(--bad-soft);border-color:transparent;color:var(--bad)}
+.btn.danger:hover{background:var(--bad);color:var(--card)}
+.btn.small{padding:5px 12px;border-radius:8px;font-size:12px}
+.table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{padding:9px 14px;text-align:left;font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);background:var(--thead);white-space:nowrap}
+td{padding:11px 14px;border-top:1px solid var(--line);vertical-align:middle}
+tbody tr:hover{background:var(--hover)}
+th.right,td.right{text-align:right}
+.strong{font-weight:600}
+.mono{font-family:var(--mono);font-size:13px}
+.muted{color:var(--muted)}
+.tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap;background:var(--accent-soft);color:var(--accent)}
+.tag.local{background:var(--ok-soft);color:var(--ok)}
+.tag.method-get{background:var(--ok-soft);color:var(--ok)}
+.tag.method-put{background:var(--warn-soft);color:var(--warn)}
+.tag.method-post{background:var(--accent-soft);color:var(--accent)}
+.tag.method-delete{background:var(--bad-soft);color:var(--bad)}
+.empty{margin:0;color:var(--muted);font-size:14px}
+.notice{margin:0;padding:12px 14px;border-radius:10px;background:var(--warn-soft);color:var(--warn);font-size:13.5px;line-height:1.7}
+code{font-family:var(--mono);font-size:.9em;padding:1px 6px;border-radius:6px;background:var(--accent-soft);color:var(--accent)}
+.toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);max-width:min(90vw,560px);padding:11px 18px;border-radius:12px;background:#101828;color:#fff;font-size:14px;box-shadow:0 12px 32px -12px rgba(0,0,0,.5);z-index:10}
+.toast.error{background:#b42318}
+footer{margin-top:22px;text-align:center;color:var(--muted);font-size:12px}
+@media (max-width:640px){.wrap{padding:24px 14px 44px}.grid{grid-template-columns:1fr}.card{padding:16px;border-radius:14px}.meta{grid-template-columns:1fr 1fr;padding:16px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>http-tunnel 管理</h1>
+      <p class="sub">本地服务反向隧道控制台</p>
+    </div>
+    <div class="top-actions">
+      <span class="pill off" id="pill"><i></i><span id="pill-text">连接中…</span></span>
+      <button class="btn small" id="refresh" type="button">刷新</button>
+    </div>
+  </header>
+
+  <section class="card meta">
+    <div><span class="k">名称</span><span class="v" id="m-name">—</span></div>
+    <div><span class="k">上游 / 监听</span><span class="v mono" id="m-remote">—</span></div>
+    <div><span class="k">传输</span><span class="v" id="m-transport">—</span></div>
+    <div><span class="k">本地服务</span><span class="v" id="m-proxies">—</span></div>
+    <div><span class="k">路由条目</span><span class="v" id="m-routes">—</span></div>
+    <div><span class="k">服务来源</span><span class="v" id="m-source">—</span></div>
+    <div><span class="k">配置文件</span><span class="v mono" id="m-config">—</span></div>
+    <div><span class="k">版本 / 运行时长</span><span class="v" id="m-version">—</span></div>
+  </section>
+
+  <section class="card">
+    <h2>新增或更新本地服务</h2>
+    <p class="notice" id="read-only" hidden>本地服务由环境变量 <code>HT_PROXIES</code> 管理，网页与 API 不可修改；如需变更，请修改该环境变量并重启 ht。</p>
+    <form id="proxy-form" autocomplete="off">
+      <div class="grid">
+        <fieldset>
+          <legend>基本</legend>
+          <label>名称<input name="name" required pattern="[A-Za-z0-9._\-]+" placeholder="例如 web"></label>
+        </fieldset>
+        <fieldset>
+          <legend>域名</legend>
+          <label>对外域名<input name="domain" required placeholder="例如 app.example.com"></label>
+        </fieldset>
+        <fieldset class="span2">
+          <legend>本地地址</legend>
+          <label>转发目标<input name="local_addr" required placeholder="127.0.0.1:8080 或 unix:///path.sock"></label>
+        </fieldset>
+      </div>
+      <div class="actions">
+        <button class="btn primary" type="submit" id="save">保存</button>
+        <span class="hint">更新已有服务时填写相同名称即可，修改会立即生效并写入 ht.toml。</span>
+      </div>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>本地服务列表<span class="count" id="proxy-count">0</span></h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>名称</th>
+            <th>域名</th>
+            <th>本地地址</th>
+            <th class="right" id="op-head">操作</th>
+          </tr>
+        </thead>
+        <tbody id="proxy-body">
+          <tr><td colspan="4" class="empty">加载中…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>路由表<span class="count" id="route-count">0</span></h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>域名</th>
+            <th>类型</th>
+            <th>名称 / 会话</th>
+            <th>目标 / 节点</th>
+          </tr>
+        </thead>
+        <tbody id="route-body">
+          <tr><td colspan="4" class="empty">加载中…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="hint">本地服务优先于同名 v4 会话；路由表变化时也会写入 info 日志。</p>
+  </section>
+
+  <section class="card">
+    <h2>接口列表</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>方法</th><th>路径</th><th>认证</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/status</td><td class="muted">Bearer</td><td class="muted">进程状态：名称、传输、上游、连通性、服务数、版本、配置文件、运行时长</td></tr>
+          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/proxies</td><td class="muted">Bearer</td><td class="muted">列出本地服务</td></tr>
+          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/routes</td><td class="muted">Bearer</td><td class="muted">生效中的路由表，包含 v4 会话</td></tr>
+          <tr><td><span class="tag method-put">PUT</span></td><td class="mono">/api/proxies/{name}</td><td class="muted">Bearer</td><td class="muted">新增或替换本地服务，请求体 <code>{"domain":"…","local_addr":"…"}</code></td></tr>
+          <tr><td><span class="tag method-delete">DELETE</span></td><td class="mono">/api/proxies/{name}</td><td class="muted">Bearer</td><td class="muted">删除本地服务</td></tr>
+          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/</td><td class="muted">Basic</td><td class="muted">本管理页面（唯一的 Basic 资源，其余接口统一用 Bearer）</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="hint">所有 <code>/api/*</code> 使用 <code>Authorization: Bearer &lt;token&gt;</code>；页面本身使用 HTTP Basic，用户名 <code>ht</code>，密码为 token。错误响应为 <code>{"error":"…","request_id":"…"}</code>。</p>
+  </section>
+
+  <footer>http-tunnel · 单页控制台，内联样式与脚本，无外部依赖</footer>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<script>
+(function () {
+  "use strict";
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  var tokenMeta = document.querySelector('meta[name="ht-token"]');
+  var TOKEN = tokenMeta ? tokenMeta.getAttribute("content") : "";
+
+  var ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+  function esc(value) {
+    if (value === null || value === undefined || value === "") { return "—"; }
+    return String(value).replace(/[&<>"']/g, function (ch) { return ESCAPES[ch]; });
+  }
+
+  var TRANSPORTS = {
+    wss: "WebSocket（TLS）",
+    ws: "WebSocket",
+    ingress: "独立入口（无上游）"
+  };
+
+  var readOnly = false;
+  var toastTimer = null;
+
+  function toast(message, kind) {
+    var box = $("toast");
+    box.textContent = message;
+    box.className = "toast" + (kind === "error" ? " error" : "");
+    box.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { box.hidden = true; }, 3600);
+  }
+
+  function request(path, options) {
+    options = options || {};
+    var headers = {
+      Accept: "application/json",
+      Authorization: "Bearer " + TOKEN
+    };
+    if (options.body) { headers["Content-Type"] = "application/json"; }
+    return fetch(path, {
+      method: options.method || "GET",
+      // The Bearer header above is the only credential the API accepts; `omit`
+      // keeps the browser from attaching its cached Basic login as well.
+      credentials: "omit",
+      headers: headers,
+      body: options.body
+    }).then(function (response) {
+      if (response.status === 401) {
+        throw new Error("登录凭据已失效，请刷新页面重新登录");
+      }
+      if (response.status === 204) { return null; }
+      return response.text().then(function (text) {
+        var data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (error) { data = { error: text }; }
+        if (!response.ok) {
+          throw new Error((data && data.error) || ("HTTP " + response.status));
+        }
+        return data;
+      });
+    });
+  }
+
+  function uptime(seconds) {
+    var total = Number(seconds) || 0;
+    var days = Math.floor(total / 86400);
+    var hours = Math.floor((total % 86400) / 3600);
+    var minutes = Math.floor((total % 3600) / 60);
+    var rest = total % 60;
+    var pad = function (n) { return n < 10 ? "0" + n : String(n); };
+    return (days ? days + " 天 " : "") + pad(hours) + ":" + pad(minutes) + ":" + pad(rest);
+  }
+
+  function renderStatus(status) {
+    readOnly = !!status.proxies_managed;
+    $("m-name").textContent = status.name;
+    $("m-remote").textContent = status.remote;
+    $("m-transport").textContent = TRANSPORTS[status.transport] || status.transport;
+    $("m-proxies").textContent = status.proxies;
+    $("m-source").textContent = readOnly ? "HT_PROXIES（只读）" : "ht.toml（可编辑）";
+    $("m-config").textContent = status.config_path;
+    $("m-version").textContent = "v" + status.version + " · " + uptime(status.uptime_seconds);
+
+    var pill = $("pill");
+    pill.className = "pill " + (status.connected ? "ok" : "off");
+    $("pill-text").textContent = status.connected ? "已连接" : "未连接";
+
+    $("read-only").hidden = !readOnly;
+    $("proxy-form").hidden = readOnly;
+    $("op-head").hidden = readOnly;
+  }
+
+  function renderProxies(proxies) {
+    $("proxy-count").textContent = proxies.length;
+    var body = $("proxy-body");
+    if (!proxies.length) {
+      body.innerHTML = '<tr><td colspan="' + (readOnly ? 3 : 4) + '" class="empty">还没有本地服务。</td></tr>';
+      return;
+    }
+    body.innerHTML = proxies.map(function (proxy) {
+      var action = readOnly ? "" :
+        '<td class="right"><button class="btn danger small" type="button" data-delete="' + esc(proxy.name) + '">删除</button></td>';
+      return "<tr>" +
+        '<td class="strong">' + esc(proxy.name) + "</td>" +
+        '<td class="mono">' + esc(proxy.domain) + "</td>" +
+        '<td class="mono muted">' + esc(proxy.local_addr) + "</td>" +
+        action +
+        "</tr>";
+    }).join("");
+  }
+
+  function renderRoutes(routes) {
+    $("route-count").textContent = routes.length;
+    $("m-routes").textContent = routes.length;
+    var body = $("route-body");
+    if (!routes.length) {
+      body.innerHTML = '<tr><td colspan="4" class="empty">路由表为空：还没有本地服务，也没有 v4 会话声明域名。</td></tr>';
+      return;
+    }
+    body.innerHTML = routes.map(function (route) {
+      var local = route.owner === "local";
+      var tag = local ? '<span class="tag local">本地</span>' : '<span class="tag">v4 会话</span>';
+      var owner = local ? esc(route.name) : (route.session_id === null || route.session_id === undefined ? "—" : "#" + esc(route.session_id));
+      var target = local ? esc(route.target) : esc(route.node);
+      return "<tr>" +
+        '<td class="mono strong">' + esc(route.domain) + "</td>" +
+        "<td>" + tag + "</td>" +
+        '<td class="mono">' + owner + "</td>" +
+        '<td class="mono muted">' + target + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+
+  function loadAll(silent) {
+    return Promise.all([
+      request("/api/status"),
+      request("/api/proxies"),
+      request("/api/routes")
+    ]).then(function (results) {
+      renderStatus(results[0]);
+      renderProxies(results[1]);
+      renderRoutes(results[2]);
+    }).catch(function (error) {
+      if (!silent) { toast(error.message, "error"); }
+    });
+  }
+
+  $("refresh").addEventListener("click", function () { loadAll(false); });
+
+  $("proxy-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    var form = event.currentTarget;
+    var fields = new FormData(form);
+    var name = String(fields.get("name") || "").trim();
+    var domain = String(fields.get("domain") || "").trim();
+    var localAddr = String(fields.get("local_addr") || "").trim();
+    if (!name || !domain || !localAddr) { return; }
+
+    var button = $("save");
+    button.disabled = true;
+    request("/api/proxies/" + encodeURIComponent(name), {
+      method: "PUT",
+      body: JSON.stringify({ domain: domain, local_addr: localAddr })
+    }).then(function () {
+      toast("已保存 " + name);
+      form.reset();
+      return loadAll(true);
+    }).catch(function (error) {
+      toast(error.message, "error");
+    }).then(function () {
+      button.disabled = false;
+    });
+  });
+
+  $("proxy-body").addEventListener("click", function (event) {
+    var button = event.target.closest("[data-delete]");
+    if (!button) { return; }
+    var name = button.getAttribute("data-delete");
+    if (!window.confirm("删除本地服务 " + name + "？")) { return; }
+    button.disabled = true;
+    request("/api/proxies/" + encodeURIComponent(name), { method: "DELETE" })
+      .then(function () {
+        toast("已删除 " + name);
+        return loadAll(true);
+      })
+      .catch(function (error) {
+        toast(error.message, "error");
+        button.disabled = false;
+      });
+  });
+
+  loadAll(false);
+  setInterval(function () {
+    if (!document.hidden) { loadAll(true); }
+  }, 10000);
+})();
+</script>
+</body>
+</html>
