@@ -166,13 +166,6 @@ pub(crate) fn response_with_headers(status: &str, headers: &[(&str, &str)], body
     response.into_bytes()
 }
 
-/// The `401` sent when a tunnel sets `auth_header` and the visitor does not
-/// present the expected `X-HTTP-TUNNEL-TOKEN`. It carries no `WWW-Authenticate`:
-/// that header describes an `Authorization` scheme, which this is not.
-pub(crate) fn unauthorized_response(failure: AuthFailure) -> Vec<u8> {
-    response_with_headers("401 Unauthorized", &[], failure.message())
-}
-
 /// Compare two byte strings without an early exit, so that the comparison time
 /// does not reveal how many leading bytes of the secret matched.
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

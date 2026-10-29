@@ -217,8 +217,15 @@ async fn run_once(
                 match frame {
                     Ok(frame) => match frame {
                         SessionFrame::OpenStream { stream_id, domain, header, trace_id, .. } => {
+                            let request_id = request_id_from_trace_id(&trace_id);
                             let target = lookup_target(&args.routes.borrow(), &domain);
                             let Some(target) = target else {
+                                warn!(
+                                    request_id = %request_id,
+                                    stream_id,
+                                    host = %domain,
+                                    "No local route matches the streamed visitor; resetting the stream"
+                                );
                                 let _ = out_tx.send(SessionFrame::StreamReset {
                                     stream_id,
                                     reason: p4::StreamError::ConnectFailed,
@@ -226,6 +233,12 @@ async fn run_once(
                                 continue;
                             };
                             if streams.len() >= p4::MAX_STREAMS_PER_SESSION {
+                                warn!(
+                                    request_id = %request_id,
+                                    stream_id,
+                                    limit = p4::MAX_STREAMS_PER_SESSION,
+                                    "The v4 stream limit of the next hop is reached; resetting the stream"
+                                );
                                 let _ = out_tx.send(SessionFrame::StreamReset {
                                     stream_id,
                                     reason: p4::StreamError::Protocol,
@@ -238,9 +251,9 @@ async fn run_once(
                             let closed = closed_tx.clone();
                             tokio::spawn(run_client_stream(
                                 stream_id,
+                                request_id,
                                 target,
                                 header,
-                                trace_id,
                                 input_rx,
                                 out,
                                 closed,
@@ -321,6 +334,19 @@ async fn run_once(
     result
 }
 
+/// Render the `trace_id` of an incoming stream as a log correlation id. New
+/// peers send the visitor's ASCII request id; an older peer may send arbitrary
+/// bytes, which are hex-encoded instead of being mangled.
+fn request_id_from_trace_id(trace_id: &[u8]) -> String {
+    match std::str::from_utf8(trace_id) {
+        Ok(id) if !id.is_empty() => id.to_string(),
+        _ => trace_id
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect(),
+    }
+}
+
 /// Find the target of a stream, preferring an exact route and then the longest
 /// wildcard suffix. A node advertises `*.relay.example.com` and receives streams
 /// for the concrete domains below it.
@@ -397,9 +423,9 @@ async fn handshake(conn: &mut BoxedIo, args: &SessionArgs) -> Result<()> {
 
 async fn run_client_stream(
     stream_id: u32,
+    request_id: String,
     target: RouteTarget,
     header: Vec<u8>,
-    _trace_id: Vec<u8>,
     mut input_rx: mpsc::UnboundedReceiver<StreamInput>,
     out_tx: mpsc::Sender<SessionFrame>,
     closed_tx: mpsc::UnboundedSender<u32>,
@@ -407,7 +433,14 @@ async fn run_client_stream(
     let request = match crate::helper::gate_auth_header(&header, target.auth_header.as_deref()) {
         crate::helper::AuthOutcome::Allowed(request) => request,
         crate::helper::AuthOutcome::Unauthorized(failure) => {
-            let response = crate::http::unauthorized_response(failure);
+            warn!(
+                request_id = %request_id,
+                stream_id,
+                target = %target.local_addr,
+                reason = ?failure,
+                "Rejected an unauthenticated streamed visitor; answered 401"
+            );
+            let response = crate::http::unauthorized_response(failure, &request_id);
             let _ = out_tx
                 .send(SessionFrame::StreamData {
                     stream_id,
@@ -423,9 +456,12 @@ async fn run_client_stream(
     let local = match crate::helper::connect_local(&target.local_addr).await {
         Ok(local) => local,
         Err(err) => {
-            debug!(
-                "v4 stream {} could not reach {}: {:#}",
-                stream_id, target.local_addr, err
+            warn!(
+                request_id = %request_id,
+                stream_id,
+                target = %target.local_addr,
+                "The v4 stream could not reach its local service: {:#}",
+                err
             );
             let _ = out_tx
                 .send(SessionFrame::StreamReset {
@@ -440,9 +476,12 @@ async fn run_client_stream(
 
     let (mut reader, mut writer) = split(local);
     if let Err(err) = writer.write_all(&request).await {
-        debug!(
-            "v4 stream {} failed to write the request: {:#}",
-            stream_id, err
+        warn!(
+            request_id = %request_id,
+            stream_id,
+            target = %target.local_addr,
+            "The v4 stream failed to write the request to its local service: {:#}",
+            err
         );
         let _ = out_tx
             .send(SessionFrame::StreamReset {
@@ -485,7 +524,12 @@ async fn run_client_stream(
                         }
                     }
                     Err(err) => {
-                        debug!("v4 stream {} local read failed: {:#}", stream_id, err);
+                        debug!(
+                            request_id = %request_id,
+                            stream_id,
+                            "v4 stream local read failed: {:#}",
+                            err
+                        );
                         let _ = out_tx.send(SessionFrame::StreamReset {
                             stream_id,
                             reason: p4::StreamError::Io,

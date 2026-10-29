@@ -2,6 +2,7 @@ use crate::config::ServerProxyEntry;
 use crate::helper::normalize_domain;
 use crate::server::ServerState;
 use anyhow::Result;
+use rand::RngCore;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +18,20 @@ const MAX_HEADER_SIZE: usize = 8 * 1024;
 const HEADER_READ_TIMEOUT: u64 = 5;
 /// Timeout for a v4 session to open a stream for a visitor
 const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+/// The header `ht` puts on every response it generates itself, so that an
+/// operator can tell its errors apart from those of a front proxy or of a
+/// local service.
+pub(crate) const REQUEST_ID_HEADER: &str = "x-http-tunnel-request-id";
+
+/// A short random id that follows one visitor request through the process, the
+/// logs, the response and every downstream v4 hop. It is not a secret; it only
+/// exists to correlate the page a visitor sees with the log line that explains
+/// it.
+pub(crate) fn new_request_id() -> String {
+    let mut id = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut id);
+    id.iter().map(|byte| format!("{:02x}", byte)).collect()
+}
 
 fn find_proxy<'a>(proxies: &'a [ServerProxyEntry], host: &str) -> Option<&'a ServerProxyEntry> {
     let mut wildcard: Option<(&ServerProxyEntry, usize)> = None;
@@ -98,6 +113,7 @@ async fn handle_visitor(
     // Count the visitor as active from the moment it's accepted, so that a
     // shutdown can wait for it instead of cutting it off.
     let activity = state.activity.guard();
+    let request_id = new_request_id();
 
     let (prefetched, host) = match time::timeout(
         Duration::from_secs(HEADER_READ_TIMEOUT),
@@ -107,19 +123,30 @@ async fn handle_visitor(
     {
         Err(_) => {
             // E3: a timed out header is its own case, not a generic parse failure
-            debug!("Timed out reading the HTTP header of {}", addr);
-            respond(
+            info!(
+                request_id = %request_id,
+                peer = %addr,
+                "Timed out reading the HTTP header; answered 408"
+            );
+            respond_error(
                 &mut stream,
+                &request_id,
                 "408 Request Timeout",
-                "Timed out reading the HTTP header\n",
+                "Timed out reading the HTTP header",
             )
             .await;
             return Ok(());
         }
         Ok(Err(e)) => {
             // E3: the error carries the reason, log it as-is
-            debug!("Bad HTTP header from {}: {}", addr, e.message);
-            respond(&mut stream, e.status, &format!("{}\n", e.message)).await;
+            info!(
+                request_id = %request_id,
+                peer = %addr,
+                status = %e.status,
+                reason = %e.message,
+                "Rejected a malformed HTTP request"
+            );
+            respond_error(&mut stream, &request_id, e.status, &e.message).await;
             return Ok(());
         }
         Ok(Ok(header)) => header,
@@ -132,7 +159,7 @@ async fn handle_visitor(
         let path = parse_request_path(&prefetched).unwrap_or_default();
         if path == crate::protocol_v4::V4_PATH {
             let Some((conn, _pending_permit)) =
-                accept_tunnel_websocket(prefetched, stream, &state, addr).await?
+                accept_tunnel_websocket(prefetched, stream, &state, addr, &request_id).await?
             else {
                 return Ok(());
             };
@@ -156,12 +183,29 @@ async fn handle_visitor(
             )
             .await
             {
-                debug!("Management connection closed: {:#}", e);
+                debug!(
+                    request_id = %request_id,
+                    "Management connection closed: {:#}",
+                    e
+                );
             }
             return Ok(());
         }
 
-        respond(&mut stream, "404 Not Found", "Unknown session endpoint\n").await;
+        warn!(
+            request_id = %request_id,
+            peer = %addr,
+            host = %host,
+            path = %path,
+            "No session endpoint or management path on the control host; answered 404"
+        );
+        respond_error(
+            &mut stream,
+            &request_id,
+            "404 Not Found",
+            &format!("No such endpoint on the control host: {}", path),
+        )
+        .await;
         return Ok(());
     }
 
@@ -173,18 +217,32 @@ async fn handle_visitor(
             match crate::helper::gate_auth_header(&prefetched, proxy.auth_header.as_deref()) {
                 crate::helper::AuthOutcome::Allowed(request) => request,
                 crate::helper::AuthOutcome::Unauthorized(failure) => {
-                    debug!(
-                        "Rejected an unauthenticated visitor {} for host {}: {:?}",
-                        addr, host, failure
+                    info!(
+                        request_id = %request_id,
+                        peer = %addr,
+                        host = %host,
+                        service = %proxy.name,
+                        reason = ?failure,
+                        "Rejected an unauthenticated visitor; answered 401"
                     );
-                    respond_unauthorized(&mut stream, failure).await;
+                    respond_error(
+                        &mut stream,
+                        &request_id,
+                        "401 Unauthorized",
+                        failure.message(),
+                    )
+                    .await;
                     drop(activity);
                     return Ok(());
                 }
             };
         debug!(
-            "Proxying visitor {} for host {} to {}",
-            addr, host, proxy.local_addr
+            request_id = %request_id,
+            peer = %addr,
+            host = %host,
+            service = %proxy.name,
+            target = %proxy.local_addr,
+            "Proxying a visitor to a local service"
         );
         match crate::helper::connect_local(&proxy.local_addr).await {
             Ok(mut upstream) => {
@@ -193,13 +251,19 @@ async fn handle_visitor(
             }
             Err(e) => {
                 warn!(
-                    "Failed to connect server-side proxy {} to {}: {}",
-                    host, proxy.local_addr, e
+                    request_id = %request_id,
+                    peer = %addr,
+                    host = %host,
+                    service = %proxy.name,
+                    target = %proxy.local_addr,
+                    "Failed to connect the visitor to the local service: {:#}",
+                    e
                 );
-                respond(
+                respond_error(
                     &mut stream,
+                    &request_id,
                     "502 Bad Gateway",
-                    "The server-side proxy target is unavailable\n",
+                    "The local service of this host is unavailable",
                 )
                 .await;
             }
@@ -210,21 +274,38 @@ async fn handle_visitor(
 
     // A v4 session multiplexes every visitor of a peer over one connection.
     if let Some(handle) = crate::session_server::lookup(&state, &host).await {
-        match handle.open(&host, prefetched, STREAM_OPEN_TIMEOUT).await {
+        match handle
+            .open(&host, prefetched, STREAM_OPEN_TIMEOUT, &request_id)
+            .await
+        {
             Ok(io) => {
-                debug!("Routing visitor {} to a v4 stream for `{}`", addr, host);
+                debug!(
+                    request_id = %request_id,
+                    peer = %addr,
+                    host = %host,
+                    session_id = handle.session_id,
+                    "Routing a visitor to a v4 stream"
+                );
                 tokio::spawn(async move {
                     let _activity = activity;
-                    crate::server::relay(io, stream).await;
+                    crate::server::relay(io, stream, request_id).await;
                 });
                 return Ok(());
             }
             Err(e) => {
-                debug!("Failed to open a v4 stream for `{}`: {:#}", host, e);
-                respond(
+                warn!(
+                    request_id = %request_id,
+                    peer = %addr,
+                    host = %host,
+                    session_id = handle.session_id,
+                    "Failed to open a v4 stream: {:#}",
+                    e
+                );
+                respond_error(
                     &mut stream,
+                    &request_id,
                     "502 Bad Gateway",
-                    "The tunnel is not available\n",
+                    "The tunnel for this host is not available",
                 )
                 .await;
                 return Ok(());
@@ -232,8 +313,19 @@ async fn handle_visitor(
         }
     }
 
-    debug!("No tunnel for the host `{}`", host);
-    respond(&mut stream, "404 Not Found", "No tunnel for this host\n").await;
+    info!(
+        request_id = %request_id,
+        peer = %addr,
+        host = %host,
+        "No route matches the host; answered 404"
+    );
+    respond_error(
+        &mut stream,
+        &request_id,
+        "404 Not Found",
+        &format!("No tunnel for this host: {}", host),
+    )
+    .await;
     Ok(())
 }
 
@@ -245,16 +337,44 @@ async fn accept_tunnel_websocket(
     mut stream: TcpStream,
     state: &Arc<ServerState>,
     addr: SocketAddr,
+    request_id: &str,
 ) -> Result<Option<(crate::transport::Conn, tokio::sync::OwnedSemaphorePermit)>> {
     if !is_websocket_upgrade(&prefetched) {
-        respond_upgrade_required(&mut stream).await;
+        warn!(
+            request_id = %request_id,
+            peer = %addr,
+            "A tunnel request reached the session endpoint without a WebSocket upgrade; answered 426"
+        );
+        respond_with(
+            &mut stream,
+            &error_response_with_headers(
+                request_id,
+                "426 Upgrade Required",
+                &[("Upgrade", "websocket")],
+                "WebSocket upgrade required",
+            ),
+        )
+        .await;
         return Ok(None);
     }
     match parse_bearer_token(&prefetched) {
         Some(token) if crate::helper::constant_time_eq(token, state.token.as_bytes()) => {}
         None | Some(_) => {
-            debug!("Rejected an unauthenticated tunnel upgrade from {}", addr);
-            respond_unauthorized_bearer(&mut stream).await;
+            warn!(
+                request_id = %request_id,
+                peer = %addr,
+                "Rejected an unauthenticated tunnel upgrade; answered 401"
+            );
+            respond_with(
+                &mut stream,
+                &error_response_with_headers(
+                    request_id,
+                    "401 Unauthorized",
+                    &[("WWW-Authenticate", "Bearer")],
+                    "Missing or invalid Authorization header",
+                ),
+            )
+            .await;
             return Ok(None);
         }
     }
@@ -264,10 +384,17 @@ async fn accept_tunnel_websocket(
     let pending_permit = match state.pending_connections.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            respond(
+            warn!(
+                request_id = %request_id,
+                peer = %addr,
+                limit = state.limits.max_pending_handshakes,
+                "The WebSocket handshake limit is reached; answered 503"
+            );
+            respond_error(
                 &mut stream,
+                request_id,
                 "503 Service Unavailable",
-                "WebSocket handshake limit reached\n",
+                "WebSocket handshake limit reached",
             )
             .await;
             return Ok(None);
@@ -498,61 +625,57 @@ fn normalize_domain_bytes(raw: &[u8]) -> Option<String> {
     std::str::from_utf8(raw).ok().and_then(normalize_domain)
 }
 
+/// Build the plain-text response of an error that `ht` generates itself, as
+/// opposed to a response forwarded from a local service. The request id appears
+/// both in a header and in the body, so that the operator can find the matching
+/// log line from the page or from `curl -i` alone.
+pub(crate) fn error_response(request_id: &str, status: &str, reason: &str) -> Vec<u8> {
+    error_response_with_headers(request_id, status, &[], reason)
+}
+
+/// Like [`error_response`], with extra headers in front of the standard ones.
+fn error_response_with_headers(
+    request_id: &str,
+    status: &str,
+    headers: &[(&str, &str)],
+    reason: &str,
+) -> Vec<u8> {
+    let body = format!(
+        "{}\nRequest ID: {}\n",
+        reason.trim_end_matches('\n'),
+        request_id
+    );
+    let mut all_headers = Vec::with_capacity(headers.len() + 1);
+    all_headers.extend_from_slice(headers);
+    all_headers.push((REQUEST_ID_HEADER, request_id));
+    response_with_headers(status, &all_headers, &body)
+}
+
 /// The `401` sent when a tunnel sets `auth_header` and the visitor does not
 /// present the expected `X-HTTP-TUNNEL-TOKEN`. It carries no `WWW-Authenticate`:
 /// that header describes an `Authorization` scheme, which this is not.
-pub(crate) fn unauthorized_response(failure: crate::helper::AuthFailure) -> Vec<u8> {
-    crate::helper::unauthorized_response(failure)
-}
-
-/// Answer a visitor with a `401`, see [`unauthorized_response`].
-pub(crate) async fn respond_unauthorized(
-    stream: &mut TcpStream,
+pub(crate) fn unauthorized_response(
     failure: crate::helper::AuthFailure,
-) {
-    let _ = stream.write_all(&unauthorized_response(failure)).await;
-    let _ = stream.flush().await;
+    request_id: &str,
+) -> Vec<u8> {
+    error_response(request_id, "401 Unauthorized", failure.message())
 }
 
-/// Build a plain-text HTTP response that closes the connection. It's shared with
-/// the server, which writes a `504` from a stream wrapper when a tunnel closes
-/// without sending anything back.
-pub(crate) fn response(status: &str, body: &str) -> Vec<u8> {
-    crate::helper::response_with_headers(status, &[], body)
-}
-
-/// Like [`response`], with extra headers in front of the standard ones.
+/// Like [`response_with_headers`], with the standard plain-text headers of a
+/// response that closes the connection.
 fn response_with_headers(status: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
     crate::helper::response_with_headers(status, headers, body)
 }
 
-async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
-    let _ = stream.write_all(&response(status, body)).await;
+/// Answer a stream with an already built response and close it.
+async fn respond_with(stream: &mut TcpStream, response: &[u8]) {
+    let _ = stream.write_all(response).await;
     let _ = stream.flush().await;
 }
 
-/// The `401` sent when a tunnel upgrade does not carry the shared token.
-async fn respond_unauthorized_bearer(stream: &mut TcpStream) {
-    let response = response_with_headers(
-        "401 Unauthorized",
-        &[("WWW-Authenticate", "Bearer")],
-        "Missing or invalid Authorization header\n",
-    );
-    let _ = stream.write_all(&response).await;
-    let _ = stream.flush().await;
-}
-
-/// The `426` sent when the server host is reached without a WebSocket upgrade.
-/// RFC 7231 §6.5.15 requires the response to list the acceptable protocols in
-/// an `Upgrade` header.
-async fn respond_upgrade_required(stream: &mut TcpStream) {
-    let response = response_with_headers(
-        "426 Upgrade Required",
-        &[("Upgrade", "websocket")],
-        "WebSocket upgrade required\n",
-    );
-    let _ = stream.write_all(&response).await;
-    let _ = stream.flush().await;
+/// Answer a visitor with an error generated by `ht`.
+async fn respond_error(stream: &mut TcpStream, request_id: &str, status: &str, reason: &str) {
+    respond_with(stream, &error_response(request_id, status, reason)).await;
 }
 
 #[cfg(test)]
@@ -580,10 +703,11 @@ mod tests {
 
     #[test]
     fn test_upgrade_required_response_lists_websocket() {
-        let response = response_with_headers(
+        let response = error_response_with_headers(
+            "0123456789abcdef",
             "426 Upgrade Required",
             &[("Upgrade", "websocket")],
-            "WebSocket upgrade required\n",
+            "WebSocket upgrade required",
         );
         let response = String::from_utf8(response).unwrap();
         assert!(response.starts_with("HTTP/1.1 426 Upgrade Required\r\n"));
@@ -593,6 +717,41 @@ mod tests {
             "{}",
             response
         );
+        assert!(
+            response.contains("\r\nx-http-tunnel-request-id: 0123456789abcdef\r\n"),
+            "{}",
+            response
+        );
+    }
+
+    #[test]
+    fn test_error_response_names_the_request_id() {
+        let response = error_response(
+            "0123456789abcdef",
+            "404 Not Found",
+            "No tunnel for this host: missing.test\n",
+        );
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(
+            response.contains("\r\nx-http-tunnel-request-id: 0123456789abcdef\r\n"),
+            "{}",
+            response
+        );
+        assert!(
+            response
+                .contains("No tunnel for this host: missing.test\nRequest ID: 0123456789abcdef\n"),
+            "{}",
+            response
+        );
+    }
+
+    #[test]
+    fn test_request_id_is_short_hex() {
+        let id = new_request_id();
+        assert_eq!(id.len(), 16);
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(id, new_request_id());
     }
 
     #[test]

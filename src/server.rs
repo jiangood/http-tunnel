@@ -220,7 +220,7 @@ impl Server {
 ///
 /// If the stream closes without sending a single byte back, the visitor is
 /// answered with a `504` instead of being left with an empty reply.
-pub(crate) async fn relay<T>(channel: T, stream: TcpStream)
+pub(crate) async fn relay<T>(channel: T, stream: TcpStream, request_id: String)
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -261,14 +261,16 @@ where
         }
         if sent == 0
             && v_wr
-                .write_all(&crate::http::response(
+                .write_all(&crate::http::error_response(
+                    &request_id,
                     "504 Gateway Timeout",
-                    "The tunnel closed without responding\n",
+                    "The tunnel closed without responding",
                 ))
                 .await
                 .is_ok()
         {
             warn!(
+                request_id = %request_id,
                 "The tunnel closed its stream without sending a response; \
                  answered the visitor with 504"
             );

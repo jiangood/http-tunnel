@@ -30,6 +30,7 @@ enum SessionCommand {
     Open {
         domain: String,
         header: Vec<u8>,
+        request_id: String,
         reply: oneshot::Sender<Result<DuplexStream>>,
     },
 }
@@ -48,12 +49,14 @@ impl V4SessionHandle {
         domain: &str,
         header: Vec<u8>,
         timeout: Duration,
+        request_id: &str,
     ) -> Result<DuplexStream> {
         let (reply, reply_rx) = oneshot::channel();
         self.tx
             .send(SessionCommand::Open {
                 domain: domain.to_string(),
                 header,
+                request_id: request_id.to_string(),
                 reply,
             })
             .await
@@ -241,7 +244,7 @@ async fn run_session(
                 }
             }
             command = open_rx.recv() => {
-                let Some(SessionCommand::Open { domain, header, reply }) = command else {
+                let Some(SessionCommand::Open { domain, header, request_id, reply }) = command else {
                     break;
                 };
                 if streams.len() >= p4::MAX_STREAMS_PER_SESSION {
@@ -253,8 +256,7 @@ async fn run_session(
                 let (visitor_io, tunnel_io) = tokio::io::duplex(STREAM_BUFFER);
                 let (input_tx, input_rx) = mpsc::unbounded_channel();
                 streams.insert(stream_id, input_tx);
-                let mut trace_id = vec![0u8; 16];
-                rand::thread_rng().fill_bytes(&mut trace_id);
+                let trace_id = request_id.as_bytes().to_vec();
                 if out_tx.send(SessionFrame::OpenStream {
                     stream_id,
                     domain: domain.clone(),
@@ -266,10 +268,18 @@ async fn run_session(
                     let _ = reply.send(Err(anyhow!("The v4 session is gone")));
                     continue;
                 }
+                debug!(
+                    request_id = %request_id,
+                    session_id,
+                    stream_id,
+                    host = %domain,
+                    "Opening a v4 stream"
+                );
                 let out_tx_stream = out_tx.clone();
                 let closed_tx_stream = closed_tx.clone();
                 tokio::spawn(run_server_stream(
                     stream_id,
+                    request_id,
                     tunnel_io,
                     input_rx,
                     out_tx_stream,
@@ -417,6 +427,7 @@ pub(crate) async fn lookup(state: &ServerState, host: &str) -> Option<V4SessionH
 
 async fn run_server_stream(
     stream_id: u32,
+    request_id: String,
     tunnel: DuplexStream,
     mut input_rx: mpsc::UnboundedReceiver<StreamInput>,
     out_tx: mpsc::Sender<SessionFrame>,
@@ -455,7 +466,12 @@ async fn run_server_stream(
                         }
                     }
                     Err(err) => {
-                        debug!("v4 stream {} read failed: {:#}", stream_id, err);
+                        debug!(
+                            request_id = %request_id,
+                            stream_id,
+                            "v4 stream read failed: {:#}",
+                            err
+                        );
                         let _ = out_tx.send(SessionFrame::StreamReset {
                             stream_id,
                             reason: p4::StreamError::Io,
@@ -487,20 +503,32 @@ async fn run_server_stream(
                     }
                     Some(StreamInput::Reset(reason)) => {
                         if !sent_to_visitor {
-                            let response = match reason {
-                                p4::StreamError::ConnectFailed => crate::http::response(
+                            let (status, message) = match reason {
+                                p4::StreamError::ConnectFailed => (
                                     "502 Bad Gateway",
-                                    "The tunnel could not reach its local service\n",
+                                    "The tunnel could not reach its local service",
                                 ),
-                                p4::StreamError::Timeout => crate::http::response(
+                                p4::StreamError::Timeout => (
                                     "504 Gateway Timeout",
-                                    "The tunnel did not answer in time\n",
+                                    "The tunnel did not answer in time",
                                 ),
-                                _ => crate::http::response(
+                                _ => (
                                     "503 Service Unavailable",
-                                    "The tunnel is not available\n",
+                                    "The tunnel is not available",
                                 ),
                             };
+                            warn!(
+                                request_id = %request_id,
+                                stream_id,
+                                reason = ?reason,
+                                status = %status,
+                                "The downstream v4 hop reset the stream before answering"
+                            );
+                            let response = crate::http::error_response(
+                                &request_id,
+                                status,
+                                message,
+                            );
                             let _ = writer.write_all(&response).await;
                             let _ = writer.shutdown().await;
                         }
@@ -516,5 +544,5 @@ async fn run_server_stream(
     }
 
     let _ = closed_tx.send(stream_id);
-    debug!("v4 stream {} finished", stream_id);
+    debug!(request_id = %request_id, stream_id, "v4 stream finished");
 }

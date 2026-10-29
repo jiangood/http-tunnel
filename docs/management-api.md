@@ -45,6 +45,21 @@ A change is validated locally, written atomically to `ht.toml`, applied to the
 running server's proxy list, and published on the route watch. An upstream
 session therefore mirrors or withdraws the route immediately, without a restart.
 
+## Errors
+
+API failures are JSON: `{"error":"...","request_id":"..."}`. A path the router
+does not know is a `404` that names the method and path, and carries the same
+request id in the body and in the `x-http-tunnel-request-id` header:
+
+```json
+{"error":"No such management API endpoint: GET /api/nope","request_id":"0123456789abcdef"}
+```
+
+An unknown path outside `/api` is answered with an HTML page that names the path
+and the request id. Both are logged at `warn` with the same id, so a typo, a
+stale bookmark, or a request that never reached `ht` can be told apart by the
+presence of `x-http-tunnel-request-id`.
+
 ## Environment-managed proxies
 
 If `HT_PROXIES` is set, the local services come from the environment and are

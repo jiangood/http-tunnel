@@ -305,6 +305,24 @@ async fn http_404_check(addr: &'static str, host: &'static str) -> Result<()> {
         "unexpected response: {}",
         text
     );
+    // The error names the host and a request id, so that the operator can find
+    // the matching log line. A response without them did not come from ht.
+    assert!(
+        text.contains("No tunnel for this host:"),
+        "unexpected response: {}",
+        text
+    );
+    assert!(
+        text.to_ascii_lowercase()
+            .contains("\r\nx-http-tunnel-request-id: "),
+        "the 404 should carry a request id: {}",
+        text
+    );
+    assert!(
+        text.contains("Request ID: "),
+        "the 404 body should carry a request id: {}",
+        text
+    );
 
     Ok(())
 }
@@ -705,6 +723,27 @@ async fn management_api_manages_proxies() -> Result<()> {
     )
     .await?;
     assert_eq!(status, 404, "unexpected response: {}", body);
+
+    info!("an unknown management path names the path and a request id");
+    let (status, body) = api_request(
+        MANAGEMENT_ADDR,
+        "GET",
+        "/api/no-such-endpoint",
+        Some(MANAGEMENT_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 404, "unexpected response: {}", body);
+    assert!(
+        body.contains("No such management API endpoint: GET /api/no-such-endpoint"),
+        "unexpected body: {}",
+        body
+    );
+    assert!(
+        body.contains("\"request_id\":"),
+        "the fallback should carry a request id: {}",
+        body
+    );
 
     info!("shutdown the server and the client");
     server_shutdown_tx.send(true)?;

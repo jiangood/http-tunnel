@@ -313,6 +313,42 @@ keepalive_interval = 15
 
 修改会立即更新运行中的代理列表和路由 watch，并写回 `ht.toml`。详见 [docs/management-api.md](./docs/management-api.md)。
 
+## 错误响应与排查
+
+`ht` 自己生成的错误响应都是纯文本，并带有同一个请求 ID：
+
+- 响应头 `x-http-tunnel-request-id: 0123456789abcdef`
+- 响应体最后一行 `Request ID: 0123456789abcdef`
+- 日志里同名字段 `request_id=0123456789abcdef`
+
+因此浏览器里看到错误时，可以直接用响应体或 `curl -i` 里的 ID 搜索日志：
+
+```sh
+curl -i -H "Host: app.example.com" http://127.0.0.1:7777/
+docker logs ht 2>&1 | grep 0123456789abcdef
+```
+
+| 状态 | 含义 |
+| --- | --- |
+| `400` / `408` / `431` | 访客请求头无法解析、读取超时或过大 |
+| `401` | 本地服务配置了 `auth_header`，但访客缺少或带错 `X-HTTP-TUNNEL-TOKEN` |
+| `404` | 没有任何路由匹配该 `Host`，或 `control_host` 上的路径不存在 |
+| `502` | 匹配到了本地服务或 v4 隧道，但连接/打开流失败 |
+| `503` | 隧道暂不可用（例如流或会话达到上限） |
+| `504` | 隧道在超时前没有返回任何响应 |
+
+管理 API 的错误是 JSON：`{"error":"...","request_id":"..."}`；未知的 `/api/*` 路径还会在 `error` 中写明方法和路径。**`ht` 不会返回 `{"message":"page not found"}`**：如果看到这种响应，且响应头里没有 `x-http-tunnel-request-id`，说明它来自前置反向代理、CDN、托管平台或本地服务，而不是 `ht`。
+
+默认日志级别是 `info`，只记录路由失败（`404`/`502`/`504` 等）和会话事件。要看每个访客的路由决策（匹配到哪个服务、转发到哪个地址、v4 流的开启与结束），用 `RUST_LOG` 提高级别，无需重新编译：
+
+```sh
+RUST_LOG=debug ./ht -c ht.toml          # 全部 debug
+RUST_LOG=http_tunnel=debug ./ht -c ht.toml  # 只开 ht 自己的 debug
+docker run ... -e RUST_LOG=debug ghcr.io/jiangood/ht:latest
+```
+
+多跳时，同一个 `request_id` 会写进 v4 `OpenStream` 的 `trace_id`，所以中继和叶子节点的日志可以用同一个 ID 关联（每一跳的嵌入式服务会重新生成 ID，按 Host 和时间即可对上）。
+
 ## Docker
 
 只发布一个通用镜像，入口、中继和叶子都用它：配置了 `[upstream]` 就向上游注册，没有就只做入口。

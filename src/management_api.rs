@@ -5,7 +5,7 @@ use crate::management::ManagementState;
 use anyhow::{Context, Result};
 use axum::extract::{Form, Path, State};
 use axum::http::header::AUTHORIZATION;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post, put};
@@ -69,14 +69,62 @@ fn build_router(token: String, management: Arc<ManagementState>) -> Router {
         .route("/web/proxies/:name/delete", post(web_delete_proxy))
         .route_layer(middleware::from_fn_with_state(token, web_auth));
 
-    Router::new().nest("/api", api).merge(web).with_state(state)
+    Router::new()
+        .nest("/api", api)
+        .merge(web)
+        .fallback(not_found)
+        .with_state(state)
 }
 
-async fn api_auth<B>(
-    State(token): State<String>,
-    req: Request<B>,
-    next: Next<B>,
-) -> Result<Response, StatusCode> {
+/// The response of a path the management router does not know. It names the
+/// method, the path and a request id, and logs the same, so that a `404` from a
+/// typo, a stale bookmark or a front proxy can be told apart instead of showing
+/// a bare "page not found".
+async fn not_found(method: Method, uri: Uri) -> Response {
+    let request_id = crate::http::new_request_id();
+    let path = uri.path().to_string();
+    warn!(
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+        "No such management endpoint; answered 404"
+    );
+
+    let mut response = if path == "/api" || path.starts_with("/api/") {
+        (
+            StatusCode::NOT_FOUND,
+            Json(FallbackBody {
+                error: format!("No such management API endpoint: {} {}", method, path),
+                request_id: request_id.clone(),
+            }),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Html(format!(
+                "<!doctype html><meta charset=\"utf-8\"><title>404</title>\
+                 <p>没有这个管理页面：{} {}</p>\
+                 <p>Request ID: {}</p>\
+                 <p><a href=\"/\">返回管理首页</a></p>",
+                method,
+                escape_html(&path),
+                request_id
+            )),
+        )
+            .into_response()
+    };
+    insert_request_id_header(&mut response, &request_id);
+    response
+}
+
+#[derive(Serialize)]
+struct FallbackBody {
+    error: String,
+    request_id: String,
+}
+
+async fn api_auth<B>(State(token): State<String>, req: Request<B>, next: Next<B>) -> Response {
     let authorized = req
         .headers()
         .get(AUTHORIZATION)
@@ -85,10 +133,25 @@ async fn api_auth<B>(
         .map(|t| t == token)
         .unwrap_or(false);
     if !authorized {
-        warn!("Rejected an unauthenticated API request");
-        return Err(StatusCode::UNAUTHORIZED);
+        let request_id = crate::http::new_request_id();
+        warn!(
+            request_id = %request_id,
+            method = %req.method(),
+            path = %req.uri().path(),
+            "Rejected an unauthenticated API request; answered 401"
+        );
+        let mut response = (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: "Missing or invalid `Authorization: Bearer <token>` header".to_string(),
+                request_id: request_id.clone(),
+            }),
+        )
+            .into_response();
+        insert_request_id_header(&mut response, &request_id);
+        return response;
     }
-    Ok(next.run(req).await)
+    next.run(req).await
 }
 
 async fn web_auth<B>(State(token): State<String>, req: Request<B>, next: Next<B>) -> Response {
@@ -103,13 +166,21 @@ async fn web_auth<B>(State(token): State<String>, req: Request<B>, next: Next<B>
         .map(|v| v == expected)
         .unwrap_or(false);
     if !authorized {
-        warn!("Rejected an unauthenticated web request");
-        return (
+        let request_id = crate::http::new_request_id();
+        warn!(
+            request_id = %request_id,
+            method = %req.method(),
+            path = %req.uri().path(),
+            "Rejected an unauthenticated web request; answered 401"
+        );
+        let mut response = (
             StatusCode::UNAUTHORIZED,
             [("www-authenticate", "Basic realm=\"http-tunnel\"")],
-            "Authentication required",
+            format!("Authentication required\nRequest ID: {}", request_id),
         )
             .into_response();
+        insert_request_id_header(&mut response, &request_id);
+        return response;
     }
     next.run(req).await
 }
@@ -180,11 +251,39 @@ struct ApiError(StatusCode, String);
 #[derive(Serialize)]
 struct ErrorBody {
     error: String,
+    request_id: String,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(ErrorBody { error: self.1 })).into_response()
+        let request_id = crate::http::new_request_id();
+        warn!(
+            request_id = %request_id,
+            status = self.0.as_u16(),
+            error = %self.1,
+            "Management API request failed"
+        );
+        let mut response = (
+            self.0,
+            Json(ErrorBody {
+                error: self.1,
+                request_id: request_id.clone(),
+            }),
+        )
+            .into_response();
+        insert_request_id_header(&mut response, &request_id);
+        response
+    }
+}
+
+/// Put the request id of a management response in the same header that the
+/// visitor path uses, so `curl -i` can tell an `ht` answer from a front proxy.
+fn insert_request_id_header(response: &mut Response, request_id: &str) {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response.headers_mut().insert(
+            HeaderName::from_static(crate::http::REQUEST_ID_HEADER),
+            value,
+        );
     }
 }
 
@@ -324,16 +423,27 @@ fn web_error(title: &str, e: anyhow::Error) -> Response {
     } else {
         StatusCode::BAD_REQUEST
     };
-    (
+    let request_id = crate::http::new_request_id();
+    warn!(
+        request_id = %request_id,
+        status = status.as_u16(),
+        error = %reason,
+        "Management web request failed"
+    );
+    let mut response = (
         status,
         Html(format!(
-            "<!doctype html><meta charset=\"utf-8\"><title>{}</title><p>{}：{}</p><p><a href=\"/\">返回</a></p>",
+            "<!doctype html><meta charset=\"utf-8\"><title>{}</title><p>{}：{}</p>\
+             <p>Request ID: {}</p><p><a href=\"/\">返回</a></p>",
             title,
             title,
-            escape_html(&reason)
+            escape_html(&reason),
+            request_id
         )),
     )
-        .into_response()
+        .into_response();
+    insert_request_id_header(&mut response, &request_id);
+    response
 }
 
 async fn web_put_proxy(

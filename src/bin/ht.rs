@@ -101,8 +101,12 @@ async fn main() -> Result<()> {
     });
 
     let is_atty = atty::is(atty::Stream::Stdout);
+    // `RUST_LOG` lets an operator raise the level (for example `RUST_LOG=debug`
+    // or `RUST_LOG=http_tunnel=debug`) without rebuilding, which is what the
+    // per-request routing logs need to be visible.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from("info"))
+        .with_env_filter(filter)
         .with_ansi(is_atty)
         .init();
 
