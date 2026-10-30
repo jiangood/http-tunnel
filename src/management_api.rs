@@ -66,6 +66,7 @@ fn build_router(token: String, management: Arc<ManagementState>) -> Router {
         .route("/proxies", get(list_proxies))
         .route("/proxies/:name", put(put_proxy).delete(delete_proxy))
         .route("/routes", get(list_routes))
+        .route("/sessions", get(list_sessions))
         .route_layer(middleware::from_fn_with_state(token.clone(), api_auth));
 
     // Only the page itself is authenticated with HTTP Basic. Everything it
@@ -245,6 +246,10 @@ struct StatusView {
     /// Whether `HT_PROXIES` owns the local services, in which case the page
     /// hides the form instead of letting every submit fail with `409`
     proxies_managed: bool,
+    /// The number of downstream v4 sessions connected right now
+    sessions: usize,
+    /// The configured limit for those sessions
+    sessions_max: usize,
     version: &'static str,
     config_path: String,
     uptime_seconds: u64,
@@ -317,6 +322,7 @@ impl ApiError {
 
 async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusView> {
     let proxies = state.management.proxies().await.len();
+    let (sessions, sessions_max) = state.management.session_count();
     Json(StatusView {
         name: state.management.name().to_string(),
         transport: state.management.transport().to_string(),
@@ -324,6 +330,8 @@ async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusView> {
         connected: state.management.connected(),
         proxies,
         proxies_managed: state.management.proxies_managed(),
+        sessions,
+        sessions_max,
         version: env!("CARGO_PKG_VERSION"),
         config_path: state.management.config_path().display().to_string(),
         uptime_seconds: state.management.uptime(),
@@ -359,6 +367,14 @@ async fn list_routes(
     State(state): State<Arc<ApiState>>,
 ) -> Json<Vec<crate::server::RouteSnapshot>> {
     Json(state.management.routes().await)
+}
+
+/// The downstream v4 sessions connected right now: one entry per session, with
+/// its node, role, uptime and the domains it owns.
+async fn list_sessions(
+    State(state): State<Arc<ApiState>>,
+) -> Json<Vec<crate::server::SessionSnapshot>> {
+    Json(state.management.sessions().await)
 }
 
 async fn put_proxy(

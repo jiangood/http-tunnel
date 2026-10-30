@@ -6,14 +6,14 @@ use rand::RngCore;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 use tracing::{debug, info, warn};
 
 use crate::protocol_v4::{self as p4, RouteAdvert, RouteError, RouteRejection, SessionFrame};
-use crate::server::ServerState;
+use crate::server::{ServerState, V4SessionInfo};
 use crate::transport::Conn;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -144,14 +144,28 @@ pub(crate) async fn accept(mut conn: Conn, state: Arc<ServerState>) -> Result<()
         .map_err(|_| anyhow!("The v4 session limit is reached"))?;
     let session_id = state.next_v4_session_id.fetch_add(1, Ordering::Relaxed);
     p4::write_frame(&mut conn, &SessionFrame::Welcome { session_id }).await?;
+    let role_name = match role {
+        p4::Role::Client => "client",
+        p4::Role::Node => "node",
+    };
+    state.v4_session_info.write().await.insert(
+        session_id,
+        V4SessionInfo {
+            node_id: node_id.clone(),
+            role: role_name,
+            since: Instant::now(),
+        },
+    );
     info!(
         session_id,
         node = %node_id,
-        role = ?role,
+        role = %role_name,
         "v4 session established"
     );
 
-    run_session(conn, state, session_id, node_id, permit).await
+    let result = run_session(conn, state.clone(), session_id, node_id, permit).await;
+    state.v4_session_info.write().await.remove(&session_id);
+    result
 }
 
 async fn run_session(

@@ -130,6 +130,17 @@ impl ManagementState {
         self.server.routes_snapshot().await
     }
 
+    /// The downstream v4 sessions connected right now, as seen by
+    /// `GET /api/sessions`.
+    pub(crate) async fn sessions(&self) -> Vec<crate::server::SessionSnapshot> {
+        self.server.sessions_snapshot().await
+    }
+
+    /// The number of connected v4 sessions and the configured limit.
+    pub(crate) fn session_count(&self) -> (usize, usize) {
+        self.server.session_count()
+    }
+
     /// Apply a change to the persisted configuration, save it, and recompute the
     /// effective configuration with the environment overlay.
     ///

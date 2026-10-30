@@ -286,6 +286,108 @@ server {
 
 `auth_header` 校验通过后，`X-HTTP-TUNNEL-TOKEN` 会在转发给后端之前被移除，后端看不到密钥。使用自定义头而不是 `Authorization`，不会和后端自己的登录鉴权冲突。
 
+### 用隧道访问 Docker API
+
+Docker API 就是普通 HTTP，一条 `[[proxies]]` 就能代理：
+
+| 运行方式 | `local_addr` | 额外端口 |
+| --- | --- | --- |
+| Linux 裸机、Docker Desktop 的 Linux 容器、WSL2 里的 Linux 版 ht | `unix:///var/run/docker.sock` | 不需要 |
+| Windows 原生 `ht.exe`，或只开了 TCP 的 dockerd | `127.0.0.1:2375` | 需要 2375，且只绑回环 |
+
+Docker 客户端按 `Host` 选路，`Host: docker.example.com:7777` 里的端口会被去掉，所以 `docker -H tcp://docker.example.com:7777 ps` 能直接匹配 `domain = "docker.example.com"`。匹配后是原样双向透传，`docker exec` / `docker attach` 的连接升级也能穿过。
+
+> Docker API 等价于宿主机 root。公网入口必须加 TLS，并给这条规则配置 `auth_header`；`2375` 只允许监听 `127.0.0.1`。Docker CLI 不会自己发 `X-HTTP-TUNNEL-TOKEN`：27.1 及以上用 `DOCKER_CUSTOM_HEADERS`，更早版本用独立配置目录的 `HttpHeaders`（见下面的示例），或者由入口的 Nginx 注入该头。
+
+#### Windows 本机示例（Docker Desktop，零发布端口）
+
+下面的示例以 Windows + Docker Desktop（WSL2 后端）为例。Windows 原生 `ht.exe` 不支持 Unix Socket 和命名管道：`local_addr` 填 `unix://...` 会在访客请求时返回 `502`，填 `npipe://...` 会在配置校验阶段被拒绝。所以让 ht 以 Linux 容器运行——引擎在 Linux VM 里，容器内可以直接挂载 socket，本机不需要开启 2375，也不需要发布任何端口。
+
+`docker-compose.yml`：
+
+```yaml
+name: ht-docker
+
+services:
+  ingress:
+    image: ghcr.io/jiangood/ht:latest
+    restart: unless-stopped
+    stop_grace_period: 40s
+    volumes:
+      - ./ingress:/app
+
+  leaf:
+    image: ghcr.io/jiangood/ht:latest
+    restart: unless-stopped
+    stop_grace_period: 40s
+    volumes:
+      - ./leaf:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  probe:
+    image: curlimages/curl:latest
+    entrypoint: ["curl"]
+```
+
+`ingress/ht.toml`（演示用的入口，正式部署换成公网那台）：
+
+```toml
+name = "ingress"
+listen_port = 7777
+control_host = "ingress"
+token = "demo-listener-token"
+```
+
+`leaf/ht.toml`（本机，`listen_port = 0` 用临时端口，全程只拨出）：
+
+```toml
+name = "win-leaf"
+listen_port = 0
+
+[[proxies]]
+name = "docker"
+domain = "docker.example.com"
+local_addr = "unix:///var/run/docker.sock"
+auth_header = "demo-visitor-token"
+
+[upstream]
+url = "ws://ingress:7777"
+token = "demo-listener-token"
+```
+
+启动并验证（不发布端口，用同一网络里的 `probe` 容器发请求）：
+
+```powershell
+docker compose up -d ingress leaf
+
+docker compose run --rm probe -sS `
+  -H "Host: docker.example.com" `
+  -H "X-HTTP-TUNNEL-TOKEN: demo-visitor-token" `
+  http://ingress:7777/version
+```
+
+返回 `ApiVersion` / `MinAPIVersion` 就说明 Docker API 已经穿过隧道。`leaf` 没有 `-p`，Windows 上不会新增监听端口，`netstat -ano | findstr 2375` 也没有结果。叶子节点不发布端口时，管理页只在容器网络内可达（镜像基于 `scratch`，没有 shell），修改规则请编辑 `leaf/ht.toml` 后 `docker compose restart leaf`；临时端口见启动日志。正式使用时把 `ingress` 换成公网入口、`[upstream].url` 改成 `wss://...`，本机配置不变。
+
+如果只用原生 `ht.exe`，就回到 2375：在 Docker Desktop 的 Settings → General 勾选 **Expose daemon on tcp://localhost:2375 without TLS**，确认它只监听回环，然后把 `local_addr` 换成 `127.0.0.1:2375`，其余配置不变。
+
+```powershell
+Get-NetTCPConnection -LocalPort 2375 -State Listen | Select-Object LocalAddress, LocalPort
+# 应为 127.0.0.1，而不是 0.0.0.0
+```
+
+要从 Windows 本机直接用 Docker CLI 访问上面的示例，需要给 `ingress` 加回环发布（`ports: ["127.0.0.1:7777:7777"]`），并让 `docker.example.com` 解析到 `127.0.0.1`；再把校验头放进独立的客户端配置，避免影响其他 context：
+
+```powershell
+# %USERPROFILE%\.docker-tunnel\config.json
+# {"HttpHeaders":{"X-HTTP-TUNNEL-TOKEN":"demo-visitor-token"}}
+
+$env:DOCKER_CONFIG = "$env:USERPROFILE\.docker-tunnel"
+$env:DOCKER_HOST   = "tcp://docker.example.com:7777"
+docker ps
+```
+
+ht 校验后会删除这个头，Docker daemon 看不到密钥。正式部署时 `docker.example.com` 指向公网入口，本机不需要任何端口。
+
 ## 多跳细节
 
 - 数据面是递归的：上游会话把访客转发到本进程的 `127.0.0.1:<实际 listen_port>`，本进程再按 `Host` 路由一次；`Host` 和报文不改写，因此 WebSocket 升级可以穿过整条链。
@@ -311,13 +413,14 @@ keepalive_interval = 15
 
 ## Web 管理
 
-管理页面与 API 始终开启，和访客、v4 会话共用 `listen_port`，只在保留的 `control_host` 上可达。浏览器打开 `http://<control_host>:<listen_port>/`，HTTP Basic 用户名填 `ht`，密码填 `token`；页面是一个内联 CSS/JS 的单页控制台，本身不做服务端渲染，所有数据都通过 `/api/*`（Bearer token）获取，可查看状态、本地服务（含来源）、路由表、已设置的环境变量和接口列表，并在弹出框中新增或编辑本地服务。`control_host` 不是本机可解析的地址时，可用 `curl -H "Host: <control_host>" http://127.0.0.1:<listen_port>/` 访问；`listen_port = 0` 时管理页也用临时端口，以启动日志为准。
+管理页面与 API 始终开启，和访客、v4 会话共用 `listen_port`，只在保留的 `control_host` 上可达。浏览器打开 `http://<control_host>:<listen_port>/`，HTTP Basic 用户名填 `ht`，密码填 `token`；页面是一个内联 CSS/JS 的单页控制台，本身不做服务端渲染，所有数据都通过 `/api/*`（Bearer token）获取，可查看状态、本地服务（含来源）、路由表、下游节点、已设置的环境变量和接口列表，并在弹出框中新增或编辑本地服务。`control_host` 不是本机可解析的地址时，可用 `curl -H "Host: <control_host>" http://127.0.0.1:<listen_port>/` 访问；`listen_port = 0` 时管理页也用临时端口，以启动日志为准。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/status` | 查看状态、本地服务数、版本、配置文件、运行时长与环境变量覆盖情况 |
+| GET | `/api/status` | 查看状态、本地服务数、下游节点数、版本、配置文件、运行时长与环境变量覆盖情况 |
 | GET | `/api/proxies` | 列出本地 `[[proxies]]` 及其来源（`ht.toml` / `HT_PROXIES`） |
 | GET | `/api/routes` | 查看当前生效的路由表（本地服务 + 下游 v4 路由及其所属节点） |
+| GET | `/api/sessions` | 列出已连接的下游节点：会话号、节点、角色、连接时长与所属域名 |
 | PUT | `/api/proxies/{name}` | 新增或更新本地服务 |
 | DELETE | `/api/proxies/{name}` | 删除本地服务 |
 

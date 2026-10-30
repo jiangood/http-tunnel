@@ -28,6 +28,28 @@ pub(crate) struct RecentWithdrawal {
     pub(crate) session_id: u64,
 }
 
+/// A downstream v4 session that is connected right now. It is used by
+/// `GET /api/sessions` and the management page, so an operator can see how many
+/// nodes are online and which domains each one advertises.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SessionSnapshot {
+    pub(crate) session_id: u64,
+    pub(crate) node: String,
+    /// The advisory role announced in the peer's `Hello`: `client` or `node`
+    pub(crate) role: &'static str,
+    /// Seconds since the session was established
+    pub(crate) connected_seconds: u64,
+    /// The routes the session owns right now
+    pub(crate) domains: Vec<String>,
+}
+
+/// The registry entry kept for a connected v4 session until it closes.
+pub(crate) struct V4SessionInfo {
+    pub(crate) node_id: String,
+    pub(crate) role: &'static str,
+    pub(crate) since: Instant,
+}
+
 /// One entry of the effective routing table: a local proxy or a route claimed
 /// by a v4 session. It is used by the route-table log and `GET /api/routes`.
 #[derive(Debug, Clone, Serialize)]
@@ -134,6 +156,8 @@ pub(crate) struct ServerState {
     pub(crate) pending_connections: Arc<Semaphore>,
     // v4 sessions
     pub(crate) v4_routes: RwLock<HashMap<String, V4SessionHandle>>,
+    // The connected v4 sessions by session id, for the management page
+    pub(crate) v4_session_info: RwLock<HashMap<u64, V4SessionInfo>>,
     pub(crate) v4_sessions: Arc<Semaphore>,
     // The total number of v4 sessions the server admits, so that a `404` can
     // say whether any leaf is connected at all.
@@ -193,6 +217,7 @@ impl ServerState {
             pending_connections: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
             limits,
             v4_routes: RwLock::new(HashMap::new()),
+            v4_session_info: RwLock::new(HashMap::new()),
             v4_sessions: Arc::new(Semaphore::new(max_sessions)),
             max_v4_sessions: max_sessions,
             v4_shutdown: broadcast::channel(1).0,
@@ -280,6 +305,35 @@ impl ServerState {
             .map(RouteSnapshot::describe_missing_route)
             .collect();
         (total, hosts)
+    }
+
+    /// The downstream v4 sessions connected right now, sorted by session id,
+    /// with the routes each one owns. The management page lists them so an
+    /// operator can see the connected nodes, not only the route table.
+    pub(crate) async fn sessions_snapshot(&self) -> Vec<SessionSnapshot> {
+        let infos = self.v4_session_info.read().await;
+        let routes = self.v4_routes.read().await;
+        let now = Instant::now();
+        let mut sessions: Vec<SessionSnapshot> = infos
+            .iter()
+            .map(|(session_id, info)| {
+                let mut domains: Vec<String> = routes
+                    .iter()
+                    .filter(|(_, handle)| handle.session_id == *session_id)
+                    .map(|(domain, _)| domain.clone())
+                    .collect();
+                domains.sort();
+                SessionSnapshot {
+                    session_id: *session_id,
+                    node: info.node_id.clone(),
+                    role: info.role,
+                    connected_seconds: now.duration_since(info.since).as_secs(),
+                    domains,
+                }
+            })
+            .collect();
+        sessions.sort_by_key(|session| session.session_id);
+        sessions
     }
 
     /// How many v4 sessions are connected right now, and the configured limit.

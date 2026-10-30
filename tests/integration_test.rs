@@ -676,6 +676,32 @@ async fn management_api_manages_proxies() -> Result<()> {
         body
     );
 
+    info!("the entry node lists the connected downstream node");
+    let (status, body) = api_request(
+        MANAGEMENT_HTTP_ENTRY_ADDR,
+        "GET",
+        "/api/sessions",
+        Some(MANAGEMENT_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(
+        body.contains("\"node\":\"home\""),
+        "unexpected body: {}",
+        body
+    );
+    assert!(
+        body.contains("\"role\":\"node\""),
+        "unexpected body: {}",
+        body
+    );
+    assert!(
+        body.contains("\"domains\":[\"echo.test\"]"),
+        "unexpected body: {}",
+        body
+    );
+
     info!("the management API lists the added tunnel");
     let (status, body) = api_request(
         MANAGEMENT_ADDR,

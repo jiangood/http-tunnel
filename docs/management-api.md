@@ -23,8 +23,9 @@ The page itself is protected by the browser-native HTTP Basic login: username
 resource. It is a single HTML document with an inline stylesheet and script and
 no external dependency; it renders nothing on the server and reads all of its
 data from `/api` with the Bearer token it is handed after login. It shows the
-status, the local services with their source, the effective route table and the
-`HT_*` variables that are set, and it adds or edits a service in a dialog.
+status, the local services with their source, the effective route table, the
+connected downstream nodes and the `HT_*` variables that are set, and it adds or
+edits a service in a dialog.
 
 ## API
 
@@ -32,9 +33,10 @@ Every API call uses a Bearer token, which is also the listener `token`:
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/status` | Name, transport, upstream, connectivity, proxy count, version, config path, uptime, the `HT_*` variables that are set |
+| GET | `/api/status` | Name, transport, upstream, connectivity, proxy count, session count, version, config path, uptime, the `HT_*` variables that are set |
 | GET | `/api/proxies` | List local `[[proxies]]` as `name`/`domain`/`local_addr`/`source` |
 | GET | `/api/routes` | The effective routing table, including v4 owners |
+| GET | `/api/sessions` | The connected downstream v4 sessions: session id, node, role, uptime and owned domains |
 | PUT | `/api/proxies/{name}` | Create or replace a local proxy |
 | DELETE | `/api/proxies/{name}` | Delete a local proxy |
 
@@ -49,7 +51,21 @@ wins, but both entries are listed:
 ]
 ```
 
-The same table is logged at `info` whenever it changes:
+`GET /api/sessions` lists the downstream nodes that are connected right now. One
+entry is one v4 session, so a node that reconnects appears with a new session id:
+
+```json
+[
+  {"session_id":3,"node":"home","role":"node","connected_seconds":125,"domains":["svc.example.com"]}
+]
+```
+
+The page shows the same list under "下游节点", with the connected count next to
+the route count. A client that only connects to an upstream does not serve
+sessions itself, so its own session list is empty; use the entry node's page to
+see all of its downstream nodes.
+
+The same route table is logged at `info` whenever it changes:
 
 ```
 INFO http_tunnel::server: The route table changed routes=2
