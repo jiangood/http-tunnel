@@ -36,7 +36,7 @@ Every API call uses a Bearer token, which is also the listener `token`:
 | GET | `/api/status` | Name, transport, upstream, connectivity, proxy count, session count, version, config path, uptime, the `HT_*` variables that are set |
 | GET | `/api/proxies` | List local `[[proxies]]` as `name`/`domain`/`local_addr`/`source` |
 | GET | `/api/routes` | The effective routing table, including v4 owners |
-| GET | `/api/sessions` | The connected downstream v4 sessions: session id, node, role, uptime and owned domains |
+| GET | `/api/sessions` | The connected downstream v4 sessions: session id, node, peer address, role, uptime and owned domains |
 | PUT | `/api/proxies/{name}` | Create or replace a local proxy |
 | DELETE | `/api/proxies/{name}` | Delete a local proxy |
 
@@ -52,18 +52,21 @@ wins, but both entries are listed:
 ```
 
 `GET /api/sessions` lists the downstream nodes that are connected right now. One
-entry is one v4 session, so a node that reconnects appears with a new session id:
+entry is one v4 session, so a node that reconnects appears with a new session id.
+`peer` is the TCP address the session connected from: when several nodes announce
+the same or a wrong `node` id, it is what tells them apart. Behind a reverse proxy
+it is the proxy's address, not the node's.
 
 ```json
 [
-  {"session_id":3,"node":"home","role":"node","connected_seconds":125,"domains":["svc.example.com"]}
+  {"session_id":3,"node":"home","peer":"10.0.0.5:51234","role":"node","connected_seconds":125,"domains":["svc.example.com"]}
 ]
 ```
 
-The page shows the same list under "下游节点", with the connected count next to
-the route count. A client that only connects to an upstream does not serve
-sessions itself, so its own session list is empty; use the entry node's page to
-see all of its downstream nodes.
+The page shows the same list under "下游节点", with the peer address next to each
+node and the connected count next to the route count. A client that only connects
+to an upstream does not serve sessions itself, so its own session list is empty;
+use the entry node's page to see all of its downstream nodes.
 
 The same route table is logged at `info` whenever it changes:
 

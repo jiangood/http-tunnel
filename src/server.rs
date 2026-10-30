@@ -3,6 +3,7 @@ use crate::session_server::V4SessionHandle;
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,6 +36,9 @@ pub(crate) struct RecentWithdrawal {
 pub(crate) struct SessionSnapshot {
     pub(crate) session_id: u64,
     pub(crate) node: String,
+    /// The TCP peer that opened the session. Several nodes may announce the
+    /// same or a wrong node id, so the address is what tells them apart.
+    pub(crate) peer: SocketAddr,
     /// The advisory role announced in the peer's `Hello`: `client` or `node`
     pub(crate) role: &'static str,
     /// Seconds since the session was established
@@ -46,6 +50,7 @@ pub(crate) struct SessionSnapshot {
 /// The registry entry kept for a connected v4 session until it closes.
 pub(crate) struct V4SessionInfo {
     pub(crate) node_id: String,
+    pub(crate) peer: SocketAddr,
     pub(crate) role: &'static str,
     pub(crate) since: Instant,
 }
@@ -326,6 +331,7 @@ impl ServerState {
                 SessionSnapshot {
                     session_id: *session_id,
                     node: info.node_id.clone(),
+                    peer: info.peer,
                     role: info.role,
                     connected_seconds: now.duration_since(info.since).as_secs(),
                     domains,

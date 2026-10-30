@@ -4,6 +4,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use rand::RngCore;
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -70,8 +71,13 @@ impl V4SessionHandle {
     }
 }
 
-/// Accept a v4 session on an already-upgraded WebSocket.
-pub(crate) async fn accept(mut conn: Conn, state: Arc<ServerState>) -> Result<()> {
+/// Accept a v4 session on an already-upgraded WebSocket. `peer` is the address
+/// the session connected from, kept for the management page and the logs.
+pub(crate) async fn accept(
+    mut conn: Conn,
+    peer: SocketAddr,
+    state: Arc<ServerState>,
+) -> Result<()> {
     let hello = time::timeout(HANDSHAKE_TIMEOUT, p4::read_frame(&mut conn))
         .await
         .context("Timed out waiting for the v4 hello")??;
@@ -152,6 +158,7 @@ pub(crate) async fn accept(mut conn: Conn, state: Arc<ServerState>) -> Result<()
         session_id,
         V4SessionInfo {
             node_id: node_id.clone(),
+            peer,
             role: role_name,
             since: Instant::now(),
         },
@@ -159,11 +166,12 @@ pub(crate) async fn accept(mut conn: Conn, state: Arc<ServerState>) -> Result<()
     info!(
         session_id,
         node = %node_id,
+        peer = %peer,
         role = %role_name,
         "v4 session established"
     );
 
-    let result = run_session(conn, state.clone(), session_id, node_id, permit).await;
+    let result = run_session(conn, state.clone(), session_id, node_id, peer, permit).await;
     state.v4_session_info.write().await.remove(&session_id);
     result
 }
@@ -173,6 +181,7 @@ async fn run_session(
     state: Arc<ServerState>,
     session_id: u64,
     node_id: String,
+    peer: SocketAddr,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
     let (mut reader, mut writer) = split(conn);
@@ -330,7 +339,7 @@ async fn run_session(
     drop(streams);
     drop(out_tx);
     let _ = time::timeout(Duration::from_secs(1), writer_task).await;
-    info!(session_id, node = %node_id, "v4 session closed");
+    info!(session_id, node = %node_id, peer = %peer, "v4 session closed");
     Ok(())
 }
 

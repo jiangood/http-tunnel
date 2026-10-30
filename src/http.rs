@@ -174,7 +174,7 @@ async fn handle_visitor(
             // This is a transport/session connection, not an in-flight visitor
             // request. Do not include its lifetime in the visitor drain counter.
             drop(activity);
-            if let Err(e) = crate::session_server::accept(conn, state).await {
+            if let Err(e) = crate::session_server::accept(conn, addr, state).await {
                 warn!(
                     request_id = %request_id,
                     peer = %addr,

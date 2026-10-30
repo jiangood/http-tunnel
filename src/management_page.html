@@ -203,17 +203,18 @@ input[readonly]{background:var(--input);color:var(--muted)}
           <tr>
             <th>会话</th>
             <th>节点</th>
+            <th>来源地址</th>
             <th>角色</th>
             <th>连接时长</th>
             <th>域名 / 路由</th>
           </tr>
         </thead>
         <tbody id="session-body">
-          <tr><td colspan="5" class="empty">加载中…</td></tr>
+          <tr><td colspan="6" class="empty">加载中…</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="hint">每个下游 v4 会话一行；节点重连后会换一个新会话号。域名列为该会话当前声明的路由。</p>
+    <p class="hint">每个下游 v4 会话一行；节点重连后会换一个新会话号。来源地址是连接的对端 IP 和端口，节点名称重名或填错时以此为准；会话经过反向代理时，这里是代理的地址。域名列为该会话当前声明的路由。</p>
   </section>
 
   <section class="card">
@@ -242,7 +243,7 @@ input[readonly]{background:var(--input);color:var(--muted)}
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/status</td><td class="muted">Bearer</td><td class="muted">进程状态：名称、传输、上游、连通性、服务数、下游节点数、版本、配置文件、运行时长、环境变量</td></tr>
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/proxies</td><td class="muted">Bearer</td><td class="muted">列出本地服务及其来源</td></tr>
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/routes</td><td class="muted">Bearer</td><td class="muted">生效中的路由表，包含 v4 会话</td></tr>
-          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/sessions</td><td class="muted">Bearer</td><td class="muted">已连接的下游节点：会话号、节点、角色、连接时长与所属域名</td></tr>
+          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/sessions</td><td class="muted">Bearer</td><td class="muted">已连接的下游节点：会话号、节点、来源地址、角色、连接时长与所属域名</td></tr>
           <tr><td><span class="tag method-put">PUT</span></td><td class="mono">/api/proxies/{name}</td><td class="muted">Bearer</td><td class="muted">新增或替换本地服务，请求体 <code>{"domain":"…","local_addr":"…"}</code></td></tr>
           <tr><td><span class="tag method-delete">DELETE</span></td><td class="mono">/api/proxies/{name}</td><td class="muted">Bearer</td><td class="muted">删除本地服务</td></tr>
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/</td><td class="muted">Basic</td><td class="muted">本管理页面（唯一的 Basic 资源，其余接口统一用 Bearer）</td></tr>
@@ -437,7 +438,7 @@ input[readonly]{background:var(--input);color:var(--muted)}
     $("session-count").textContent = sessions.length;
     var body = $("session-body");
     if (!sessions.length) {
-      body.innerHTML = '<tr><td colspan="5" class="empty">还没有下游节点连接。</td></tr>';
+      body.innerHTML = '<tr><td colspan="6" class="empty">还没有下游节点连接。</td></tr>';
       return;
     }
     body.innerHTML = sessions.map(function (session) {
@@ -450,6 +451,7 @@ input[readonly]{background:var(--input);color:var(--muted)}
       return "<tr>" +
         '<td class="mono strong">#' + esc(session.session_id) + "</td>" +
         '<td class="strong">' + esc(session.node) + "</td>" +
+        '<td class="mono muted">' + esc(session.peer) + "</td>" +
         "<td>" + role + "</td>" +
         '<td class="mono muted">' + esc(uptime(session.connected_seconds)) + "</td>" +
         "<td>" + domains + "</td>" +

@@ -692,6 +692,11 @@ async fn management_api_manages_proxies() -> Result<()> {
         body
     );
     assert!(
+        body.contains("\"peer\":\"127.0.0.1:"),
+        "the session should report the downstream peer address: {}",
+        body
+    );
+    assert!(
         body.contains("\"role\":\"node\""),
         "unexpected body: {}",
         body
