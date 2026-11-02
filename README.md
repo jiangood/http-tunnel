@@ -388,6 +388,75 @@ docker ps
 
 ht 校验后会删除这个头，Docker daemon 看不到密钥。正式部署时 `docker.example.com` 指向公网入口，本机不需要任何端口。
 
+### 客户端跑在容器里：`127.0.0.1` 不是宿主机
+
+`local_addr` 由**发起连接的那个进程**解析。ht 以容器运行时，`127.0.0.1:2375` 指向容器自己的回环，不是宿主机上监听 2375 的 dockerd——daemon 开着、`netstat` 也能看到 2375，访客仍然收到 `502`，错误页里 `target` 会原样显示 `127.0.0.1:2375`。规则同样适用于任何宿主服务：容器里的 `127.0.0.1` 永远是容器自己。
+
+| 目标 | `local_addr` |
+| --- | --- |
+| 同一 compose 中的另一个服务 | 服务名，如 `api:8080` |
+| 宿主机上的服务（Docker Desktop） | `host.docker.internal:<端口>`，如 `host.docker.internal:2375` |
+| 宿主机上的 Unix Socket | 挂载进容器后用 `unix:///var/run/docker.sock` |
+
+#### 方式一：挂载 socket（推荐，不需要开 2375）
+
+ht 是 Linux 容器，可以直接使用宿主机的 socket；Docker Desktop 会在 Linux VM 里把 `/var/run/docker.sock` 挂进来：
+
+```yaml
+services:
+  leaf:
+    image: ghcr.io/jiangood/ht:latest
+    volumes:
+      - ./leaf:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+```
+
+```toml
+[[proxies]]
+name = "docker"
+domain = "docker.example.com"
+local_addr = "unix:///var/run/docker.sock"
+```
+
+宿主机不用勾选 2375，也不会新增任何监听端口。原生 `ht.exe` 不支持 Unix Socket，这种方式只适用于容器里的 ht。
+
+#### 方式二：继续走 TCP，改成容器视角的宿主机地址
+
+```toml
+[[proxies]]
+name = "docker"
+domain = "docker.example.com"
+local_addr = "host.docker.internal:2375"
+```
+
+Docker Desktop（Windows / macOS）内置 `host.docker.internal`；Linux 上的 Docker Engine 需要显式加一条：
+
+```yaml
+services:
+  leaf:
+    image: ghcr.io/jiangood/ht:latest
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+```
+
+用 `docker run` 时等价于 `--add-host=host.docker.internal:host-gateway`。2375 仍然只能绑回环或内网，不要发布到公网。daemon 只监听 `127.0.0.1:2375` 时，Docker Desktop 一般仍能经 `host.docker.internal` 访问；普通 Linux Engine 从网桥过来连不上回环，需要让 daemon 监听网桥地址并配防火墙——所以更推荐方式一。
+
+#### 验证
+
+`leaf` 镜像基于 `scratch`，没有 shell 和 `curl`，验证请求要在同网络的另一个容器里发（沿用前面的 `ingress` / `probe` 服务）：
+
+```powershell
+docker compose run --rm probe -sS `
+  -H "Host: docker.example.com" `
+  -H "X-HTTP-TUNNEL-TOKEN: demo-visitor-token" `
+  http://ingress:7777/version
+```
+
+返回 `ApiVersion` / `MinAPIVersion` 就说明 Docker API 已经穿过隧道。仍是 `502` 时看错误页：
+
+- `cause` 为 `Connection refused`：地址在容器内不可达，检查 `local_addr` 是否还是 `127.0.0.1`。
+- `cause` 为 `no such host` 或解析失败：`host.docker.internal` 没有配置，补 `extra_hosts` / `--add-host`，或改用方式一。
+
 ## 多跳细节
 
 - 数据面是递归的：上游会话把访客转发到本进程的 `127.0.0.1:<实际 listen_port>`，本进程再按 `Host` 路由一次；`Host` 和报文不改写，因此 WebSocket 升级可以穿过整条链。
@@ -526,7 +595,7 @@ docker run -d --name ht --restart unless-stopped \
 - Docker 用 `SIGTERM` 停止容器，`ht` 会优雅关闭并最多 drain 30 秒；Docker 默认只等 10 秒就 `SIGKILL`，所以要显式设置 `--stop-timeout 40`（或 compose 的 `stop_grace_period: 40s`），否则在途访客会被截断。
 - 端口映射必须与 `listen_port` 一致，管理页/API 也在这个端口上，无需额外映射。
 - 保存管理页修改需要 `/app` 可写（会原子回写 `ht.toml`），请挂载整个目录；只想只读运行就用 `HT_PROXIES` 让代理列表只读。
-- `local_addr` 在容器内解析：`127.0.0.1` 指容器本身，转发宿主机服务用 `host.docker.internal:<端口>`，转发同一 compose 中的服务用服务名。
+- `local_addr` 在容器内解析：`127.0.0.1` 指容器本身，转发宿主机服务用 `host.docker.internal:<端口>`，转发同一 compose 中的服务用服务名。详见[客户端跑在容器里](#客户端跑在容器里127001-不是宿主机)。
 - 镜像是基于 `scratch` 的静态镜像，没有 shell，用 `docker logs ht` 查看日志；默认以 root 运行，可用 `--user 65532:65532` 并保证挂载目录对该 UID 可写。
 - 镜像没有内置 `HEALTHCHECK`，对 `listen_port` 做 TCP 检查即可。
 
