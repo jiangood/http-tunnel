@@ -33,6 +33,10 @@ Authorization: Bearer <token>
 X-HTTP-Tunnel-Node: <node_id>
 ```
 
+A peer also sends `X-HTTP-Tunnel-Version: <software version>`. The header is
+optional and diagnostic: the server stores it for `GET /api/sessions` and the
+management page, and a peer that omits it is still a valid v4 peer.
+
 The bearer token is checked before the WebSocket upgrade, so an unauthenticated
 peer never reserves a session slot. The node id is a non-empty identifier used
 for logging and for the proof below; it is not a trust boundary on its own.
@@ -44,6 +48,7 @@ client                                            server
   |  GET /_http-tunnel/v4/connect                  |
   |  Authorization: Bearer <token>                 |
   |  X-HTTP-Tunnel-Node: <node_id>                 |
+  |  X-HTTP-Tunnel-Version: <version>              |
   |----------------------------------------------->|
   |  101 Switching Protocols                       |
   |<-----------------------------------------------|

@@ -44,6 +44,10 @@ pub(crate) struct SessionSnapshot {
     /// or the gateway did not add the header.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) forwarded: Option<String>,
+    /// The software version the peer announced in its WebSocket upgrade. Older
+    /// peers omit the header, so `None` means the version is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) version: Option<String>,
     /// The advisory role announced in the peer's `Hello`: `client` or `node`
     pub(crate) role: &'static str,
     /// Seconds since the session was established
@@ -61,6 +65,7 @@ pub(crate) struct V4SessionInfo {
     pub(crate) node_id: String,
     pub(crate) peer: SocketAddr,
     pub(crate) forwarded: Option<String>,
+    pub(crate) version: Option<String>,
     pub(crate) role: &'static str,
     pub(crate) since: Instant,
     /// The capability bits announced in `Hello`
@@ -292,9 +297,10 @@ impl ServerState {
         );
     }
 
-    /// A snapshot of the effective routing table, sorted by domain. Local
-    /// proxies and v4 routes can carry the same domain; the local proxy wins,
-    /// but both entries stay visible for diagnosis.
+    /// A snapshot of the effective routing table. Local proxies come first,
+    /// then v4 routes, each group sorted by domain. Local proxies and v4 routes
+    /// can carry the same domain; the local proxy wins, but both entries stay
+    /// visible for diagnosis.
     pub(crate) async fn routes_snapshot(&self) -> Vec<RouteSnapshot> {
         let proxies = self.proxies.read().await;
         let v4_routes = self.v4_routes.read().await;
@@ -328,7 +334,15 @@ impl ServerState {
                 node: Some(handle.node_id.clone()),
             });
         }
-        table.sort_by(|a, b| a.domain.cmp(&b.domain).then(a.owner.cmp(b.owner)));
+        // The local routes are what this process serves itself, so surface them
+        // first; the downstream routes follow, sorted by domain. `local` sorts
+        // before `v4` lexicographically too, but compare explicitly so a new
+        // owner string does not silently reorder the table.
+        table.sort_by(|a, b| {
+            (a.owner != "local")
+                .cmp(&(b.owner != "local"))
+                .then_with(|| a.domain.cmp(&b.domain))
+        });
         table
     }
 
@@ -367,6 +381,7 @@ impl ServerState {
                     node: info.node_id.clone(),
                     peer: info.peer,
                     forwarded: info.forwarded.clone(),
+                    version: info.version.clone(),
                     role: info.role,
                     connected_seconds: now.duration_since(info.since).as_secs(),
                     domains,

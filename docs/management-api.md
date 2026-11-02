@@ -24,11 +24,11 @@ resource. It is a single HTML document with an inline stylesheet and script and
 no external dependency; it renders nothing on the server and reads all of its
 data from `/api` with the Bearer token it is handed after login. One node
 card lists the local process together with every connected downstream v4
-session; the route table lists the effective routes of both. A local route
-adds, edits or deletes a service in a dialog; a downstream node row offers
-"管理服务", which lists, adds, edits and deletes that node's own `[[proxies]]`,
-and "断开", which closes that one session. The `HT_*` variables that are set
-are shown as well.
+session. Every row offers "管理服务", which opens a dialog that lists, adds,
+edits and deletes that node's own `[[proxies]]`; downstream rows also offer
+"断开", which closes that one session. The route table is a read-only view of
+the effective routes of both. The `HT_*` variables that are set are shown as
+well.
 
 ## API
 
@@ -39,12 +39,13 @@ Every API call uses a Bearer token, which is also the listener `token`:
 | GET | `/api/status` | Name, transport, upstream, connectivity, proxy count, session count, version, config path, uptime, the `HT_*` variables that are set |
 | GET | `/api/proxies` | List local `[[proxies]]` as `name`/`domain`/`local_addr`/`source`; with `?node=` or `?session=`, list the proxies of that downstream node |
 | GET | `/api/routes` | The effective routing table, including v4 owners |
-| GET | `/api/sessions` | The connected downstream v4 sessions: session id, node, peer address, forwarded client address, role, uptime, owned domains, `manageable` and `writable` |
+| GET | `/api/sessions` | The connected downstream v4 sessions: session id, node, version, peer address, forwarded client address, role, uptime, owned domains, `manageable` and `writable` |
 | PUT | `/api/proxies/{name}` | Create or replace a local proxy; with `?node=`/`?session=`, write it on that downstream node |
 | DELETE | `/api/proxies/{name}` | Delete a local proxy; with `?node=`/`?session=`, delete it on that downstream node |
 | DELETE | `/api/sessions/{id}` | Close one downstream session |
 
-`GET /api/routes` shows the table the visitor path actually uses. A local
+`GET /api/routes` shows the table the visitor path actually uses. Local routes
+come first, then the downstream routes, each group sorted by domain. A local
 service and a downstream session can claim the same domain; the local service
 wins, but both entries are listed:
 
@@ -65,19 +66,24 @@ nodes announce the same or a wrong `node` id, `forwarded`/`peer` is what tells
 them apart. The header can be spoofed by a peer that reaches the endpoint
 directly, so it is diagnostic, not an authorization decision.
 
+`version` is the software version the node announced in its WebSocket upgrade.
+It is also diagnostic: an older node that does not send it omits the field, and
+the page shows `—`.
+
 ```json
 [
-  {"session_id":3,"node":"home","peer":"10.0.0.6:60216","forwarded":"203.0.113.9","role":"node","connected_seconds":125,"domains":["svc.example.com"],"manageable":true,"writable":true}
+  {"session_id":3,"node":"home","version":"2.5.3","peer":"10.0.0.6:60216","forwarded":"203.0.113.9","role":"node","connected_seconds":125,"domains":["svc.example.com"],"manageable":true,"writable":true}
 ]
 ```
 
 `forwarded` is omitted when the node connects directly or the gateway does not
-add a forwarding header. The page shows it next to the TCP peer, labelled "经".
+add a forwarding header; `version` is omitted by older nodes that do not
+announce it. The page shows `forwarded` next to the TCP peer, labelled "经".
 
-The page shows the same list under "下游节点", with the peer address next to each
-node and the connected count next to the route count. A client that only connects
-to an upstream does not serve sessions itself, so its own session list is empty;
-use the entry node's page to see all of its downstream nodes.
+The page shows the same list under "下游节点", with the version and peer address
+next to each node and the connected count next to the route count. A client that
+only connects to an upstream does not serve sessions itself, so its own session
+list is empty; use the entry node's page to see all of its downstream nodes.
 
 The same route table is logged at `info` whenever it changes:
 

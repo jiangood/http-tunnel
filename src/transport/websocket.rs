@@ -91,6 +91,10 @@ async fn connect_websocket_path(
     if let Some(node_id) = node_id {
         let value = HeaderValue::from_str(node_id).context("The node id is not a valid header")?;
         request.headers_mut().insert("X-HTTP-Tunnel-Node", value);
+        request.headers_mut().insert(
+            crate::protocol_v4::VERSION_HEADER,
+            HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+        );
     }
 
     let result = timeout(

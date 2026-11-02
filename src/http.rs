@@ -177,6 +177,7 @@ async fn handle_visitor(
             // is the TCP peer; the node's own address is only in the forwarding
             // headers it adds to the upgrade request.
             let forwarded = forwarded_client(&prefetched);
+            let peer_version = peer_version(&prefetched);
             let Some((conn, _pending_permit)) =
                 accept_tunnel_websocket(prefetched, stream, &state, addr, &request_id).await?
             else {
@@ -185,7 +186,9 @@ async fn handle_visitor(
             // This is a transport/session connection, not an in-flight visitor
             // request. Do not include its lifetime in the visitor drain counter.
             drop(activity);
-            if let Err(e) = crate::session_server::accept(conn, addr, forwarded, state).await {
+            if let Err(e) =
+                crate::session_server::accept(conn, addr, forwarded, peer_version, state).await
+            {
                 warn!(
                     request_id = %request_id,
                     peer = %addr,
@@ -610,6 +613,26 @@ fn header_for_log(head: &[u8], name: &str) -> Option<String> {
         return Some(String::from_utf8_lossy(trim_ascii(&line[colon + 1..])).into_owned());
     }
     None
+}
+
+/// The software version a peer announced in its WebSocket upgrade.
+///
+/// It is diagnostic only: an older peer does not send the header, and a peer
+/// may send anything, so the value is trimmed to printable ASCII and bounded
+/// before it reaches the management page or the logs.
+fn peer_version(head: &[u8]) -> Option<String> {
+    let value = header_for_log(head, crate::protocol_v4::VERSION_HEADER)?;
+    let version: String = value
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_graphic())
+        .take(64)
+        .collect();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
 }
 
 /// The address a gateway in front of us reports for the peer that opened a
@@ -1122,6 +1145,25 @@ mod tests {
 
         let head = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n";
         assert!(header_for_log(head, "user-agent").is_none());
+    }
+
+    #[test]
+    fn test_peer_version_is_optional_and_bounded() {
+        let head = b"GET /_http-tunnel/v4/connect HTTP/1.1\r\nX-HTTP-Tunnel-Version: 2.5.2\r\n\r\n";
+        assert_eq!(peer_version(head).as_deref(), Some("2.5.2"));
+
+        let head = b"GET /_http-tunnel/v4/connect HTTP/1.1\r\nHost: control.test\r\n\r\n";
+        assert!(peer_version(head).is_none());
+
+        let head = b"GET /_http-tunnel/v4/connect HTTP/1.1\r\nX-HTTP-Tunnel-Version: \r\n\r\n";
+        assert!(peer_version(head).is_none());
+
+        // The value is peer-controlled, so it is clipped before it is stored.
+        let long = format!(
+            "GET /_http-tunnel/v4/connect HTTP/1.1\r\nX-HTTP-Tunnel-Version: {}\r\n\r\n",
+            "9".repeat(100)
+        );
+        assert_eq!(peer_version(long.as_bytes()).unwrap().len(), 64);
     }
 
     #[test]

@@ -482,13 +482,13 @@ keepalive_interval = 15
 
 ## Web 管理
 
-管理页面与 API 始终开启，和访客、v4 会话共用 `listen_port`，只在保留的 `control_host` 上可达。浏览器打开 `http://<control_host>:<listen_port>/`，HTTP Basic 用户名填 `ht`，密码填 `token`；页面是一个内联 CSS/JS 的单页控制台，本身不做服务端渲染，所有数据都通过 `/api/*`（Bearer token）获取，可查看状态、本地服务（含来源）、路由表、下游节点（含来源 IP）、已设置的环境变量和接口列表，并在弹出框中新增或编辑本地服务。下游节点行还可以“管理服务”（增删改该节点自己的 `[[proxies]]`）和“断开”当前会话；远程管理默认开启，能访问入口管理面并持有 token 的人可以修改下游的 `ht.toml`，只应在可信节点间使用。`control_host` 不是本机可解析的地址时，可用 `curl -H "Host: <control_host>" http://127.0.0.1:<listen_port>/` 访问；`listen_port = 0` 时管理页也用临时端口，以启动日志为准。
+管理页面与 API 始终开启，和访客、v4 会话共用 `listen_port`，只在保留的 `control_host` 上可达。浏览器打开 `http://<control_host>:<listen_port>/`，HTTP Basic 用户名填 `ht`，密码填 `token`；页面是一个内联 CSS/JS 的单页控制台，本身不做服务端渲染，所有数据都通过 `/api/*`（Bearer token）获取，可查看状态、本地服务（含来源）、路由表、下游节点（含来源 IP）、已设置的环境变量和接口列表。节点卡片中本节点和下游节点的每一行都有“管理服务”，点开后可在弹窗内增删改该节点自己的 `[[proxies]]`；下游节点行还可以“断开”当前会话。远程管理默认开启，能访问入口管理面并持有 token 的人可以修改下游的 `ht.toml`，只应在可信节点间使用。`control_host` 不是本机可解析的地址时，可用 `curl -H "Host: <control_host>" http://127.0.0.1:<listen_port>/` 访问；`listen_port = 0` 时管理页也用临时端口，以启动日志为准。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/status` | 查看状态、本地服务数、下游节点数、版本、配置文件、运行时长与环境变量覆盖情况 |
 | GET | `/api/proxies` | 列出本地 `[[proxies]]` 及其来源（`ht.toml` / `HT_PROXIES`）；带 `?node=` 或 `?session=` 时列出该下游节点的服务 |
-| GET | `/api/routes` | 查看当前生效的路由表（本地服务 + 下游 v4 路由及其所属节点） |
+| GET | `/api/routes` | 查看当前生效的路由表（本地服务在前，下游 v4 路由在后，均按域名排序） |
 | GET | `/api/sessions` | 列出已连接的下游节点：会话号、节点、网关转发的来源 IP、TCP 对端、角色、连接时长、所属域名与是否可管理 |
 | PUT | `/api/proxies/{name}` | 新增或更新本地服务；带 `?node=`/`?session=` 时写入下游节点 |
 | DELETE | `/api/proxies/{name}` | 删除本地服务；带 `?node=`/`?session=` 时删除下游节点的服务 |

@@ -110,12 +110,14 @@ impl V4SessionHandle {
 }
 
 /// Accept a v4 session on an already-upgraded WebSocket. `peer` is the address
-/// the session connected from and `forwarded` the address a gateway in front of
-/// us reported, kept for the management page and the logs.
+/// the session connected from, `forwarded` the address a gateway in front of us
+/// reported and `peer_version` the software version the peer announced in the
+/// upgrade. The last three are kept for the management page and the logs.
 pub(crate) async fn accept(
     mut conn: Conn,
     peer: SocketAddr,
     forwarded: Option<String>,
+    peer_version: Option<String>,
     state: Arc<ServerState>,
 ) -> Result<()> {
     let hello = time::timeout(HANDSHAKE_TIMEOUT, p4::read_frame(&mut conn))
@@ -201,6 +203,7 @@ pub(crate) async fn accept(
             node_id: node_id.clone(),
             peer,
             forwarded: forwarded.clone(),
+            version: peer_version.clone(),
             role: role_name,
             since: Instant::now(),
             capabilities,
@@ -212,6 +215,7 @@ pub(crate) async fn accept(
         node = %node_id,
         peer = %peer,
         client = forwarded.as_deref().unwrap_or("-"),
+        version = peer_version.as_deref().unwrap_or("-"),
         role = %role_name,
         "v4 session established"
     );

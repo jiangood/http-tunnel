@@ -741,6 +741,11 @@ async fn management_api_manages_proxies() -> Result<()> {
         body
     );
     assert!(
+        body.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))),
+        "the session should report the downstream software version: {}",
+        body
+    );
+    assert!(
         body.contains("\"domains\":[\"echo.test\"]"),
         "unexpected body: {}",
         body

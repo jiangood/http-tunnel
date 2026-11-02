@@ -14,6 +14,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// The entry path of a v4 session.
 pub const V4_PATH: &str = "/_http-tunnel/v4/connect";
+/// The optional software version carried in the WebSocket upgrade. It is
+/// diagnostic only: a peer that does not send it is still a valid v4 peer, the
+/// management page then shows no version for it.
+pub const VERSION_HEADER: &str = "X-HTTP-Tunnel-Version";
 /// The protocol version carried in `Hello`.
 pub const V4_VERSION: u16 = 4;
 /// The maximum size of one encoded frame. Stream data frames are smaller.

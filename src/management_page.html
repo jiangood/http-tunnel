@@ -102,6 +102,7 @@ th.right,td.right{text-align:right}
 .muted{color:var(--muted)}
 .tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap;background:var(--accent-soft);color:var(--accent)}
 .tag.local{background:var(--ok-soft);color:var(--ok)}
+.tag.downstream{padding:0 7px;border:1px solid var(--line);background:transparent;color:var(--muted);font-weight:500}
 .tag.method-get{background:var(--ok-soft);color:var(--ok)}
 .tag.method-put{background:var(--warn-soft);color:var(--warn)}
 .tag.method-post{background:var(--accent-soft);color:var(--accent)}
@@ -164,24 +165,22 @@ input[readonly]{background:var(--input);color:var(--muted)}
             <th>会话</th>
             <th>节点名称</th>
             <th>类型</th>
+            <th>版本</th>
             <th>来源地址</th>
             <th>连接时长</th>
             <th class="right">操作</th>
           </tr>
         </thead>
         <tbody id="node-body">
-          <tr><td colspan="6" class="empty">加载中…</td></tr>
+          <tr><td colspan="7" class="empty">加载中…</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="hint">“本节点”是当前进程，来源地址列显示它的监听或上游地址；下游节点每个 v4 会话一行，节点重连后会换一个新会话号。下游的来源地址优先显示网关（雷池、nginx 等）转发的对端 IP，没有网关时显示直接连到本机的 TCP 地址。“管理服务”编辑该节点自己的 <code>[[proxies]]</code>；“断开”只关闭当前会话，节点会按自己的重连间隔重新连上。</p>
+    <p class="hint">“本节点”是当前进程，来源地址列显示它的监听或上游地址；下游节点每个 v4 会话一行，节点重连后会换一个新会话号。版本列来自节点连接时上报的软件版本，旧版本节点不提供该信息时显示“—”。下游的来源地址优先显示网关（雷池、nginx 等）转发的对端 IP，没有网关时显示直接连到本机的 TCP 地址。“管理服务”打开本节点或下游节点的服务列表，可在弹窗内增删改该节点自己的 <code>[[proxies]]</code>；“断开”只关闭当前会话，节点会按自己的重连间隔重新连上。</p>
   </section>
 
   <section class="card">
-    <div class="card-head">
-      <h2>路由表<span class="count" id="route-count">0</span></h2>
-      <button class="btn primary small" id="add-proxy" type="button">新增服务</button>
-    </div>
+    <h2>路由表<span class="count" id="route-count">0</span></h2>
     <p class="notice" id="read-only" hidden>本节点的服务由环境变量 <code>HT_PROXIES</code> 管理，网页与 API 不可修改；如需变更，请修改该环境变量并重启 ht。</p>
     <div class="table-wrap">
       <table>
@@ -194,15 +193,14 @@ input[readonly]{background:var(--input);color:var(--muted)}
             <th>会话</th>
             <th>来源</th>
             <th>目标地址</th>
-            <th class="right">操作</th>
           </tr>
         </thead>
         <tbody id="route-body">
-          <tr><td colspan="8" class="empty">加载中…</td></tr>
+          <tr><td colspan="7" class="empty">加载中…</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="hint">本节点服务优先于同名 v4 会话。“类型”区分本节点和下游节点；“来源”对本节点是配置来源，对下游是连接地址。下游路由的名称和目标地址从该节点的服务列表读取，读取不到时显示“—”。</p>
+    <p class="hint">本节点服务排在路由表前面，并优先于同名 v4 会话。“类型”区分本节点和下游节点；“来源”是两个节点各自服务的配置来源（<code>ht.toml</code> / <code>HT_PROXIES</code>），下游节点读取不到时显示“—”。下游路由的名称和目标地址从该节点的服务列表读取，读取不到时显示“—”或“下游转发”。新增、编辑或删除服务请在上方节点卡片的“管理服务”弹窗中操作。</p>
   </section>
 
   <section class="card">
@@ -231,7 +229,7 @@ input[readonly]{background:var(--input);color:var(--muted)}
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/status</td><td class="muted">Bearer</td><td class="muted">进程状态：名称、传输、上游、连通性、服务数、下游节点数、版本、配置文件、运行时长、环境变量</td></tr>
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/proxies</td><td class="muted">Bearer</td><td class="muted">列出本地服务及其来源；加 <code>?node=</code> 或 <code>?session=</code> 时列出该下游节点自己的服务</td></tr>
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/routes</td><td class="muted">Bearer</td><td class="muted">生效中的路由表，包含 v4 会话</td></tr>
-          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/sessions</td><td class="muted">Bearer</td><td class="muted">已连接的下游节点：会话号、节点、网关转发的来源 IP、TCP 对端、角色、连接时长、所属域名与是否可管理</td></tr>
+          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/sessions</td><td class="muted">Bearer</td><td class="muted">已连接的下游节点：会话号、节点、版本、网关转发的来源 IP、TCP 对端、角色、连接时长、所属域名与是否可管理</td></tr>
           <tr><td><span class="tag method-put">PUT</span></td><td class="mono">/api/proxies/{name}</td><td class="muted">Bearer</td><td class="muted">新增或替换服务，请求体 <code>{"domain":"…","local_addr":"…"}</code>；带 <code>?node=</code>/<code>?session=</code> 时写入下游节点</td></tr>
           <tr><td><span class="tag method-delete">DELETE</span></td><td class="mono">/api/proxies/{name}</td><td class="muted">Bearer</td><td class="muted">删除服务；带 <code>?node=</code>/<code>?session=</code> 时删除下游节点的服务</td></tr>
           <tr><td><span class="tag method-delete">DELETE</span></td><td class="mono">/api/sessions/{id}</td><td class="muted">Bearer</td><td class="muted">断开一个下游会话；节点会按自己的重连间隔重新连上</td></tr>
@@ -275,16 +273,16 @@ input[readonly]{background:var(--input);color:var(--muted)}
   </form>
 </dialog>
 
-<dialog class="modal wide" id="session-proxy-dialog" closedby="none" aria-labelledby="session-proxy-title">
+<dialog class="modal wide" id="service-dialog" closedby="none" aria-labelledby="service-title">
   <div class="modal-body">
     <div class="modal-head">
-      <h2 id="session-proxy-title">下游服务</h2>
-      <button class="btn small icon" type="button" id="session-proxy-close" aria-label="关闭">✕</button>
+      <h2 id="service-title">节点服务</h2>
+      <button class="btn small icon" type="button" id="service-close" aria-label="关闭">✕</button>
     </div>
-    <p class="notice" id="session-proxy-readonly" hidden>该节点的本地服务由环境变量 <code>HT_PROXIES</code> 管理，只能查看，不能修改。</p>
+    <p class="notice" id="service-readonly" hidden></p>
     <div class="card-head">
-      <span class="muted" id="session-proxy-subtitle">—</span>
-      <button class="btn primary small" id="session-proxy-add" type="button">新增服务</button>
+      <span class="muted" id="service-subtitle">—</span>
+      <button class="btn primary small" id="service-add" type="button">新增服务</button>
     </div>
     <div class="table-wrap">
       <table>
@@ -293,15 +291,15 @@ input[readonly]{background:var(--input);color:var(--muted)}
             <th>名称</th>
             <th>域名</th>
             <th>本地地址</th>
-            <th class="right" id="session-proxy-op-head">操作</th>
+            <th class="right" id="service-op-head">操作</th>
           </tr>
         </thead>
-        <tbody id="session-proxy-body">
+        <tbody id="service-body">
           <tr><td colspan="4" class="empty">加载中…</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="hint">这里操作的是该下游节点自己的 <code>[[proxies]]</code>，保存后会写回它的 <code>ht.toml</code> 并立即生效；relay 再下游的节点不在这里管理。</p>
+    <p class="hint" id="service-hint"></p>
   </div>
 </dialog>
 
@@ -338,13 +336,14 @@ input[readonly]{background:var(--input);color:var(--muted)}
   var readOnly = false;
   var nodeName = "";
   var nodeRemote = "";
+  var nodeVersion = "";
   var nodeUptime = 0;
   var toastTimer = null;
   var proxiesCache = [];
   var sessionsCache = [];
   var sessionProxyMap = {};
-  var sessionProxiesCache = [];
-  var sessionProxyTarget = null;
+  var serviceProxiesCache = [];
+  var serviceTarget = null;
 
   var ENV_DOCS = {
     HT_UPSTREAM_URL: "下一跳 WebSocket 地址",
@@ -428,6 +427,7 @@ input[readonly]{background:var(--input);color:var(--muted)}
     readOnly = !!status.proxies_managed;
     nodeName = status.name || "";
     nodeRemote = status.remote || "";
+    nodeVersion = status.version || "";
     nodeUptime = status.uptime_seconds || 0;
     $("m-name").textContent = status.name;
     $("m-remote").textContent = status.remote;
@@ -443,7 +443,6 @@ input[readonly]{background:var(--input);color:var(--muted)}
     $("pill-text").textContent = status.connected ? "已连接" : "未连接";
 
     $("read-only").hidden = !readOnly;
-    $("add-proxy").hidden = readOnly;
     renderEnv(status.env_vars || []);
   }
 
@@ -467,10 +466,10 @@ input[readonly]{background:var(--input);color:var(--muted)}
 
   function renderSessions(sessions) {
     sessionsCache = sessions;
-    if (sessionProxyTarget && !sessions.some(function (item) {
-      return String(item.session_id) === String(sessionProxyTarget.session_id);
+    if (serviceTarget && !serviceTarget.local && !sessions.some(function (item) {
+      return String(item.session_id) === String(serviceTarget.scope.session_id);
     })) {
-      closeSessionProxyDialog();
+      closeServiceDialog();
     }
   }
 
@@ -488,16 +487,9 @@ input[readonly]{background:var(--input);color:var(--muted)}
       : '<span class="mono muted">' + esc(session.peer) + "</span>";
   }
 
-  function localActions(proxy) {
-    if (readOnly) {
-      return '<td class="right"><span class="muted">只读</span></td>';
-    }
-    if (!proxy) {
-      return '<td class="right"><span class="muted">—</span></td>';
-    }
+  function localNodeActions() {
     return '<td class="right"><div class="row-actions">' +
-      '<button class="btn small" type="button" data-edit="' + esc(proxy.name) + '">编辑</button>' +
-      '<button class="btn danger small" type="button" data-delete="' + esc(proxy.name) + '">删除</button>' +
+      '<button class="btn small" type="button" data-manage-local="1">管理服务</button>' +
       "</div></td>";
   }
 
@@ -523,15 +515,17 @@ input[readonly]{background:var(--input);color:var(--muted)}
       '<td class="muted">—</td>' +
       '<td class="strong">' + esc(nodeName) + "</td>" +
       '<td><span class="tag local">本节点</span></td>' +
+      '<td class="mono muted">' + (nodeVersion ? "v" + esc(nodeVersion) : "—") + "</td>" +
       '<td class="mono muted">' + esc(nodeRemote) + "</td>" +
       '<td class="mono muted">' + esc(uptime(nodeUptime)) + "</td>" +
-      '<td class="right"><span class="muted">—</span></td>' +
+      localNodeActions() +
       "</tr>");
     sessions.forEach(function (session) {
       rows.push("<tr>" +
-        '<td class="mono strong">#' + esc(session.session_id) + "</td>" +
-        '<td class="strong">' + esc(session.node) + "</td>" +
-        '<td><span class="tag">下游节点</span></td>' +
+        '<td class="mono muted">#' + esc(session.session_id) + "</td>" +
+        "<td>" + esc(session.node) + "</td>" +
+        '<td><span class="tag downstream">下游节点</span></td>' +
+        '<td class="mono muted">' + (session.version ? "v" + esc(session.version) : "—") + "</td>" +
         "<td class=\"nowrap\">" + sessionSource(session) + "</td>" +
         '<td class="mono muted">' + esc(uptime(session.connected_seconds)) + "</td>" +
         sessionActions(session) +
@@ -543,7 +537,7 @@ input[readonly]{background:var(--input);color:var(--muted)}
 
   function renderRouteRow(route) {
     var local = route.owner === "local";
-    var tag = local ? '<span class="tag local">本节点</span>' : '<span class="tag">下游节点</span>';
+    var tag = local ? '<span class="tag local">本节点</span>' : '<span class="tag downstream">下游节点</span>';
     var proxy = local
       ? proxiesCache.find(function (item) { return item.name === route.name; })
       : null;
@@ -569,22 +563,18 @@ input[readonly]{background:var(--input);color:var(--muted)}
     var sessionCell = local || route.session_id === null || route.session_id === undefined
       ? '<span class="muted">—</span>'
       : "#" + esc(route.session_id);
-    var source = local ? configSource(proxy) : sessionSource(session);
+    var source = configSource(local ? proxy : remoteProxy);
     var target = local
       ? esc(route.target)
       : (remoteProxy ? esc(remoteProxy.local_addr) : '<span class="muted">下游转发</span>');
-    var actions = local
-      ? localActions(proxy)
-      : '<td class="right"><span class="muted">—</span></td>';
     return "<tr>" +
       '<td class="mono strong">' + esc(route.domain) + "</td>" +
       "<td>" + tag + "</td>" +
-      '<td class="strong">' + node + "</td>" +
+      '<td' + (local ? ' class="strong"' : "") + ">" + node + "</td>" +
       '<td class="mono">' + name + "</td>" +
       "<td>" + sessionCell + "</td>" +
       "<td class=\"nowrap\">" + source + "</td>" +
       '<td class="mono muted">' + target + "</td>" +
-      actions +
       "</tr>";
   }
 
@@ -593,7 +583,7 @@ input[readonly]{background:var(--input);color:var(--muted)}
     $("m-routes").textContent = routes.length;
     var body = $("route-body");
     if (!routes.length) {
-      body.innerHTML = '<tr><td colspan="8" class="empty">路由表为空：本节点还没有服务，也没有 v4 会话声明域名。</td></tr>';
+      body.innerHTML = '<tr><td colspan="7" class="empty">路由表为空：本节点还没有服务，也没有 v4 会话声明域名。</td></tr>';
       return;
     }
     body.innerHTML = routes.map(renderRouteRow).join("");
@@ -669,7 +659,6 @@ input[readonly]{background:var(--input);color:var(--muted)}
     if (dialog.open) { dialog.close(); }
   }
 
-  $("add-proxy").addEventListener("click", function () { openDialog(null, null); });
   $("dialog-close").addEventListener("click", closeDialog);
   $("dialog-cancel").addEventListener("click", closeDialog);
   dialog.addEventListener("close", function () {
@@ -696,10 +685,7 @@ input[readonly]{background:var(--input);color:var(--muted)}
     }).then(function () {
       toast((editing ? "已更新 " : "已新增 ") + name);
       closeDialog();
-      if (scope) {
-        return Promise.all([loadAll(true), loadSessionProxies()]);
-      }
-      return loadAll(true);
+      return Promise.all([loadAll(true), loadServiceProxies()]);
     }).catch(function (error) {
       toast(error.message, "error");
     }).then(function () {
@@ -707,42 +693,27 @@ input[readonly]{background:var(--input);color:var(--muted)}
     });
   });
 
-  $("route-body").addEventListener("click", function (event) {
-    var edit = event.target.closest("[data-edit]");
-    if (edit) {
-      var editingName = edit.getAttribute("data-edit");
-      var proxy = proxiesCache.find(function (item) { return item.name === editingName; });
-      if (proxy) { openDialog(proxy, null); }
-      return;
-    }
-
-    var button = event.target.closest("[data-delete]");
-    if (button) {
-      var name = button.getAttribute("data-delete");
-      if (!window.confirm("删除本节点服务 " + name + "？")) { return; }
-      button.disabled = true;
-      request(proxyPath(name, null), { method: "DELETE" })
-        .then(function () {
-          toast("已删除 " + name);
-          return loadAll(true);
-        })
-        .catch(function (error) {
-          toast(error.message, "error");
-          button.disabled = false;
-        });
-      return;
-    }
-
-  });
-
   $("node-body").addEventListener("click", function (event) {
+    var localManage = event.target.closest("[data-manage-local]");
+    if (localManage) {
+      openServiceDialog({ local: true, node: nodeName, writable: !readOnly, scope: null });
+      return;
+    }
+
     var manage = event.target.closest("[data-manage]");
     if (manage) {
       var manageId = manage.getAttribute("data-manage");
       var session = sessionsCache.find(function (item) {
         return String(item.session_id) === manageId;
       });
-      if (session) { openSessionProxies(session); }
+      if (session) {
+        openServiceDialog({
+          local: false,
+          node: session.node,
+          writable: !!session.writable,
+          scope: session
+        });
+      }
       return;
     }
 
@@ -762,56 +733,64 @@ input[readonly]{background:var(--input);color:var(--muted)}
       });
   });
 
-  var sessionProxyDialog = $("session-proxy-dialog");
+  var serviceDialog = $("service-dialog");
 
-  function closeSessionProxyDialog() {
-    if (sessionProxyDialog.open) { sessionProxyDialog.close(); }
+  function closeServiceDialog() {
+    if (serviceDialog.open) { serviceDialog.close(); }
   }
 
-  sessionProxyDialog.addEventListener("close", function () {
-    sessionProxyTarget = null;
-    sessionProxiesCache = [];
+  serviceDialog.addEventListener("close", function () {
+    serviceTarget = null;
+    serviceProxiesCache = [];
   });
-  $("session-proxy-close").addEventListener("click", closeSessionProxyDialog);
+  $("service-close").addEventListener("click", closeServiceDialog);
 
-  function openSessionProxies(session) {
-    sessionProxyTarget = session;
-    $("session-proxy-title").textContent = "下游服务 · " + session.node;
-    $("session-proxy-subtitle").textContent = "会话 #" + session.session_id +
-      " · " + (session.writable ? "保存会写回该节点的 ht.toml" : "HT_PROXIES 只读");
-    $("session-proxy-readonly").hidden = !!session.writable;
-    $("session-proxy-add").hidden = !session.writable;
-    $("session-proxy-op-head").hidden = !session.writable;
-    sessionProxiesCache = [];
-    $("session-proxy-body").innerHTML = '<tr><td colspan="4" class="empty">加载中…</td></tr>';
-    if (!sessionProxyDialog.open) { sessionProxyDialog.showModal(); }
-    loadSessionProxies();
+  function openServiceDialog(target) {
+    serviceTarget = target;
+    var local = !!target.local;
+    $("service-title").textContent = local ? "本节点服务" : "下游服务 · " + target.node;
+    $("service-subtitle").textContent = local
+      ? "当前进程 · " + (target.writable ? "保存会写回本节点的 ht.toml" : "HT_PROXIES 只读")
+      : "会话 #" + target.scope.session_id + " · " +
+        (target.writable ? "保存会写回该节点的 ht.toml" : "HT_PROXIES 只读");
+    $("service-readonly").hidden = !!target.writable;
+    $("service-readonly").innerHTML = (local ? "本节点" : "该节点") +
+      "的本地服务由环境变量 <code>HT_PROXIES</code> 管理，只能查看，不能修改。";
+    $("service-add").hidden = !target.writable;
+    $("service-op-head").hidden = !target.writable;
+    $("service-hint").innerHTML = local
+      ? "这里操作的是本节点自己的 <code>[[proxies]]</code>，保存后会写回 <code>ht.toml</code> 并立即生效。"
+      : "这里操作的是该下游节点自己的 <code>[[proxies]]</code>，保存后会写回它的 <code>ht.toml</code> 并立即生效；relay 再下游的节点不在这里管理。";
+    serviceProxiesCache = [];
+    $("service-body").innerHTML = '<tr><td colspan="4" class="empty">加载中…</td></tr>';
+    if (!serviceDialog.open) { serviceDialog.showModal(); }
+    loadServiceProxies();
   }
 
-  function loadSessionProxies() {
-    if (!sessionProxyTarget) { return Promise.resolve(); }
-    var target = sessionProxyTarget;
-    return request("/api/proxies" + scopeQuery(target)).then(function (proxies) {
-      if (sessionProxyTarget !== target) { return; }
-      sessionProxiesCache = proxies;
-      renderSessionProxies(proxies, target);
+  function loadServiceProxies() {
+    if (!serviceTarget) { return Promise.resolve(); }
+    var target = serviceTarget;
+    return request("/api/proxies" + scopeQuery(target.scope)).then(function (proxies) {
+      if (serviceTarget !== target) { return; }
+      serviceProxiesCache = proxies;
+      renderServiceProxies(proxies, target);
     }).catch(function (error) {
-      if (sessionProxyTarget !== target) { return; }
+      if (serviceTarget !== target) { return; }
       toast(error.message, "error");
-      $("session-proxy-body").innerHTML =
+      $("service-body").innerHTML =
         '<tr><td colspan="4" class="empty">' + esc(error.message) + "</td></tr>";
     });
   }
 
-  function renderSessionProxies(proxies, session) {
-    var body = $("session-proxy-body");
+  function renderServiceProxies(proxies, target) {
+    var body = $("service-body");
     if (!proxies.length) {
-      body.innerHTML = '<tr><td colspan="' + (session.writable ? 4 : 3) +
-        '" class="empty">该节点还没有本地服务。</td></tr>';
+      body.innerHTML = '<tr><td colspan="' + (target.writable ? 4 : 3) +
+        '" class="empty">' + (target.local ? "本节点" : "该节点") + "还没有本地服务。</td></tr>";
       return;
     }
     body.innerHTML = proxies.map(function (proxy) {
-      var actions = !session.writable ? "" :
+      var actions = !target.writable ? "" :
         '<td class="right"><div class="row-actions">' +
           '<button class="btn small" type="button" data-edit="' + esc(proxy.name) + '">编辑</button>' +
           '<button class="btn danger small" type="button" data-delete="' + esc(proxy.name) + '">删除</button>' +
@@ -825,31 +804,31 @@ input[readonly]{background:var(--input);color:var(--muted)}
     }).join("");
   }
 
-  $("session-proxy-add").addEventListener("click", function () {
-    if (sessionProxyTarget && sessionProxyTarget.writable) {
-      openDialog(null, sessionProxyTarget);
+  $("service-add").addEventListener("click", function () {
+    if (serviceTarget && serviceTarget.writable) {
+      openDialog(null, serviceTarget.scope);
     }
   });
 
-  $("session-proxy-body").addEventListener("click", function (event) {
-    if (!sessionProxyTarget) { return; }
+  $("service-body").addEventListener("click", function (event) {
+    if (!serviceTarget) { return; }
     var edit = event.target.closest("[data-edit]");
     if (edit) {
       var editName = edit.getAttribute("data-edit");
-      var proxy = sessionProxiesCache.find(function (item) { return item.name === editName; });
-      if (proxy) { openDialog(proxy, sessionProxyTarget); }
+      var proxy = serviceProxiesCache.find(function (item) { return item.name === editName; });
+      if (proxy) { openDialog(proxy, serviceTarget.scope); }
       return;
     }
     var button = event.target.closest("[data-delete]");
     if (!button) { return; }
     var name = button.getAttribute("data-delete");
-    if (!window.confirm("删除节点 " + sessionProxyTarget.node + " 的本地服务 " + name + "？")) { return; }
-    var target = sessionProxyTarget;
+    var target = serviceTarget;
+    if (!window.confirm("删除节点 " + target.node + " 的本地服务 " + name + "？")) { return; }
     button.disabled = true;
-    request(proxyPath(name, target), { method: "DELETE" })
+    request(proxyPath(name, target.scope), { method: "DELETE" })
       .then(function () {
         toast("已删除 " + name);
-        return Promise.all([loadAll(true), loadSessionProxies()]);
+        return Promise.all([loadAll(true), loadServiceProxies()]);
       })
       .catch(function (error) {
         toast(error.message, "error");
