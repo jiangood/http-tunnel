@@ -194,16 +194,35 @@ A downstream node may let its upstream manage its local `[[proxies]]` over the
 same session. This is an optional capability, not a new protocol version:
 
 - `Hello.capabilities` carries `CAP_PROXY_ADMIN` (`1 << 0`) when the node
-  understands management requests.
+  understands management requests. It is announced even when writes are
+  disabled, so the upstream can still list the services.
 - `CAP_PROXY_WRITE` (`1 << 1`) is also set when the node allows changes. It is
-  cleared when `HT_PROXIES` owns the list, so the upstream can list but not
-  edit it.
+  cleared by default (`allow_upstream_modify = false`) and when `HT_PROXIES`
+  owns the list. The node reconnects its session when the switch changes, so the
+  next `Hello` carries the new value immediately.
+- `CAP_PROXY_AUTH` (`1 << 2`) is set when the node speaks the proxy frame shape
+  that carries `auth_header`. This is a wire-format change, not a new frame:
+  `ProxyEntry` gained `auth_header` and `ProxyOp::Put` gained `auth_header`.
+  All nodes on one control plane must run the same release. An upstream refuses
+  proxy management of a peer without this capability and reports a `409`
+  instead of sending a frame the peer cannot decode.
+- `CAP_PROXY_ENV` (`1 << 3`) is set when the node's local services come from
+  `HT_PROXIES`. It distinguishes an environment-managed read-only list from a
+  list that is read-only only because `allow_upstream_modify` is off; the
+  management page uses it for the `proxy_source` field.
 - The server only sends `ProxyRequest` to a session that announced
-  `CAP_PROXY_ADMIN`. Older peers send `capabilities = 0` and are never sent the
-  new frames.
-- `ProxyOp` is `List`, `Put { name, domain, local_addr }` or `Delete { name }`.
-  `ProxyResponse` carries the node's current proxy list and an optional error
-  string. The request id correlates the response with the pending request.
+  `CAP_PROXY_ADMIN`. Older peers send `capabilities = 0` and are never sent
+  management frames.
+- `ProxyOp` is `List`, `Put { name, domain, local_addr, auth_header }` or
+  `Delete { name }`. `auth_header` is the visitor token (`X-HTTP-TUNNEL-TOKEN`)
+  or `None` when authentication is off; `Put` replaces the whole entry.
+  `ProxyResponse` carries the node's current proxy list, including each entry's
+  `auth_header`, and an optional error string. The request id correlates the
+  response with the pending request.
+- The capability bits are advisory. The node itself rejects `Put` and `Delete`
+  when `allow_upstream_modify` is off or `HT_PROXIES` owns the list, even if an
+  upstream sends the frame without the advertised capability. `List` is always
+  allowed.
 
 The downstream executes the operation with its local management state: validate,
 write its `ht.toml` atomically, replace the running proxy list, and publish the

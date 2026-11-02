@@ -40,6 +40,7 @@ pub(crate) enum ProxyAdminRequest {
         name: String,
         domain: String,
         local_addr: String,
+        auth_header: Option<MaskedString>,
         reply: oneshot::Sender<Result<Vec<ServerProxyEntry>>>,
     },
     Delete {
@@ -56,7 +57,13 @@ pub(crate) struct SessionArgs {
     pub(crate) role: Role,
     pub(crate) keepalive_interval: u64,
     pub(crate) retry_interval: u64,
-    pub(crate) capabilities: u32,
+    /// Whether the local `[[proxies]]` come from `HT_PROXIES`. It is announced
+    /// with `CAP_PROXY_ENV`, and such a node never advertises `CAP_PROXY_WRITE`.
+    pub(crate) proxies_managed: bool,
+    /// The live `allow_upstream_modify` switch. A change reconnects the session
+    /// so that the next hop learns the new capability bits immediately. `None`
+    /// in a build without the management feature.
+    pub(crate) allow_upstream_modify: Option<watch::Receiver<bool>>,
     /// The local management worker. `None` in a build without the management
     /// feature; the process then advertises no proxy capability.
     pub(crate) proxy_admin: Option<mpsc::Sender<ProxyAdminRequest>>,
@@ -103,6 +110,21 @@ pub(crate) async fn run(
                             let _ = args.fatal_tx.send(anyhow!("{}", fatal.0));
                             return Err(err);
                         }
+                        if err.downcast_ref::<ReconnectRequested>().is_some() {
+                            // The switch is a configuration change, not a
+                            // failure, so reconnect immediately and reset the
+                            // retry backoff.
+                            info!(
+                                allow_upstream_modify = args
+                                    .allow_upstream_modify
+                                    .as_ref()
+                                    .map(|rx| *rx.borrow())
+                                    .unwrap_or(false),
+                                "Reconnecting to announce the changed proxy capabilities"
+                            );
+                            backoff = run_session_backoff(args.retry_interval);
+                            continue;
+                        }
                         if args.fatal_tx.is_closed() {
                             return Err(err);
                         }
@@ -136,10 +158,54 @@ impl std::error::Error for FatalSessionError {
     }
 }
 
+/// The session must reconnect at once, without the retry backoff, because the
+/// local `allow_upstream_modify` switch changed and the next hop has to receive
+/// the new capability bits in a fresh `Hello`.
+#[derive(Debug)]
+struct ReconnectRequested;
+
+impl std::fmt::Display for ReconnectRequested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reconnecting to announce the changed capabilities")
+    }
+}
+
+impl std::error::Error for ReconnectRequested {}
+
+/// The proxy capability bits of the current attempt.
+///
+/// `CAP_PROXY_ADMIN` and `CAP_PROXY_AUTH` are always announced when the local
+/// management worker exists: the next hop may still list the services.
+/// `CAP_PROXY_WRITE` depends on `allow_upstream_modify` and is absent when
+/// `HT_PROXIES` owns the list, which is announced with `CAP_PROXY_ENV`.
+fn proxy_capabilities(args: &SessionArgs) -> u32 {
+    if args.proxy_admin.is_none() {
+        return 0;
+    }
+    let mut capabilities = p4::CAP_PROXY_ADMIN | p4::CAP_PROXY_AUTH;
+    if args.proxies_managed {
+        capabilities |= p4::CAP_PROXY_ENV;
+    } else if args
+        .allow_upstream_modify
+        .as_ref()
+        .map(|rx| *rx.borrow())
+        .unwrap_or(false)
+    {
+        capabilities |= p4::CAP_PROXY_WRITE;
+    }
+    capabilities
+}
+
 async fn run_once(
     args: &mut SessionArgs,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
+    // Mark the current switch value as seen before connecting. Otherwise a
+    // clone of a receiver that has never observed the last change would report
+    // it as changed immediately and reconnect forever.
+    if let Some(rx) = args.allow_upstream_modify.as_mut() {
+        rx.borrow_and_update();
+    }
     let mut sent: BTreeSet<String> = args.routes.borrow_and_update().keys().cloned().collect();
     let mut generation = 1u64;
 
@@ -181,6 +247,7 @@ async fn run_once(
 
     let mut streams: HashMap<u32, mpsc::UnboundedSender<StreamInput>> = HashMap::new();
     let (closed_tx, mut closed_rx) = mpsc::unbounded_channel::<u32>();
+    let mut switch_rx = args.allow_upstream_modify.clone();
 
     let routes: Vec<RouteAdvert> = sent
         .iter()
@@ -204,6 +271,20 @@ async fn run_once(
                     drain_seconds: 0,
                 }).await;
                 result = Ok(());
+                break;
+            }
+            changed = wait_for_switch(&mut switch_rx) => {
+                match changed {
+                    Some(()) => {
+                        info!("The allow_upstream_modify switch changed; reconnecting");
+                        result = Err(ReconnectRequested.into());
+                    }
+                    None => {
+                        // The management state is gone, so no further change is
+                        // possible. The process is stopping anyway.
+                        result = Ok(());
+                    }
+                }
                 break;
             }
             changed = args.routes.changed() => {
@@ -339,9 +420,22 @@ async fn run_once(
                         }
                         SessionFrame::ProxyRequest { request_id, op } => {
                             let admin = args.proxy_admin.clone();
+                            let allow_upstream_modify = args
+                                .allow_upstream_modify
+                                .as_ref()
+                                .map(|rx| *rx.borrow())
+                                .unwrap_or(false);
+                            let proxies_managed = args.proxies_managed;
                             let out = out_tx.clone();
                             tokio::spawn(async move {
-                                let (proxies, error) = match handle_proxy_request(admin, op).await {
+                                let (proxies, error) = match handle_proxy_request(
+                                    admin,
+                                    op,
+                                    allow_upstream_modify,
+                                    proxies_managed,
+                                )
+                                .await
+                                {
                                     Ok(proxies) => (proxies, None),
                                     Err(error) => (Vec::new(), Some(error)),
                                 };
@@ -394,15 +488,46 @@ fn request_id_from_trace_id(trace_id: &[u8]) -> String {
     }
 }
 
+/// Wait for a change of the optional `allow_upstream_modify` watch. Without a
+/// management feature the future never resolves, so the `select!` branch stays
+/// inactive.
+async fn wait_for_switch(rx: &mut Option<watch::Receiver<bool>>) -> Option<()> {
+    match rx {
+        Some(rx) => rx.changed().await.ok(),
+        None => std::future::pending().await,
+    }
+}
+
 /// Run one proxy operation through the local management worker and convert its
 /// result into the wire representation.
+///
+/// A `Put` or `Delete` is rejected here as well as in the worker: the capability
+/// bits are advisory, and a next hop that ignores them must not be able to write
+/// merely by sending a frame.
 async fn handle_proxy_request(
     admin: Option<mpsc::Sender<ProxyAdminRequest>>,
     op: p4::ProxyOp,
+    allow_upstream_modify: bool,
+    proxies_managed: bool,
 ) -> std::result::Result<Vec<p4::ProxyEntry>, String> {
     let Some(admin) = admin else {
         return Err("the downstream node does not support remote proxy management".to_string());
     };
+    let write = matches!(op, p4::ProxyOp::Put { .. } | p4::ProxyOp::Delete { .. });
+    if write {
+        if proxies_managed {
+            return Err(
+                "the local services are managed by HT_PROXIES and cannot be changed".to_string(),
+            );
+        }
+        if !allow_upstream_modify {
+            return Err(
+                "the node does not allow its upstream to modify its local services; \
+                 set `allow_upstream_modify = true` on that node"
+                    .to_string(),
+            );
+        }
+    }
     let (reply, reply_rx) = oneshot::channel();
     let request = match op {
         p4::ProxyOp::List => ProxyAdminRequest::List { reply },
@@ -410,10 +535,12 @@ async fn handle_proxy_request(
             name,
             domain,
             local_addr,
+            auth_header,
         } => ProxyAdminRequest::Put {
             name,
             domain,
             local_addr,
+            auth_header,
             reply,
         },
         p4::ProxyOp::Delete { name } => ProxyAdminRequest::Delete { name, reply },
@@ -430,6 +557,7 @@ async fn handle_proxy_request(
                 name: proxy.name,
                 domain: proxy.domain,
                 local_addr: proxy.local_addr,
+                auth_header: proxy.auth_header,
             })
             .collect()),
         Ok(Ok(Err(error))) => Err(format!("{:#}", error)),
@@ -471,7 +599,7 @@ async fn handshake(conn: &mut BoxedIo, args: &SessionArgs) -> Result<()> {
             version: p4::V4_VERSION,
             node_id: args.node_id.clone(),
             role: args.role,
-            capabilities: args.capabilities,
+            capabilities: proxy_capabilities(args),
         },
     )
     .await?;

@@ -78,6 +78,23 @@ fn write_leaf_config(
     Ok(path.to_str().unwrap().to_string())
 }
 
+/// Add `allow_upstream_modify = true` to a config written by
+/// [`write_leaf_config`]. The field is top-level, so it must be inserted before
+/// the `[upstream]` table.
+fn enable_upstream_modify(path: &str) -> Result<()> {
+    let content = std::fs::read_to_string(path)?;
+    let marker = "\n[upstream]";
+    let index = content
+        .find(marker)
+        .unwrap_or_else(|| panic!("no [upstream] table in {}", path));
+    let mut updated = String::with_capacity(content.len() + 32);
+    updated.push_str(&content[..index]);
+    updated.push_str("\nallow_upstream_modify = true");
+    updated.push_str(&content[index..]);
+    std::fs::write(path, updated)?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn http_routing() -> Result<()> {
     init();
@@ -243,6 +260,39 @@ async fn http_echo_hitter(addr: &'static str, host: &'static str) -> Result<()> 
     assert_eq!(response, request);
 
     Ok(())
+}
+
+/// Send one visitor request with an optional `X-HTTP-TUNNEL-TOKEN` and return
+/// the status line and the first chunk of the response.
+async fn visitor_status(addr: &str, host: &str, token: Option<&str>) -> Result<(u16, String)> {
+    let mut conn = TcpStream::connect(addr).await?;
+    let auth = token
+        .map(|token| format!("X-HTTP-TUNNEL-TOKEN: {}\r\n", token))
+        .unwrap_or_default();
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: {}\r\n{}Connection: close\r\n\r\n",
+        host, auth
+    );
+    conn.write_all(request.as_bytes()).await?;
+
+    let mut buffer = [0u8; 8192];
+    let read = time::timeout(Duration::from_secs(10), conn.read(&mut buffer)).await??;
+    let response = String::from_utf8_lossy(&buffer[..read]).to_string();
+    // A rejected visitor gets an `ht` error page. An accepted one reaches the
+    // raw echo backend in these tests, which sends the request back verbatim
+    // without a status line.
+    let status = if response.starts_with("HTTP/1.1 ") {
+        response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|status| status.parse().ok())
+            .unwrap_or(0)
+    } else if response.starts_with("GET ") {
+        200
+    } else {
+        0
+    };
+    Ok((status, response))
 }
 
 /// Poll `addr` until it accepts TCP connections. Tests use this instead of a
@@ -699,6 +749,79 @@ async fn management_api_manages_proxies() -> Result<()> {
         .await
         .unwrap();
 
+    info!("the management API enables visitor authentication");
+    let (status, body) = api_request(
+        MANAGEMENT_ADDR,
+        "PUT",
+        "/api/proxies/echo",
+        Some(MANAGEMENT_TOKEN),
+        Some(
+            r#"{"domain":"echo.test","local_addr":"127.0.0.1:8093","auth_header":"visitor-secret"}"#,
+        ),
+    )
+    .await?;
+    assert_eq!(status, 201, "unexpected response: {}", body);
+    assert!(
+        body.contains("\"auth_header\":\"visitor-secret\""),
+        "unexpected body: {}",
+        body
+    );
+
+    let (status, body) = api_request(
+        MANAGEMENT_ADDR,
+        "GET",
+        "/api/proxies",
+        Some(MANAGEMENT_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(
+        body.contains("\"auth_header\":\"visitor-secret\""),
+        "the API should return the visitor token: {}",
+        body
+    );
+
+    let (status, _) = visitor_status(MANAGEMENT_HTTP_ENTRY_ADDR, "echo.test", None).await?;
+    assert_eq!(status, 401, "a visitor without the token must be rejected");
+    let (status, _) = visitor_status(
+        MANAGEMENT_HTTP_ENTRY_ADDR,
+        "echo.test",
+        Some("wrong-secret"),
+    )
+    .await?;
+    assert_eq!(status, 401, "a wrong token must be rejected");
+    let (status, response) = visitor_status(
+        MANAGEMENT_HTTP_ENTRY_ADDR,
+        "echo.test",
+        Some("visitor-secret"),
+    )
+    .await?;
+    assert_eq!(status, 200, "the visitor token should be accepted");
+    assert!(
+        !response.contains("X-HTTP-TUNNEL-TOKEN"),
+        "the token must be stripped before the backend: {}",
+        response
+    );
+
+    info!("replacing the proxy without auth_header clears the gate");
+    let (status, body) = api_request(
+        MANAGEMENT_ADDR,
+        "PUT",
+        "/api/proxies/echo",
+        Some(MANAGEMENT_TOKEN),
+        Some(r#"{"domain":"echo.test","local_addr":"127.0.0.1:8093"}"#),
+    )
+    .await?;
+    assert_eq!(status, 201, "unexpected response: {}", body);
+    assert!(
+        body.contains("\"auth_header\":null"),
+        "unexpected body: {}",
+        body
+    );
+    let (status, _) = visitor_status(MANAGEMENT_HTTP_ENTRY_ADDR, "echo.test", None).await?;
+    assert_eq!(status, 200, "clearing auth_header should reopen the proxy");
+
     info!("the management API now reports the client as connected");
     let (status, body) = api_request(
         MANAGEMENT_ADDR,
@@ -877,6 +1000,7 @@ async fn management_api_manages_downstream_proxies() -> Result<()> {
         DOWNSTREAM_LEAF_PORT,
         &[],
     )?;
+    enable_upstream_modify(&config_path)?;
 
     let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
@@ -960,11 +1084,70 @@ async fn management_api_manages_downstream_proxies() -> Result<()> {
     time::sleep(Duration::from_millis(500)).await;
     http_echo_hitter(DOWNSTREAM_HTTP_ENTRY_ADDR, DOWNSTREAM_HOST).await?;
 
+    info!("the entry sets auth_header on the downstream proxy");
+    let (status, body) = api_request(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        "PUT",
+        &format!(
+            "/api/proxies/remote?node={}&session={}",
+            DOWNSTREAM_NODE, session_id
+        ),
+        Some(DOWNSTREAM_TOKEN),
+        Some(
+            r#"{"domain":"remote.test","local_addr":"127.0.0.1:8094","auth_header":"remote-visitor"}"#,
+        ),
+    )
+    .await?;
+    assert_eq!(status, 201, "unexpected response: {}", body);
+    assert!(
+        body.contains("\"auth_header\":\"remote-visitor\""),
+        "unexpected body: {}",
+        body
+    );
+
+    let (status, _) = visitor_status(DOWNSTREAM_HTTP_ENTRY_ADDR, DOWNSTREAM_HOST, None).await?;
+    assert_eq!(
+        status, 401,
+        "the downstream gate must reject a missing token"
+    );
+    let (status, response) = visitor_status(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        DOWNSTREAM_HOST,
+        Some("remote-visitor"),
+    )
+    .await?;
+    assert_eq!(status, 200, "the downstream gate must accept the token");
+    assert!(
+        !response.contains("X-HTTP-TUNNEL-TOKEN"),
+        "the downstream token must be stripped: {}",
+        response
+    );
+
+    let (status, body) = api_request(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        "GET",
+        &format!("/api/proxies?node={}", DOWNSTREAM_NODE),
+        Some(DOWNSTREAM_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(
+        body.contains("\"auth_header\":\"remote-visitor\""),
+        "the downstream list should return the visitor token: {}",
+        body
+    );
+
     info!("the downstream node wrote the change to its config");
     let written = std::fs::read_to_string(&config_path)?;
     assert!(
         written.contains("remote.test"),
         "the downstream config wasn't written: {}",
+        written
+    );
+    assert!(
+        written.contains("auth_header = \"remote-visitor\""),
+        "the downstream auth_header wasn't written: {}",
         written
     );
 
@@ -1095,6 +1278,212 @@ async fn management_api_manages_downstream_proxies() -> Result<()> {
     )
     .await?;
     assert_eq!(status, 404, "expected 404");
+
+    server_shutdown_tx.send(true)?;
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server, client);
+    Ok(())
+}
+
+// ==== The allow_upstream_modify switch test ====
+
+const SECURE_ECHO_SERVER_ADDR: &str = "127.0.0.1:8095";
+const SECURE_HTTP_ENTRY_PORT: u16 = 2484;
+const SECURE_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2484";
+const SECURE_LEAF_PORT: u16 = 2485;
+const SECURE_LEAF_ADDR: &str = "127.0.0.1:2485";
+const SECURE_TOKEN: &str = "a_secure_token";
+const SECURE_NODE: &str = "secure-leaf";
+const SECURE_HOST: &str = "secure.test";
+
+/// Poll `/api/sessions` until the node's session reports the expected
+/// `writable` value, and return its current session id. The switch takes effect
+/// by reconnecting the upstream session, so the id may change.
+async fn wait_for_writable(addr: &str, token: &str, node: &str, writable: bool) -> Result<u64> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let expected = format!("\"writable\":{}", writable);
+    loop {
+        let (status, body) = api_request(addr, "GET", "/api/sessions", Some(token), None).await?;
+        assert_eq!(status, 200, "unexpected response: {}", body);
+        if let Some(id) = session_id_for_node(&body, node) {
+            if body.contains(&expected) {
+                return Ok(id);
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "the session of {} did not become writable={}: last body {}",
+                node, writable, body
+            );
+        }
+        time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// `allow_upstream_modify` is off by default: the entry may list a downstream
+/// node's services but cannot write them. The node's own page may turn it on and
+/// off, and each change reconnects the upstream session.
+#[cfg(feature = "management")]
+#[tokio::test]
+async fn management_api_respects_allow_upstream_modify() -> Result<()> {
+    init();
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(SECURE_ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the secure echo server: {:?}", e);
+        }
+    });
+
+    let config_path = write_leaf_config(
+        "http_tunnel_allow_upstream_modify.toml",
+        SECURE_NODE,
+        "127.0.0.1",
+        SECURE_HTTP_ENTRY_PORT,
+        SECURE_TOKEN,
+        SECURE_LEAF_PORT,
+        &[],
+    )?;
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    let server = tokio::spawn(async move {
+        run_http_tunnel_server(
+            SECURE_HTTP_ENTRY_PORT,
+            "127.0.0.1",
+            SECURE_TOKEN,
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_tcp(SECURE_HTTP_ENTRY_ADDR, Duration::from_secs(10)).await?;
+
+    let client_config = config_path.clone();
+    let client = tokio::spawn(async move {
+        run_http_tunnel_from_config(&client_config, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_tcp(SECURE_LEAF_ADDR, Duration::from_secs(10)).await?;
+    let session_id =
+        wait_for_writable(SECURE_HTTP_ENTRY_ADDR, SECURE_TOKEN, SECURE_NODE, false).await?;
+
+    info!("the node reports the switch as off and editable");
+    let (status, body) = api_request(
+        SECURE_LEAF_ADDR,
+        "GET",
+        "/api/status",
+        Some(SECURE_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(body.contains("\"allow_upstream_modify\":false"), "{}", body);
+    assert!(
+        body.contains("\"allow_upstream_modify_editable\":true"),
+        "{}",
+        body
+    );
+
+    info!("the entry may still list but not write the downstream services");
+    let (status, body) = api_request(
+        SECURE_HTTP_ENTRY_ADDR,
+        "GET",
+        &format!("/api/proxies?node={}&session={}", SECURE_NODE, session_id),
+        Some(SECURE_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+
+    let (status, body) = api_request(
+        SECURE_HTTP_ENTRY_ADDR,
+        "PUT",
+        &format!(
+            "/api/proxies/secure?node={}&session={}",
+            SECURE_NODE, session_id
+        ),
+        Some(SECURE_TOKEN),
+        Some(r#"{"domain":"secure.test","local_addr":"127.0.0.1:8095"}"#),
+    )
+    .await?;
+    assert_eq!(status, 409, "a disabled switch must return 409: {}", body);
+    let written = std::fs::read_to_string(&config_path)?;
+    assert!(
+        !written.contains("secure.test"),
+        "a rejected write must not touch the config: {}",
+        written
+    );
+
+    info!("the node turns the switch on through its own management API");
+    let (status, body) = api_request(
+        SECURE_LEAF_ADDR,
+        "PUT",
+        "/api/settings/allow-upstream-modify",
+        Some(SECURE_TOKEN),
+        Some(r#"{"allowed":true}"#),
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(body.contains("\"allow_upstream_modify\":true"), "{}", body);
+
+    let writable_after =
+        wait_for_writable(SECURE_HTTP_ENTRY_ADDR, SECURE_TOKEN, SECURE_NODE, true).await?;
+    info!(%writable_after, "the reconnected session now allows writes");
+    assert!(std::fs::read_to_string(&config_path)?.contains("allow_upstream_modify = true"));
+
+    let (status, body) = api_request(
+        SECURE_HTTP_ENTRY_ADDR,
+        "PUT",
+        &format!(
+            "/api/proxies/secure?node={}&session={}",
+            SECURE_NODE, writable_after
+        ),
+        Some(SECURE_TOKEN),
+        Some(r#"{"domain":"secure.test","local_addr":"127.0.0.1:8095"}"#),
+    )
+    .await?;
+    assert_eq!(status, 201, "unexpected response: {}", body);
+    assert!(std::fs::read_to_string(&config_path)?.contains("secure.test"));
+
+    info!("the node turns the switch off again");
+    let (status, body) = api_request(
+        SECURE_LEAF_ADDR,
+        "PUT",
+        "/api/settings/allow-upstream-modify",
+        Some(SECURE_TOKEN),
+        Some(r#"{"allowed":false}"#),
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    let writable_off =
+        wait_for_writable(SECURE_HTTP_ENTRY_ADDR, SECURE_TOKEN, SECURE_NODE, false).await?;
+
+    let (status, body) = api_request(
+        SECURE_HTTP_ENTRY_ADDR,
+        "DELETE",
+        &format!(
+            "/api/proxies/secure?node={}&session={}",
+            SECURE_NODE, writable_off
+        ),
+        Some(SECURE_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 409, "a disabled switch must return 409: {}", body);
+    assert!(std::fs::read_to_string(&config_path)?.contains("secure.test"));
+
+    info!("a standalone ingress rejects the switch with 409");
+    let (status, body) = api_request(
+        SECURE_HTTP_ENTRY_ADDR,
+        "PUT",
+        "/api/settings/allow-upstream-modify",
+        Some(SECURE_TOKEN),
+        Some(r#"{"allowed":true}"#),
+    )
+    .await?;
+    assert_eq!(status, 409, "an ingress has no upstream: {}", body);
 
     server_shutdown_tx.send(true)?;
     client_shutdown_tx.send(true)?;

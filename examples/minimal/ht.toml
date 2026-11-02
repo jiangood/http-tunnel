@@ -5,6 +5,10 @@ listen_port = 7777
 control_host = "edge.lan"
 token = "replace-with-the-downstream-secret"
 
+## 是否允许上一跳修改本节点的 [[proxies]]。默认 false：上级只能查看。
+## 本节点管理页顶部也可以切换；切换会立即重连上游会话。
+allow_upstream_modify = false
+
 ## 本进程代理的本地服务
 [[proxies]]
 name = "nas"

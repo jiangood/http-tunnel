@@ -25,6 +25,8 @@ pub(crate) const ENV_LISTEN_PORT: &str = "HT_LISTEN_PORT";
 pub(crate) const ENV_CONTROL_HOST: &str = "HT_CONTROL_HOST";
 /// The WebSocket ping interval in secs.
 pub(crate) const ENV_KEEPALIVE_INTERVAL: &str = "HT_KEEPALIVE_INTERVAL";
+/// Whether the next hop may change this node's local services.
+pub(crate) const ENV_ALLOW_UPSTREAM_MODIFY: &str = "HT_ALLOW_UPSTREAM_MODIFY";
 /// The interval between retries to connect to the next hop.
 pub(crate) const ENV_RETRY_INTERVAL: &str = "HT_RETRY_INTERVAL";
 /// The local services, as a TOML array of inline tables.
@@ -41,6 +43,7 @@ pub(crate) const KNOWN_ENV_VARS: &[&str] = &[
     ENV_LISTEN_PORT,
     ENV_CONTROL_HOST,
     ENV_KEEPALIVE_INTERVAL,
+    ENV_ALLOW_UPSTREAM_MODIFY,
     ENV_RETRY_INTERVAL,
     ENV_PROXIES,
 ];
@@ -66,6 +69,7 @@ pub(crate) struct EnvConfig {
     listen_port: Option<u16>,
     control_host: Option<String>,
     keepalive_interval: Option<u64>,
+    allow_upstream_modify: Option<bool>,
     retry_interval: Option<u64>,
     proxies: Option<Vec<ServerProxyEntry>>,
     upstream_token: Option<MaskedString>,
@@ -142,6 +146,10 @@ impl EnvConfig {
                 "a number of seconds",
             )?);
         }
+        if let Some(value) = read(&lookup, ENV_ALLOW_UPSTREAM_MODIFY)? {
+            env.vars.push(ENV_ALLOW_UPSTREAM_MODIFY);
+            env.allow_upstream_modify = Some(parse_bool(ENV_ALLOW_UPSTREAM_MODIFY, &value)?);
+        }
         if let Some(value) = read(&lookup, ENV_RETRY_INTERVAL)? {
             env.vars.push(ENV_RETRY_INTERVAL);
             env.retry_interval = Some(parse_number(
@@ -175,6 +183,9 @@ impl EnvConfig {
         if let Some(keepalive_interval) = self.keepalive_interval {
             config.keepalive_interval = keepalive_interval;
         }
+        if let Some(allow_upstream_modify) = self.allow_upstream_modify {
+            config.allow_upstream_modify = allow_upstream_modify;
+        }
         if let Some(retry_interval) = self.retry_interval {
             config.retry_interval = retry_interval;
         }
@@ -206,6 +217,12 @@ impl EnvConfig {
     /// Whether the proxies come from `HT_PROXIES` rather than from the file.
     pub(crate) fn proxies_managed(&self) -> bool {
         self.proxies.is_some()
+    }
+
+    /// Whether `HT_ALLOW_UPSTREAM_MODIFY` owns the switch, so an API change
+    /// would be overwritten by the environment at runtime.
+    pub(crate) fn allow_upstream_modify_managed(&self) -> bool {
+        self.allow_upstream_modify.is_some()
     }
 
     /// The names of the variables that were set, without their values.
@@ -244,6 +261,16 @@ where
     raw.trim()
         .parse::<T>()
         .map_err(|_| anyhow!("{} must be {}, got {:?}", key, expected, raw))
+}
+
+/// Parse a boolean variable. `true`/`false` are the documented forms; the
+/// numeric forms keep compose files that use `1`/`0` working.
+fn parse_bool(key: &str, raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(anyhow!("{} must be `true` or `false`, got {:?}", key, raw)),
+    }
 }
 
 /// The `HT_PROXIES` value, wrapped so that the existing TOML parser reads it.
@@ -350,6 +377,7 @@ mod tests {
             (ENV_LISTEN_PORT, "7777"),
             (ENV_CONTROL_HOST, "control.example.com"),
             (ENV_KEEPALIVE_INTERVAL, "5"),
+            (ENV_ALLOW_UPSTREAM_MODIFY, "true"),
             (ENV_RETRY_INTERVAL, "3"),
             (ENV_PROXIES, ENV_PROXY),
         ])?;
@@ -368,6 +396,7 @@ mod tests {
         assert_eq!(config.listen_port, 7777);
         assert_eq!(config.control_host(), "control.example.com");
         assert_eq!(config.keepalive_interval, 5);
+        assert!(config.allow_upstream_modify);
         assert_eq!(config.retry_interval, 3);
 
         assert_eq!(config.proxies.len(), 2);
@@ -385,11 +414,13 @@ mod tests {
                 ENV_LISTEN_PORT,
                 ENV_CONTROL_HOST,
                 ENV_KEEPALIVE_INTERVAL,
+                ENV_ALLOW_UPSTREAM_MODIFY,
                 ENV_RETRY_INTERVAL,
                 ENV_PROXIES,
             ]
         );
         assert!(parsed.proxies_managed());
+        assert!(parsed.allow_upstream_modify_managed());
         Ok(())
     }
 
@@ -416,7 +447,26 @@ mod tests {
         let parsed = env(&[(ENV_NAME, "  "), (ENV_TOKEN, ""), (ENV_PROXIES, "\n")])?;
         assert!(parsed.is_empty());
         assert!(!parsed.proxies_managed());
+        assert!(!parsed.allow_upstream_modify_managed());
         assert_eq!(parsed, EnvConfig::default());
+        Ok(())
+    }
+
+    #[test]
+    fn test_allow_upstream_modify_accepts_the_boolean_forms() -> Result<()> {
+        for (raw, expected) in [
+            ("true", true),
+            ("TRUE", true),
+            ("1", true),
+            ("false", false),
+            ("0", false),
+        ] {
+            let parsed = env(&[(ENV_ALLOW_UPSTREAM_MODIFY, raw)])?;
+            let mut config = Config::default();
+            parsed.apply(&mut config);
+            assert_eq!(config.allow_upstream_modify, expected, "{}", raw);
+            assert!(parsed.allow_upstream_modify_managed());
+        }
         Ok(())
     }
 
@@ -453,6 +503,12 @@ mod tests {
     fn test_invalid_values_name_the_variable() {
         let err = format!("{:#}", env(&[(ENV_RETRY_INTERVAL, "-1")]).unwrap_err());
         assert!(err.contains(ENV_RETRY_INTERVAL), "{}", err);
+
+        let err = format!(
+            "{:#}",
+            env(&[(ENV_ALLOW_UPSTREAM_MODIFY, "sometimes")]).unwrap_err()
+        );
+        assert!(err.contains(ENV_ALLOW_UPSTREAM_MODIFY), "{}", err);
 
         let err = format!("{:#}", env(&[(ENV_PROXIES, "{oops")]).unwrap_err());
         assert!(err.contains(ENV_PROXIES), "{}", err);

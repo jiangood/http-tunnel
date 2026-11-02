@@ -58,6 +58,10 @@ pub(crate) struct SessionSnapshot {
     pub(crate) manageable: bool,
     /// Whether the session allows its local services to be changed as well
     pub(crate) writable: bool,
+    /// Where the session's local services come from: `file` when it reads its
+    /// `ht.toml`, `env` when `HT_PROXIES` owns them. Unlike `writable`, it does
+    /// not change when the node turns `allow_upstream_modify` off.
+    pub(crate) proxy_source: &'static str,
 }
 
 /// The registry entry kept for a connected v4 session until it closes.
@@ -387,6 +391,11 @@ impl ServerState {
                     domains,
                     manageable: info.capabilities & crate::protocol_v4::CAP_PROXY_ADMIN != 0,
                     writable: info.capabilities & crate::protocol_v4::CAP_PROXY_WRITE != 0,
+                    proxy_source: if info.capabilities & crate::protocol_v4::CAP_PROXY_ENV != 0 {
+                        "env"
+                    } else {
+                        "file"
+                    },
                 }
             })
             .collect();

@@ -1,11 +1,11 @@
 //! Management API and minimal server-rendered web UI of the universal process.
 
-use crate::config::ServerProxyEntry;
+use crate::config::{MaskedString, ServerProxyEntry};
 use crate::management::{ManagementState, SessionAdminError};
 use anyhow::{Context, Result};
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, CACHE_CONTROL};
 use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -69,6 +69,10 @@ fn build_router(token: String, management: Arc<ManagementState>) -> Router {
         .route("/routes", get(list_routes))
         .route("/sessions", get(list_sessions))
         .route("/sessions/:id", delete(delete_session))
+        .route(
+            "/settings/allow-upstream-modify",
+            put(put_allow_upstream_modify),
+        )
         .route_layer(middleware::from_fn_with_state(token.clone(), api_auth));
 
     // Only the page itself is authenticated with HTTP Basic. Everything it
@@ -82,6 +86,17 @@ fn build_router(token: String, management: Arc<ManagementState>) -> Router {
         .merge(web)
         .fallback(not_found)
         .with_state(state)
+        .layer(middleware::from_fn(no_store))
+}
+
+/// The proxy list returns the visitor token in plain text, and the page carries
+/// the Bearer token in its HTML, so no management response may be cached.
+async fn no_store<B>(req: Request<B>, next: Next<B>) -> Response {
+    let mut response = next.run(req).await;
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// The response of a path the management router does not know. It names the
@@ -218,6 +233,9 @@ struct ProxyView {
     name: String,
     domain: String,
     local_addr: String,
+    /// The visitor token, in plain text. The management response is always
+    /// `no-store`, and the whole management plane is meant to run behind TLS.
+    auth_header: Option<String>,
     /// `file` when the proxy comes from `ht.toml`, `env` when `HT_PROXIES`
     /// replaces the whole list
     source: &'static str,
@@ -228,6 +246,7 @@ fn proxy_view(proxy: &ServerProxyEntry, source: &'static str) -> ProxyView {
         name: proxy.name.clone(),
         domain: proxy.domain.clone(),
         local_addr: proxy.local_addr.clone(),
+        auth_header: proxy.auth_header.as_deref().map(str::to_string),
         source,
     }
 }
@@ -248,6 +267,12 @@ struct StatusView {
     /// Whether `HT_PROXIES` owns the local services, in which case the page
     /// hides the form instead of letting every submit fail with `409`
     proxies_managed: bool,
+    /// Whether the next hop may change this process's local services
+    allow_upstream_modify: bool,
+    /// Whether the page may change [`allow_upstream_modify`]. It is false
+    /// without an upstream, when `HT_ALLOW_UPSTREAM_MODIFY` owns the value, or
+    /// when `HT_PROXIES` already makes the service list read-only.
+    allow_upstream_modify_editable: bool,
     /// The number of downstream v4 sessions connected right now
     sessions: usize,
     /// The configured limit for those sessions
@@ -263,6 +288,20 @@ struct StatusView {
 struct PutProxy {
     domain: String,
     local_addr: String,
+    /// PUT replaces the whole entry: an omitted, `null` or empty value disables
+    /// visitor authentication.
+    #[serde(default)]
+    auth_header: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PutAllowUpstreamModify {
+    allowed: bool,
+}
+
+#[derive(Serialize)]
+struct AllowUpstreamModifyView {
+    allow_upstream_modify: bool,
 }
 
 /// The optional downstream selector of the proxy endpoints. Without either
@@ -334,6 +373,41 @@ fn parse_session_id(id: &str) -> std::result::Result<u64, ApiError> {
     })
 }
 
+/// Trim an incoming visitor token and turn an empty value into "no auth".
+///
+/// The length limit keeps an API call from writing an arbitrarily large header
+/// into `ht.toml`; line breaks would break the `X-HTTP-TUNNEL-TOKEN` header.
+fn normalize_auth_header(
+    value: Option<String>,
+) -> std::result::Result<Option<MaskedString>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.contains('\r') || value.contains('\n') {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "The `auth_header` must not contain line breaks".to_string(),
+        ));
+    }
+    if value.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "The `auth_header` must not contain control characters".to_string(),
+        ));
+    }
+    if value.len() > 8192 {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "The `auth_header` must not exceed 8192 bytes".to_string(),
+        ));
+    }
+    Ok(Some(MaskedString::from(value)))
+}
+
 struct ApiError(StatusCode, String);
 
 #[derive(Serialize)]
@@ -395,7 +469,8 @@ impl ApiError {
             SessionAdminError::NotFound(_) => StatusCode::NOT_FOUND,
             SessionAdminError::Ambiguous(_)
             | SessionAdminError::NotManageable
-            | SessionAdminError::ReadOnly => StatusCode::CONFLICT,
+            | SessionAdminError::ReadOnly
+            | SessionAdminError::Unsupported(_) => StatusCode::CONFLICT,
             SessionAdminError::BadRequest(_) => StatusCode::BAD_REQUEST,
             SessionAdminError::Timeout => StatusCode::GATEWAY_TIMEOUT,
             SessionAdminError::Downstream(_) => StatusCode::BAD_GATEWAY,
@@ -414,6 +489,8 @@ async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusView> {
         connected: state.management.connected(),
         proxies,
         proxies_managed: state.management.proxies_managed(),
+        allow_upstream_modify: state.management.allow_upstream_modify(),
+        allow_upstream_modify_editable: state.management.allow_upstream_modify_editable(),
         sessions,
         sessions_max,
         version: env!("CARGO_PKG_VERSION"),
@@ -426,6 +503,25 @@ async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusView> {
             .map(|(name, set)| EnvVarView { name, set })
             .collect(),
     })
+}
+
+/// Change this process's `allow_upstream_modify` and persist it.
+///
+/// The switch only matters for a node with an upstream, so a standalone ingress
+/// and both environment-managed cases are rejected with `409` rather than
+/// silently written to a file that the environment would override.
+async fn put_allow_upstream_modify(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<PutAllowUpstreamModify>,
+) -> Result<Json<AllowUpstreamModifyView>, ApiError> {
+    state
+        .management
+        .set_allow_upstream_modify(body.allowed)
+        .await
+        .map_err(|error| ApiError(StatusCode::CONFLICT, format!("{:#}", error)))?;
+    Ok(Json(AllowUpstreamModifyView {
+        allow_upstream_modify: state.management.allow_upstream_modify(),
+    }))
 }
 
 async fn list_proxies(
@@ -456,7 +552,7 @@ async fn list_proxies(
         .session_proxies(node.as_deref(), session)
         .await
         .map_err(ApiError::from_session)?;
-    let source = if snapshot.writable { "file" } else { "env" };
+    let source = snapshot.proxy_source;
     Ok(Json(
         snapshot
             .proxies
@@ -491,10 +587,16 @@ async fn put_proxy(
     let name = name.trim().to_string();
     let scope = query_scope(scope)?;
     let (node, session) = proxy_scope(&scope)?;
+    let PutProxy {
+        domain,
+        local_addr,
+        auth_header,
+    } = body;
+    let auth_header = normalize_auth_header(auth_header)?;
     if node.is_none() && session.is_none() {
         state
             .management
-            .put_proxy(name.clone(), body.domain, body.local_addr)
+            .put_proxy(name.clone(), domain, local_addr, auth_header.clone())
             .await
             .map_err(|e| ApiError::from_reason(format!("{:#}", e)))?;
         return match state
@@ -517,12 +619,13 @@ async fn put_proxy(
             node.as_deref(),
             session,
             name.clone(),
-            body.domain,
-            body.local_addr,
+            domain,
+            local_addr,
+            auth_header,
         )
         .await
         .map_err(ApiError::from_session)?;
-    let source = if snapshot.writable { "file" } else { "env" };
+    let source = snapshot.proxy_source;
     match snapshot.proxies.iter().find(|proxy| proxy.name == name) {
         Some(proxy) => Ok((StatusCode::CREATED, Json(proxy_view(proxy, source))).into_response()),
         None => Ok(StatusCode::CREATED.into_response()),

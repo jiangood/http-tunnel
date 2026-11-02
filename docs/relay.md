@@ -44,6 +44,7 @@ token = "upstream-secret"
 | `control_host` | Exact Host reserved for the v4 session endpoint. Required without `[upstream]`; defaults to `127.0.0.1` with it. |
 | `token` | Token for downstream peers. May be omitted with `[upstream]`, in which case the upstream token is reused. |
 | `[[proxies]]` | Local services served by this process. They take precedence over downstream session routes. |
+| `allow_upstream_modify` | Whether the next hop may change the local `[[proxies]]` over v4. Defaults to `false`; the next hop may still list them. The node's own page can switch it at runtime. |
 | `[upstream]` | The next hop. Remove it to run as a standalone ingress. |
 
 ## Route advertisement
@@ -57,6 +58,10 @@ token = "upstream-secret"
   migration hint, so an upgrade cannot silently change the advertised topology.
 - Duplicate domains are rejected as `Conflict`. A rejected route is logged and
   does not stop the process.
+- A relay also advertises `CAP_PROXY_ADMIN` for its own local services and
+  announces `CAP_PROXY_WRITE` only when `allow_upstream_modify` is on and
+  `HT_PROXIES` is not managing the list. Toggling the switch reconnects the
+  upstream session so the new capability is announced immediately.
 
 ## Data plane
 

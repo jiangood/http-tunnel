@@ -5,7 +5,7 @@
 //! applied to the running server's proxy list, and published on the route watch
 //! so an upstream session mirrors it immediately.
 
-use crate::config::{Config, ConfigSource, ServerProxyEntry};
+use crate::config::{Config, ConfigSource, MaskedString, ServerProxyEntry};
 use crate::config_env::EnvConfig;
 use crate::protocol_v4;
 use crate::server::{ServerState, SessionLookupError, SessionTarget};
@@ -16,13 +16,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{oneshot, watch, RwLock};
 use tokio::time;
 use tracing::info;
 
 /// The local services of one downstream node, as returned by its session.
 pub(crate) struct SessionProxySnapshot {
-    pub(crate) writable: bool,
+    /// `file` when the downstream reads `[[proxies]]` from `ht.toml`, `env`
+    /// when `HT_PROXIES` owns them.
+    pub(crate) proxy_source: &'static str,
     pub(crate) proxies: Vec<ServerProxyEntry>,
 }
 
@@ -33,6 +35,8 @@ pub(crate) enum SessionAdminError {
     BadRequest(String),
     NotManageable,
     ReadOnly,
+    /// The downstream node predates the `auth_header` wire shape
+    Unsupported(String),
     Timeout,
     Downstream(String),
 }
@@ -57,9 +61,11 @@ impl fmt::Display for SessionAdminError {
             ),
             SessionAdminError::ReadOnly => write!(
                 f,
-                "The downstream node manages its local services with HT_PROXIES; change that \
-                 variable on the node and restart it"
+                "The downstream node does not allow its upstream to modify its local services: \
+                 set `allow_upstream_modify = true` on that node (or remove `HT_PROXIES`, which \
+                 keeps them read-only) and restart it"
             ),
+            SessionAdminError::Unsupported(message) => write!(f, "{}", message),
             SessionAdminError::Timeout => write!(
                 f,
                 "The downstream node did not answer the management request in time"
@@ -90,6 +96,13 @@ pub(crate) struct ManagementState {
     name: String,
     server_addr: String,
     transport: String,
+    /// Whether this process has a next hop. The switch is meaningless without
+    /// one, so the page and the API refuse to change it.
+    upstream_configured: bool,
+    /// The live value of `allow_upstream_modify`. A change is persisted first
+    /// and then published here so the upstream session reconnects with the new
+    /// capability bits.
+    allow_upstream_modify: watch::Sender<bool>,
     /// When the management state was created, for the uptime of the console
     started: Instant,
 }
@@ -122,6 +135,8 @@ impl ManagementState {
         } else {
             "ingress".to_string()
         };
+        let upstream_configured = config.upstream.is_some();
+        let (allow_upstream_modify, _) = watch::channel(config.allow_upstream_modify);
 
         ManagementState {
             config: RwLock::new(config),
@@ -133,6 +148,8 @@ impl ManagementState {
             name,
             server_addr,
             transport,
+            upstream_configured,
+            allow_upstream_modify,
             started: Instant::now(),
         }
     }
@@ -161,6 +178,26 @@ impl ManagementState {
     /// through the API
     pub(crate) fn proxies_managed(&self) -> bool {
         self.env.proxies_managed()
+    }
+
+    /// Whether the next hop may change the local `[[proxies]]`.
+    pub(crate) fn allow_upstream_modify(&self) -> bool {
+        *self.allow_upstream_modify.borrow()
+    }
+
+    /// A receiver that changes when `allow_upstream_modify` changes. The
+    /// upstream session uses it to reconnect and re-announce its capabilities.
+    pub(crate) fn subscribe_allow_upstream_modify(&self) -> watch::Receiver<bool> {
+        self.allow_upstream_modify.subscribe()
+    }
+
+    /// Whether the web page may change the switch: it needs a next hop, must
+    /// not be overridden by `HT_ALLOW_UPSTREAM_MODIFY`, and must not already be
+    /// forced read-only by `HT_PROXIES`.
+    pub(crate) fn allow_upstream_modify_editable(&self) -> bool {
+        self.upstream_configured
+            && !self.env.allow_upstream_modify_managed()
+            && !self.proxies_managed()
     }
 
     /// The configuration file the API writes back to
@@ -264,6 +301,13 @@ impl ManagementState {
         if target.capabilities & protocol_v4::CAP_PROXY_ADMIN == 0 {
             return Err(SessionAdminError::NotManageable);
         }
+        if target.capabilities & protocol_v4::CAP_PROXY_AUTH == 0 {
+            return Err(SessionAdminError::Unsupported(
+                "The downstream node does not support `auth_header` management; upgrade it so \
+                 both ends use the same proxy wire shape"
+                    .to_string(),
+            ));
+        }
         if !matches!(op, protocol_v4::ProxyOp::List)
             && target.capabilities & protocol_v4::CAP_PROXY_WRITE == 0
         {
@@ -291,7 +335,7 @@ impl ManagementState {
                     name: proxy.name,
                     domain: proxy.domain,
                     local_addr: proxy.local_addr,
-                    auth_header: None,
+                    auth_header: proxy.auth_header,
                 })
                 .collect()),
             Ok(Ok(Err(error))) => {
@@ -331,6 +375,7 @@ impl ManagementState {
         name: String,
         domain: String,
         local_addr: String,
+        auth_header: Option<MaskedString>,
     ) -> std::result::Result<SessionProxySnapshot, SessionAdminError> {
         let name = crate::config::validate_name(&name)
             .map_err(|error| SessionAdminError::BadRequest(format!("{:#}", error)))?;
@@ -346,6 +391,7 @@ impl ManagementState {
                     name,
                     domain,
                     local_addr,
+                    auth_header,
                 },
             )
             .await?;
@@ -410,17 +456,14 @@ impl ManagementState {
     /// The file is written first, so that a failed write leaves the runtime
     /// untouched. The environment values are reapplied afterwards: they win at
     /// runtime but must not end up in the file.
-    async fn update_persisted<F>(&self, change: F) -> Result<()>
+    ///
+    /// The caller applies the runtime side effects of the returned effective
+    /// configuration, because a proxy change and a settings change publish
+    /// different things.
+    async fn update_persisted<F>(&self, change: F) -> Result<Config>
     where
         F: FnOnce(&mut Config) -> Result<()>,
     {
-        if self.env.proxies_managed() {
-            bail!(
-                "The local services are managed by HT_PROXIES; change that environment \
-                 variable and restart ht"
-            );
-        }
-
         let mut persisted = self.persisted.write().await;
         let mut candidate = persisted.clone();
         change(&mut candidate)?;
@@ -441,11 +484,17 @@ impl ManagementState {
 
         *persisted = candidate;
         *self.config.write().await = effective.clone();
-        // Publish the new proxy list before returning, so that the next visitor
-        // and the upstream route watch see it.
-        let proxy_count = effective.proxies.len();
-        self.server.set_proxies(effective.proxies).await;
-        info!(proxies = proxy_count, "The local services were updated");
+        Ok(effective)
+    }
+
+    /// Reject a proxy change that `HT_PROXIES` owns.
+    fn ensure_proxies_editable(&self) -> Result<()> {
+        if self.env.proxies_managed() {
+            bail!(
+                "The local services are managed by HT_PROXIES; change that environment \
+                 variable and restart ht"
+            );
+        }
         Ok(())
     }
 
@@ -456,30 +505,80 @@ impl ManagementState {
         name: String,
         domain: String,
         local_addr: String,
+        auth_header: Option<MaskedString>,
     ) -> Result<()> {
+        self.ensure_proxies_editable()?;
         if local_addr.trim().is_empty() {
             bail!("The `local_addr` must not be empty");
         }
         let domain = crate::helper::normalize_domain(&domain)
             .ok_or_else(|| anyhow!("The domain `{}` is invalid", domain))?;
 
-        self.update_persisted(|config| {
-            config.set_proxy(name, domain, local_addr);
-            Ok(())
-        })
-        .await
+        let effective = self
+            .update_persisted(|config| {
+                config.set_proxy(name, domain, local_addr, auth_header);
+                Ok(())
+            })
+            .await?;
+        let proxy_count = effective.proxies.len();
+        self.server.set_proxies(effective.proxies).await;
+        info!(proxies = proxy_count, "The local services were updated");
+        Ok(())
     }
 
     /// Delete the local service of the given name, persist the configuration,
     /// and apply the change.
     pub(crate) async fn delete_proxy(&self, name: &str) -> Result<()> {
-        self.update_persisted(|config| {
-            if !config.remove_proxy(name.trim()) {
-                bail!("No such a local service `{}`", name);
-            }
-            Ok(())
-        })
-        .await
+        self.ensure_proxies_editable()?;
+        let effective = self
+            .update_persisted(|config| {
+                if !config.remove_proxy(name.trim()) {
+                    bail!("No such a local service `{}`", name);
+                }
+                Ok(())
+            })
+            .await?;
+        let proxy_count = effective.proxies.len();
+        self.server.set_proxies(effective.proxies).await;
+        info!(proxies = proxy_count, "The local services were updated");
+        Ok(())
+    }
+
+    /// Change `allow_upstream_modify`, persist it, and publish the new value so
+    /// the upstream session reconnects with the new capability bits.
+    pub(crate) async fn set_allow_upstream_modify(&self, allowed: bool) -> Result<()> {
+        if !self.upstream_configured {
+            bail!("No upstream is configured; this node is a standalone ingress");
+        }
+        if self.env.allow_upstream_modify_managed() {
+            bail!(
+                "The switch is set by HT_ALLOW_UPSTREAM_MODIFY; change that environment \
+                 variable and restart ht"
+            );
+        }
+        if self.proxies_managed() {
+            bail!(
+                "The local services are managed by HT_PROXIES and are already read-only; \
+                 change that environment variable and restart ht"
+            );
+        }
+
+        let effective = self
+            .update_persisted(|config| {
+                config.allow_upstream_modify = allowed;
+                Ok(())
+            })
+            .await?;
+        // Do not reconnect the upstream when the value did not actually change.
+        if self.allow_upstream_modify() != effective.allow_upstream_modify {
+            self.allow_upstream_modify
+                .send_replace(effective.allow_upstream_modify);
+        }
+        info!(
+            allow_upstream_modify = effective.allow_upstream_modify,
+            "The upstream proxy modification switch was updated"
+        );
+        Ok(())
     }
 }
 
@@ -488,7 +587,11 @@ fn session_snapshot(
     proxies: Vec<ServerProxyEntry>,
 ) -> SessionProxySnapshot {
     SessionProxySnapshot {
-        writable: target.capabilities & protocol_v4::CAP_PROXY_WRITE != 0,
+        proxy_source: if target.capabilities & protocol_v4::CAP_PROXY_ENV != 0 {
+            "env"
+        } else {
+            "file"
+        },
         proxies,
     }
 }
@@ -582,6 +685,7 @@ local_addr = "127.0.0.1:80"
                 "git".to_string(),
                 "git.example.com".to_string(),
                 "127.0.0.1:81".to_string(),
+                None,
             )
             .await?;
 
@@ -595,6 +699,210 @@ local_addr = "127.0.0.1:80"
         assert!(saved.contains("git.example.com"), "{}", saved);
         assert!(saved.contains("[[proxies]]"), "{}", saved);
         assert_eq!(state.proxies().await.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_api_sets_and_clears_the_auth_header() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "http-tunnel-management-{}-auth-header.toml",
+            std::process::id()
+        ));
+        let persisted = Config::parse(
+            r#"
+control_host = "control.example.com"
+name = "file"
+token = "file-token"
+
+[[proxies]]
+name = "nas"
+domain = "nas.example.com"
+local_addr = "127.0.0.1:80"
+"#,
+        )?;
+        std::fs::write(&path, persisted.to_toml()?)?;
+        let state = state(persisted, path.clone());
+
+        state
+            .put_proxy(
+                "nas".to_string(),
+                "nas.example.com".to_string(),
+                "127.0.0.1:80".to_string(),
+                Some(MaskedString::from("visitor-secret")),
+            )
+            .await?;
+
+        let proxies = state.proxies().await;
+        assert_eq!(proxies[0].auth_header.as_deref(), Some("visitor-secret"));
+        let saved = std::fs::read_to_string(&path)?;
+        assert!(
+            saved.contains("auth_header = \"visitor-secret\""),
+            "{}",
+            saved
+        );
+
+        // A PUT without auth_header replaces the entry and disables the gate
+        state
+            .put_proxy(
+                "nas".to_string(),
+                "nas.example.com".to_string(),
+                "127.0.0.1:80".to_string(),
+                None,
+            )
+            .await?;
+        assert!(state.proxies().await[0].auth_header.is_none());
+        let saved = std::fs::read_to_string(&path)?;
+        let _ = std::fs::remove_file(&path);
+        assert!(!saved.contains("auth_header"), "{}", saved);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_api_rejects_an_auth_header_with_line_breaks() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "http-tunnel-management-{}-auth-newline.toml",
+            std::process::id()
+        ));
+        let persisted = Config::parse(
+            r#"
+control_host = "control.example.com"
+name = "file"
+token = "file-token"
+"#,
+        )?;
+        std::fs::write(&path, persisted.to_toml()?)?;
+        let state = state(persisted, path.clone());
+
+        let err = state
+            .put_proxy(
+                "nas".to_string(),
+                "nas.example.com".to_string(),
+                "127.0.0.1:80".to_string(),
+                Some(MaskedString::from("bad\r\nheader")),
+            )
+            .await
+            .expect_err("a line break in auth_header must be rejected");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            format!("{:#}", err).contains("must not contain line breaks"),
+            "{}",
+            err
+        );
+        assert!(state.proxies().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_allow_upstream_modify_requires_an_upstream() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "http-tunnel-management-{}-no-upstream.toml",
+            std::process::id()
+        ));
+        let persisted =
+            Config::parse("control_host = \"control.example.com\"\ntoken = \"secret\"\n")?;
+        let _ = std::fs::remove_file(&path);
+        let state = state(persisted, path.clone());
+
+        assert!(!state.allow_upstream_modify());
+        assert!(!state.allow_upstream_modify_editable());
+        let err = state
+            .set_allow_upstream_modify(true)
+            .await
+            .expect_err("an ingress has no upstream to authorize");
+        assert!(format!("{:#}", err).contains("No upstream"), "{}", err);
+        assert!(!path.exists(), "a rejected change must not write a config");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_allow_upstream_modify_is_persisted_and_published() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "http-tunnel-management-{}-upstream-switch.toml",
+            std::process::id()
+        ));
+        let persisted = Config::parse(
+            "control_host = \"control.example.com\"\ntoken = \"secret\"\n\n\
+             [upstream]\nurl = \"ws://upstream.test:7777\"\ntoken = \"secret\"\n",
+        )?;
+        let _ = std::fs::remove_file(&path);
+        let state = state(persisted, path.clone());
+        let mut published = state.subscribe_allow_upstream_modify();
+
+        assert!(state.allow_upstream_modify_editable());
+        assert!(!state.allow_upstream_modify());
+        state.set_allow_upstream_modify(true).await?;
+        assert!(state.allow_upstream_modify());
+        published.changed().await?;
+        assert!(*published.borrow_and_update());
+
+        let saved = std::fs::read_to_string(&path)?;
+        let _ = std::fs::remove_file(&path);
+        assert!(saved.contains("allow_upstream_modify = true"), "{}", saved);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_allow_upstream_modify_environment_wins() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "http-tunnel-management-{}-upstream-env.toml",
+            std::process::id()
+        ));
+        let env = EnvConfig::from_lookup(|key| {
+            Ok(match key {
+                crate::config_env::ENV_ALLOW_UPSTREAM_MODIFY => Some("true".to_string()),
+                _ => None,
+            })
+        })?;
+        let mut effective = Config::parse(
+            "control_host = \"control.example.com\"\ntoken = \"secret\"\n\n\
+             [upstream]\nurl = \"ws://upstream.test:7777\"\ntoken = \"secret\"\n",
+        )?;
+        env.apply(&mut effective);
+        effective.source.env = env;
+        let state = state(effective, path.clone());
+
+        assert!(state.allow_upstream_modify());
+        assert!(!state.allow_upstream_modify_editable());
+        let err = state
+            .set_allow_upstream_modify(false)
+            .await
+            .expect_err("the environment owns the switch");
+        assert!(
+            format!("{:#}", err).contains("HT_ALLOW_UPSTREAM_MODIFY"),
+            "{}",
+            err
+        );
+        assert!(!path.exists(), "a rejected change must not write a config");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_allow_upstream_modify_is_disabled_by_environment_proxies() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "http-tunnel-management-{}-upstream-proxies.toml",
+            std::process::id()
+        ));
+        let env = EnvConfig::from_lookup(|key| {
+            Ok(match key {
+                crate::config_env::ENV_PROXIES => Some("[]".to_string()),
+                _ => None,
+            })
+        })?;
+        let mut effective = Config::parse(
+            "control_host = \"control.example.com\"\ntoken = \"secret\"\n\n\
+             [upstream]\nurl = \"ws://upstream.test:7777\"\ntoken = \"secret\"\n",
+        )?;
+        env.apply(&mut effective);
+        effective.source.env = env;
+        let state = state(effective, path.clone());
+
+        assert!(!state.allow_upstream_modify_editable());
+        let err = state
+            .set_allow_upstream_modify(true)
+            .await
+            .expect_err("HT_PROXIES already makes the list read-only");
+        assert!(format!("{:#}", err).contains("HT_PROXIES"), "{}", err);
+        assert!(!path.exists(), "a rejected change must not write a config");
         Ok(())
     }
 
@@ -627,6 +935,7 @@ local_addr = "127.0.0.1:80"
                 "git".to_string(),
                 "git.example.com".to_string(),
                 "127.0.0.1:81".to_string(),
+                None,
             )
             .await
             .expect_err("the proxies of the environment must not be changed");
@@ -661,6 +970,7 @@ local_addr = "127.0.0.1:80"
                 "git".to_string(),
                 "git.example.com".to_string(),
                 "http://127.0.0.1:81".to_string(),
+                None,
             )
             .await
             .expect_err("a URL must not be accepted as a local address");

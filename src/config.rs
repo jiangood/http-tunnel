@@ -188,6 +188,11 @@ pub struct Config {
     /// WebSocket ping interval in secs. `0` disables keepalive pings.
     #[serde(default = "default_keepalive_interval")]
     pub keepalive_interval: u64,
+    /// Whether the next hop may change this process's local `[[proxies]]` over
+    /// the v4 session. It is off by default: the next hop may still list them
+    /// when the `management` feature is enabled.
+    #[serde(default)]
+    pub allow_upstream_modify: bool,
     /// Load metadata, never written to TOML.
     #[serde(skip)]
     pub(crate) source: ConfigSource,
@@ -206,6 +211,7 @@ impl Default for Config {
             max_pending_handshakes: default_max_pending_handshakes(),
             max_sessions: default_max_sessions(),
             keepalive_interval: default_keepalive_interval(),
+            allow_upstream_modify: false,
             source: ConfigSource::default(),
         }
     }
@@ -260,17 +266,27 @@ impl Config {
     }
 
     /// Replace the local service of the given name, or add it.
-    pub fn set_proxy(&mut self, name: String, domain: String, local_addr: String) {
+    ///
+    /// The call replaces the whole entry: `auth_header` is stored as given, so
+    /// `None` turns visitor authentication off.
+    pub fn set_proxy(
+        &mut self,
+        name: String,
+        domain: String,
+        local_addr: String,
+        auth_header: Option<MaskedString>,
+    ) {
         match self.proxies.iter_mut().find(|entry| entry.name == name) {
             Some(entry) => {
                 entry.domain = domain;
                 entry.local_addr = local_addr;
+                entry.auth_header = auth_header;
             }
             None => self.proxies.push(ServerProxyEntry {
                 name,
                 domain,
                 local_addr,
-                auth_header: None,
+                auth_header,
             }),
         }
     }
@@ -1014,6 +1030,7 @@ local_addr = "127.0.0.1:81"
             "nas".to_string(),
             "nas.example.com".to_string(),
             "127.0.0.1:80".to_string(),
+            None,
         );
         Config::validate(&mut cfg)?;
         assert_eq!(cfg.proxies.len(), 1);
@@ -1023,6 +1040,7 @@ local_addr = "127.0.0.1:81"
             "nas".to_string(),
             "nas2.example.com".to_string(),
             "127.0.0.1:81".to_string(),
+            None,
         );
         Config::validate(&mut cfg)?;
         let proxies = &cfg.proxies;
@@ -1038,6 +1056,34 @@ local_addr = "127.0.0.1:81"
     }
 
     #[test]
+    fn test_set_proxy_replaces_the_whole_entry() -> Result<()> {
+        let mut cfg = router("control_host = \"control.test\"\ntoken = \"secret\"\n");
+
+        cfg.set_proxy(
+            "docker".to_string(),
+            "docker.example.com".to_string(),
+            "127.0.0.1:2375".to_string(),
+            Some(MaskedString::from("visitor-secret")),
+        );
+        Config::validate(&mut cfg)?;
+        assert_eq!(
+            cfg.proxies[0].auth_header.as_deref(),
+            Some("visitor-secret")
+        );
+
+        // A later call without a secret turns authentication off
+        cfg.set_proxy(
+            "docker".to_string(),
+            "docker.example.com".to_string(),
+            "127.0.0.1:2375".to_string(),
+            None,
+        );
+        Config::validate(&mut cfg)?;
+        assert!(cfg.proxies[0].auth_header.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn test_set_proxy_adds_and_keeps_names_distinct() -> Result<()> {
         let mut cfg = router("control_host = \"control.test\"\ntoken = \"secret\"\n");
 
@@ -1045,12 +1091,14 @@ local_addr = "127.0.0.1:81"
             "app-1".to_string(),
             "nas.example.com".to_string(),
             "127.0.0.1:80".to_string(),
+            None,
         );
         // A different name serving the same domain is not adopted: it clashes
         cfg.set_proxy(
             "app-2".to_string(),
             "nas.example.com".to_string(),
             "127.0.0.1:80".to_string(),
+            None,
         );
         assert!(Config::validate(&mut cfg).is_err());
 
@@ -1059,6 +1107,7 @@ local_addr = "127.0.0.1:81"
             "app-1".to_string(),
             "nas.example.com".to_string(),
             "127.0.0.1:81".to_string(),
+            None,
         );
         Config::validate(&mut cfg)?;
         assert_eq!(cfg.proxies.len(), 1);
@@ -1073,7 +1122,23 @@ local_addr = "127.0.0.1:81"
         assert_eq!(cfg.name, "ht");
         assert_eq!(cfg.listen_port, DEFAULT_LISTEN_PORT);
         assert_eq!(cfg.retry_interval, DEFAULT_RETRY_INTERVAL_SECS);
+        assert!(!cfg.allow_upstream_modify);
         assert!(cfg.proxies.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_allow_upstream_modify_is_opt_in() -> Result<()> {
+        // The security-sensitive switch is off unless the file opts in.
+        let cfg = router("control_host = \"control.test\"\ntoken = \"secret\"\n");
+        assert!(!cfg.allow_upstream_modify);
+
+        let cfg = router(
+            "control_host = \"control.test\"\ntoken = \"secret\"\n\
+             allow_upstream_modify = true\n",
+        );
+        assert!(cfg.allow_upstream_modify);
+        assert!(cfg.to_toml()?.contains("allow_upstream_modify = true"));
         Ok(())
     }
 
@@ -1309,7 +1374,7 @@ local_addr = "127.0.0.1:80"
 "#;
         let cfg = router(s);
         let dumped = cfg.to_toml()?;
-        assert!(!dumped.contains("upstream"));
+        assert!(!dumped.contains("[upstream]"));
         let reparsed = Config::parse(&dumped)?;
         assert_eq!(cfg, reparsed);
         Ok(())

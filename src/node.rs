@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -173,20 +173,24 @@ async fn run_relay(
     let routes = mirrored_routes(route_rx, local_target);
 
     #[cfg(feature = "management")]
-    let (proxy_admin, capabilities) = match _management.as_ref() {
+    let (proxy_admin, proxies_managed, allow_upstream_modify): (
+        Option<mpsc::Sender<ProxyAdminRequest>>,
+        bool,
+        Option<watch::Receiver<bool>>,
+    ) = match _management.as_ref() {
         Some(management) => {
             let (proxy_tx, proxy_rx) = mpsc::channel::<ProxyAdminRequest>(8);
             tokio::spawn(run_proxy_admin(management.clone(), proxy_rx));
-            let mut capabilities = crate::protocol_v4::CAP_PROXY_ADMIN;
-            if !management.proxies_managed() {
-                capabilities |= crate::protocol_v4::CAP_PROXY_WRITE;
-            }
-            (Some(proxy_tx), capabilities)
+            (
+                Some(proxy_tx),
+                management.proxies_managed(),
+                Some(management.subscribe_allow_upstream_modify()),
+            )
         }
-        None => (None, 0),
+        None => (None, false, None),
     };
     #[cfg(not(feature = "management"))]
-    let (proxy_admin, capabilities) = (None, 0u32);
+    let (proxy_admin, proxies_managed, allow_upstream_modify) = (None, false, None);
 
     let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel::<anyhow::Error>();
     let (session_stop_tx, session_stop_rx) = broadcast::channel::<bool>(1);
@@ -200,7 +204,8 @@ async fn run_relay(
         role: Role::Node,
         keepalive_interval: config.keepalive_interval,
         retry_interval: config.retry_interval,
-        capabilities,
+        proxies_managed,
+        allow_upstream_modify,
         proxy_admin,
         routes,
         fatal_tx,
@@ -311,6 +316,25 @@ async fn ensure_upstream_is_not_self(config: &Config, actual_port: u16) -> Resul
     Ok(())
 }
 
+/// Reject a proxy write that the local node does not allow its upstream to make.
+///
+/// This is the authoritative check: the v4 capability bits only tell the next
+/// hop what to display, and a next hop that sends a `Put`/`Delete` anyway must
+/// still be refused.
+#[cfg(feature = "management")]
+fn ensure_upstream_may_modify(management: &crate::management::ManagementState) -> Result<()> {
+    if management.proxies_managed() {
+        bail!("The local services are managed by HT_PROXIES and cannot be changed");
+    }
+    if !management.allow_upstream_modify() {
+        bail!(
+            "The upstream is not allowed to modify this node's local services; enable \
+             `allow_upstream_modify` on the node's own management page or in ht.toml"
+        );
+    }
+    Ok(())
+}
+
 /// Serve the proxy operations an upstream sends over the v4 session with the
 /// same management state as the local page.
 #[cfg(feature = "management")]
@@ -327,10 +351,14 @@ async fn run_proxy_admin(
                 name,
                 domain,
                 local_addr,
+                auth_header,
                 reply,
             } => {
                 let result: Result<Vec<crate::config::ServerProxyEntry>> = async {
-                    management.put_proxy(name, domain, local_addr).await?;
+                    ensure_upstream_may_modify(&management)?;
+                    management
+                        .put_proxy(name, domain, local_addr, auth_header)
+                        .await?;
                     Ok(management.proxies().await)
                 }
                 .await;
@@ -338,6 +366,7 @@ async fn run_proxy_admin(
             }
             ProxyAdminRequest::Delete { name, reply } => {
                 let result: Result<Vec<crate::config::ServerProxyEntry>> = async {
+                    ensure_upstream_may_modify(&management)?;
                     management.delete_proxy(&name).await?;
                     Ok(management.proxies().await)
                 }

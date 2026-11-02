@@ -36,13 +36,24 @@ Every API call uses a Bearer token, which is also the listener `token`:
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/status` | Name, transport, upstream, connectivity, proxy count, session count, version, config path, uptime, the `HT_*` variables that are set |
-| GET | `/api/proxies` | List local `[[proxies]]` as `name`/`domain`/`local_addr`/`source`; with `?node=` or `?session=`, list the proxies of that downstream node |
+| GET | `/api/status` | Name, transport, upstream, connectivity, proxy count, session count, `allow_upstream_modify` and whether it is editable, version, config path, uptime, the `HT_*` variables that are set |
+| GET | `/api/proxies` | List local `[[proxies]]` as `name`/`domain`/`local_addr`/`auth_header`/`source`; with `?node=` or `?session=`, list the proxies of that downstream node |
 | GET | `/api/routes` | The effective routing table, including v4 owners |
-| GET | `/api/sessions` | The connected downstream v4 sessions: session id, node, version, peer address, forwarded client address, role, uptime, owned domains, `manageable` and `writable` |
-| PUT | `/api/proxies/{name}` | Create or replace a local proxy; with `?node=`/`?session=`, write it on that downstream node |
+| GET | `/api/sessions` | The connected downstream v4 sessions: session id, node, version, peer address, forwarded client address, role, uptime, owned domains, `manageable`, `writable` and `proxy_source` |
+| PUT | `/api/proxies/{name}` | Create or replace a local proxy, including its `auth_header`; with `?node=`/`?session=`, write it on that downstream node |
+| PUT | `/api/settings/allow-upstream-modify` | Allow or forbid the next hop from changing this process's local proxies; body `{"allowed":true}` |
 | DELETE | `/api/proxies/{name}` | Delete a local proxy; with `?node=`/`?session=`, delete it on that downstream node |
 | DELETE | `/api/sessions/{id}` | Close one downstream session |
+
+`GET /api/proxies` returns the visitor token in `auth_header`; the field is
+`null` when authentication is off:
+
+```json
+[
+  {"name":"app","domain":"app.example.com","local_addr":"127.0.0.1:3000","auth_header":"visitor-secret","source":"file"},
+  {"name":"nas","domain":"nas.example.com","local_addr":"127.0.0.1:80","auth_header":null,"source":"file"}
+]
+```
 
 `GET /api/routes` shows the table the visitor path actually uses. Local routes
 come first, then the downstream routes, each group sorted by domain. A local
@@ -72,7 +83,7 @@ the page shows `—`.
 
 ```json
 [
-  {"session_id":3,"node":"home","version":"2.5.3","peer":"10.0.0.6:60216","forwarded":"203.0.113.9","role":"node","connected_seconds":125,"domains":["svc.example.com"],"manageable":true,"writable":true}
+  {"session_id":3,"node":"home","version":"2.5.3","peer":"10.0.0.6:60216","forwarded":"203.0.113.9","role":"node","connected_seconds":125,"domains":["svc.example.com"],"manageable":true,"writable":false,"proxy_source":"file"}
 ]
 ```
 
@@ -98,13 +109,60 @@ curl -H "Host: edge.lan" -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:7777/api/proxies
 curl -X PUT -H "Host: edge.lan" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"domain":"nas.example.com","local_addr":"127.0.0.1:80"}' \
+  -d '{"domain":"nas.example.com","local_addr":"127.0.0.1:80","auth_header":"visitor-secret"}' \
   http://127.0.0.1:7777/api/proxies/nas
 ```
+
+`GET /api/proxies` returns the visitor token **in plain text** in
+`auth_header` (`null` when authentication is off). The management responses are
+sent with `Cache-Control: no-store`, but the whole management plane must still
+be reached over HTTPS/TLS: anyone who can read the API response or the management
+token can use the tunnel. A front proxy must not log response bodies.
+
+`PUT` replaces the whole entry. Omitting `auth_header`, sending `null`, or
+sending an empty string disables visitor authentication; a non-empty value sets
+or rotates it. The value is trimmed and may not contain line breaks or exceed
+8192 bytes. The web page pre-fills the current value, so editing a domain or
+address from the page keeps the token; scripts that change only
+`domain`/`local_addr` must include the current `auth_header` to keep it.
 
 A change is validated locally, written atomically to `ht.toml`, applied to the
 running server's proxy list, and published on the route watch. An upstream
 session therefore mirrors or withdraws the route immediately, without a restart.
+
+## The upstream modification switch
+
+`PUT /api/settings/allow-upstream-modify` changes this process's own switch. It
+does not accept `node` or `session`:
+
+```sh
+curl -X PUT -H "Host: edge.lan" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"allowed":true}' \
+  http://127.0.0.1:7777/api/settings/allow-upstream-modify
+```
+
+The response is `{"allow_upstream_modify":true}`. The value is written to
+`ht.toml` and published to the running upstream session, which reconnects at once
+without the retry backoff so the next hop receives the new capability bits in a
+fresh `Hello`. A `PUT` is rejected with `409` when:
+
+- there is no `[upstream]` (a standalone ingress has nothing to authorize);
+- `HT_ALLOW_UPSTREAM_MODIFY` owns the value, so a file write would be
+  immediately overridden;
+- `HT_PROXIES` owns the local services and already keeps them read-only.
+
+`GET /api/status` reports:
+
+```json
+{"allow_upstream_modify":false,"allow_upstream_modify_editable":true}
+```
+
+`allow_upstream_modify_editable` is the page's hint: it is `true` only when an
+upstream exists, the environment does not own the value, and `HT_PROXIES` is not
+managing the local services. The page shows the current value, disables the
+control with a reason when it is not editable, and shows "无上游" on a standalone
+ingress.
 
 ## Downstream node proxies
 
@@ -128,19 +186,39 @@ the error (use `session` to disambiguate).
 The response is the same array as the local endpoint. Each session listed by
 `GET /api/sessions` carries:
 
-- `manageable`: the node understands proxy management requests.
-- `writable`: its local services may be changed. It is `false` when the node is
-  running with `HT_PROXIES`.
+- `manageable`: the node understands proxy management requests. It may still
+  list its services when `writable` is `false`.
+- `writable`: its local services may be changed. It is `false` when the node
+  turns `allow_upstream_modify` off (the default) or runs with `HT_PROXIES`.
+- `proxy_source`: `file` when the node reads `[[proxies]]` from its `ht.toml`,
+  `env` when `HT_PROXIES` owns them. It does not change when only the
+  `allow_upstream_modify` switch is off.
+
+`allow_upstream_modify` is `false` by default. The entry may list a downstream
+node's services (including `auth_header`) but a `PUT` or `DELETE` returns `409`.
+The node can turn the switch on or off from its own management page, which writes
+`allow_upstream_modify` to its `ht.toml` and reconnects its upstream session at
+once so the new capability is announced. The routes of that node are withdrawn
+and advertised again during the reconnect. When `HT_PROXIES` owns the local
+services the switch is disabled, because writes are already impossible.
 
 A downstream operation is executed by the node itself with the same code as its
 own management page: the change is validated, written atomically to that node's
 `ht.toml`, applied to its running proxy list, and published on its route watch.
 The entry node therefore sees the added or withdrawn route without a restart.
 
-Remote management is enabled by default when both processes are built with the
-`management` feature. Anyone who can reach the entry `control_host` and knows
-its token can edit the connected downstream nodes' `ht.toml`; run only trusted
-nodes on that control plane, or build without `management` to remove the
+The proxy management frames carry `auth_header` now, which is a wire-format
+change inside v4. All nodes on one control plane must run the same release. A
+new entry node refuses management of a downstream that does not advertise
+`CAP_PROXY_AUTH` and answers `409` with an upgrade hint, instead of letting the
+session fail to decode the frame.
+
+Remote management is off by default when both processes are built with the
+`management` feature. A node opts in with `allow_upstream_modify = true` or with
+its own management page; only then may the previous hop edit its `ht.toml`.
+Anyone who can reach the entry `control_host` and knows its token can still list
+the connected downstream nodes' services, including `auth_header`; run only
+trusted nodes on that control plane, or build without `management` to remove the
 feature.
 
 Failures:
@@ -149,7 +227,7 @@ Failures:
 | --- | --- |
 | `400` | The session id is not a number, `node` and `session` disagree, or the input is invalid |
 | `404` | No session matches the selector, or the proxy does not exist on the node |
-| `409` | The node is not manageable, is `HT_PROXIES` read-only, or several sessions share the name |
+| `409` | The node is not manageable, does not allow upstream writes (`allow_upstream_modify = false`), is `HT_PROXIES` read-only, predates the `auth_header` wire shape, or several sessions share the name |
 | `502` | The node rejected the change (for example a domain conflict or an unwritable file) |
 | `504` | The node did not answer within 10 seconds; the change may still have been applied |
 
@@ -188,6 +266,8 @@ read-only at runtime:
 - `/api/status` reports `"proxies_managed": true` and lists `HT_PROXIES` among
   the set variables; the page hides the add, edit and delete actions.
 - `PUT` and `DELETE /api/proxies/*` return `409 Conflict`.
+- The `allow_upstream_modify` control is disabled, because the services are
+  already read-only.
 - Nothing is written to `ht.toml`.
 
 Scalar environment overrides (`HT_TOKEN`, `HT_UPSTREAM_URL`, ...) also win at runtime

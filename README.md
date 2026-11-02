@@ -171,6 +171,7 @@ curl -i -H "Host: app.example.com" http://127.0.0.1:7777/
 | `control_host` | 留给 v4 会话入口和管理页/API 的精确 Host，不能是泛域名，也不能与任何 `[[proxies]]` 域名重叠；无 `[upstream]` 时必填，有则默认 `127.0.0.1` |
 | `token` | 下游对等节点使用的监听 Token；有 `[upstream]` 且省略时复用 `[upstream].token` |
 | `retry_interval` / `keepalive_interval` | 重连上一跳的间隔秒数 / WebSocket ping 间隔秒数（`0` 关闭保活） |
+| `allow_upstream_modify` | 是否允许上一跳通过 v4 管理通道修改本节点的 `[[proxies]]`，默认 `false`；关闭时上级仍可列出服务但不能增删改 |
 | `max_pending_handshakes` / `max_sessions` | 待握手升级数上限 / v4 会话上限 |
 | `[[proxies]]` | 本进程直接服务的本地服务，字段见[转发配置](#转发配置) |
 | `[upstream]` | 上一跳：`url` 为不带路径的 `ws://` / `wss://` 地址，`token` 为共享密钥；省略即独立入口 |
@@ -199,6 +200,7 @@ curl -i -H "Host: app.example.com" http://127.0.0.1:7777/
 | `HT_CONTROL_HOST` | `control_host` | v4 会话入口与管理页的保留 Host |
 | `HT_RETRY_INTERVAL` | `retry_interval` | 重连上一跳的间隔秒数 |
 | `HT_KEEPALIVE_INTERVAL` | `keepalive_interval` | WebSocket ping 间隔秒数 |
+| `HT_ALLOW_UPSTREAM_MODIFY` | `allow_upstream_modify` | 是否允许上级修改本节点服务，`true`/`false`/`1`/`0` |
 
 ```sh
 HT_UPSTREAM_URL=wss://control.example.com:443 HT_TOKEN=<上游 token> \
@@ -207,7 +209,8 @@ HT_UPSTREAM_URL=wss://control.example.com:443 HT_TOKEN=<上游 token> \
 
 - 未设置或值为空字符串的变量会被忽略；环境变量不会写回 `ht.toml`。
 - `HT_PROXIES` 整体替换文件里的 `[[proxies]]`，不合并；`HT_PROXIES='[]'` 表示不启用本地服务。
-- 本地服务来自 `HT_PROXIES` 时，页面会隐藏表单和删除按钮，`PUT`/`DELETE /api/proxies/*` 返回 `409`；修改环境变量并重启后才会生效。
+- 本地服务来自 `HT_PROXIES` 时，页面会隐藏表单和删除按钮，`PUT`/`DELETE /api/proxies/*` 返回 `409`；修改环境变量并重启后才会生效。此时“上级修改”开关也会被禁用。
+- `HT_ALLOW_UPSTREAM_MODIFY` 设置后，“上级修改”开关由环境变量接管，页面只显示状态、不能切换。
 - `ht.toml` 不存在时，只要设置了任一 `HT_*`，进程就用默认值加环境变量启动，**不会**生成或写入 `ht.toml`。
 
 ### 从 1.x 迁移
@@ -482,19 +485,26 @@ keepalive_interval = 15
 
 ## Web 管理
 
-管理页面与 API 始终开启，和访客、v4 会话共用 `listen_port`，只在保留的 `control_host` 上可达。浏览器打开 `http://<control_host>:<listen_port>/`，HTTP Basic 用户名填 `ht`，密码填 `token`；页面是一个内联 CSS/JS 的单页控制台，本身不做服务端渲染，所有数据都通过 `/api/*`（Bearer token）获取，可查看状态、本地服务（含来源）、路由表、下游节点（含来源 IP）、已设置的环境变量和接口列表。节点卡片中本节点和下游节点的每一行都有“管理服务”，点开后可在弹窗内增删改该节点自己的 `[[proxies]]`；下游节点行还可以“断开”当前会话。远程管理默认开启，能访问入口管理面并持有 token 的人可以修改下游的 `ht.toml`，只应在可信节点间使用。`control_host` 不是本机可解析的地址时，可用 `curl -H "Host: <control_host>" http://127.0.0.1:<listen_port>/` 访问；`listen_port = 0` 时管理页也用临时端口，以启动日志为准。
+管理页面与 API 始终开启，和访客、v4 会话共用 `listen_port`，只在保留的 `control_host` 上可达。浏览器打开 `http://<control_host>:<listen_port>/`，HTTP Basic 用户名填 `ht`，密码填 `token`；页面是一个内联 CSS/JS 的单页控制台，本身不做服务端渲染，所有数据都通过 `/api/*`（Bearer token）获取，可查看状态、本地服务（含来源）、路由表、下游节点（含来源 IP）、已设置的环境变量和接口列表。节点卡片中本节点和下游节点的每一行都有“管理服务”（只读时为“查看服务”），点开后可在弹窗内查看，或在允许时增删改该节点自己的 `[[proxies]]`；下游节点行还可以“断开”当前会话。
+
+**上级修改默认关闭。** 下游节点的 `[[proxies]]` 默认只能由本机管理页修改；上一跳仍可列出这些服务（包括 `auth_header` 明文），但写入会返回 `409`。下游节点可以在自己的管理页顶部“上级修改”中切换，切换会立即重连上游会话以重新上报能力位，期间该节点的路由会短暂撤销并重新通告。`HT_ALLOW_UPSTREAM_MODIFY` 已设置时开关由环境变量接管；本地服务由 `HT_PROXIES` 管理时开关禁用。独立入口没有上游，页面显示“无上游”。
+
+`control_host` 不是本机可解析的地址时，可用 `curl -H "Host: <control_host>" http://127.0.0.1:<listen_port>/` 访问；`listen_port = 0` 时管理页也用临时端口，以启动日志为准。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/status` | 查看状态、本地服务数、下游节点数、版本、配置文件、运行时长与环境变量覆盖情况 |
-| GET | `/api/proxies` | 列出本地 `[[proxies]]` 及其来源（`ht.toml` / `HT_PROXIES`）；带 `?node=` 或 `?session=` 时列出该下游节点的服务 |
+| GET | `/api/status` | 查看状态、本地服务数、下游节点数、上级修改开关及是否可编辑、版本、配置文件、运行时长与环境变量覆盖情况 |
+| GET | `/api/proxies` | 列出本地 `[[proxies]]`（含 `auth_header` 明文和来源 `ht.toml` / `HT_PROXIES`）；带 `?node=` 或 `?session=` 时列出该下游节点的服务 |
 | GET | `/api/routes` | 查看当前生效的路由表（本地服务在前，下游 v4 路由在后，均按域名排序） |
-| GET | `/api/sessions` | 列出已连接的下游节点：会话号、节点、网关转发的来源 IP、TCP 对端、角色、连接时长、所属域名与是否可管理 |
-| PUT | `/api/proxies/{name}` | 新增或更新本地服务；带 `?node=`/`?session=` 时写入下游节点 |
+| GET | `/api/sessions` | 列出已连接的下游节点：会话号、节点、网关转发的来源 IP、TCP 对端、角色、连接时长、所属域名、是否可管理/可写与服务来源 |
+| PUT | `/api/proxies/{name}` | 新增或替换本地服务，可设置/清除 `auth_header`；带 `?node=`/`?session=` 时写入下游节点 |
+| PUT | `/api/settings/allow-upstream-modify` | 开关本节点是否允许上级修改，请求体 `{"allowed":true}`；保存后立即重连上游会话 |
 | DELETE | `/api/proxies/{name}` | 删除本地服务；带 `?node=`/`?session=` 时删除下游节点的服务 |
 | DELETE | `/api/sessions/{id}` | 断开一个下游会话（节点会按自己的重连间隔重新连上） |
 
-修改会立即更新运行中的代理列表和路由 watch，并写回 `ht.toml`；带下游参数时写回的是该节点的 `ht.toml`。`node` 与 `session` 可同时给出，必须指向同一会话；不给出时只操作本进程。详见 [docs/management-api.md](./docs/management-api.md)。
+修改会立即更新运行中的代理列表和路由 watch，并写回 `ht.toml`；带下游参数时写回的是该节点的 `ht.toml`。`node` 与 `session` 可同时给出，必须指向同一会话；不给出时只操作本进程。上级修改开关只作用于本进程，不能带 `?node=`/`?session=`；没有 `[upstream]`、由 `HT_ALLOW_UPSTREAM_MODIFY` 接管或 `HT_PROXIES` 只读时返回 `409`。
+
+`GET /api/proxies` 会以明文返回 `auth_header`，管理响应带 `Cache-Control: no-store`；管理面仍必须通过 HTTPS/TLS 访问，且前置代理不要记录响应体。`PUT` 是整体替换：省略、`null` 或空字符串都会关闭该服务的访客认证，管理页会回填当前值。代理管理的帧结构已携带 `auth_header`，同一控制面的所有节点必须运行同一版本；入口会拒绝管理不支持该能力的旧下游并返回 `409`。详见 [docs/management-api.md](./docs/management-api.md)。
 
 ## 错误响应与排查
 

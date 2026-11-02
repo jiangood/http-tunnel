@@ -7,6 +7,7 @@
 //! v4 is the only protocol `ht` speaks. The entry path is
 //! `/_http-tunnel/v4/connect`; no other protocol is supported.
 
+use crate::config::MaskedString;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -36,6 +37,16 @@ pub const CAP_PROXY_ADMIN: u32 = 1 << 0;
 /// The peer also allows its local `[[proxies]]` to be changed. It is cleared
 /// when `HT_PROXIES` owns the list, so the upstream can list but not edit it.
 pub const CAP_PROXY_WRITE: u32 = 1 << 1;
+/// The peer speaks the `ProxyEntry`/`ProxyOp::Put` shape that carries
+/// `auth_header`. It is a wire-format change, so an upstream refuses proxy
+/// management on a peer that does not announce it instead of causing a decode
+/// failure.
+pub const CAP_PROXY_AUTH: u32 = 1 << 2;
+/// The peer's local `[[proxies]]` come from `HT_PROXIES`, so they are
+/// environment-managed and cannot be written even when it allows management.
+/// It lets an upstream tell "HT_PROXIES read-only" apart from "the node turned
+/// `allow_upstream_modify` off".
+pub const CAP_PROXY_ENV: u32 = 1 << 3;
 
 /// The role announced in `Hello`. It is advisory: authentication and ACLs
 /// decide what a peer may do.
@@ -64,6 +75,8 @@ pub struct ProxyEntry {
     pub name: String,
     pub domain: String,
     pub local_addr: String,
+    /// The visitor token of this proxy, if authentication is enabled
+    pub auth_header: Option<MaskedString>,
 }
 
 /// A management operation the upstream asks a downstream node to perform on its
@@ -75,6 +88,8 @@ pub enum ProxyOp {
         name: String,
         domain: String,
         local_addr: String,
+        /// Replace the whole entry, so `None` disables visitor authentication
+        auth_header: Option<MaskedString>,
     },
     Delete {
         name: String,
@@ -330,6 +345,7 @@ mod tests {
                     name: "nas".to_string(),
                     domain: "nas.example.com".to_string(),
                     local_addr: "127.0.0.1:80".to_string(),
+                    auth_header: Some(MaskedString::from("visitor-secret")),
                 },
             },
             SessionFrame::ProxyResponse {
@@ -338,6 +354,7 @@ mod tests {
                     name: "nas".to_string(),
                     domain: "nas.example.com".to_string(),
                     local_addr: "127.0.0.1:80".to_string(),
+                    auth_header: Some(MaskedString::from("visitor-secret")),
                 }],
                 error: None,
             },
