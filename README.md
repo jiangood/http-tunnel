@@ -420,7 +420,7 @@ keepalive_interval = 15
 | GET | `/api/status` | 查看状态、本地服务数、下游节点数、版本、配置文件、运行时长与环境变量覆盖情况 |
 | GET | `/api/proxies` | 列出本地 `[[proxies]]` 及其来源（`ht.toml` / `HT_PROXIES`） |
 | GET | `/api/routes` | 查看当前生效的路由表（本地服务 + 下游 v4 路由及其所属节点） |
-| GET | `/api/sessions` | 列出已连接的下游节点：会话号、节点、来源地址、角色、连接时长与所属域名 |
+| GET | `/api/sessions` | 列出已连接的下游节点：会话号、节点、网关转发的来源 IP、TCP 对端、角色、连接时长与所属域名 |
 | PUT | `/api/proxies/{name}` | 新增或更新本地服务 |
 | DELETE | `/api/proxies/{name}` | 删除本地服务 |
 

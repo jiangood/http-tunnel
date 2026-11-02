@@ -36,7 +36,7 @@ Every API call uses a Bearer token, which is also the listener `token`:
 | GET | `/api/status` | Name, transport, upstream, connectivity, proxy count, session count, version, config path, uptime, the `HT_*` variables that are set |
 | GET | `/api/proxies` | List local `[[proxies]]` as `name`/`domain`/`local_addr`/`source` |
 | GET | `/api/routes` | The effective routing table, including v4 owners |
-| GET | `/api/sessions` | The connected downstream v4 sessions: session id, node, peer address, role, uptime and owned domains |
+| GET | `/api/sessions` | The connected downstream v4 sessions: session id, node, peer address, forwarded client address, role, uptime and owned domains |
 | PUT | `/api/proxies/{name}` | Create or replace a local proxy |
 | DELETE | `/api/proxies/{name}` | Delete a local proxy |
 
@@ -53,15 +53,22 @@ wins, but both entries are listed:
 
 `GET /api/sessions` lists the downstream nodes that are connected right now. One
 entry is one v4 session, so a node that reconnects appears with a new session id.
-`peer` is the TCP address the session connected from: when several nodes announce
-the same or a wrong `node` id, it is what tells them apart. Behind a reverse proxy
-it is the proxy's address, not the node's.
+`peer` is the TCP address the session connected from. When a gateway (SafeLine,
+nginx, a cloud load balancer) sits in front of the server, that is the gateway;
+`forwarded` is then the address the gateway reports for the node, taken from the
+last hop of `X-Forwarded-For` (or `X-Real-IP`, or `Forwarded`). When several
+nodes announce the same or a wrong `node` id, `forwarded`/`peer` is what tells
+them apart. The header can be spoofed by a peer that reaches the endpoint
+directly, so it is diagnostic, not an authorization decision.
 
 ```json
 [
-  {"session_id":3,"node":"home","peer":"10.0.0.5:51234","role":"node","connected_seconds":125,"domains":["svc.example.com"]}
+  {"session_id":3,"node":"home","peer":"10.0.0.6:60216","forwarded":"203.0.113.9","role":"node","connected_seconds":125,"domains":["svc.example.com"]}
 ]
 ```
+
+`forwarded` is omitted when the node connects directly or the gateway does not
+add a forwarding header. The page shows it next to the TCP peer, labelled "经".
 
 The page shows the same list under "下游节点", with the peer address next to each
 node and the connected count next to the route count. A client that only connects

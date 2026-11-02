@@ -3,7 +3,7 @@ use crate::helper::normalize_domain;
 use crate::server::ServerState;
 use anyhow::Result;
 use rand::RngCore;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -166,6 +166,10 @@ async fn handle_visitor(
     if state.control_host == host {
         let path = parse_request_path(&prefetched).unwrap_or_default();
         if path == crate::protocol_v4::V4_PATH {
+            // A gateway in front of us (SafeLine, nginx, a cloud load balancer)
+            // is the TCP peer; the node's own address is only in the forwarding
+            // headers it adds to the upgrade request.
+            let forwarded = forwarded_client(&prefetched);
             let Some((conn, _pending_permit)) =
                 accept_tunnel_websocket(prefetched, stream, &state, addr, &request_id).await?
             else {
@@ -174,7 +178,7 @@ async fn handle_visitor(
             // This is a transport/session connection, not an in-flight visitor
             // request. Do not include its lifetime in the visitor drain counter.
             drop(activity);
-            if let Err(e) = crate::session_server::accept(conn, addr, state).await {
+            if let Err(e) = crate::session_server::accept(conn, addr, forwarded, state).await {
                 warn!(
                     request_id = %request_id,
                     peer = %addr,
@@ -571,6 +575,74 @@ fn header_for_log(head: &[u8], name: &str) -> Option<String> {
     None
 }
 
+/// The address a gateway in front of us reports for the peer that opened a
+/// v4 session.
+///
+/// `X-Forwarded-For` is a chain: every proxy appends the address it received
+/// the request from, so the last entry is the one added by the proxy closest to
+/// us (SafeLine, nginx, a cloud load balancer). That is the node's real address,
+/// while the TCP peer is the gateway. `X-Real-IP` and RFC 7239 `Forwarded` are
+/// used when the chain is absent. The value is advisory: a peer that can reach
+/// us directly may send anything, so the management page shows the TCP peer
+/// next to it.
+fn forwarded_client(head: &[u8]) -> Option<String> {
+    if let Some(value) = header_for_log(head, "x-forwarded-for") {
+        if let Some(client) = value
+            .split(',')
+            .filter_map(|entry| normalize_forwarded_address(entry.trim()))
+            .last()
+        {
+            return Some(client);
+        }
+    }
+    if let Some(value) = header_for_log(head, "x-real-ip") {
+        if let Some(client) = normalize_forwarded_address(value.trim()) {
+            return Some(client);
+        }
+    }
+    let value = header_for_log(head, "forwarded")?;
+    value
+        .split(',')
+        .filter_map(|entry| {
+            entry.split(';').find_map(|parameter| {
+                let (name, value) = parameter.split_once('=')?;
+                if name.trim().eq_ignore_ascii_case("for") {
+                    normalize_forwarded_address(value.trim())
+                } else {
+                    None
+                }
+            })
+        })
+        .last()
+}
+
+/// Strip the quotes, brackets and optional port that forwarding headers may
+/// carry, and return the bare IP address. Anything that does not look like an
+/// IP (e.g. an obfuscated `_hidden` token) is ignored instead of being shown.
+fn normalize_forwarded_address(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(value);
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Some(ip.to_string());
+    }
+    if let Ok(address) = value.parse::<SocketAddr>() {
+        return Some(address.ip().to_string());
+    }
+    // An IPv6 address in brackets without a port: `[2001:db8::1]`
+    if let Some(inner) = value
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        if let Ok(ip) = inner.parse::<IpAddr>() {
+            return Some(ip.to_string());
+        }
+    }
+    None
+}
+
 /// Cut a log field at `limit` characters, on a character boundary.
 fn truncate_for_log(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
@@ -942,6 +1014,47 @@ mod tests {
 
         let head = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n";
         assert!(header_for_log(head, "user-agent").is_none());
+    }
+
+    #[test]
+    fn test_forwarded_client_prefers_the_nearest_proxy_hop() {
+        // SafeLine appends the address it received the request from, so the
+        // last entry is the node, not the client-supplied first entry.
+        let head = b"GET /_http-tunnel/v4/connect HTTP/1.1\r\nX-Forwarded-For: 203.0.113.9, 198.51.100.7\r\n\r\n";
+        assert_eq!(forwarded_client(head).as_deref(), Some("198.51.100.7"));
+
+        let head = b"GET /_http-tunnel/v4/connect HTTP/1.1\r\nX-Real-IP: 203.0.113.9\r\n\r\n";
+        assert_eq!(forwarded_client(head).as_deref(), Some("203.0.113.9"));
+
+        let head = b"GET /_http-tunnel/v4/connect HTTP/1.1\r\nForwarded: for=203.0.113.9;proto=https, for=\"[2001:db8::1]:443\"\r\n\r\n";
+        assert_eq!(forwarded_client(head).as_deref(), Some("2001:db8::1"));
+
+        let head = b"GET /_http-tunnel/v4/connect HTTP/1.1\r\nX-Forwarded-For: _hidden\r\n\r\n";
+        assert!(forwarded_client(head).is_none());
+
+        let head = b"GET /_http-tunnel/v4/connect HTTP/1.1\r\nHost: control.test\r\n\r\n";
+        assert!(forwarded_client(head).is_none());
+    }
+
+    #[test]
+    fn test_normalize_forwarded_address_variants() {
+        assert_eq!(
+            normalize_forwarded_address(" 198.51.100.7 ").as_deref(),
+            Some("198.51.100.7")
+        );
+        assert_eq!(
+            normalize_forwarded_address("198.51.100.7:54321").as_deref(),
+            Some("198.51.100.7")
+        );
+        assert_eq!(
+            normalize_forwarded_address("[2001:db8::1]").as_deref(),
+            Some("2001:db8::1")
+        );
+        assert_eq!(
+            normalize_forwarded_address("[2001:db8::1]:443").as_deref(),
+            Some("2001:db8::1")
+        );
+        assert!(normalize_forwarded_address("unknown").is_none());
     }
 
     #[test]

@@ -72,10 +72,12 @@ impl V4SessionHandle {
 }
 
 /// Accept a v4 session on an already-upgraded WebSocket. `peer` is the address
-/// the session connected from, kept for the management page and the logs.
+/// the session connected from and `forwarded` the address a gateway in front of
+/// us reported, kept for the management page and the logs.
 pub(crate) async fn accept(
     mut conn: Conn,
     peer: SocketAddr,
+    forwarded: Option<String>,
     state: Arc<ServerState>,
 ) -> Result<()> {
     let hello = time::timeout(HANDSHAKE_TIMEOUT, p4::read_frame(&mut conn))
@@ -159,6 +161,7 @@ pub(crate) async fn accept(
         V4SessionInfo {
             node_id: node_id.clone(),
             peer,
+            forwarded: forwarded.clone(),
             role: role_name,
             since: Instant::now(),
         },
@@ -167,11 +170,12 @@ pub(crate) async fn accept(
         session_id,
         node = %node_id,
         peer = %peer,
+        client = forwarded.as_deref().unwrap_or("-"),
         role = %role_name,
         "v4 session established"
     );
 
-    let result = run_session(conn, state.clone(), session_id, node_id, peer, permit).await;
+    let result = run_session(conn, state.clone(), session_id, node_id, forwarded, permit).await;
     state.v4_session_info.write().await.remove(&session_id);
     result
 }
@@ -181,7 +185,7 @@ async fn run_session(
     state: Arc<ServerState>,
     session_id: u64,
     node_id: String,
-    peer: SocketAddr,
+    forwarded: Option<String>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
     let (mut reader, mut writer) = split(conn);
@@ -339,7 +343,12 @@ async fn run_session(
     drop(streams);
     drop(out_tx);
     let _ = time::timeout(Duration::from_secs(1), writer_task).await;
-    info!(session_id, node = %node_id, peer = %peer, "v4 session closed");
+    info!(
+        session_id,
+        node = %node_id,
+        client = forwarded.as_deref().unwrap_or("-"),
+        "v4 session closed"
+    );
     Ok(())
 }
 

@@ -39,6 +39,11 @@ pub(crate) struct SessionSnapshot {
     /// The TCP peer that opened the session. Several nodes may announce the
     /// same or a wrong node id, so the address is what tells them apart.
     pub(crate) peer: SocketAddr,
+    /// The node address reported by a gateway in front of the server
+    /// (`X-Forwarded-For` and friends). `None` when the node connected directly
+    /// or the gateway did not add the header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) forwarded: Option<String>,
     /// The advisory role announced in the peer's `Hello`: `client` or `node`
     pub(crate) role: &'static str,
     /// Seconds since the session was established
@@ -51,6 +56,7 @@ pub(crate) struct SessionSnapshot {
 pub(crate) struct V4SessionInfo {
     pub(crate) node_id: String,
     pub(crate) peer: SocketAddr,
+    pub(crate) forwarded: Option<String>,
     pub(crate) role: &'static str,
     pub(crate) since: Instant,
 }
@@ -332,6 +338,7 @@ impl ServerState {
                     session_id: *session_id,
                     node: info.node_id.clone(),
                     peer: info.peer,
+                    forwarded: info.forwarded.clone(),
                     role: info.role,
                     connected_seconds: now.duration_since(info.since).as_secs(),
                     domains,
