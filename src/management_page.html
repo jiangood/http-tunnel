@@ -99,6 +99,9 @@ th.right,td.right{text-align:right}
 .strong{font-weight:600}
 .mono{font-family:var(--mono);font-size:13px}
 .nowrap{white-space:nowrap}
+.geo{font-size:12.5px;line-height:1.45}
+.geo-line{display:block;overflow-wrap:anywhere}
+.geo-isp{color:var(--muted)}
 .muted{color:var(--muted)}
 .tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap;background:var(--accent-soft);color:var(--accent)}
 .tag.local{background:var(--ok-soft);color:var(--ok)}
@@ -167,16 +170,17 @@ input[readonly]{background:var(--input);color:var(--muted)}
             <th>类型</th>
             <th>版本</th>
             <th>来源地址</th>
+            <th>IP 归属</th>
             <th>连接时长</th>
             <th class="right">操作</th>
           </tr>
         </thead>
         <tbody id="node-body">
-          <tr><td colspan="7" class="empty">加载中…</td></tr>
+          <tr><td colspan="8" class="empty">加载中…</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="hint">“本节点”是当前进程，来源地址列显示它的监听或上游地址；下游节点每个 v4 会话一行，节点重连后会换一个新会话号。版本列来自节点连接时上报的软件版本，旧版本节点不提供该信息时显示“—”。下游的来源地址优先显示网关（雷池、nginx 等）转发的对端 IP，没有网关时显示直接连到本机的 TCP 地址。“管理服务”打开本节点或下游节点的服务列表，可在弹窗内增删改该节点自己的 <code>[[proxies]]</code>；“断开”只关闭当前会话，节点会按自己的重连间隔重新连上。</p>
+    <p class="hint">“本节点”是当前进程，来源地址列显示它的监听或上游地址；下游节点每个 v4 会话一行，节点重连后会换一个新会话号。版本列来自节点连接时上报的软件版本，旧版本节点不提供该信息时显示“—”。下游的来源地址优先显示网关（雷池、nginx 等）转发的对端 IP，没有网关时显示直接连到本机的 TCP 地址。“IP 归属”在页面加载后由浏览器直接向公共 IP 归属接口查询来源 IP 的供应商和地理位置，不经过本服务；局域网、回环和无法识别的地址不查询，查询会把来源 IP 发送给该第三方服务。“管理服务”打开本节点或下游节点的服务列表，可在弹窗内增删改该节点自己的 <code>[[proxies]]</code>；“断开”只关闭当前会话，节点会按自己的重连间隔重新连上。</p>
   </section>
 
   <section class="card">
@@ -423,6 +427,246 @@ input[readonly]{background:var(--input);color:var(--muted)}
     return (days ? days + " 天 " : "") + pad(hours) + ":" + pad(minutes) + ":" + pad(rest);
   }
 
+  // ---- IP 归属查询 -------------------------------------------------------
+  // 来源 IP 的供应商和地理位置由浏览器直接查询，后端不参与。结果按 IP 缓存，
+  // 页面每 10 秒刷新时不会重复请求；局域网、回环和非法地址一律跳过。
+  var GEO_CACHE = Object.create(null);
+  var GEO_QUEUE = [];
+  var GEO_ACTIVE = false;
+  var GEO_RETRY_MS = 120000;
+
+  function ipv4Parts(text) {
+    var parts = String(text).split(".");
+    if (parts.length !== 4) { return null; }
+    var out = [];
+    for (var i = 0; i < 4; i += 1) {
+      if (!/^\d{1,3}$/.test(parts[i])) { return null; }
+      var octet = Number(parts[i]);
+      if (octet > 255) { return null; }
+      out.push(octet);
+    }
+    return out;
+  }
+
+  function isIpv4(text) { return ipv4Parts(text) !== null; }
+
+  function isIpv6(text) {
+    var value = String(text).replace(/%.*$/, "");
+    if (value.indexOf(":") < 0 || !/^[0-9a-fA-F:.]+$/.test(value)) { return false; }
+    if (value.indexOf(".") >= 0 &&
+      !/^[0-9a-fA-F:]*:\d{1,3}(?:\.\d{1,3}){3}$/.test(value)) {
+      return false;
+    }
+    return true;
+  }
+
+  // 从 "1.2.3.4:5678"、"[2001:db8::1]:443"、"wss://host:443" 或裸 IP 中取出 IP。
+  function extractIp(value) {
+    var text = String(value === null || value === undefined ? "" : value).trim();
+    if (!text) { return null; }
+    var bracket = text.match(/^\[([0-9a-fA-F:.%]+)\](?::\d+)?$/);
+    if (bracket) { return isIpv6(bracket[1]) ? bracket[1].replace(/%.*$/, "") : null; }
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) {
+      try { text = new URL(text).hostname; } catch (error) { return null; }
+      text = text.replace(/^\[|\]$/g, "");
+    }
+    var v4 = text.match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?$/);
+    if (v4) { return isIpv4(v4[1]) ? v4[1] : null; }
+    return isIpv6(text) ? text.replace(/%.*$/, "") : null;
+  }
+
+  function normalizeIp(ip) {
+    var mapped = String(ip).toLowerCase().match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+    return mapped ? mapped[1] : ip;
+  }
+
+  // "public" 才查询；"private" 是局域网/回环/保留段；"none" 是未指定地址。
+  function ipScope(ip) {
+    var value = normalizeIp(ip);
+    var v4 = ipv4Parts(value);
+    if (v4) {
+      if (v4[0] === 0) { return "none"; }
+      if (v4[0] === 10 || v4[0] === 127 ||
+        (v4[0] === 172 && v4[1] >= 16 && v4[1] <= 31) ||
+        (v4[0] === 192 && v4[1] === 168) ||
+        (v4[0] === 192 && v4[1] === 0 && v4[2] === 0) ||
+        (v4[0] === 192 && v4[1] === 0 && v4[2] === 2) ||
+        (v4[0] === 198 && (v4[1] === 18 || v4[1] === 19)) ||
+        (v4[0] === 198 && v4[1] === 51 && v4[2] === 100) ||
+        (v4[0] === 203 && v4[1] === 0 && v4[2] === 113) ||
+        (v4[0] === 169 && v4[1] === 254) ||
+        (v4[0] === 100 && v4[1] >= 64 && v4[1] <= 127) ||
+        v4[0] >= 224) {
+        return "private";
+      }
+      return "public";
+    }
+    var low = String(value).toLowerCase();
+    if (low === "::" || low === "::1") { return "none"; }
+    if (/^f[cd][0-9a-f]{0,2}:/.test(low)) { return "private"; }
+    if (/^fe[89abcdef][0-9a-f]?:/.test(low)) { return "private"; }
+    if (/^ff[0-9a-f]{0,2}:/.test(low)) { return "private"; }
+    if (low.indexOf("2001:db8") === 0) { return "private"; }
+    return "public";
+  }
+
+  function providerName(connection) {
+    if (!connection) { return ""; }
+    var isp = String(connection.isp || "").trim();
+    var org = String(connection.org || "").trim();
+    // 部分地区的 isp 字段是街道地址，组织名更适合作为供应商显示。
+    if (isp && !/^no\.\s*\d/i.test(isp) && !/\b(street|road|avenue|boulevard)\b/i.test(isp)) {
+      return isp;
+    }
+    return org || isp;
+  }
+
+  function geoLocation(data) {
+    var seen = Object.create(null);
+    var parts = [];
+    [data.country, data.region, data.city].forEach(function (part) {
+      var text = String(part || "").trim();
+      var key = text.toLowerCase();
+      if (text && !seen[key]) {
+        seen[key] = true;
+        parts.push(text);
+      }
+    });
+    return parts.join(" ");
+  }
+
+  function geoCellContent(ip) {
+    var scope = ipScope(ip);
+    if (scope === "none") { return '<span class="muted">—</span>'; }
+    if (scope === "private") { return '<span class="muted">局域网</span>'; }
+    var entry = GEO_CACHE[ip];
+    if (entry && entry.state === "ok") {
+      var title = ip + (entry.asn ? " · AS" + entry.asn : "");
+      return '<span class="geo-line" title="' + esc(title) + '">' +
+          esc(entry.location) + "</span>" +
+        '<span class="geo-line geo-isp" title="' + esc(entry.provider) + '">' +
+          esc(entry.provider) + "</span>";
+    }
+    if (entry && entry.state === "fail" && (!entry.retryAt || Date.now() < entry.retryAt)) {
+      return '<span class="muted" title="稍后刷新会自动重试">查询失败</span>';
+    }
+    return '<span class="muted">查询中…</span>';
+  }
+
+  function findGeoCells(ip) {
+    var cells = document.querySelectorAll("[data-geo-ip]");
+    for (var i = 0; i < cells.length; i += 1) {
+      if (cells[i].getAttribute("data-geo-ip") === ip) {
+        cells[i].innerHTML = geoCellContent(ip);
+      }
+    }
+  }
+
+  // 逐个排队查询，避免页面加载时同时打出多个请求被接口限流。
+  function geoFetch(url) {
+    var options = {};
+    var timer = null;
+    if (typeof AbortController === "function") {
+      var controller = new AbortController();
+      options.signal = controller.signal;
+      timer = setTimeout(function () { controller.abort(); }, 7000);
+    }
+    return fetch(url, options).then(function (response) {
+      if (!response.ok) { throw new Error("HTTP " + response.status); }
+      return response.json();
+    }).then(function (data) {
+      if (timer) { clearTimeout(timer); }
+      return data;
+    }, function (error) {
+      if (timer) { clearTimeout(timer); }
+      throw error;
+    });
+  }
+
+  function queryGeo(ip) {
+    return geoFetch("https://ipwho.is/" + encodeURIComponent(ip) + "?lang=zh-CN")
+      .then(function (data) {
+        if (!data || data.success === false) {
+          throw new Error((data && data.message) || "查询失败");
+        }
+        return {
+          location: geoLocation(data) || "未知位置",
+          provider: providerName(data.connection) || "未知供应商",
+          asn: data.connection && data.connection.asn ? String(data.connection.asn) : ""
+        };
+      })
+      .catch(function () {
+        // 主接口被限流或不可用时换一个 HTTPS 数据源。
+        return geoFetch("https://api.ip.sb/geoip/" + encodeURIComponent(ip)).then(function (data) {
+          if (!data || !data.ip) { throw new Error("查询失败"); }
+          return {
+            location: geoLocation(data) || "未知位置",
+            provider: String(data.isp || data.organization || data.asn_organization || "").trim() ||
+              "未知供应商",
+            asn: data.asn ? String(data.asn) : ""
+          };
+        });
+      });
+  }
+
+  function lookupGeo(ip) {
+    if (ipScope(ip) !== "public") { return; }
+    var entry = GEO_CACHE[ip];
+    if (entry) {
+      if (entry.state === "loading" || entry.state === "ok") { return; }
+      if (entry.retryAt && Date.now() < entry.retryAt) { return; }
+    }
+    GEO_CACHE[ip] = { state: "loading" };
+    GEO_QUEUE.push(ip);
+    pumpGeoQueue();
+  }
+
+  function pumpGeoQueue() {
+    if (GEO_ACTIVE) { return; }
+    var ip = null;
+    while (GEO_QUEUE.length) {
+      var candidate = GEO_QUEUE.shift();
+      if (GEO_CACHE[candidate] && GEO_CACHE[candidate].state === "loading") {
+        ip = candidate;
+        break;
+      }
+    }
+    if (!ip) { return; }
+    var entry = GEO_CACHE[ip];
+    GEO_ACTIVE = true;
+    queryGeo(ip).then(function (result) {
+      entry.state = "ok";
+      entry.location = result.location;
+      entry.provider = result.provider;
+      entry.asn = result.asn;
+    }).catch(function () {
+      entry.state = "fail";
+      entry.retryAt = Date.now() + GEO_RETRY_MS;
+    }).then(function () {
+      GEO_ACTIVE = false;
+      findGeoCells(ip);
+      pumpGeoQueue();
+    });
+  }
+
+  function renderGeoCell(address) {
+    var ip = extractIp(address);
+    if (!ip) { return '<td class="geo"><span class="muted">—</span></td>'; }
+    ip = normalizeIp(ip);
+    var scope = ipScope(ip);
+    if (scope !== "public") {
+      return '<td class="geo">' + geoCellContent(ip) + "</td>";
+    }
+    return '<td class="geo" data-geo-ip="' + esc(ip) + '">' + geoCellContent(ip) + "</td>";
+  }
+
+  function hydrateGeo() {
+    var cells = document.querySelectorAll("[data-geo-ip]");
+    for (var i = 0; i < cells.length; i += 1) {
+      lookupGeo(cells[i].getAttribute("data-geo-ip"));
+    }
+  }
+
   function renderStatus(status) {
     readOnly = !!status.proxies_managed;
     nodeName = status.name || "";
@@ -517,6 +761,7 @@ input[readonly]{background:var(--input);color:var(--muted)}
       '<td><span class="tag local">本节点</span></td>' +
       '<td class="mono muted">' + (nodeVersion ? "v" + esc(nodeVersion) : "—") + "</td>" +
       '<td class="mono muted">' + esc(nodeRemote) + "</td>" +
+      renderGeoCell(nodeRemote) +
       '<td class="mono muted">' + esc(uptime(nodeUptime)) + "</td>" +
       localNodeActions() +
       "</tr>");
@@ -527,12 +772,14 @@ input[readonly]{background:var(--input);color:var(--muted)}
         '<td><span class="tag downstream">下游节点</span></td>' +
         '<td class="mono muted">' + (session.version ? "v" + esc(session.version) : "—") + "</td>" +
         "<td class=\"nowrap\">" + sessionSource(session) + "</td>" +
+        renderGeoCell(session.forwarded || session.peer) +
         '<td class="mono muted">' + esc(uptime(session.connected_seconds)) + "</td>" +
         sessionActions(session) +
         "</tr>");
     });
     $("node-count").textContent = rows.length;
     $("node-body").innerHTML = rows.join("");
+    hydrateGeo();
   }
 
   function renderRouteRow(route) {
