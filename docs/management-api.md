@@ -22,12 +22,13 @@ The page itself is protected by the browser-native HTTP Basic login: username
 `ht`, password = the listener `token`. It is the only Basic-authenticated
 resource. It is a single HTML document with an inline stylesheet and script and
 no external dependency; it renders nothing on the server and reads all of its
-data from `/api` with the Bearer token it is handed after login. It shows the
-status, the local services with their source, the effective route table, the
-connected downstream nodes and the `HT_*` variables that are set, and it adds or
-edits a service in a dialog. A downstream row also offers "管理服务", which
-lists, adds, edits and deletes that node's own `[[proxies]]`, and "断开", which
-closes that one session.
+data from `/api` with the Bearer token it is handed after login. One node
+card lists the local process together with every connected downstream v4
+session; the route table lists the effective routes of both. A local route
+adds, edits or deletes a service in a dialog; a downstream node row offers
+"管理服务", which lists, adds, edits and deletes that node's own `[[proxies]]`,
+and "断开", which closes that one session. The `HT_*` variables that are set
+are shown as well.
 
 ## API
 

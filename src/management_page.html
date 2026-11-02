@@ -156,8 +156,31 @@ input[readonly]{background:var(--input);color:var(--muted)}
   </section>
 
   <section class="card">
+    <h2>节点<span class="count" id="node-count">0</span></h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>会话</th>
+            <th>节点</th>
+            <th>类型</th>
+            <th>来源地址</th>
+            <th>角色</th>
+            <th>连接时长</th>
+            <th class="right">操作</th>
+          </tr>
+        </thead>
+        <tbody id="node-body">
+          <tr><td colspan="7" class="empty">加载中…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="hint">“本节点”是当前进程，来源地址列显示它的监听或上游地址；下游节点每个 v4 会话一行，节点重连后会换一个新会话号。下游的来源地址优先显示网关（雷池、nginx 等）转发的对端 IP，下一行“经”是直接连到本机的 TCP 地址。“管理服务”编辑该节点自己的 <code>[[proxies]]</code>；“断开”只关闭当前会话，节点会按自己的重连间隔重新连上。</p>
+  </section>
+
+  <section class="card">
     <div class="card-head">
-      <h2>本节点服务<span class="count" id="proxy-count">0</span></h2>
+      <h2>路由表<span class="count" id="route-count">0</span></h2>
       <button class="btn primary small" id="add-proxy" type="button">新增服务</button>
     </div>
     <p class="notice" id="read-only" hidden>本节点的服务由环境变量 <code>HT_PROXIES</code> 管理，网页与 API 不可修改；如需变更，请修改该环境变量并重启 ht。</p>
@@ -165,63 +188,22 @@ input[readonly]{background:var(--input);color:var(--muted)}
       <table>
         <thead>
           <tr>
-            <th>名称</th>
-            <th>域名</th>
-            <th>本地地址</th>
-            <th>来源</th>
-            <th class="right" id="op-head">操作</th>
-          </tr>
-        </thead>
-        <tbody id="proxy-body">
-          <tr><td colspan="5" class="empty">加载中…</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <p class="hint">这里是当前进程自己的服务；每个下游节点各自的 <code>[[proxies]]</code> 请在下表的“管理服务”里查看。</p>
-  </section>
-
-  <section class="card">
-    <h2>下游节点<span class="count" id="session-count">0</span></h2>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>会话</th>
-            <th>节点</th>
-            <th>来源地址</th>
-            <th>角色</th>
-            <th>连接时长</th>
-            <th>域名 / 路由</th>
-            <th class="right">操作</th>
-          </tr>
-        </thead>
-        <tbody id="session-body">
-          <tr><td colspan="7" class="empty">加载中…</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <p class="hint">每个下游 v4 会话一行；节点重连后会换一个新会话号。来源地址优先显示网关（雷池、nginx 等）在转发头里报告的对端 IP，即节点真正连出来的地址，下面一行“经”是直接连到本机的 TCP 地址；没有网关时只显示 TCP 地址。域名列为该会话当前声明的路由。“管理服务”编辑该节点自己的 <code>[[proxies]]</code>；“断开”只是关闭当前会话，节点会按自己的重连间隔重新连上。</p>
-  </section>
-
-  <section class="card">
-    <h2>路由表<span class="count" id="route-count">0</span></h2>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
             <th>域名</th>
             <th>类型</th>
             <th>所在节点</th>
-            <th>名称 / 会话</th>
+            <th>名称</th>
+            <th>会话</th>
+            <th>来源</th>
             <th>目标地址</th>
+            <th class="right">操作</th>
           </tr>
         </thead>
         <tbody id="route-body">
-          <tr><td colspan="5" class="empty">加载中…</td></tr>
+          <tr><td colspan="8" class="empty">加载中…</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="hint">本节点服务优先于同名 v4 会话；“所在节点”列标明路由属于当前进程（本节点）还是某个下游节点；路由表变化时也会写入 info 日志。</p>
+    <p class="hint">本节点服务优先于同名 v4 会话。“类型”区分本节点和下游节点；“来源”对本节点是配置来源，对下游是连接地址。下游服务的实际目标地址在远端节点上，可在“节点”卡片里点“管理服务”查看。</p>
   </section>
 
   <section class="card">
@@ -355,6 +337,9 @@ input[readonly]{background:var(--input);color:var(--muted)}
   };
 
   var readOnly = false;
+  var nodeName = "";
+  var nodeRemote = "";
+  var nodeUptime = 0;
   var toastTimer = null;
   var proxiesCache = [];
   var sessionsCache = [];
@@ -441,6 +426,9 @@ input[readonly]{background:var(--input);color:var(--muted)}
 
   function renderStatus(status) {
     readOnly = !!status.proxies_managed;
+    nodeName = status.name || "";
+    nodeRemote = status.remote || "";
+    nodeUptime = status.uptime_seconds || 0;
     $("m-name").textContent = status.name;
     $("m-remote").textContent = status.remote;
     $("m-transport").textContent = TRANSPORTS[status.transport] || status.transport;
@@ -456,7 +444,6 @@ input[readonly]{background:var(--input);color:var(--muted)}
 
     $("read-only").hidden = !readOnly;
     $("add-proxy").hidden = readOnly;
-    $("op-head").hidden = readOnly;
     renderEnv(status.env_vars || []);
   }
 
@@ -476,29 +463,6 @@ input[readonly]{background:var(--input);color:var(--muted)}
 
   function renderProxies(proxies) {
     proxiesCache = proxies;
-    $("proxy-count").textContent = proxies.length;
-    var body = $("proxy-body");
-    if (!proxies.length) {
-      body.innerHTML = '<tr><td colspan="' + (readOnly ? 4 : 5) + '" class="empty">本节点还没有服务。</td></tr>';
-      return;
-    }
-    body.innerHTML = proxies.map(function (proxy) {
-      var source = proxy.source === "env"
-        ? '<span class="tag env">HT_PROXIES</span>'
-        : '<span class="tag">ht.toml</span>';
-      var action = readOnly ? "" :
-        '<td class="right"><div class="row-actions">' +
-          '<button class="btn small" type="button" data-edit="' + esc(proxy.name) + '">编辑</button>' +
-          '<button class="btn danger small" type="button" data-delete="' + esc(proxy.name) + '">删除</button>' +
-        "</div></td>";
-      return "<tr>" +
-        '<td class="strong">' + esc(proxy.name) + "</td>" +
-        '<td class="mono">' + esc(proxy.domain) + "</td>" +
-        '<td class="mono muted">' + esc(proxy.local_addr) + "</td>" +
-        "<td>" + source + "</td>" +
-        action +
-        "</tr>";
-    }).join("");
   }
 
   function renderSessions(sessions) {
@@ -508,42 +472,114 @@ input[readonly]{background:var(--input);color:var(--muted)}
     })) {
       closeSessionProxyDialog();
     }
-    $("session-count").textContent = sessions.length;
-    var body = $("session-body");
-    if (!sessions.length) {
-      body.innerHTML = '<tr><td colspan="7" class="empty">还没有下游节点连接。</td></tr>';
-      return;
+  }
+
+  function configSource(proxy) {
+    if (!proxy) { return '<span class="muted">—</span>'; }
+    return proxy.source === "env"
+      ? '<span class="tag env">HT_PROXIES</span>'
+      : '<span class="tag">ht.toml</span>';
+  }
+
+  function sessionSource(session) {
+    if (!session) { return '<span class="muted">—</span>'; }
+    return session.forwarded
+      ? '<span class="mono strong">' + esc(session.forwarded) + "</span>" +
+        '<br><span class="mono muted">经 ' + esc(session.peer) + "</span>"
+      : '<span class="mono muted">' + esc(session.peer) + "</span>";
+  }
+
+  function localActions(proxy) {
+    if (readOnly) {
+      return '<td class="right"><span class="muted">只读</span></td>';
     }
-    body.innerHTML = sessions.map(function (session) {
+    if (!proxy) {
+      return '<td class="right"><span class="muted">—</span></td>';
+    }
+    return '<td class="right"><div class="row-actions">' +
+      '<button class="btn small" type="button" data-edit="' + esc(proxy.name) + '">编辑</button>' +
+      '<button class="btn danger small" type="button" data-delete="' + esc(proxy.name) + '">删除</button>' +
+      "</div></td>";
+  }
+
+  function sessionActions(session) {
+    if (!session) {
+      return '<td class="right"><span class="muted">—</span></td>';
+    }
+    var actions = '<td class="right"><div class="row-actions">';
+    if (session.manageable) {
+      actions += '<button class="btn small" type="button" data-manage="' +
+        esc(session.session_id) + '">管理服务</button>';
+    } else {
+      actions += '<span class="muted" title="该节点版本不支持远程管理">不可管理</span>';
+    }
+    actions += '<button class="btn danger small" type="button" data-disconnect="' +
+      esc(session.session_id) + '">断开</button></div></td>';
+    return actions;
+  }
+
+  function renderNodes(sessions) {
+    var rows = [];
+    rows.push("<tr>" +
+      '<td class="muted">—</td>' +
+      '<td class="strong">' + esc(nodeName) + "</td>" +
+      '<td><span class="tag local">本节点</span></td>' +
+      '<td class="mono muted">' + esc(nodeRemote) + "</td>" +
+      '<td class="muted">—</td>' +
+      '<td class="mono muted">' + esc(uptime(nodeUptime)) + "</td>" +
+      '<td class="right"><span class="muted">—</span></td>' +
+      "</tr>");
+    sessions.forEach(function (session) {
       var role = session.role === "client"
         ? '<span class="tag local">客户端</span>'
         : '<span class="tag">节点</span>';
-      var domains = session.domains && session.domains.length
-        ? session.domains.map(function (domain) { return '<span class="tag">' + esc(domain) + "</span>"; }).join(" ")
-        : '<span class="muted">—</span>';
-      var source = session.forwarded
-        ? '<span class="mono strong">' + esc(session.forwarded) + "</span>" +
-          '<br><span class="mono muted">经 ' + esc(session.peer) + "</span>"
-        : '<span class="mono muted">' + esc(session.peer) + "</span>";
-      var actions = '<td class="right"><div class="row-actions">';
-      if (session.manageable) {
-        actions += '<button class="btn small" type="button" data-manage="' +
-          esc(session.session_id) + '">管理服务</button>';
-      } else {
-        actions += '<span class="muted" title="该节点版本不支持远程管理">不可管理</span>';
-      }
-      actions += '<button class="btn danger small" type="button" data-disconnect="' +
-        esc(session.session_id) + '">断开</button></div></td>';
-      return "<tr>" +
+      rows.push("<tr>" +
         '<td class="mono strong">#' + esc(session.session_id) + "</td>" +
         '<td class="strong">' + esc(session.node) + "</td>" +
-        "<td class=\"nowrap\">" + source + "</td>" +
+        '<td><span class="tag">下游节点</span></td>' +
+        "<td class=\"nowrap\">" + sessionSource(session) + "</td>" +
         "<td>" + role + "</td>" +
         '<td class="mono muted">' + esc(uptime(session.connected_seconds)) + "</td>" +
-        "<td>" + domains + "</td>" +
-        actions +
-        "</tr>";
-    }).join("");
+        sessionActions(session) +
+        "</tr>");
+    });
+    $("node-count").textContent = rows.length;
+    $("node-body").innerHTML = rows.join("");
+  }
+
+  function renderRouteRow(route) {
+    var local = route.owner === "local";
+    var tag = local ? '<span class="tag local">本节点</span>' : '<span class="tag">下游节点</span>';
+    var proxy = local
+      ? proxiesCache.find(function (item) { return item.name === route.name; })
+      : null;
+    var session = local
+      ? null
+      : sessionsCache.find(function (item) {
+          return String(item.session_id) === String(route.session_id);
+        });
+    var node = local
+      ? esc(nodeName)
+      : (route.node === null || route.node === undefined ? "—" : esc(route.node));
+    var name = local ? esc(route.name) : '<span class="muted">—</span>';
+    var sessionCell = local || route.session_id === null || route.session_id === undefined
+      ? '<span class="muted">—</span>'
+      : "#" + esc(route.session_id);
+    var source = local ? configSource(proxy) : sessionSource(session);
+    var target = local ? esc(route.target) : '<span class="muted">下游转发</span>';
+    var actions = local
+      ? localActions(proxy)
+      : '<td class="right"><span class="muted">—</span></td>';
+    return "<tr>" +
+      '<td class="mono strong">' + esc(route.domain) + "</td>" +
+      "<td>" + tag + "</td>" +
+      '<td class="strong">' + node + "</td>" +
+      '<td class="mono">' + name + "</td>" +
+      "<td>" + sessionCell + "</td>" +
+      "<td class=\"nowrap\">" + source + "</td>" +
+      '<td class="mono muted">' + target + "</td>" +
+      actions +
+      "</tr>";
   }
 
   function renderRoutes(routes) {
@@ -551,25 +587,10 @@ input[readonly]{background:var(--input);color:var(--muted)}
     $("m-routes").textContent = routes.length;
     var body = $("route-body");
     if (!routes.length) {
-      body.innerHTML = '<tr><td colspan="5" class="empty">路由表为空：本节点还没有服务，也没有 v4 会话声明域名。</td></tr>';
+      body.innerHTML = '<tr><td colspan="8" class="empty">路由表为空：本节点还没有服务，也没有 v4 会话声明域名。</td></tr>';
       return;
     }
-    body.innerHTML = routes.map(function (route) {
-      var local = route.owner === "local";
-      var tag = local ? '<span class="tag local">本地</span>' : '<span class="tag">v4 会话</span>';
-      var node = local
-        ? "本节点"
-        : (route.node === null || route.node === undefined ? "—" : esc(route.node));
-      var owner = local ? esc(route.name) : (route.session_id === null || route.session_id === undefined ? "—" : "#" + esc(route.session_id));
-      var target = local ? esc(route.target) : '<span class="muted">—</span>';
-      return "<tr>" +
-        '<td class="mono strong">' + esc(route.domain) + "</td>" +
-        "<td>" + tag + "</td>" +
-        '<td class="strong">' + node + "</td>" +
-        '<td class="mono">' + owner + "</td>" +
-        '<td class="mono muted">' + target + "</td>" +
-        "</tr>";
-    }).join("");
+    body.innerHTML = routes.map(renderRouteRow).join("");
   }
 
   function loadAll(silent) {
@@ -581,8 +602,9 @@ input[readonly]{background:var(--input);color:var(--muted)}
     ]).then(function (results) {
       renderStatus(results[0]);
       renderProxies(results[1]);
-      renderRoutes(results[2]);
       renderSessions(results[3]);
+      renderNodes(results[3]);
+      renderRoutes(results[2]);
     }).catch(function (error) {
       if (!silent) { toast(error.message, "error"); }
     });
@@ -654,7 +676,7 @@ input[readonly]{background:var(--input);color:var(--muted)}
     });
   });
 
-  $("proxy-body").addEventListener("click", function (event) {
+  $("route-body").addEventListener("click", function (event) {
     var edit = event.target.closest("[data-edit]");
     if (edit) {
       var editingName = edit.getAttribute("data-edit");
@@ -664,18 +686,48 @@ input[readonly]{background:var(--input);color:var(--muted)}
     }
 
     var button = event.target.closest("[data-delete]");
-    if (!button) { return; }
-    var name = button.getAttribute("data-delete");
-    if (!window.confirm("删除本节点服务 " + name + "？")) { return; }
-    button.disabled = true;
-    request(proxyPath(name, null), { method: "DELETE" })
+    if (button) {
+      var name = button.getAttribute("data-delete");
+      if (!window.confirm("删除本节点服务 " + name + "？")) { return; }
+      button.disabled = true;
+      request(proxyPath(name, null), { method: "DELETE" })
+        .then(function () {
+          toast("已删除 " + name);
+          return loadAll(true);
+        })
+        .catch(function (error) {
+          toast(error.message, "error");
+          button.disabled = false;
+        });
+      return;
+    }
+
+  });
+
+  $("node-body").addEventListener("click", function (event) {
+    var manage = event.target.closest("[data-manage]");
+    if (manage) {
+      var manageId = manage.getAttribute("data-manage");
+      var session = sessionsCache.find(function (item) {
+        return String(item.session_id) === manageId;
+      });
+      if (session) { openSessionProxies(session); }
+      return;
+    }
+
+    var disconnect = event.target.closest("[data-disconnect]");
+    if (!disconnect) { return; }
+    var id = disconnect.getAttribute("data-disconnect");
+    if (!window.confirm("断开下游会话 #" + id + "？节点会按自己的重连间隔自动重连。")) { return; }
+    disconnect.disabled = true;
+    request("/api/sessions/" + encodeURIComponent(id), { method: "DELETE" })
       .then(function () {
-        toast("已删除 " + name);
+        toast("已断开会话 #" + id);
         return loadAll(true);
       })
       .catch(function (error) {
         toast(error.message, "error");
-        button.disabled = false;
+        disconnect.disabled = false;
       });
   });
 
@@ -771,33 +823,6 @@ input[readonly]{background:var(--input);color:var(--muted)}
       .catch(function (error) {
         toast(error.message, "error");
         button.disabled = false;
-      });
-  });
-
-  $("session-body").addEventListener("click", function (event) {
-    var manage = event.target.closest("[data-manage]");
-    if (manage) {
-      var manageId = manage.getAttribute("data-manage");
-      var session = sessionsCache.find(function (item) {
-        return String(item.session_id) === manageId;
-      });
-      if (session) { openSessionProxies(session); }
-      return;
-    }
-
-    var disconnect = event.target.closest("[data-disconnect]");
-    if (!disconnect) { return; }
-    var id = disconnect.getAttribute("data-disconnect");
-    if (!window.confirm("断开下游会话 #" + id + "？节点会按自己的重连间隔自动重连。")) { return; }
-    disconnect.disabled = true;
-    request("/api/sessions/" + encodeURIComponent(id), { method: "DELETE" })
-      .then(function () {
-        toast("已断开会话 #" + id);
-        return loadAll(true);
-      })
-      .catch(function (error) {
-        toast(error.message, "error");
-        disconnect.disabled = false;
       });
   });
 
