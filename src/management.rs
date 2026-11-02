@@ -7,14 +7,75 @@
 
 use crate::config::{Config, ConfigSource, ServerProxyEntry};
 use crate::config_env::EnvConfig;
-use crate::server::ServerState;
+use crate::protocol_v4;
+use crate::server::{ServerState, SessionLookupError, SessionTarget};
+use crate::session_server::SessionControl;
 use anyhow::{anyhow, bail, Result};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+use tokio::sync::{oneshot, RwLock};
+use tokio::time;
 use tracing::info;
+
+/// The local services of one downstream node, as returned by its session.
+pub(crate) struct SessionProxySnapshot {
+    pub(crate) writable: bool,
+    pub(crate) proxies: Vec<ServerProxyEntry>,
+}
+
+/// Why a management request aimed at a downstream session failed.
+pub(crate) enum SessionAdminError {
+    NotFound(String),
+    Ambiguous(Vec<u64>),
+    BadRequest(String),
+    NotManageable,
+    ReadOnly,
+    Timeout,
+    Downstream(String),
+}
+
+impl fmt::Display for SessionAdminError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SessionAdminError::NotFound(message) => write!(f, "{}", message),
+            SessionAdminError::Ambiguous(ids) => write!(
+                f,
+                "Several connected sessions use this node name; use the `session` parameter \
+                 with one of: {}",
+                ids.iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            SessionAdminError::BadRequest(message) => write!(f, "{}", message),
+            SessionAdminError::NotManageable => write!(
+                f,
+                "The downstream node does not support remote proxy management"
+            ),
+            SessionAdminError::ReadOnly => write!(
+                f,
+                "The downstream node manages its local services with HT_PROXIES; change that \
+                 variable on the node and restart it"
+            ),
+            SessionAdminError::Timeout => write!(
+                f,
+                "The downstream node did not answer the management request in time"
+            ),
+            SessionAdminError::Downstream(message) => write!(f, "{}", message),
+        }
+    }
+}
+
+impl fmt::Debug for SessionAdminError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl std::error::Error for SessionAdminError {}
 
 /// The state behind the web management page and administration API.
 pub(crate) struct ManagementState {
@@ -141,6 +202,208 @@ impl ManagementState {
         self.server.session_count()
     }
 
+    /// Resolve a downstream target from the optional `node` and `session`
+    /// selectors. Both may be given; they must then identify the same session.
+    async fn resolve_session(
+        &self,
+        node: Option<&str>,
+        session: Option<u64>,
+    ) -> std::result::Result<SessionTarget, SessionAdminError> {
+        match (node, session) {
+            (Some(node), Some(session_id)) => {
+                let target = self
+                    .server
+                    .session_target_by_id(session_id)
+                    .await
+                    .ok_or_else(|| {
+                        SessionAdminError::NotFound(format!(
+                            "No such downstream session: {}",
+                            session_id
+                        ))
+                    })?;
+                if target.node_id != node {
+                    return Err(SessionAdminError::BadRequest(format!(
+                        "The session {} belongs to node `{}`, not `{}`",
+                        session_id, target.node_id, node
+                    )));
+                }
+                Ok(target)
+            }
+            (Some(node), None) => self
+                .server
+                .session_target_by_node(node)
+                .await
+                .map_err(|error| match error {
+                    SessionLookupError::NotFound => {
+                        SessionAdminError::NotFound(format!("No such downstream node: {}", node))
+                    }
+                    SessionLookupError::Ambiguous(ids) => SessionAdminError::Ambiguous(ids),
+                }),
+            (None, Some(session_id)) => self
+                .server
+                .session_target_by_id(session_id)
+                .await
+                .ok_or_else(|| {
+                    SessionAdminError::NotFound(format!(
+                        "No such downstream session: {}",
+                        session_id
+                    ))
+                }),
+            (None, None) => Err(SessionAdminError::BadRequest(
+                "A downstream proxy request needs `node` or `session`".to_string(),
+            )),
+        }
+    }
+
+    /// Send one proxy operation to a downstream session and wait for its answer.
+    async fn request_session(
+        &self,
+        target: &SessionTarget,
+        op: protocol_v4::ProxyOp,
+    ) -> std::result::Result<Vec<ServerProxyEntry>, SessionAdminError> {
+        if target.capabilities & protocol_v4::CAP_PROXY_ADMIN == 0 {
+            return Err(SessionAdminError::NotManageable);
+        }
+        if !matches!(op, protocol_v4::ProxyOp::List)
+            && target.capabilities & protocol_v4::CAP_PROXY_WRITE == 0
+        {
+            return Err(SessionAdminError::ReadOnly);
+        }
+        let (reply, reply_rx) = oneshot::channel();
+        match time::timeout(
+            Duration::from_secs(5),
+            target.control.send(SessionControl::Proxy { op, reply }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                return Err(SessionAdminError::NotFound(
+                    "The downstream session closed before the request".to_string(),
+                ));
+            }
+            Err(_) => return Err(SessionAdminError::Timeout),
+        }
+        match time::timeout(Duration::from_secs(10), reply_rx).await {
+            Ok(Ok(Ok(proxies))) => Ok(proxies
+                .into_iter()
+                .map(|proxy| ServerProxyEntry {
+                    name: proxy.name,
+                    domain: proxy.domain,
+                    local_addr: proxy.local_addr,
+                    auth_header: None,
+                })
+                .collect()),
+            Ok(Ok(Err(error))) => {
+                // The downstream uses the same wording as the local API for a
+                // missing proxy. Keep that a `404` instead of a generic `502`.
+                if error.contains("No such") {
+                    Err(SessionAdminError::NotFound(error))
+                } else {
+                    Err(SessionAdminError::Downstream(error))
+                }
+            }
+            Ok(Err(_)) => Err(SessionAdminError::Downstream(
+                "The downstream session dropped the management request".to_string(),
+            )),
+            Err(_) => Err(SessionAdminError::Timeout),
+        }
+    }
+
+    /// The local services of one downstream node.
+    pub(crate) async fn session_proxies(
+        &self,
+        node: Option<&str>,
+        session: Option<u64>,
+    ) -> std::result::Result<SessionProxySnapshot, SessionAdminError> {
+        let target = self.resolve_session(node, session).await?;
+        let proxies = self
+            .request_session(&target, protocol_v4::ProxyOp::List)
+            .await?;
+        Ok(session_snapshot(&target, proxies))
+    }
+
+    /// Create or replace one local service on a downstream node.
+    pub(crate) async fn put_session_proxy(
+        &self,
+        node: Option<&str>,
+        session: Option<u64>,
+        name: String,
+        domain: String,
+        local_addr: String,
+    ) -> std::result::Result<SessionProxySnapshot, SessionAdminError> {
+        let name = crate::config::validate_name(&name)
+            .map_err(|error| SessionAdminError::BadRequest(format!("{:#}", error)))?;
+        let domain = crate::helper::normalize_domain(&domain).ok_or_else(|| {
+            SessionAdminError::BadRequest(format!("The domain `{}` is invalid", domain))
+        })?;
+        let local_addr = validate_local_addr(&local_addr)?;
+        let target = self.resolve_session(node, session).await?;
+        let proxies = self
+            .request_session(
+                &target,
+                protocol_v4::ProxyOp::Put {
+                    name,
+                    domain,
+                    local_addr,
+                },
+            )
+            .await?;
+        Ok(session_snapshot(&target, proxies))
+    }
+
+    /// Delete one local service on a downstream node.
+    pub(crate) async fn delete_session_proxy(
+        &self,
+        node: Option<&str>,
+        session: Option<u64>,
+        name: &str,
+    ) -> std::result::Result<SessionProxySnapshot, SessionAdminError> {
+        let name = crate::config::validate_name(name)
+            .map_err(|error| SessionAdminError::BadRequest(format!("{:#}", error)))?;
+        let target = self.resolve_session(node, session).await?;
+        let proxies = self
+            .request_session(&target, protocol_v4::ProxyOp::Delete { name })
+            .await?;
+        Ok(session_snapshot(&target, proxies))
+    }
+
+    /// Close one downstream session. The node may reconnect by itself.
+    pub(crate) async fn disconnect_session(
+        &self,
+        session_id: u64,
+    ) -> std::result::Result<(), SessionAdminError> {
+        let target = self
+            .server
+            .session_target_by_id(session_id)
+            .await
+            .ok_or_else(|| {
+                SessionAdminError::NotFound(format!("No such downstream session: {}", session_id))
+            })?;
+        let (reply, reply_rx) = oneshot::channel();
+        match time::timeout(
+            Duration::from_secs(5),
+            target.control.send(SessionControl::Close { reply }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                return Err(SessionAdminError::NotFound(
+                    "The downstream session closed before the request".to_string(),
+                ));
+            }
+            Err(_) => return Err(SessionAdminError::Timeout),
+        }
+        match time::timeout(Duration::from_secs(5), reply_rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(SessionAdminError::Downstream(
+                "The downstream session did not confirm the close".to_string(),
+            )),
+            Err(_) => Err(SessionAdminError::Timeout),
+        }
+    }
+
     /// Apply a change to the persisted configuration, save it, and recompute the
     /// effective configuration with the environment overlay.
     ///
@@ -220,6 +483,37 @@ impl ManagementState {
     }
 }
 
+fn session_snapshot(
+    target: &SessionTarget,
+    proxies: Vec<ServerProxyEntry>,
+) -> SessionProxySnapshot {
+    SessionProxySnapshot {
+        writable: target.capabilities & protocol_v4::CAP_PROXY_WRITE != 0,
+        proxies,
+    }
+}
+
+/// Validate the address shape before asking the downstream node, so a URL or an
+/// empty target is a local `400` instead of a round trip and a `502`.
+fn validate_local_addr(local_addr: &str) -> std::result::Result<String, SessionAdminError> {
+    let local_addr = local_addr.trim();
+    if local_addr.is_empty() {
+        return Err(SessionAdminError::BadRequest(
+            "The `local_addr` must not be empty".to_string(),
+        ));
+    }
+    if let Some((scheme, _)) = local_addr.split_once("://") {
+        if scheme != "unix" {
+            return Err(SessionAdminError::BadRequest(format!(
+                "The `local_addr` must be `host:port` or `unix:///path`, not a URL: \
+                 remove the `{}://` from `{}`",
+                scheme, local_addr
+            )));
+        }
+    }
+    Ok(local_addr.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +537,7 @@ mod tests {
         };
         let server = Arc::new(ServerState::new(
             MaskedString::from("token"),
+            config.name.clone(),
             "control.test".to_string(),
             config.server_limits(),
             routes,

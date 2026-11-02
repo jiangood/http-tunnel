@@ -731,7 +731,7 @@ fn normalize_upstream_host(raw: &str) -> Result<String> {
 }
 
 /// Validate a local-service name and return it trimmed.
-fn validate_name(name: &str) -> Result<String> {
+pub(crate) fn validate_name(name: &str) -> Result<String> {
     let name = name.trim();
     if name.is_empty() {
         bail!("A `[[proxies]].name` must not be empty");

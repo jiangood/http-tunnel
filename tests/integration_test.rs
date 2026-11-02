@@ -365,6 +365,15 @@ const MANAGEMENT_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2464";
 const MANAGEMENT_ADDR: &str = "127.0.0.1:2465";
 const MANAGEMENT_TOKEN: &str = "a_secret_token";
 
+const DOWNSTREAM_ECHO_SERVER_ADDR: &str = "127.0.0.1:8094";
+const DOWNSTREAM_HTTP_ENTRY_PORT: u16 = 2474;
+const DOWNSTREAM_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2474";
+const DOWNSTREAM_LEAF_ADDR: &str = "127.0.0.1:2475";
+const DOWNSTREAM_LEAF_PORT: u16 = 2475;
+const DOWNSTREAM_TOKEN: &str = "a_secret_token";
+const DOWNSTREAM_NODE: &str = "remote-leaf";
+const DOWNSTREAM_HOST: &str = "remote.test";
+
 /// A WebSocket session carries the routes and every visitor stream over the
 /// HTTP entrypoint, and reconnects after a server restart.
 #[tokio::test]
@@ -535,9 +544,20 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
     // this test is about the connect failure, not the unregistered-tunnel path.
     time::sleep(Duration::from_secs(2)).await;
 
+    // A loopback visitor may hand in a request id. The ingress carries it to
+    // the leaf, so the 502 the leaf generates names the same id the ingress
+    // logged: that is what lets one grep find the failing hop.
+    const VISITOR_REQUEST_ID: &str = "0123456789abcdef";
     let mut visitor = TcpStream::connect(WS_FAILURE_HTTP_ADDR).await?;
     visitor
-        .write_all(b"GET / HTTP/1.1\r\nHost: unavailable-ws.test\r\nConnection: close\r\n\r\n")
+        .write_all(
+            format!(
+                "GET / HTTP/1.1\r\nHost: unavailable-ws.test\r\n\
+                 x-http-tunnel-request-id: {}\r\nConnection: close\r\n\r\n",
+                VISITOR_REQUEST_ID
+            )
+            .as_bytes(),
+        )
         .await?;
     let mut response = Vec::new();
     time::timeout(Duration::from_secs(18), visitor.read_to_end(&mut response)).await??;
@@ -547,6 +567,25 @@ async fn websocket_transport_handles_unavailable_local_target() -> Result<()> {
         "expected 502 for an unavailable local target, got {}",
         response
     );
+    // The page must say which layer failed and which node/target to look at,
+    // so a bare 502 does not send the operator to the wrong hop.
+    for expected in [
+        "failed layer:",
+        "local service",
+        "node:",
+        LEAF_NAME,
+        "target:",
+        WS_FAILURE_TARGET_ADDR,
+        "Request ID: 0123456789abcdef",
+        "x-http-tunnel-request-id: 0123456789abcdef",
+    ] {
+        assert!(
+            response.contains(expected),
+            "the 502 should name `{}`, got {}",
+            expected,
+            response
+        );
+    }
     // Let the ingress observe the visitor close before it drains for shutdown.
     drop(visitor);
 
@@ -810,6 +849,254 @@ async fn management_api_manages_proxies() -> Result<()> {
     Ok(())
 }
 
+/// The entry management API manages the local `[[proxies]]` of a connected
+/// downstream node through the same `/api/proxies` endpoints, and can close
+/// that session.
+#[cfg(feature = "management")]
+#[tokio::test]
+async fn management_api_manages_downstream_proxies() -> Result<()> {
+    init();
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(DOWNSTREAM_ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the downstream echo server: {:?}", e);
+        }
+    });
+
+    let config_path = write_leaf_config(
+        "http_tunnel_downstream_management.toml",
+        DOWNSTREAM_NODE,
+        "127.0.0.1",
+        DOWNSTREAM_HTTP_ENTRY_PORT,
+        DOWNSTREAM_TOKEN,
+        DOWNSTREAM_LEAF_PORT,
+        &[],
+    )?;
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    let server = tokio::spawn(async move {
+        run_http_tunnel_server(
+            DOWNSTREAM_HTTP_ENTRY_PORT,
+            "127.0.0.1",
+            DOWNSTREAM_TOKEN,
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_tcp(DOWNSTREAM_HTTP_ENTRY_ADDR, Duration::from_secs(10)).await?;
+
+    let client_config = config_path.clone();
+    let client = tokio::spawn(async move {
+        run_http_tunnel_from_config(&client_config, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_tcp(DOWNSTREAM_LEAF_ADDR, Duration::from_secs(10)).await?;
+    time::sleep(Duration::from_millis(1500)).await;
+
+    info!("the entry lists the downstream node as manageable");
+    let (status, body) = api_request(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        "GET",
+        "/api/sessions",
+        Some(DOWNSTREAM_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(
+        body.contains("\"node\":\"remote-leaf\""),
+        "unexpected body: {}",
+        body
+    );
+    assert!(
+        body.contains("\"manageable\":true") && body.contains("\"writable\":true"),
+        "the session should be manageable: {}",
+        body
+    );
+    let session_id = session_id_for_node(&body, DOWNSTREAM_NODE)
+        .unwrap_or_else(|| panic!("no session id in {}", body));
+
+    info!("the entry lists the downstream proxies");
+    let (status, body) = api_request(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        "GET",
+        &format!(
+            "/api/proxies?node={}&session={}",
+            DOWNSTREAM_NODE, session_id
+        ),
+        Some(DOWNSTREAM_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert_eq!(body.trim(), "[]", "unexpected body: {}", body);
+
+    info!("the entry adds a proxy on the downstream node");
+    let (status, body) = api_request(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        "PUT",
+        &format!(
+            "/api/proxies/remote?node={}&session={}",
+            DOWNSTREAM_NODE, session_id
+        ),
+        Some(DOWNSTREAM_TOKEN),
+        Some(r#"{"domain":"remote.test","local_addr":"127.0.0.1:8094"}"#),
+    )
+    .await?;
+    assert_eq!(status, 201, "unexpected response: {}", body);
+    assert!(body.contains("remote.test"), "unexpected body: {}", body);
+    assert!(body.contains("127.0.0.1:8094"), "unexpected body: {}", body);
+
+    info!("the downstream route is served without a restart");
+    time::sleep(Duration::from_millis(500)).await;
+    http_echo_hitter(DOWNSTREAM_HTTP_ENTRY_ADDR, DOWNSTREAM_HOST).await?;
+
+    info!("the downstream node wrote the change to its config");
+    let written = std::fs::read_to_string(&config_path)?;
+    assert!(
+        written.contains("remote.test"),
+        "the downstream config wasn't written: {}",
+        written
+    );
+
+    info!("the node name alone selects the same session");
+    let (status, body) = api_request(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        "GET",
+        &format!("/api/proxies?node={}", DOWNSTREAM_NODE),
+        Some(DOWNSTREAM_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(body.contains("remote.test"), "unexpected body: {}", body);
+
+    info!("an empty selector is rejected instead of falling back to the local list");
+    let (status, _) = api_request(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        "GET",
+        "/api/proxies?node=",
+        Some(DOWNSTREAM_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 400, "expected 400");
+
+    info!("an unknown selector is rejected instead of falling back to the local list");
+    let (status, body) = api_request(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        "GET",
+        "/api/proxies?ndoe=home",
+        Some(DOWNSTREAM_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 400, "expected 400: {}", body);
+    assert!(
+        body.contains("Invalid proxy selector"),
+        "unexpected body: {}",
+        body
+    );
+
+    info!("an unknown node is rejected with 404");
+    let (status, _) = api_request(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        "GET",
+        "/api/proxies?node=no-such-node",
+        Some(DOWNSTREAM_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 404, "expected 404");
+
+    info!("a node and session that disagree are rejected with 400");
+    let (status, _) = api_request(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        "GET",
+        &format!("/api/proxies?node=wrong&session={}", session_id),
+        Some(DOWNSTREAM_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 400, "expected 400");
+
+    info!("the entry deletes the downstream proxy");
+    let (status, _) = api_request(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        "DELETE",
+        &format!(
+            "/api/proxies/remote?node={}&session={}",
+            DOWNSTREAM_NODE, session_id
+        ),
+        Some(DOWNSTREAM_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 204, "expected 204");
+    time::sleep(Duration::from_millis(500)).await;
+    http_404_check(DOWNSTREAM_HTTP_ENTRY_ADDR, DOWNSTREAM_HOST).await?;
+
+    info!("deleting a missing downstream proxy is rejected with 404");
+    let (status, _) = api_request(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        "DELETE",
+        &format!(
+            "/api/proxies/remote?node={}&session={}",
+            DOWNSTREAM_NODE, session_id
+        ),
+        Some(DOWNSTREAM_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 404, "expected 404");
+
+    info!("the entry disconnects the downstream session");
+    let (status, _) = api_request(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        "DELETE",
+        &format!("/api/sessions/{}", session_id),
+        Some(DOWNSTREAM_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 204, "expected 204");
+
+    let (status, body) = api_request(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        "GET",
+        "/api/sessions",
+        Some(DOWNSTREAM_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(
+        !body.contains(&format!("\"session_id\":{}", session_id)),
+        "the closed session still appears: {}",
+        body
+    );
+
+    info!("disconnecting an unknown session is rejected with 404");
+    let (status, _) = api_request(
+        DOWNSTREAM_HTTP_ENTRY_ADDR,
+        "DELETE",
+        &format!("/api/sessions/{}", session_id),
+        Some(DOWNSTREAM_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 404, "expected 404");
+
+    server_shutdown_tx.send(true)?;
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server, client);
+    Ok(())
+}
+
 // ==== The fatal auth error test ====
 
 const FATAL_HTTP_PORT: u16 = 2454;
@@ -895,6 +1182,22 @@ async fn server_fails_when_listen_port_cannot_be_bound() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Extract the session id of a node from the compact JSON of `/api/sessions`.
+/// The session id is serialized before the node name, so the nearest preceding
+/// `"session_id"` belongs to the matched node.
+fn session_id_for_node(body: &str, node: &str) -> Option<u64> {
+    let node_key = format!("\"node\":\"{}\"", node);
+    let node_at = body.find(&node_key)?;
+    let before = &body[..node_at];
+    let key = "\"session_id\":";
+    let start = before.rfind(key)? + key.len();
+    let digits: String = before[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
 }
 
 /// Send a minimal HTTP request and return the status code and the body

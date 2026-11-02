@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time;
 use tracing::{debug, info, warn};
 
-use crate::config::MaskedString;
+use crate::config::{MaskedString, ServerProxyEntry};
 use crate::constants::run_session_backoff;
 use crate::protocol_v4::{self as p4, Role, RouteAdvert, SessionFrame};
 use crate::transport::websocket::{connect_websocket_v4, BoxedIo};
@@ -22,9 +22,31 @@ use crate::transport::websocket::{connect_websocket_v4, BoxedIo};
 pub(crate) struct RouteTarget {
     pub(crate) local_addr: String,
     pub(crate) auth_header: Option<MaskedString>,
+    /// Whether `local_addr` is this process's own embedded listener (a relay
+    /// mirrors its route set to loopback). Such a hop carries the visitor's
+    /// request id across in a private header.
+    pub(crate) internal: bool,
 }
 
 pub(crate) type RouteMap = BTreeMap<String, RouteTarget>;
+
+/// One proxy operation the upstream asked this process to perform. The worker
+/// in `node` handles it with the same `ManagementState` as the local page.
+pub(crate) enum ProxyAdminRequest {
+    List {
+        reply: oneshot::Sender<Result<Vec<ServerProxyEntry>>>,
+    },
+    Put {
+        name: String,
+        domain: String,
+        local_addr: String,
+        reply: oneshot::Sender<Result<Vec<ServerProxyEntry>>>,
+    },
+    Delete {
+        name: String,
+        reply: oneshot::Sender<Result<Vec<ServerProxyEntry>>>,
+    },
+}
 
 pub(crate) struct SessionArgs {
     pub(crate) server_addr: String,
@@ -34,6 +56,10 @@ pub(crate) struct SessionArgs {
     pub(crate) role: Role,
     pub(crate) keepalive_interval: u64,
     pub(crate) retry_interval: u64,
+    pub(crate) capabilities: u32,
+    /// The local management worker. `None` in a build without the management
+    /// feature; the process then advertises no proxy capability.
+    pub(crate) proxy_admin: Option<mpsc::Sender<ProxyAdminRequest>>,
     pub(crate) routes: watch::Receiver<RouteMap>,
     pub(crate) fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
     pub(crate) connected: Arc<AtomicBool>,
@@ -226,9 +252,11 @@ async fn run_once(
                                     host = %domain,
                                     "No local route matches the streamed visitor; resetting the stream"
                                 );
+                                // No local route is a routing/configuration problem,
+                                // not a missing service: do not report it as a 502.
                                 let _ = out_tx.send(SessionFrame::StreamReset {
                                     stream_id,
-                                    reason: p4::StreamError::ConnectFailed,
+                                    reason: p4::StreamError::Protocol,
                                 }).await;
                                 continue;
                             };
@@ -252,6 +280,8 @@ async fn run_once(
                             tokio::spawn(run_client_stream(
                                 stream_id,
                                 request_id,
+                                args.node_id.clone(),
+                                domain,
                                 target,
                                 header,
                                 input_rx,
@@ -307,6 +337,23 @@ async fn run_once(
                             }
                             break;
                         }
+                        SessionFrame::ProxyRequest { request_id, op } => {
+                            let admin = args.proxy_admin.clone();
+                            let out = out_tx.clone();
+                            tokio::spawn(async move {
+                                let (proxies, error) = match handle_proxy_request(admin, op).await {
+                                    Ok(proxies) => (proxies, None),
+                                    Err(error) => (Vec::new(), Some(error)),
+                                };
+                                let _ = out
+                                    .send(SessionFrame::ProxyResponse {
+                                        request_id,
+                                        proxies,
+                                        error,
+                                    })
+                                    .await;
+                            });
+                        }
                         other => {
                             warn!("Unexpected v4 frame: {:?}", other);
                             result = Err(anyhow!("Unexpected v4 frame"));
@@ -347,6 +394,50 @@ fn request_id_from_trace_id(trace_id: &[u8]) -> String {
     }
 }
 
+/// Run one proxy operation through the local management worker and convert its
+/// result into the wire representation.
+async fn handle_proxy_request(
+    admin: Option<mpsc::Sender<ProxyAdminRequest>>,
+    op: p4::ProxyOp,
+) -> std::result::Result<Vec<p4::ProxyEntry>, String> {
+    let Some(admin) = admin else {
+        return Err("the downstream node does not support remote proxy management".to_string());
+    };
+    let (reply, reply_rx) = oneshot::channel();
+    let request = match op {
+        p4::ProxyOp::List => ProxyAdminRequest::List { reply },
+        p4::ProxyOp::Put {
+            name,
+            domain,
+            local_addr,
+        } => ProxyAdminRequest::Put {
+            name,
+            domain,
+            local_addr,
+            reply,
+        },
+        p4::ProxyOp::Delete { name } => ProxyAdminRequest::Delete { name, reply },
+    };
+    match time::timeout(Duration::from_secs(5), admin.send(request)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return Err("the local management worker is not running".to_string()),
+        Err(_) => return Err("the local management worker is busy".to_string()),
+    }
+    match time::timeout(Duration::from_secs(10), reply_rx).await {
+        Ok(Ok(Ok(proxies))) => Ok(proxies
+            .into_iter()
+            .map(|proxy| p4::ProxyEntry {
+                name: proxy.name,
+                domain: proxy.domain,
+                local_addr: proxy.local_addr,
+            })
+            .collect()),
+        Ok(Ok(Err(error))) => Err(format!("{:#}", error)),
+        Ok(Err(_)) => Err("the local management worker dropped the request".to_string()),
+        Err(_) => Err("the local management worker timed out".to_string()),
+    }
+}
+
 /// Find the target of a stream, preferring an exact route and then the longest
 /// wildcard suffix. A node advertises `*.relay.example.com` and receives streams
 /// for the concrete domains below it.
@@ -380,7 +471,7 @@ async fn handshake(conn: &mut BoxedIo, args: &SessionArgs) -> Result<()> {
             version: p4::V4_VERSION,
             node_id: args.node_id.clone(),
             role: args.role,
-            capabilities: 0,
+            capabilities: args.capabilities,
         },
     )
     .await?;
@@ -424,6 +515,8 @@ async fn handshake(conn: &mut BoxedIo, args: &SessionArgs) -> Result<()> {
 async fn run_client_stream(
     stream_id: u32,
     request_id: String,
+    node_name: String,
+    domain: String,
     target: RouteTarget,
     header: Vec<u8>,
     mut input_rx: mpsc::UnboundedReceiver<StreamInput>,
@@ -453,20 +546,45 @@ async fn run_client_stream(
         }
     };
 
+    // A relay mirrors its routes to its own embedded listener; carrying the id
+    // across that loopback hop keeps one id across every hop and every log.
+    let request = if target.internal {
+        crate::helper::insert_request_id(&request, &request_id)
+    } else {
+        request
+    };
+
     let local = match crate::helper::connect_local(&target.local_addr).await {
         Ok(local) => local,
         Err(err) => {
             warn!(
                 request_id = %request_id,
                 stream_id,
+                node = %node_name,
+                host = %domain,
                 target = %target.local_addr,
                 "The v4 stream could not reach its local service: {:#}",
                 err
             );
+            let reason = crate::http::gateway_failure(
+                "The tunnel reached this node, but the local service behind it is unavailable.",
+                "local service (downstream node)",
+                &[
+                    ("node", &node_name),
+                    ("tunnel", &domain),
+                    ("target", &target.local_addr),
+                    ("cause", &format!("{:#}", err)),
+                ],
+                "The tunnel session is healthy and this node received the request; only the \
+                 service behind the tunnel could not be reached. Start it, or fix the target \
+                 above on this node.",
+            );
+            let response = crate::http::error_response(&request_id, "502 Bad Gateway", &reason);
             let _ = out_tx
-                .send(SessionFrame::StreamReset {
+                .send(SessionFrame::StreamData {
                     stream_id,
-                    reason: p4::StreamError::ConnectFailed,
+                    data: response,
+                    fin: true,
                 })
                 .await;
             let _ = closed_tx.send(stream_id);
@@ -479,14 +597,30 @@ async fn run_client_stream(
         warn!(
             request_id = %request_id,
             stream_id,
+            node = %node_name,
+            host = %domain,
             target = %target.local_addr,
             "The v4 stream failed to write the request to its local service: {:#}",
             err
         );
+        let reason = crate::http::gateway_failure(
+            "The local service behind this tunnel accepted the connection, then closed it.",
+            "local service (downstream node)",
+            &[
+                ("node", &node_name),
+                ("tunnel", &domain),
+                ("target", &target.local_addr),
+                ("cause", &format!("{:#}", err)),
+            ],
+            "The tunnel session is healthy; the service behind it dropped the request before \
+             reading it. Check that service on this node.",
+        );
+        let response = crate::http::error_response(&request_id, "502 Bad Gateway", &reason);
         let _ = out_tx
-            .send(SessionFrame::StreamReset {
+            .send(SessionFrame::StreamData {
                 stream_id,
-                reason: p4::StreamError::Io,
+                data: response,
+                fin: true,
             })
             .await;
         let _ = closed_tx.send(stream_id);

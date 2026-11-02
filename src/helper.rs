@@ -130,6 +130,76 @@ pub fn gate_auth_header(header: &[u8], auth: Option<&str>) -> AuthOutcome {
     AuthOutcome::Allowed(out)
 }
 
+/// Carry the request id of a visitor across the loopback hop a relay makes into
+/// its own embedded listener.
+///
+/// Without this, the embedded listener would start a new id, and the page the
+/// visitor sees would name an id that exists only in the last hop's log. The
+/// header is only trusted from a loopback peer (see [`take_request_id`]).
+pub(crate) fn insert_request_id(header: &[u8], request_id: &str) -> Vec<u8> {
+    let Some(end) = header.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return header.to_vec();
+    };
+    let (mut out, _) = strip_request_id_header(&header[..end]);
+    out.extend_from_slice(crate::http::REQUEST_ID_HEADER.as_bytes());
+    out.extend_from_slice(b": ");
+    out.extend_from_slice(request_id.as_bytes());
+    out.extend_from_slice(b"\r\n\r\n");
+    out.extend_from_slice(&header[end + 4..]);
+    out
+}
+
+/// Take the request id that a relay put on a visitor when it handed it to its
+/// own embedded listener, and strip the header so the local service never sees
+/// it. Only a loopback peer may carry it: anyone else could invent an id and
+/// collide with the operator's log search.
+pub(crate) fn take_request_id(header: &mut Vec<u8>, peer_is_loopback: bool) -> Option<String> {
+    if !peer_is_loopback {
+        return None;
+    }
+    let end = header.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let (mut out, value) = strip_request_id_header(&header[..end]);
+    // No private header: leave the request byte-for-byte untouched, so that the
+    // body and its `Content-Length` still line up.
+    let value = value?;
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&header[end + 4..]);
+    *header = out;
+    let valid = value.len() == 16 && value.bytes().all(|b| b.is_ascii_hexdigit());
+    valid.then_some(value)
+}
+
+/// Drop every request-id line of a head that has no final blank line, and
+/// return the rebuilt lines plus the last value seen.
+fn strip_request_id_header(head: &[u8]) -> (Vec<u8>, Option<String>) {
+    let mut out = Vec::with_capacity(head.len());
+    let mut value = None;
+    let mut lines = head.split(|b| *b == b'\n');
+    if let Some(first) = lines.next() {
+        out.extend_from_slice(first.strip_suffix(b"\r").unwrap_or(first));
+        out.extend_from_slice(b"\r\n");
+    }
+    for raw in lines {
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.is_empty() {
+            continue;
+        }
+        match line.iter().position(|b| *b == b':') {
+            Some(colon)
+                if line[..colon]
+                    .eq_ignore_ascii_case(crate::http::REQUEST_ID_HEADER.as_bytes()) =>
+            {
+                value = Some(String::from_utf8_lossy(trim_ascii(&line[colon + 1..])).into_owned());
+            }
+            _ => {
+                out.extend_from_slice(line);
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+    }
+    (out, value)
+}
+
 /// Trim ASCII whitespace (spaces and tabs) from both ends of a byte slice
 fn trim_ascii(mut s: &[u8]) -> &[u8] {
     while let Some((first, rest)) = s.split_first() {
@@ -355,6 +425,60 @@ mod tests {
             .contains("X-HTTP-TUNNEL-TOKEN"));
         assert!(AuthFailure::Missing.message().ends_with('\n'));
         assert!(AuthFailure::Invalid.message().ends_with('\n'));
+    }
+
+    #[test]
+    fn test_request_id_header_round_trips_through_the_loopback_hop() {
+        let head = b"GET / HTTP/1.1\r\nHost: a.test\r\nAccept: */*\r\n\r\nbody";
+        let carried = insert_request_id(head, "0123456789abcdef");
+        let text = String::from_utf8(carried.clone()).unwrap();
+        assert!(text.contains("\r\nx-http-tunnel-request-id: 0123456789abcdef\r\n"));
+        assert!(text.ends_with("\r\n\r\nbody"));
+
+        let mut received = carried;
+        assert_eq!(
+            take_request_id(&mut received, true).as_deref(),
+            Some("0123456789abcdef")
+        );
+        let received = String::from_utf8(received).unwrap();
+        assert!(!received.to_lowercase().contains("x-http-tunnel-request-id"));
+        assert!(received.ends_with("\r\n\r\nbody"));
+    }
+
+    #[test]
+    fn test_request_id_header_is_not_trusted_from_a_non_loopback_peer() {
+        let mut head =
+            b"GET / HTTP/1.1\r\nHost: a.test\r\nx-http-tunnel-request-id: 0123456789abcdef\r\n\r\n"
+                .to_vec();
+        assert_eq!(take_request_id(&mut head, false), None);
+        // The head is untouched, so a visitor cannot strip its own header.
+        assert!(String::from_utf8(head)
+            .unwrap()
+            .contains("x-http-tunnel-request-id: 0123456789abcdef"));
+    }
+
+    #[test]
+    fn test_request_id_header_replaces_a_visitor_supplied_value() {
+        let head =
+            b"GET / HTTP/1.1\r\nHost: a.test\r\nX-HTTP-Tunnel-Request-Id: deadbeefdeadbeef\r\n\r\n";
+        let carried = insert_request_id(head, "0123456789abcdef");
+        let text = String::from_utf8(carried).unwrap();
+        assert!(!text.contains("deadbeefdeadbeef"));
+        assert_eq!(text.matches("x-http-tunnel-request-id").count(), 1);
+        assert!(text.contains("x-http-tunnel-request-id: 0123456789abcdef"));
+    }
+
+    #[test]
+    fn test_request_id_header_rejects_a_malformed_value() {
+        let mut head =
+            b"GET / HTTP/1.1\r\nHost: a.test\r\nx-http-tunnel-request-id: not-an-id\r\n\r\n"
+                .to_vec();
+        assert_eq!(take_request_id(&mut head, true), None);
+        // A malformed value is still stripped, so the local service never sees it.
+        assert!(!String::from_utf8(head)
+            .unwrap()
+            .to_lowercase()
+            .contains("x-http-tunnel-request-id"));
     }
 
     #[test]

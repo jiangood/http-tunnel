@@ -25,7 +25,9 @@ no external dependency; it renders nothing on the server and reads all of its
 data from `/api` with the Bearer token it is handed after login. It shows the
 status, the local services with their source, the effective route table, the
 connected downstream nodes and the `HT_*` variables that are set, and it adds or
-edits a service in a dialog.
+edits a service in a dialog. A downstream row also offers "管理服务", which
+lists, adds, edits and deletes that node's own `[[proxies]]`, and "断开", which
+closes that one session.
 
 ## API
 
@@ -34,11 +36,12 @@ Every API call uses a Bearer token, which is also the listener `token`:
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/api/status` | Name, transport, upstream, connectivity, proxy count, session count, version, config path, uptime, the `HT_*` variables that are set |
-| GET | `/api/proxies` | List local `[[proxies]]` as `name`/`domain`/`local_addr`/`source` |
+| GET | `/api/proxies` | List local `[[proxies]]` as `name`/`domain`/`local_addr`/`source`; with `?node=` or `?session=`, list the proxies of that downstream node |
 | GET | `/api/routes` | The effective routing table, including v4 owners |
-| GET | `/api/sessions` | The connected downstream v4 sessions: session id, node, peer address, forwarded client address, role, uptime and owned domains |
-| PUT | `/api/proxies/{name}` | Create or replace a local proxy |
-| DELETE | `/api/proxies/{name}` | Delete a local proxy |
+| GET | `/api/sessions` | The connected downstream v4 sessions: session id, node, peer address, forwarded client address, role, uptime, owned domains, `manageable` and `writable` |
+| PUT | `/api/proxies/{name}` | Create or replace a local proxy; with `?node=`/`?session=`, write it on that downstream node |
+| DELETE | `/api/proxies/{name}` | Delete a local proxy; with `?node=`/`?session=`, delete it on that downstream node |
+| DELETE | `/api/sessions/{id}` | Close one downstream session |
 
 `GET /api/routes` shows the table the visitor path actually uses. A local
 service and a downstream session can claim the same domain; the local service
@@ -63,7 +66,7 @@ directly, so it is diagnostic, not an authorization decision.
 
 ```json
 [
-  {"session_id":3,"node":"home","peer":"10.0.0.6:60216","forwarded":"203.0.113.9","role":"node","connected_seconds":125,"domains":["svc.example.com"]}
+  {"session_id":3,"node":"home","peer":"10.0.0.6:60216","forwarded":"203.0.113.9","role":"node","connected_seconds":125,"domains":["svc.example.com"],"manageable":true,"writable":true}
 ]
 ```
 
@@ -95,6 +98,65 @@ curl -X PUT -H "Host: edge.lan" -H "Authorization: Bearer $TOKEN" \
 A change is validated locally, written atomically to `ht.toml`, applied to the
 running server's proxy list, and published on the route watch. An upstream
 session therefore mirrors or withdraws the route immediately, without a restart.
+
+## Downstream node proxies
+
+The same proxy endpoints operate on a connected downstream node when a `node`
+or `session` query parameter is present:
+
+```text
+GET    /api/proxies?node=home
+GET    /api/proxies?session=3
+PUT    /api/proxies/nas?node=home
+DELETE /api/proxies/nas?session=3
+```
+
+Without either parameter the request manages the local process, exactly as
+before. Both parameters may be given; they must identify the same session,
+which also protects against a reconnect overlap where the old and the new
+session use the same node name. A node name is not a unique key: zero matches
+return `404`, several matches return `409` with the candidate session ids in
+the error (use `session` to disambiguate).
+
+The response is the same array as the local endpoint. Each session listed by
+`GET /api/sessions` carries:
+
+- `manageable`: the node understands proxy management requests.
+- `writable`: its local services may be changed. It is `false` when the node is
+  running with `HT_PROXIES`.
+
+A downstream operation is executed by the node itself with the same code as its
+own management page: the change is validated, written atomically to that node's
+`ht.toml`, applied to its running proxy list, and published on its route watch.
+The entry node therefore sees the added or withdrawn route without a restart.
+
+Remote management is enabled by default when both processes are built with the
+`management` feature. Anyone who can reach the entry `control_host` and knows
+its token can edit the connected downstream nodes' `ht.toml`; run only trusted
+nodes on that control plane, or build without `management` to remove the
+feature.
+
+Failures:
+
+| Status | Meaning |
+| --- | --- |
+| `400` | The session id is not a number, `node` and `session` disagree, or the input is invalid |
+| `404` | No session matches the selector, or the proxy does not exist on the node |
+| `409` | The node is not manageable, is `HT_PROXIES` read-only, or several sessions share the name |
+| `502` | The node rejected the change (for example a domain conflict or an unwritable file) |
+| `504` | The node did not answer within 10 seconds; the change may still have been applied |
+
+## Disconnecting a downstream node
+
+```sh
+curl -X DELETE -H "Host: edge.lan" -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:7777/api/sessions/3
+```
+
+A successful `DELETE /api/sessions/{id}` withdraws the session's routes, closes
+the connection and returns `204`. This is a temporary disconnect: the node
+reconnects according to its own `retry_interval`. Unknown or already closed
+sessions return `404`.
 
 ## Errors
 

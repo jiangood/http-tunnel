@@ -66,6 +66,13 @@ connects to `127.0.0.1:<actual listen_port>`. The embedded listener reads the
 The `Host` header and the bytes are not rewritten, so WebSocket upgrades and any
 other protocol upgrade traverse the whole chain.
 
+One private header is added on that loopback hop:
+`x-http-tunnel-request-id` carries the visitor's id from the session into the
+embedded listener, which adopts and strips it. The id therefore stays the same
+from the ingress through every relay to the leaf, in every log line and in the
+error page. Only a loopback peer may use it; an id from any other peer is
+ignored and stripped.
+
 Each hop uses one v4 session for every domain and every visitor stream.
 WebSocket ping/pong provides keepalive.
 

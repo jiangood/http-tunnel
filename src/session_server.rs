@@ -19,6 +19,10 @@ use crate::transport::Conn;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_BUFFER: usize = p4::INITIAL_WINDOW as usize;
+/// The number of management requests that may wait for a downstream answer on
+/// one session. The management API also times out, so this only bounds a peer
+/// that never answers.
+const MAX_PENDING_MANAGEMENT: usize = 16;
 
 /// A handle used by the visitor path to open a stream on a v4 session.
 #[derive(Clone)]
@@ -37,10 +41,41 @@ enum SessionCommand {
     },
 }
 
+/// A control operation the management API submits to a connected session.
+pub(crate) enum SessionControl {
+    /// Ask the session task to close after withdrawing its routes.
+    Close { reply: oneshot::Sender<()> },
+    /// Perform one proxy operation on the downstream node.
+    Proxy {
+        op: p4::ProxyOp,
+        reply: oneshot::Sender<std::result::Result<Vec<p4::ProxyEntry>, String>>,
+    },
+}
+
 enum StreamInput {
     Data(Vec<u8>, bool),
     Window(u32),
     Reset(p4::StreamError),
+}
+
+/// Why a visitor stream did not open on a v4 session, in the terms a gateway
+/// error page needs: is the session itself gone, or did it not answer in time?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpenFailure {
+    /// The session is gone, refused the stream, or dropped the request.
+    Unavailable(String),
+    /// The downstream did not open the stream before the timeout.
+    Timeout,
+}
+
+impl OpenFailure {
+    /// The cause as one line for the visitor-facing page.
+    pub(crate) fn cause(&self) -> String {
+        match self {
+            OpenFailure::Unavailable(message) => message.clone(),
+            OpenFailure::Timeout => "the downstream did not open the stream in time".to_string(),
+        }
+    }
 }
 
 impl V4SessionHandle {
@@ -52,7 +87,7 @@ impl V4SessionHandle {
         header: Vec<u8>,
         timeout: Duration,
         request_id: &str,
-    ) -> Result<DuplexStream> {
+    ) -> std::result::Result<DuplexStream, OpenFailure> {
         let (reply, reply_rx) = oneshot::channel();
         self.tx
             .send(SessionCommand::Open {
@@ -62,11 +97,14 @@ impl V4SessionHandle {
                 reply,
             })
             .await
-            .map_err(|_| anyhow!("The v4 session is gone"))?;
+            .map_err(|_| OpenFailure::Unavailable("the v4 session is gone".to_string()))?;
         match time::timeout(timeout, reply_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(anyhow!("The v4 session dropped the stream request")),
-            Err(_) => Err(anyhow!("The v4 session did not open a stream in time")),
+            Ok(Ok(Ok(stream))) => Ok(stream),
+            Ok(Ok(Err(e))) => Err(OpenFailure::Unavailable(format!("{:#}", e))),
+            Ok(Err(_)) => Err(OpenFailure::Unavailable(
+                "the v4 session dropped the stream request".to_string(),
+            )),
+            Err(_) => Err(OpenFailure::Timeout),
         }
     }
 }
@@ -83,12 +121,12 @@ pub(crate) async fn accept(
     let hello = time::timeout(HANDSHAKE_TIMEOUT, p4::read_frame(&mut conn))
         .await
         .context("Timed out waiting for the v4 hello")??;
-    let (node_id, role) = match hello {
+    let (node_id, role, capabilities) = match hello {
         SessionFrame::Hello {
             version,
             node_id,
             role,
-            ..
+            capabilities,
         } => {
             if version != p4::V4_VERSION {
                 let _ = p4::write_frame(
@@ -104,7 +142,7 @@ pub(crate) async fn accept(
             if node_id.trim().is_empty() {
                 bail!("A v4 session has an empty node id");
             }
-            (node_id, role)
+            (node_id, role, capabilities)
         }
         _ => bail!("The first v4 frame is not Hello"),
     };
@@ -156,6 +194,7 @@ pub(crate) async fn accept(
         p4::Role::Client => "client",
         p4::Role::Node => "node",
     };
+    let (control_tx, control_rx) = mpsc::channel(MAX_PENDING_MANAGEMENT);
     state.v4_session_info.write().await.insert(
         session_id,
         V4SessionInfo {
@@ -164,6 +203,8 @@ pub(crate) async fn accept(
             forwarded: forwarded.clone(),
             role: role_name,
             since: Instant::now(),
+            capabilities,
+            control: control_tx,
         },
     );
     info!(
@@ -175,17 +216,30 @@ pub(crate) async fn accept(
         "v4 session established"
     );
 
-    let result = run_session(conn, state.clone(), session_id, node_id, forwarded, permit).await;
+    let result = run_session(
+        conn,
+        state.clone(),
+        session_id,
+        node_id,
+        forwarded,
+        capabilities,
+        control_rx,
+        permit,
+    )
+    .await;
     state.v4_session_info.write().await.remove(&session_id);
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     conn: Conn,
     state: Arc<ServerState>,
     session_id: u64,
     node_id: String,
     forwarded: Option<String>,
+    capabilities: u32,
+    mut control_rx: mpsc::Receiver<SessionControl>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
     let (mut reader, mut writer) = split(conn);
@@ -210,6 +264,12 @@ async fn run_session(
     let mut owned: HashSet<String> = HashSet::new();
     let mut streams: HashMap<u32, mpsc::UnboundedSender<StreamInput>> = HashMap::new();
     let mut next_stream_id: u32 = 1;
+    let mut next_request_id: u64 = 1;
+    let mut pending: HashMap<
+        u64,
+        oneshot::Sender<std::result::Result<Vec<p4::ProxyEntry>, String>>,
+    > = HashMap::new();
+    let mut close_reply = None;
 
     loop {
         tokio::select! {
@@ -260,6 +320,21 @@ async fn run_session(
                                 warn!(session_id, "v4 peer error {:?}: {}", code, message);
                                 break;
                             }
+                            SessionFrame::ProxyResponse { request_id, proxies, error } => {
+                                match pending.remove(&request_id) {
+                                    Some(reply) => {
+                                        let _ = reply.send(match error {
+                                            Some(error) => Err(error),
+                                            None => Ok(proxies),
+                                        });
+                                    }
+                                    None => debug!(
+                                        session_id,
+                                        request_id,
+                                        "An unexpected proxy response was ignored"
+                                    ),
+                                }
+                            }
                             other => {
                                 warn!(session_id, "Unexpected v4 frame: {:?}", other);
                                 break;
@@ -308,6 +383,9 @@ async fn run_session(
                 let closed_tx_stream = closed_tx.clone();
                 tokio::spawn(run_server_stream(
                     stream_id,
+                    session_id,
+                    node_id.clone(),
+                    domain,
                     request_id,
                     tunnel_io,
                     input_rx,
@@ -315,6 +393,47 @@ async fn run_session(
                     closed_tx_stream,
                 ));
                 let _ = reply.send(Ok(visitor_io));
+            }
+            command = control_rx.recv() => {
+                let Some(command) = command else {
+                    break;
+                };
+                match command {
+                    SessionControl::Close { reply } => {
+                        let _ = out_tx.send(SessionFrame::GoAway {
+                            reason: "disconnected by the management API".to_string(),
+                            drain_seconds: 0,
+                        }).await;
+                        close_reply = Some(reply);
+                        break;
+                    }
+                    SessionControl::Proxy { op, reply } => {
+                        if capabilities & p4::CAP_PROXY_ADMIN == 0 {
+                            let _ = reply.send(Err(
+                                "the downstream node does not support remote proxy management"
+                                    .to_string(),
+                            ));
+                            continue;
+                        }
+                        if pending.len() >= MAX_PENDING_MANAGEMENT {
+                            let _ = reply.send(Err(
+                                "too many pending management requests on this session".to_string(),
+                            ));
+                            continue;
+                        }
+                        let request_id = next_request_id;
+                        next_request_id = next_request_id.wrapping_add(1).max(1);
+                        if out_tx
+                            .send(SessionFrame::ProxyRequest { request_id, op })
+                            .await
+                            .is_err()
+                        {
+                            let _ = reply.send(Err("the v4 session is gone".to_string()));
+                            continue;
+                        }
+                        pending.insert(request_id, reply);
+                    }
+                }
             }
             id = closed_rx.recv() => {
                 if let Some(id) = id {
@@ -331,6 +450,10 @@ async fn run_session(
         }
     }
 
+    // A management request that cloned the sender just before the close must
+    // fail fast instead of waiting for a reply that can no longer be produced.
+    drop(control_rx);
+
     // Withdraw every route owned by this session, unless a newer session has
     // already taken it over.
     let had_routes = !owned.is_empty();
@@ -339,6 +462,13 @@ async fn run_session(
     }
     if had_routes {
         state.refresh_routes().await;
+    }
+    for (_, reply) in pending.drain() {
+        let _ = reply.send(Err("the v4 session closed".to_string()));
+    }
+    state.v4_session_info.write().await.remove(&session_id);
+    if let Some(reply) = close_reply {
+        let _ = reply.send(());
     }
     drop(streams);
     drop(out_tx);
@@ -493,6 +623,9 @@ pub(crate) async fn lookup(state: &ServerState, host: &str) -> Option<V4SessionH
 
 async fn run_server_stream(
     stream_id: u32,
+    session_id: u64,
+    node_id: String,
+    domain: String,
     request_id: String,
     tunnel: DuplexStream,
     mut input_rx: mpsc::UnboundedReceiver<StreamInput>,
@@ -569,31 +702,57 @@ async fn run_server_stream(
                     }
                     Some(StreamInput::Reset(reason)) => {
                         if !sent_to_visitor {
-                            let (status, message) = match reason {
+                            let (status, summary, layer, hint) = match reason {
                                 p4::StreamError::ConnectFailed => (
                                     "502 Bad Gateway",
-                                    "The tunnel could not reach its local service",
+                                    "The downstream node could not reach its local service.",
+                                    "local service (downstream node)",
+                                    "A new peer answers this itself with its target; an older peer \
+                                     only resets the stream, so look up this Request ID in that \
+                                     node's log for the local_addr it tried.",
                                 ),
                                 p4::StreamError::Timeout => (
                                     "504 Gateway Timeout",
-                                    "The tunnel did not answer in time",
+                                    "The downstream node did not answer in time.",
+                                    "tunnel (downstream node)",
+                                    "The node accepted the stream but sent nothing back; check that \
+                                     node's log with this Request ID.",
                                 ),
                                 _ => (
                                     "503 Service Unavailable",
-                                    "The tunnel is not available",
+                                    "The downstream node could not serve this visitor.",
+                                    "tunnel (downstream node)",
+                                    "The session was reset or closed, the node has no local route \
+                                     for this host, or it ran out of streams; look up this Request \
+                                     ID in that node's log.",
                                 ),
                             };
                             warn!(
                                 request_id = %request_id,
+                                session_id,
                                 stream_id,
+                                node = %node_id,
+                                host = %domain,
                                 reason = ?reason,
                                 status = %status,
                                 "The downstream v4 hop reset the stream before answering"
                             );
+                            let session = format!("#{}", session_id);
+                            let message = crate::http::gateway_failure(
+                                summary,
+                                layer,
+                                &[
+                                    ("node", &node_id),
+                                    ("session", &session),
+                                    ("tunnel", &domain),
+                                    ("cause", &format!("{:?}", reason)),
+                                ],
+                                hint,
+                            );
                             let response = crate::http::error_response(
                                 &request_id,
                                 status,
-                                message,
+                                &message,
                             );
                             let _ = writer.write_all(&response).await;
                             let _ = writer.shutdown().await;

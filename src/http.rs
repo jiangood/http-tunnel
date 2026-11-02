@@ -121,9 +121,9 @@ async fn handle_visitor(
     // Count the visitor as active from the moment it's accepted, so that a
     // shutdown can wait for it instead of cutting it off.
     let activity = state.activity.guard();
-    let request_id = new_request_id();
+    let mut request_id = new_request_id();
 
-    let (prefetched, host) = match time::timeout(
+    let (mut prefetched, host) = match time::timeout(
         Duration::from_secs(HEADER_READ_TIMEOUT),
         read_header(&mut stream),
     )
@@ -159,6 +159,13 @@ async fn handle_visitor(
         }
         Ok(Ok(header)) => header,
     };
+
+    // A relay hands the visitor to its own embedded listener over loopback,
+    // carrying the id it was given in a private header. Adopting it keeps one
+    // request id across every hop, the logs and the page the visitor sees.
+    if let Some(id) = crate::helper::take_request_id(&mut prefetched, addr.ip().is_loopback()) {
+        request_id = id;
+    }
 
     // Reserve the configured server Host for the internal WebSocket transport
     // and the management page/API. Host is a routing key only; the token in the
@@ -276,13 +283,20 @@ async fn handle_visitor(
                     "Failed to connect the visitor to the local service: {:#}",
                     e
                 );
-                respond_error(
-                    &mut stream,
-                    &request_id,
-                    "502 Bad Gateway",
-                    "The local service of this host is unavailable",
-                )
-                .await;
+                let reason = gateway_failure(
+                    "The tunnel is registered, but the local service behind it is unavailable.",
+                    "local service (the node owning the tunnel)",
+                    &[
+                        ("node", &state.node_name),
+                        ("tunnel", &host),
+                        ("service", &proxy.name),
+                        ("target", &proxy.local_addr),
+                        ("cause", &format!("{:#}", e)),
+                    ],
+                    "No downstream node is involved: this node owns the tunnel and dialled the \
+                     target above directly. Start the local service, or fix its target.",
+                );
+                respond_error(&mut stream, &request_id, "502 Bad Gateway", &reason).await;
             }
         }
         drop(activity);
@@ -310,21 +324,44 @@ async fn handle_visitor(
                 return Ok(());
             }
             Err(e) => {
+                let (status, summary, hint) = match &e {
+                    crate::session_server::OpenFailure::Timeout => (
+                        "504 Gateway Timeout",
+                        "The downstream node did not open a visitor stream in time.",
+                        "The route is still advertised, but the node did not answer before the \
+                         stream timeout; check that node's log with this Request ID.",
+                    ),
+                    crate::session_server::OpenFailure::Unavailable(_) => (
+                        "503 Service Unavailable",
+                        "The downstream node could not accept a visitor stream.",
+                        "The route is still advertised, but its session is closing, out of \
+                         streams, or gone; check that node's log with this Request ID.",
+                    ),
+                };
+                let cause = e.cause();
                 warn!(
                     request_id = %request_id,
                     peer = %addr,
                     host = %host,
                     session_id = handle.session_id,
-                    "Failed to open a v4 stream: {:#}",
-                    e
+                    node = %handle.node_id,
+                    cause = %cause,
+                    "Failed to open a v4 stream; answered {}",
+                    status
                 );
-                respond_error(
-                    &mut stream,
-                    &request_id,
-                    "502 Bad Gateway",
-                    "The tunnel for this host is not available",
-                )
-                .await;
+                let session = format!("#{}", handle.session_id);
+                let reason = gateway_failure(
+                    summary,
+                    "tunnel (downstream node)",
+                    &[
+                        ("node", &handle.node_id),
+                        ("session", &session),
+                        ("tunnel", &host),
+                        ("cause", &cause),
+                    ],
+                    hint,
+                );
+                respond_error(&mut stream, &request_id, status, &reason).await;
                 return Ok(());
             }
         }
@@ -803,6 +840,51 @@ fn normalize_domain_bytes(raw: &[u8]) -> Option<String> {
     std::str::from_utf8(raw).ok().and_then(normalize_domain)
 }
 
+/// Build the body of a gateway error (`502`/`503`/`504`) that names the layer
+/// that failed: this node's local service, the tunnel session, or the local
+/// service behind a downstream node.
+///
+/// The detail (node, session, target, cause) is deliberately visible: without
+/// it a bare `502` cannot tell an operator whether a node is down, a session is
+/// gone, or only the service behind the tunnel refused the connection.
+pub(crate) fn gateway_failure(
+    summary: &str,
+    layer: &str,
+    fields: &[(&str, &str)],
+    hint: &str,
+) -> String {
+    let mut rows: Vec<(&str, String)> = Vec::with_capacity(fields.len() + 1);
+    rows.push(("failed layer", layer.to_string()));
+    rows.extend(
+        fields
+            .iter()
+            .map(|(label, value)| (*label, one_line(value))),
+    );
+    // The width includes the colon, so every value starts in the same column.
+    let width = rows
+        .iter()
+        .map(|(label, _)| label.len() + 1)
+        .max()
+        .unwrap_or(0);
+
+    let mut body = format!("{}\n\n", one_line(summary));
+    for (label, value) in rows {
+        body.push_str(&format!("  {:width$}  {}\n", format!("{}:", label), value));
+    }
+    if !hint.is_empty() {
+        body.push('\n');
+        body.push_str(&one_line(hint));
+        body.push('\n');
+    }
+    body
+}
+
+/// Collapse a value onto one line, so a multi-line error chain cannot break the
+/// alignment of a gateway error body.
+fn one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Build the plain-text response of an error that `ht` generates itself, as
 /// opposed to a response forwarded from a local service. The request id appears
 /// both in a header and in the body, so that the operator can find the matching
@@ -900,6 +982,32 @@ mod tests {
             "{}",
             response
         );
+    }
+
+    #[test]
+    fn test_gateway_failure_names_the_layer_the_node_and_the_target() {
+        let body = gateway_failure(
+            "The tunnel is registered, but the local service behind it is unavailable.",
+            "local service (the node owning the tunnel)",
+            &[
+                ("node", "home"),
+                ("tunnel", "app.test"),
+                ("target", "127.0.0.1:8080"),
+                ("cause", "Connection refused\n(second line)"),
+            ],
+            "Start the local service.",
+        );
+        assert!(body.starts_with("The tunnel is registered"));
+        assert!(body.contains("failed layer:  local service (the node owning the tunnel)"));
+        assert!(body.contains("node:"));
+        assert!(body.contains("home"));
+        assert!(body.contains("tunnel:"));
+        assert!(body.contains("app.test"));
+        assert!(body.contains("target:"));
+        assert!(body.contains("127.0.0.1:8080"));
+        // A multi-line cause is folded so the column layout survives.
+        assert!(body.contains("Connection refused (second line)"));
+        assert!(body.ends_with('\n'));
     }
 
     #[test]

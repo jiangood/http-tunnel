@@ -14,7 +14,7 @@
 - 隧道只使用 WebSocket，推荐 `wss://`；`ws://` 仅用于可信网络
 - `[[proxies]]` 支持 TCP 与 Unix Socket，可选用 `X-HTTP-TUNNEL-TOKEN` 做入口校验
 - 一条 v4 会话承载所有域名和访客流，多跳时一个进程一跳
-- 管理页和 API 可增删本地服务，立即生效并写回 `ht.toml`
+- 管理页和 API 可增删改本地服务，立即生效并写回 `ht.toml`；也能管理已连接下游节点的 `[[proxies]]` 并断开其会话
 
 ## 快速开始
 
@@ -413,18 +413,19 @@ keepalive_interval = 15
 
 ## Web 管理
 
-管理页面与 API 始终开启，和访客、v4 会话共用 `listen_port`，只在保留的 `control_host` 上可达。浏览器打开 `http://<control_host>:<listen_port>/`，HTTP Basic 用户名填 `ht`，密码填 `token`；页面是一个内联 CSS/JS 的单页控制台，本身不做服务端渲染，所有数据都通过 `/api/*`（Bearer token）获取，可查看状态、本地服务（含来源）、路由表、下游节点（含来源 IP）、已设置的环境变量和接口列表，并在弹出框中新增或编辑本地服务。`control_host` 不是本机可解析的地址时，可用 `curl -H "Host: <control_host>" http://127.0.0.1:<listen_port>/` 访问；`listen_port = 0` 时管理页也用临时端口，以启动日志为准。
+管理页面与 API 始终开启，和访客、v4 会话共用 `listen_port`，只在保留的 `control_host` 上可达。浏览器打开 `http://<control_host>:<listen_port>/`，HTTP Basic 用户名填 `ht`，密码填 `token`；页面是一个内联 CSS/JS 的单页控制台，本身不做服务端渲染，所有数据都通过 `/api/*`（Bearer token）获取，可查看状态、本地服务（含来源）、路由表、下游节点（含来源 IP）、已设置的环境变量和接口列表，并在弹出框中新增或编辑本地服务。下游节点行还可以“管理服务”（增删改该节点自己的 `[[proxies]]`）和“断开”当前会话；远程管理默认开启，能访问入口管理面并持有 token 的人可以修改下游的 `ht.toml`，只应在可信节点间使用。`control_host` 不是本机可解析的地址时，可用 `curl -H "Host: <control_host>" http://127.0.0.1:<listen_port>/` 访问；`listen_port = 0` 时管理页也用临时端口，以启动日志为准。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/status` | 查看状态、本地服务数、下游节点数、版本、配置文件、运行时长与环境变量覆盖情况 |
-| GET | `/api/proxies` | 列出本地 `[[proxies]]` 及其来源（`ht.toml` / `HT_PROXIES`） |
+| GET | `/api/proxies` | 列出本地 `[[proxies]]` 及其来源（`ht.toml` / `HT_PROXIES`）；带 `?node=` 或 `?session=` 时列出该下游节点的服务 |
 | GET | `/api/routes` | 查看当前生效的路由表（本地服务 + 下游 v4 路由及其所属节点） |
-| GET | `/api/sessions` | 列出已连接的下游节点：会话号、节点、网关转发的来源 IP、TCP 对端、角色、连接时长与所属域名 |
-| PUT | `/api/proxies/{name}` | 新增或更新本地服务 |
-| DELETE | `/api/proxies/{name}` | 删除本地服务 |
+| GET | `/api/sessions` | 列出已连接的下游节点：会话号、节点、网关转发的来源 IP、TCP 对端、角色、连接时长、所属域名与是否可管理 |
+| PUT | `/api/proxies/{name}` | 新增或更新本地服务；带 `?node=`/`?session=` 时写入下游节点 |
+| DELETE | `/api/proxies/{name}` | 删除本地服务；带 `?node=`/`?session=` 时删除下游节点的服务 |
+| DELETE | `/api/sessions/{id}` | 断开一个下游会话（节点会按自己的重连间隔重新连上） |
 
-修改会立即更新运行中的代理列表和路由 watch，并写回 `ht.toml`。详见 [docs/management-api.md](./docs/management-api.md)。
+修改会立即更新运行中的代理列表和路由 watch，并写回 `ht.toml`；带下游参数时写回的是该节点的 `ht.toml`。`node` 与 `session` 可同时给出，必须指向同一会话；不给出时只操作本进程。详见 [docs/management-api.md](./docs/management-api.md)。
 
 ## 错误响应与排查
 
@@ -446,9 +447,34 @@ docker logs ht 2>&1 | grep 0123456789abcdef
 | `400` / `408` / `431` | 访客请求头无法解析、读取超时或过大 |
 | `401` | 本地服务配置了 `auth_header`，但访客缺少或带错 `X-HTTP-TUNNEL-TOKEN` |
 | `404` | 没有任何路由匹配该 `Host`，或 `control_host` 上的路径不存在 |
-| `502` | 匹配到了本地服务或 v4 隧道，但连接/打开流失败 |
-| `503` | 隧道暂不可用（例如流或会话达到上限） |
-| `504` | 隧道在超时前没有返回任何响应 |
+| `502` | 匹配到了隧道，但隧道背后的本地服务连不上 |
+| `503` | 隧道会话无法打开流（正在关闭、流或会话达到上限、会话已断开） |
+| `504` | 下游节点在超时前没有打开流，或隧道打开后没有返回任何响应 |
+
+`502`/`503`/`504` 的响应体都写明**失败层级**，不用再猜是哪一跳出问题：
+
+```
+502 Bad Gateway
+
+The tunnel is registered, but the local service behind it is unavailable.
+
+  failed layer:  local service (the node owning the tunnel)
+  node:          home
+  tunnel:        app.example.com
+  service:       web
+  target:        127.0.0.1:8080
+  cause:         Failed to connect to local TCP service 127.0.0.1:8080: Connection refused
+
+No downstream node is involved: this node owns the tunnel and dialled the target above directly.
+Start the local service, or fix its target.
+Request ID: 0123456789abcdef
+```
+
+- `failed layer=local service (the node owning the tunnel)`：路由就在该节点上，是它连不上自己的 `local_addr`。
+- `failed layer=local service (downstream node)`：节点和隧道都在线，是节点背后的服务连不上；`target` 就是该节点的 `local_addr`。
+- `failed layer=tunnel (downstream node)`：路由还在，但下游节点开不了流（会话关闭/达到上限/超时），不是本地服务的问题。
+- `node`/`session` 指明是哪一跳、哪条 v4 会话；配合同一 `Request ID` 可以直接定位到该节点的日志。
+- 中间节点（中继）生成的 `502` 中，`node` 是**拥有该隧道的节点**，不是入口节点；入口只负责转发这条响应。
 
 管理 API 的错误是 JSON：`{"error":"...","request_id":"..."}`；未知的 `/api/*` 路径还会在 `error` 中写明方法和路径。**`ht` 不会返回 `{"message":"page not found"}`**：如果看到这种响应，且响应头里没有 `x-http-tunnel-request-id`，说明它来自前置反向代理、CDN、托管平台或本地服务，而不是 `ht`。
 
@@ -479,7 +505,7 @@ RUST_LOG=http_tunnel=debug ./ht -c ht.toml  # 只开 ht 自己的 debug
 docker run ... -e RUST_LOG=debug ghcr.io/jiangood/ht:latest
 ```
 
-多跳时，同一个 `request_id` 会写进 v4 `OpenStream` 的 `trace_id`，所以中继和叶子节点的日志可以用同一个 ID 关联（每一跳的嵌入式服务会重新生成 ID，按 Host 和时间即可对上）。
+多跳时，同一个 `request_id` 会写进 v4 `OpenStream` 的 `trace_id`，中继把它转给自身嵌入式监听器时会放在内部请求头里，嵌入式服务继续沿用。因此入口、每个中继、叶子节点的日志，以及访客看到的错误页，都是同一个 ID，一次 `grep` 就能走完整条链路。
 
 ## Docker
 

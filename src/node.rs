@@ -10,7 +10,9 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::helper::{to_bind_addr, DEFAULT_BIND_HOST};
 use crate::protocol_v4::Role;
-use crate::server::{run_server_with_listener_and_state, ServerState};
+use crate::server::{run_server_with_listener_and_state, Management, ServerState};
+#[cfg(feature = "management")]
+use crate::session_client::ProxyAdminRequest;
 use crate::session_client::{self, RouteMap, RouteTarget, SessionArgs};
 
 /// Run the universal process: an embedded server plus one optional upstream
@@ -67,6 +69,7 @@ pub(crate) async fn run_router(
     let (routes, route_rx) = watch::channel(BTreeSet::new());
     let state = Arc::new(ServerState::new(
         token,
+        config.name.clone(),
         config.control_host().to_string(),
         config.server_limits(),
         routes,
@@ -94,7 +97,7 @@ pub(crate) async fn run_router(
     let server_task = tokio::spawn(run_server_with_listener_and_state(
         http_listener,
         state.clone(),
-        management,
+        management.clone(),
         stop_tx.subscribe(),
     ));
 
@@ -103,6 +106,7 @@ pub(crate) async fn run_router(
         stop_tx,
         shutdown_rx,
         connected,
+        management,
     };
 
     match config.upstream.clone() {
@@ -117,6 +121,9 @@ struct RouterRuntime {
     stop_tx: broadcast::Sender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
     connected: Arc<AtomicBool>,
+    /// The management state of the embedded server, shared with the upstream
+    /// session so it can serve proxy requests from the next hop.
+    management: Option<Management>,
 }
 
 /// An ingress serves the visitors and downstream peers on its own.
@@ -149,11 +156,13 @@ async fn run_relay(
         stop_tx,
         mut shutdown_rx,
         connected,
+        management: _management,
     } = runtime;
 
     let local_target = RouteTarget {
         local_addr: format!("127.0.0.1:{}", actual_port),
         auth_header: None,
+        internal: true,
     };
 
     info!(
@@ -162,6 +171,22 @@ async fn run_relay(
         actual_port
     );
     let routes = mirrored_routes(route_rx, local_target);
+
+    #[cfg(feature = "management")]
+    let (proxy_admin, capabilities) = match _management.as_ref() {
+        Some(management) => {
+            let (proxy_tx, proxy_rx) = mpsc::channel::<ProxyAdminRequest>(8);
+            tokio::spawn(run_proxy_admin(management.clone(), proxy_rx));
+            let mut capabilities = crate::protocol_v4::CAP_PROXY_ADMIN;
+            if !management.proxies_managed() {
+                capabilities |= crate::protocol_v4::CAP_PROXY_WRITE;
+            }
+            (Some(proxy_tx), capabilities)
+        }
+        None => (None, 0),
+    };
+    #[cfg(not(feature = "management"))]
+    let (proxy_admin, capabilities) = (None, 0u32);
 
     let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel::<anyhow::Error>();
     let (session_stop_tx, session_stop_rx) = broadcast::channel::<bool>(1);
@@ -175,6 +200,8 @@ async fn run_relay(
         role: Role::Node,
         keepalive_interval: config.keepalive_interval,
         retry_interval: config.retry_interval,
+        capabilities,
+        proxy_admin,
         routes,
         fatal_tx,
         connected,
@@ -282,6 +309,43 @@ async fn ensure_upstream_is_not_self(config: &Config, actual_port: u16) -> Resul
         }
     }
     Ok(())
+}
+
+/// Serve the proxy operations an upstream sends over the v4 session with the
+/// same management state as the local page.
+#[cfg(feature = "management")]
+async fn run_proxy_admin(
+    management: Arc<crate::management::ManagementState>,
+    mut requests: mpsc::Receiver<ProxyAdminRequest>,
+) {
+    while let Some(request) = requests.recv().await {
+        match request {
+            ProxyAdminRequest::List { reply } => {
+                let _ = reply.send(Ok(management.proxies().await));
+            }
+            ProxyAdminRequest::Put {
+                name,
+                domain,
+                local_addr,
+                reply,
+            } => {
+                let result: Result<Vec<crate::config::ServerProxyEntry>> = async {
+                    management.put_proxy(name, domain, local_addr).await?;
+                    Ok(management.proxies().await)
+                }
+                .await;
+                let _ = reply.send(result);
+            }
+            ProxyAdminRequest::Delete { name, reply } => {
+                let result: Result<Vec<crate::config::ServerProxyEntry>> = async {
+                    management.delete_proxy(&name).await?;
+                    Ok(management.proxies().await)
+                }
+                .await;
+                let _ = reply.send(result);
+            }
+        }
+    }
 }
 
 /// Turn the result of the embedded server task into the result of the process.

@@ -1,5 +1,5 @@
 use crate::config::{domain_overlaps_control_host, MaskedString, ServerLimits, ServerProxyEntry};
-use crate::session_server::V4SessionHandle;
+use crate::session_server::{SessionControl, V4SessionHandle};
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, watch, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, watch, RwLock, Semaphore};
 use tokio::time;
 use tracing::{info, warn};
 
@@ -50,6 +50,10 @@ pub(crate) struct SessionSnapshot {
     pub(crate) connected_seconds: u64,
     /// The routes the session owns right now
     pub(crate) domains: Vec<String>,
+    /// Whether the session accepts proxy management requests
+    pub(crate) manageable: bool,
+    /// Whether the session allows its local services to be changed as well
+    pub(crate) writable: bool,
 }
 
 /// The registry entry kept for a connected v4 session until it closes.
@@ -59,6 +63,25 @@ pub(crate) struct V4SessionInfo {
     pub(crate) forwarded: Option<String>,
     pub(crate) role: &'static str,
     pub(crate) since: Instant,
+    /// The capability bits announced in `Hello`
+    pub(crate) capabilities: u32,
+    /// The control channel of the session task, used by the management API
+    pub(crate) control: mpsc::Sender<SessionControl>,
+}
+
+/// A connected session resolved for a management request.
+pub(crate) struct SessionTarget {
+    pub(crate) node_id: String,
+    pub(crate) capabilities: u32,
+    pub(crate) control: mpsc::Sender<SessionControl>,
+}
+
+/// Why a node name did not resolve to exactly one connected session.
+pub(crate) enum SessionLookupError {
+    NotFound,
+    /// Several sessions announce the same node id, including a reconnect that
+    /// overlaps the previous connection.
+    Ambiguous(Vec<u64>),
 }
 
 /// One entry of the effective routing table: a local proxy or a route claimed
@@ -159,6 +182,9 @@ impl Drop for ActivityGuard {
 pub(crate) struct ServerState {
     // The shared token every peers authenticates with
     pub(crate) token: MaskedString,
+    // The configured node name, named in gateway errors so an operator can tell
+    // which hop of a chain failed
+    pub(crate) node_name: String,
     // Reserved HTTP Host for the WebSocket transport; never a business tunnel
     pub(crate) control_host: String,
     // The configurable capacity and keepalive settings
@@ -216,6 +242,7 @@ struct Server {
 impl ServerState {
     pub(crate) fn new(
         token: MaskedString,
+        node_name: String,
         control_host: String,
         limits: ServerLimits,
         routes: watch::Sender<BTreeSet<String>>,
@@ -224,6 +251,7 @@ impl ServerState {
         let max_sessions = limits.max_sessions;
         ServerState {
             token,
+            node_name,
             control_host,
             pending_connections: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
             limits,
@@ -342,11 +370,52 @@ impl ServerState {
                     role: info.role,
                     connected_seconds: now.duration_since(info.since).as_secs(),
                     domains,
+                    manageable: info.capabilities & crate::protocol_v4::CAP_PROXY_ADMIN != 0,
+                    writable: info.capabilities & crate::protocol_v4::CAP_PROXY_WRITE != 0,
                 }
             })
             .collect();
         sessions.sort_by_key(|session| session.session_id);
         sessions
+    }
+
+    /// Resolve one connected session by its id.
+    pub(crate) async fn session_target_by_id(&self, session_id: u64) -> Option<SessionTarget> {
+        let infos = self.v4_session_info.read().await;
+        infos.get(&session_id).map(|info| SessionTarget {
+            node_id: info.node_id.clone(),
+            capabilities: info.capabilities,
+            control: info.control.clone(),
+        })
+    }
+
+    /// Resolve a node name to its connected session. A name is not a unique
+    /// key: duplicates are reported instead of picking one arbitrarily.
+    pub(crate) async fn session_target_by_node(
+        &self,
+        node: &str,
+    ) -> std::result::Result<SessionTarget, SessionLookupError> {
+        let infos = self.v4_session_info.read().await;
+        let mut matching = infos
+            .iter()
+            .filter(|(_, info)| info.node_id == node)
+            .map(|(session_id, info)| (*session_id, info));
+        let Some((session_id, info)) = matching.next() else {
+            return Err(SessionLookupError::NotFound);
+        };
+        let target = SessionTarget {
+            node_id: info.node_id.clone(),
+            capabilities: info.capabilities,
+            control: info.control.clone(),
+        };
+        let mut ids = vec![session_id];
+        ids.extend(matching.map(|(session_id, _)| session_id));
+        if ids.len() > 1 {
+            ids.sort_unstable();
+            Err(SessionLookupError::Ambiguous(ids))
+        } else {
+            Ok(target)
+        }
     }
 
     /// How many v4 sessions are connected right now, and the configured limit.

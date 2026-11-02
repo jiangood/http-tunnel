@@ -27,6 +27,11 @@ pub const INITIAL_WINDOW: u32 = 256 * 1024;
 pub const MAX_ROUTES_PER_SESSION: usize = 256;
 /// The number of streams one session may run at once.
 pub const MAX_STREAMS_PER_SESSION: usize = 256;
+/// The peer accepts proxy management requests from its upstream.
+pub const CAP_PROXY_ADMIN: u32 = 1 << 0;
+/// The peer also allows its local `[[proxies]]` to be changed. It is cleared
+/// when `HT_PROXIES` owns the list, so the upstream can list but not edit it.
+pub const CAP_PROXY_WRITE: u32 = 1 << 1;
 
 /// The role announced in `Hello`. It is advisory: authentication and ACLs
 /// decide what a peer may do.
@@ -45,6 +50,31 @@ pub struct RouteAdvert {
     pub origin: String,
     /// The number of relay hops the route has crossed.
     pub hops: u8,
+}
+
+/// One local service of a downstream node, as returned by a proxy request. It
+/// is deliberately the same shape as `[[proxies]]`, so the upstream can render
+/// it without knowing how the downstream stores its configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyEntry {
+    pub name: String,
+    pub domain: String,
+    pub local_addr: String,
+}
+
+/// A management operation the upstream asks a downstream node to perform on its
+/// own local `[[proxies]]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProxyOp {
+    List,
+    Put {
+        name: String,
+        domain: String,
+        local_addr: String,
+    },
+    Delete {
+        name: String,
+    },
 }
 
 /// Why a route was rejected. The advertiser logs it once and does not retry
@@ -166,6 +196,19 @@ pub enum SessionFrame {
         code: ErrorCode,
         message: String,
     },
+
+    // Proxy management. These variants are appended at the end so that the
+    // bincode discriminants of the frames above stay stable. A peer only sees
+    // them after announcing `CAP_PROXY_ADMIN` in its `Hello`.
+    ProxyRequest {
+        request_id: u64,
+        op: ProxyOp,
+    },
+    ProxyResponse {
+        request_id: u64,
+        proxies: Vec<ProxyEntry>,
+        error: Option<String>,
+    },
 }
 
 /// Write one length-prefixed frame.
@@ -276,6 +319,23 @@ mod tests {
             SessionFrame::GoAway {
                 reason: "shutdown".to_string(),
                 drain_seconds: 5,
+            },
+            SessionFrame::ProxyRequest {
+                request_id: 9,
+                op: ProxyOp::Put {
+                    name: "nas".to_string(),
+                    domain: "nas.example.com".to_string(),
+                    local_addr: "127.0.0.1:80".to_string(),
+                },
+            },
+            SessionFrame::ProxyResponse {
+                request_id: 9,
+                proxies: vec![ProxyEntry {
+                    name: "nas".to_string(),
+                    domain: "nas.example.com".to_string(),
+                    local_addr: "127.0.0.1:80".to_string(),
+                }],
+                error: None,
             },
         ];
         for frame in frames {

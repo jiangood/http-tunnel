@@ -1,14 +1,15 @@
 //! Management API and minimal server-rendered web UI of the universal process.
 
 use crate::config::ServerProxyEntry;
-use crate::management::ManagementState;
+use crate::management::{ManagementState, SessionAdminError};
 use anyhow::{Context, Result};
-use axum::extract::{Path, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{delete, get, put};
 use axum::{Json, Router};
 use hyper::service::Service as _;
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,7 @@ fn build_router(token: String, management: Arc<ManagementState>) -> Router {
         .route("/proxies/:name", put(put_proxy).delete(delete_proxy))
         .route("/routes", get(list_routes))
         .route("/sessions", get(list_sessions))
+        .route("/sessions/:id", delete(delete_session))
         .route_layer(middleware::from_fn_with_state(token.clone(), api_auth));
 
     // Only the page itself is authenticated with HTTP Basic. Everything it
@@ -263,6 +265,75 @@ struct PutProxy {
     local_addr: String,
 }
 
+/// The optional downstream selector of the proxy endpoints. Without either
+/// parameter the request manages the local process, exactly as before.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyScope {
+    node: Option<String>,
+    session: Option<String>,
+}
+
+/// Turn an axum query rejection into the JSON error shape of the API.
+fn query_scope(
+    scope: std::result::Result<Query<ProxyScope>, QueryRejection>,
+) -> std::result::Result<ProxyScope, ApiError> {
+    scope.map(|Query(scope)| scope).map_err(|error| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid proxy selector: {}", error),
+        )
+    })
+}
+
+/// The parsed selector: `(None, None)` means the local process.
+fn proxy_scope(scope: &ProxyScope) -> std::result::Result<(Option<String>, Option<u64>), ApiError> {
+    let node = match scope.node.as_deref() {
+        None => None,
+        Some(node) => {
+            let node = node.trim();
+            if node.is_empty() {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "The `node` query parameter must not be empty".to_string(),
+                ));
+            }
+            Some(node.to_string())
+        }
+    };
+    let session = match scope.session.as_deref() {
+        None => None,
+        Some(session) => {
+            let session = session.trim();
+            if session.is_empty() {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "The `session` query parameter must not be empty".to_string(),
+                ));
+            }
+            Some(session.parse::<u64>().map_err(|_| {
+                ApiError(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "The `session` query parameter must be a number: {}",
+                        session
+                    ),
+                )
+            })?)
+        }
+    };
+    Ok((node, session))
+}
+
+fn parse_session_id(id: &str) -> std::result::Result<u64, ApiError> {
+    id.trim().parse::<u64>().map_err(|_| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("The session id must be a number: {}", id),
+        )
+    })
+}
+
 struct ApiError(StatusCode, String);
 
 #[derive(Serialize)]
@@ -318,6 +389,19 @@ impl ApiError {
         };
         ApiError(status, reason)
     }
+
+    fn from_session(error: SessionAdminError) -> ApiError {
+        let status = match &error {
+            SessionAdminError::NotFound(_) => StatusCode::NOT_FOUND,
+            SessionAdminError::Ambiguous(_)
+            | SessionAdminError::NotManageable
+            | SessionAdminError::ReadOnly => StatusCode::CONFLICT,
+            SessionAdminError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            SessionAdminError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            SessionAdminError::Downstream(_) => StatusCode::BAD_GATEWAY,
+        };
+        ApiError(status, error.to_string())
+    }
 }
 
 async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusView> {
@@ -344,21 +428,42 @@ async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusView> {
     })
 }
 
-async fn list_proxies(State(state): State<Arc<ApiState>>) -> Json<Vec<ProxyView>> {
-    let source = if state.management.proxies_managed() {
-        "env"
-    } else {
-        "file"
-    };
-    Json(
-        state
-            .management
-            .proxies()
-            .await
+async fn list_proxies(
+    State(state): State<Arc<ApiState>>,
+    scope: std::result::Result<Query<ProxyScope>, QueryRejection>,
+) -> Result<Json<Vec<ProxyView>>, ApiError> {
+    let scope = query_scope(scope)?;
+    let (node, session) = proxy_scope(&scope)?;
+    if node.is_none() && session.is_none() {
+        let source = if state.management.proxies_managed() {
+            "env"
+        } else {
+            "file"
+        };
+        return Ok(Json(
+            state
+                .management
+                .proxies()
+                .await
+                .iter()
+                .map(|proxy| proxy_view(proxy, source))
+                .collect(),
+        ));
+    }
+
+    let snapshot = state
+        .management
+        .session_proxies(node.as_deref(), session)
+        .await
+        .map_err(ApiError::from_session)?;
+    let source = if snapshot.writable { "file" } else { "env" };
+    Ok(Json(
+        snapshot
+            .proxies
             .iter()
             .map(|proxy| proxy_view(proxy, source))
             .collect(),
-    )
+    ))
 }
 
 /// The effective routing table: local services and the domains claimed by v4
@@ -379,36 +484,85 @@ async fn list_sessions(
 
 async fn put_proxy(
     State(state): State<Arc<ApiState>>,
+    scope: std::result::Result<Query<ProxyScope>, QueryRejection>,
     Path(name): Path<String>,
     Json(body): Json<PutProxy>,
 ) -> Result<Response, ApiError> {
     let name = name.trim().to_string();
-    state
+    let scope = query_scope(scope)?;
+    let (node, session) = proxy_scope(&scope)?;
+    if node.is_none() && session.is_none() {
+        state
+            .management
+            .put_proxy(name.clone(), body.domain, body.local_addr)
+            .await
+            .map_err(|e| ApiError::from_reason(format!("{:#}", e)))?;
+        return match state
+            .management
+            .proxies()
+            .await
+            .into_iter()
+            .find(|proxy| proxy.name == name)
+        {
+            Some(proxy) => {
+                Ok((StatusCode::CREATED, Json(proxy_view(&proxy, "file"))).into_response())
+            }
+            None => Ok(StatusCode::CREATED.into_response()),
+        };
+    }
+
+    let snapshot = state
         .management
-        .put_proxy(name.clone(), body.domain, body.local_addr)
+        .put_session_proxy(
+            node.as_deref(),
+            session,
+            name.clone(),
+            body.domain,
+            body.local_addr,
+        )
         .await
-        .map_err(|e| ApiError::from_reason(format!("{:#}", e)))?;
-    match state
-        .management
-        .proxies()
-        .await
-        .into_iter()
-        .find(|proxy| proxy.name == name)
-    {
-        Some(proxy) => Ok((StatusCode::CREATED, Json(proxy_view(&proxy, "file"))).into_response()),
+        .map_err(ApiError::from_session)?;
+    let source = if snapshot.writable { "file" } else { "env" };
+    match snapshot.proxies.iter().find(|proxy| proxy.name == name) {
+        Some(proxy) => Ok((StatusCode::CREATED, Json(proxy_view(proxy, source))).into_response()),
         None => Ok(StatusCode::CREATED.into_response()),
     }
 }
 
 async fn delete_proxy(
     State(state): State<Arc<ApiState>>,
+    scope: std::result::Result<Query<ProxyScope>, QueryRejection>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    let name = name.trim();
+    let scope = query_scope(scope)?;
+    let (node, session) = proxy_scope(&scope)?;
+    if node.is_none() && session.is_none() {
+        state
+            .management
+            .delete_proxy(name)
+            .await
+            .map_err(|e| ApiError::from_reason(format!("{:#}", e)))?;
+    } else {
+        state
+            .management
+            .delete_session_proxy(node.as_deref(), session, name)
+            .await
+            .map_err(ApiError::from_session)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_session(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let id = parse_session_id(&id)?;
     state
         .management
-        .delete_proxy(name.trim())
+        .disconnect_session(id)
         .await
-        .map_err(|e| ApiError::from_reason(format!("{:#}", e)))?;
+        .map_err(ApiError::from_session)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

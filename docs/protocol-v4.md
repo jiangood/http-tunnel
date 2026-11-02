@@ -102,6 +102,10 @@ enum SessionFrame {
     Pong { seq: u64 },
     GoAway { reason: String, drain_seconds: u32 },
     Error { code: ErrorCode, message: String },
+
+    // Proxy management (appended to keep older discriminants stable)
+    ProxyRequest { request_id: u64, op: ProxyOp },
+    ProxyResponse { request_id: u64, proxies: Vec<ProxyEntry>, error: Option<String> },
 }
 ```
 
@@ -145,10 +149,13 @@ to the `local_addr` of the matched route and pipes bytes in both directions.
   connecting.
 - `StreamData { fin: true }` half-closes that direction. A stream ends when both
   directions are finished or one side resets it.
-- A downstream that cannot reach its `local_addr` answers
-  `StreamReset { ConnectFailed }`; the server answers the visitor with `502`.
+- A downstream that cannot reach its `local_addr` answers the visitor itself
+  with a `502` (`StreamData { fin: true }`), naming its node, the tunnel and the
+  target it dialled. Older peers only send `StreamReset { ConnectFailed }`; the
+  server then answers `502` with the node and session it knows.
 - A stream whose session dies is reset, so the visitor receives `502`/`503`/`504`
-  instead of hanging.
+  instead of hanging. A reset for any other reason is answered with a `503`
+  that names the node and session.
 - The downstream never opens visitor streams. A relay is both a downstream and
   an upstream process, using one session in each direction.
 
@@ -175,6 +182,31 @@ limit.
   streams. Reconnecting sends a fresh full snapshot with a new generation.
 - A rejected token is fatal: the process reports it and exits instead of
   retrying forever.
+
+## Proxy management
+
+A downstream node may let its upstream manage its local `[[proxies]]` over the
+same session. This is an optional capability, not a new protocol version:
+
+- `Hello.capabilities` carries `CAP_PROXY_ADMIN` (`1 << 0`) when the node
+  understands management requests.
+- `CAP_PROXY_WRITE` (`1 << 1`) is also set when the node allows changes. It is
+  cleared when `HT_PROXIES` owns the list, so the upstream can list but not
+  edit it.
+- The server only sends `ProxyRequest` to a session that announced
+  `CAP_PROXY_ADMIN`. Older peers send `capabilities = 0` and are never sent the
+  new frames.
+- `ProxyOp` is `List`, `Put { name, domain, local_addr }` or `Delete { name }`.
+  `ProxyResponse` carries the node's current proxy list and an optional error
+  string. The request id correlates the response with the pending request.
+
+The downstream executes the operation with its local management state: validate,
+write its `ht.toml` atomically, replace the running proxy list, and publish the
+route change. The upstream therefore receives the usual `Update`/`RouteAck`
+traffic; there is no separate route-management frame.
+
+`GoAway` sent by the server with the reason `disconnected by the management API`
+closes one session. The node reconnects according to its own retry policy.
 
 ## Not in 1.0
 
