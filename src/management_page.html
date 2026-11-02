@@ -162,20 +162,19 @@ input[readonly]{background:var(--input);color:var(--muted)}
         <thead>
           <tr>
             <th>会话</th>
-            <th>节点</th>
+            <th>节点名称</th>
             <th>类型</th>
             <th>来源地址</th>
-            <th>角色</th>
             <th>连接时长</th>
             <th class="right">操作</th>
           </tr>
         </thead>
         <tbody id="node-body">
-          <tr><td colspan="7" class="empty">加载中…</td></tr>
+          <tr><td colspan="6" class="empty">加载中…</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="hint">“本节点”是当前进程，来源地址列显示它的监听或上游地址；下游节点每个 v4 会话一行，节点重连后会换一个新会话号。下游的来源地址优先显示网关（雷池、nginx 等）转发的对端 IP，下一行“经”是直接连到本机的 TCP 地址。“管理服务”编辑该节点自己的 <code>[[proxies]]</code>；“断开”只关闭当前会话，节点会按自己的重连间隔重新连上。</p>
+    <p class="hint">“本节点”是当前进程，来源地址列显示它的监听或上游地址；下游节点每个 v4 会话一行，节点重连后会换一个新会话号。下游的来源地址优先显示网关（雷池、nginx 等）转发的对端 IP，没有网关时显示直接连到本机的 TCP 地址。“管理服务”编辑该节点自己的 <code>[[proxies]]</code>；“断开”只关闭当前会话，节点会按自己的重连间隔重新连上。</p>
   </section>
 
   <section class="card">
@@ -203,7 +202,7 @@ input[readonly]{background:var(--input);color:var(--muted)}
         </tbody>
       </table>
     </div>
-    <p class="hint">本节点服务优先于同名 v4 会话。“类型”区分本节点和下游节点；“来源”对本节点是配置来源，对下游是连接地址。下游服务的实际目标地址在远端节点上，可在“节点”卡片里点“管理服务”查看。</p>
+    <p class="hint">本节点服务优先于同名 v4 会话。“类型”区分本节点和下游节点；“来源”对本节点是配置来源，对下游是连接地址。下游路由的名称和目标地址从该节点的服务列表读取，读取不到时显示“—”。</p>
   </section>
 
   <section class="card">
@@ -343,6 +342,7 @@ input[readonly]{background:var(--input);color:var(--muted)}
   var toastTimer = null;
   var proxiesCache = [];
   var sessionsCache = [];
+  var sessionProxyMap = {};
   var sessionProxiesCache = [];
   var sessionProxyTarget = null;
 
@@ -484,8 +484,7 @@ input[readonly]{background:var(--input);color:var(--muted)}
   function sessionSource(session) {
     if (!session) { return '<span class="muted">—</span>'; }
     return session.forwarded
-      ? '<span class="mono strong">' + esc(session.forwarded) + "</span>" +
-        '<br><span class="mono muted">经 ' + esc(session.peer) + "</span>"
+      ? '<span class="mono strong">' + esc(session.forwarded) + "</span>"
       : '<span class="mono muted">' + esc(session.peer) + "</span>";
   }
 
@@ -525,20 +524,15 @@ input[readonly]{background:var(--input);color:var(--muted)}
       '<td class="strong">' + esc(nodeName) + "</td>" +
       '<td><span class="tag local">本节点</span></td>' +
       '<td class="mono muted">' + esc(nodeRemote) + "</td>" +
-      '<td class="muted">—</td>' +
       '<td class="mono muted">' + esc(uptime(nodeUptime)) + "</td>" +
       '<td class="right"><span class="muted">—</span></td>' +
       "</tr>");
     sessions.forEach(function (session) {
-      var role = session.role === "client"
-        ? '<span class="tag local">客户端</span>'
-        : '<span class="tag">节点</span>';
       rows.push("<tr>" +
         '<td class="mono strong">#' + esc(session.session_id) + "</td>" +
         '<td class="strong">' + esc(session.node) + "</td>" +
         '<td><span class="tag">下游节点</span></td>' +
         "<td class=\"nowrap\">" + sessionSource(session) + "</td>" +
-        "<td>" + role + "</td>" +
         '<td class="mono muted">' + esc(uptime(session.connected_seconds)) + "</td>" +
         sessionActions(session) +
         "</tr>");
@@ -558,15 +552,27 @@ input[readonly]{background:var(--input);color:var(--muted)}
       : sessionsCache.find(function (item) {
           return String(item.session_id) === String(route.session_id);
         });
+    var remoteProxy = null;
+    if (!local && session) {
+      var sessionProxies = sessionProxyMap[String(session.session_id)] || [];
+      remoteProxy = sessionProxies.find(function (item) {
+        return item.domain && route.domain &&
+          String(item.domain).toLowerCase() === String(route.domain).toLowerCase();
+      }) || null;
+    }
     var node = local
       ? esc(nodeName)
       : (route.node === null || route.node === undefined ? "—" : esc(route.node));
-    var name = local ? esc(route.name) : '<span class="muted">—</span>';
+    var name = local
+      ? esc(route.name)
+      : (remoteProxy ? esc(remoteProxy.name) : '<span class="muted">—</span>');
     var sessionCell = local || route.session_id === null || route.session_id === undefined
       ? '<span class="muted">—</span>'
       : "#" + esc(route.session_id);
     var source = local ? configSource(proxy) : sessionSource(session);
-    var target = local ? esc(route.target) : '<span class="muted">下游转发</span>';
+    var target = local
+      ? esc(route.target)
+      : (remoteProxy ? esc(remoteProxy.local_addr) : '<span class="muted">下游转发</span>');
     var actions = local
       ? localActions(proxy)
       : '<td class="right"><span class="muted">—</span></td>';
@@ -593,6 +599,28 @@ input[readonly]{background:var(--input);color:var(--muted)}
     body.innerHTML = routes.map(renderRouteRow).join("");
   }
 
+  function loadSessionProxyMap(sessions, routes) {
+    var routed = {};
+    routes.forEach(function (route) {
+      if (route.owner !== "local" && route.session_id !== null && route.session_id !== undefined) {
+        routed[String(route.session_id)] = true;
+      }
+    });
+    var next = {};
+    var targets = sessions.filter(function (session) {
+      return session.manageable && routed[String(session.session_id)];
+    });
+    return Promise.all(targets.map(function (session) {
+      return request("/api/proxies" + scopeQuery(session)).then(function (proxies) {
+        next[String(session.session_id)] = proxies;
+      }).catch(function () {
+        next[String(session.session_id)] = [];
+      });
+    })).then(function () {
+      sessionProxyMap = next;
+    });
+  }
+
   function loadAll(silent) {
     return Promise.all([
       request("/api/status"),
@@ -605,6 +633,9 @@ input[readonly]{background:var(--input);color:var(--muted)}
       renderSessions(results[3]);
       renderNodes(results[3]);
       renderRoutes(results[2]);
+      return loadSessionProxyMap(results[3], results[2]).then(function () {
+        renderRoutes(results[2]);
+      });
     }).catch(function (error) {
       if (!silent) { toast(error.message, "error"); }
     });
