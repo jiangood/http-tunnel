@@ -2953,8 +2953,19 @@ async fn bind_host_changes_are_hot_reloaded_and_rolled_back() -> Result<()> {
     write("192.0.2.1")?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let (status, body) =
-            api_request(&addr, "GET", "/api/status", Some("bind-secret"), None).await?;
+        // The rollback briefly releases the old listener, so a connection
+        // refused here means the new listener is not back yet.
+        let response = api_request(&addr, "GET", "/api/status", Some("bind-secret"), None).await;
+        let (status, body) = match response {
+            std::result::Result::Ok(pair) => pair,
+            std::result::Result::Err(_) => {
+                if Instant::now() >= deadline {
+                    anyhow::bail!("the listener did not come back after the bad bind change");
+                }
+                time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         if status == 200 && body.contains("last_reload_error") {
             break;
         }
