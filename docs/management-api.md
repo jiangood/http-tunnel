@@ -394,6 +394,7 @@ presence of `x-http-tunnel-request-id`.
 
 `ht.toml` is the only configuration source. The management page and
 `PUT /api/settings` write that same file. On first start a missing file is
-replaced with a commented example that runs as a server (`[server]` enabled,
-`[upstream]` commented out); the process keeps starting with it and hot-reloads
-later edits. There is no environment-only mode.
+replaced with a commented example that runs as a server (`[server]` enabled on
+`0.0.0.0:7777` with a random `token`, `[upstream]` commented out); the process
+keeps starting with it and hot-reloads later edits. There is no environment-only
+mode.

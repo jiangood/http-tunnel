@@ -290,7 +290,7 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
         <span class="muted" id="settings-status">加载中…</span>
       </div>
     </form>
-    <p class="hint">配置只来自 <code>ht.toml</code>，保存后会原子写回该文件。只改“上级修改”会立即应用；修改 <code>[server]</code>、Token、上游、重连/保活间隔或并发上限时会先弹框确认，确认后立即重启运行时（重建监听器和上游会话），现有连接和下游会话会短暂断开。取消“启用 [server]”后本节点不再监听任何端口，管理页也会随这个监听器一起消失。默认 <code>[server].bind = "127.0.0.1"</code> 只允许本机访问；Docker、局域网中继或直接公网访问时改成 <code>0.0.0.0</code>。更改 Token 后需要用新 Token 重新登录。<code>[[proxies]]</code> 请在节点卡片的“管理服务”中维护。</p>
+    <p class="hint">配置只来自 <code>ht.toml</code>，保存后会原子写回该文件。只改“上级修改”会立即应用；修改 <code>[server]</code>、Token、上游、重连/保活间隔或并发上限时会先弹框确认，确认后立即重启运行时（重建监听器和上游会话），现有连接和下游会话会短暂断开。取消“启用 [server]”后本节点不再监听任何端口，管理页也会随这个监听器一起消失。生成的配置默认 <code>[server].bind = "0.0.0.0"</code>，监听所有网卡；只允许本机 Nginx/Caddy 反代时改成 <code>127.0.0.1</code>。<code>0.0.0.0</code> 会把端口暴露给所有可达网络，公网部署务必设置强 Token 并用防火墙限制来源。更改 Token 后需要用新 Token 重新登录。<code>[[proxies]]</code> 请在节点卡片的“管理服务”中维护。</p>
   </section>
 
   <section class="card">

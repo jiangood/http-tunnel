@@ -50,7 +50,7 @@ keepalive_interval = 15
 | --- | --- |
 | `[server]` | Server-mode switch. Omit it to never bind a port. |
 | `[server].port` | The listener port for visitors, downstream peers, and the WebSocket endpoint. Defaults to `7777`; `0` picks an ephemeral port and requires `[upstream]`. |
-| `[server].bind` | The listener address, an IPv4/IPv6 literal. Defaults to `127.0.0.1`; use `0.0.0.0` for Docker, a LAN relay, or direct public access. |
+| `[server].bind` | The listener address, an IPv4/IPv6 literal. Defaults to `127.0.0.1` when omitted; the generated template writes `0.0.0.0` so Docker, a LAN relay, or direct public access works out of the box. `0.0.0.0` exposes the port to every reachable network, so keep the token strong and restrict the source with a firewall when it is public. |
 | `[server].domain` | Exact Host reserved for the v4 session and management endpoint. Omit it to serve visitors only, with no control plane. |
 | `[server].token` | Token for downstream peers. May be omitted with `[upstream]`, in which case the upstream token is reused. |
 | `[server].max_pending_handshakes` | Maximum concurrently unauthenticated upgrades. Defaults to `256`. |

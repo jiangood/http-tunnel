@@ -359,14 +359,15 @@ impl Config {
     }
 
     /// Read the configuration file. If it is missing, write the commented
-    /// example and continue with it, so the first start runs as a server
-    /// instead of exiting and asking for an edit.
+    /// example with a fresh random token and continue with it, so the first
+    /// start runs as a server instead of exiting and asking for an edit.
     pub async fn from_file(path: &Path) -> Result<Config> {
         let source = match Config::read(path).await? {
             Some(s) => s,
             None => {
-                Config::write_example(path).await?;
-                DEFAULT_CONFIG.to_string()
+                let source = generated_config();
+                Config::write_example(path, &source).await?;
+                source
             }
         };
         let mut config = Config::parse(&source)
@@ -384,9 +385,9 @@ impl Config {
         }
     }
 
-    /// Write the commented example that a first start uses.
-    pub(crate) async fn write_example(path: &Path) -> Result<()> {
-        fs::write(path, DEFAULT_CONFIG)
+    /// Write the generated config that a first start uses.
+    pub(crate) async fn write_example(path: &Path, source: &str) -> Result<()> {
+        fs::write(path, source)
             .await
             .with_context(|| format!("Failed to generate the default config {:?}", path))
     }
@@ -1127,6 +1128,33 @@ impl ServerLimits {
 /// compile time, so the shipped binary needs no example directory at runtime.
 pub(crate) const DEFAULT_CONFIG: &str = include_str!("../examples/minimal/ht.toml");
 
+/// The length of the random token written into a freshly generated config.
+const GENERATED_TOKEN_LEN: usize = 32;
+
+/// A random lowercase hexadecimal token, the same shape as `openssl rand -hex 16`.
+fn generated_token() -> String {
+    use rand::Rng;
+
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut rng = rand::thread_rng();
+    (0..GENERATED_TOKEN_LEN)
+        .map(|_| HEX[rng.gen_range(0..HEX.len())] as char)
+        .collect()
+}
+
+/// The example with a fresh random `[server].token` enabled.
+///
+/// The shipped example keeps the token commented so it stays a readable
+/// template. The generated file activates it, so a first start never uses the
+/// documented placeholder as its secret.
+pub(crate) fn generated_config() -> String {
+    DEFAULT_CONFIG.replacen(
+        "# token = \"replace-with-the-downstream-secret\"",
+        &format!("token = \"{}\"", generated_token()),
+        1,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1280,10 +1308,9 @@ mod tests {
         for p in paths {
             let s = fs::read_to_string(&p)?;
             let mut config: Config = toml::from_str(&s)?;
-            // The shipped template is a runnable server, so a first start can
+            // Every shipped example is a runnable config, so a first start can
             // use it as-is instead of exiting for an edit.
             Config::validate(&mut config)?;
-            assert_eq!(config.name, "edge");
         }
         Ok(())
     }
@@ -1803,8 +1830,25 @@ local_addr = "127.0.0.1:80"
         let config = Config::from_file(&path).await?;
         assert_eq!(config.listen_port(), Some(DEFAULT_LISTEN_PORT));
         assert!(config.upstream.is_none());
-        assert_eq!(std::fs::read_to_string(&path)?, DEFAULT_CONFIG);
+        let generated = std::fs::read_to_string(&path)?;
+        assert_ne!(generated, DEFAULT_CONFIG);
+        assert!(
+            !generated.contains("replace-with-the-downstream-secret"),
+            "the generated config must not keep the placeholder token"
+        );
+        let token = config
+            .listener_token()
+            .expect("the generated config enables a listener token");
+        assert_eq!(token.len(), GENERATED_TOKEN_LEN);
+        assert!(
+            token.chars().all(|c| c.is_ascii_hexdigit()),
+            "the generated token must be hexadecimal"
+        );
+        assert_eq!(config.bind_host(), "0.0.0.0");
         assert_eq!(config.source.path.as_deref(), Some(path.as_path()));
+
+        // Every generation gets its own token.
+        assert_ne!(generated_token(), generated_token());
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
@@ -1979,6 +2023,7 @@ local_addr = "127.0.0.1:81"
         // `[upstream]` stays commented out.
         assert!(cfg.server.is_some());
         assert!(cfg.upstream.is_none());
+        assert_eq!(cfg.bind_host(), "0.0.0.0");
         assert_eq!(cfg.proxies.len(), 1);
         assert_eq!(disabled_settings(example, "# [server]"), 0);
         assert_eq!(disabled_settings(example, "# [upstream]"), 1);
