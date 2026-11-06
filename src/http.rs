@@ -251,7 +251,7 @@ async fn handle_visitor(
         find_proxy(&proxies, &host).cloned()
     } {
         let request =
-            match crate::helper::gate_auth_header(&prefetched, proxy.auth_header.as_deref()) {
+            match crate::helper::gate_x_auth(&prefetched, proxy.x_auth.as_deref()) {
                 crate::helper::AuthOutcome::Allowed(request) => request,
                 crate::helper::AuthOutcome::Unauthorized(failure) => {
                     info!(
@@ -945,8 +945,8 @@ fn error_response_with_headers(
     response_with_headers(status, &all_headers, &body)
 }
 
-/// The `401` sent when a tunnel sets `auth_header` and the visitor does not
-/// present the expected `X-HTTP-TUNNEL-TOKEN`. It carries no `WWW-Authenticate`:
+/// The `401` sent when a tunnel sets `x_auth` and the visitor does not
+/// present the expected `X-Auth`. It carries no `WWW-Authenticate`:
 /// that header describes an `Authorization` scheme, which this is not.
 pub(crate) fn unauthorized_response(
     failure: crate::helper::AuthFailure,

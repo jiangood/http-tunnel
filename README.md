@@ -12,7 +12,7 @@
 
 - 按 `Host` 路由，支持多域名和 `*.example.com` 泛域名
 - 隧道只使用 WebSocket，推荐 `wss://`；`ws://` 仅用于可信网络
-- `[[proxies]]` 支持 TCP 与 Unix Socket，可选用 `X-HTTP-TUNNEL-TOKEN` 做入口校验
+- `[[proxies]]` 支持 TCP 与 Unix Socket，可选用 `X-Auth` 做入口校验
 - 一条 v4 会话承载所有域名和访客流，多跳时一个进程一跳
 - 管理页和 API 可增删改本地服务，立即生效并写回 `ht.toml`；也能管理已连接下游节点的 `[[proxies]]` 并断开其会话
 - 管理页显示活跃访客和本次运行的累计连接，以及热加载错误；可筛选路由、测试本地服务、导出配置；保存配置时保留原有注释
@@ -106,7 +106,7 @@ curl -i http://app.example.com:7777/
 
 - 只有一台机器（入口和本地服务同机）：[单节点：入口 + 本地代理](#单节点入口--本地代理)
 - 客户端不能直接访问公网入口：[三个节点：服务端 + 中继 + 客户端](#三个节点服务端--中继--客户端)
-- 公网部署：补上 [TLS](#传输模式与-tls)，并给敏感服务的 `[[proxies]]` 加 `auth_header`
+- 公网部署：补上 [TLS](#传输模式与-tls)，并给敏感服务的 `[[proxies]]` 加 `x-auth`
 - 连不上或返回错误：[验证与常见问题](#验证与常见问题)、[错误响应与排查](#错误响应与排查)
 
 ## 拓扑与配置
@@ -279,7 +279,7 @@ curl -i -H "Host: app.example.com" http://127.0.0.1:7777/
 | `[[proxies]].name` | 是 | 无 | 规则名称，进程内唯一 |
 | `[[proxies]].domain` | 是 | 无 | 要匹配的域名，支持如 `*.example.com` 的泛域名 |
 | `[[proxies]].local_addr` | 是 | 无 | 本地目标地址，可使用 TCP 地址或 Unix Socket |
-| `[[proxies]].auth_header` | 否 | 无 | 设置后访客必须携带 `X-HTTP-TUNNEL-TOKEN: <密钥>`，否则返回 `401` |
+| `[[proxies]].x-auth` | 否 | 无 | 设置后访客必须携带 `X-Auth: <密钥>`，否则返回 `401` |
 
 表中“条件”表示按角色判断：`[server]` 与 `[upstream]` 至少要有一个；设置 `[server].domain` 时必须提供 `[server].token`（可直接复用 `[upstream].token`）。未列出的旧键会在启动时被拒绝。
 
@@ -379,11 +379,11 @@ server {
 
 ## 转发配置
 
-所有本地服务都使用 `[[proxies]]`，各字段（`name`、`domain`、`local_addr`、`auth_header`）的必填项和默认值见[配置参考](#配置参考)。
+所有本地服务都使用 `[[proxies]]`，各字段（`name`、`domain`、`local_addr`、`x-auth`）的必填项和默认值见[配置参考](#配置参考)。
 
 `local_addr` 是原始 TCP 地址（`127.0.0.1:3000`）或 Unix Socket（`unix:///var/run/docker.sock`），不是 URL：写成 `http://127.0.0.1:3000` 会在启动或保存规则时报错。
 
-`auth_header` 校验通过后，`X-HTTP-TUNNEL-TOKEN` 会在转发给后端之前被移除，后端看不到密钥。使用自定义头而不是 `Authorization`，不会和后端自己的登录鉴权冲突。
+`x-auth` 校验通过后，`X-Auth` 会在转发给后端之前被移除，后端看不到密钥。使用自定义头而不是 `Authorization`，不会和后端自己的登录鉴权冲突。
 
 ### 用隧道访问 Docker API
 
@@ -394,10 +394,10 @@ Docker API 是普通 HTTP，挂载 socket 后用一条 `[[proxies]]` 即可代�
 name = "docker"
 domain = "docker.example.com"
 local_addr = "unix:///var/run/docker.sock"
-auth_header = "demo-visitor-token"
+x-auth = "demo-visitor-token"
 ```
 
-完整可运行的 compose、Dockerfile、Docker CLI 接入方式和 Windows 说明见 [examples/docker/client-docker-sock](./examples/docker/client-docker-sock/) 与 [examples/docker/README.md](./examples/docker/README.md)。Docker API 等价于宿主机 root：公网部署必须加 TLS 和 `auth_header`，优先只通过 VPN 或内网暴露。Windows 原生 `ht.exe` 不支持 Unix Socket，请让 ht 以 Linux 容器运行。
+完整可运行的 compose、Dockerfile、Docker CLI 接入方式和 Windows 说明见 [examples/docker/client-docker-sock](./examples/docker/client-docker-sock/) 与 [examples/docker/README.md](./examples/docker/README.md)。Docker API 等价于宿主机 root：公网部署必须加 TLS 和 `x-auth`，优先只通过 VPN 或内网暴露。Windows 原生 `ht.exe` 不支持 Unix Socket，请让 ht 以 Linux 容器运行。
 
 ## 多跳细节
 
@@ -434,7 +434,7 @@ keepalive_interval = 15
 
 配置了 `[server].domain` 时管理页面与 API 开启，和访客、v4 会话共用 `[server].port`，只在保留的 `[server].domain` 上可达。浏览器打开 `http://<server.domain>:<server.port>/`，HTTP Basic 用户名填 `ht`，密码填 `[server].token`；页面是一个内联 CSS/JS 的单页控制台，本身不做服务端渲染，所有数据都通过 `/api/*`（Bearer token）获取，可查看状态、活跃访客与本次运行的累计连接、热加载错误、编辑本节点全部配置、管理本地服务、筛选路由表、查看下游节点（含来源 IP）、接口列表和 `ht.toml` 配置项参考。节点卡片中本节点和下游节点的每一行都有“管理服务”，点开后可在弹窗内查看，本节点服务还可以一键“测试”`local_addr` 是否可达，或在允许时增删改该节点自己的 `[[proxies]]`；下游节点行还可以“断开”当前会话。顶部“导出配置”会下载包含注释和 Token 明文的 `ht.toml`；保存配置时会保留文件里的注释和未修改服务的说明。
 
-**上级修改默认关闭。** 下游节点的 `[[proxies]]` 默认只能由本机管理页修改；上一跳仍可列出这些服务（包括 `auth_header` 明文），但写入会返回 `409`。下游节点可以在自己的管理页顶部“上级修改”中切换，切换会立即重连上游会话以重新上报能力位，期间该节点的路由会短暂撤销并重新通告。独立入口没有上游，页面显示“无上游”。
+**上级修改默认关闭。** 下游节点的 `[[proxies]]` 默认只能由本机管理页修改；上一跳仍可列出这些服务（包括 `x-auth` 明文），但写入会返回 `409`。下游节点可以在自己的管理页顶部“上级修改”中切换，切换会立即重连上游会话以重新上报能力位，期间该节点的路由会短暂撤销并重新通告。独立入口没有上游，页面显示“无上游”。
 
 `[server].domain` 不是本机可解析的地址时，可用 `curl -H "Host: <server.domain>" http://127.0.0.1:<server.port>/` 访问；`[server].port = 0` 时管理页也用临时端口，以启动日志为准。没有 `[server]` 或没有 `domain` 时没有管理页。
 
@@ -443,13 +443,13 @@ keepalive_interval = 15
 | GET | `/api/status` | 查看状态、本地服务数、下游节点数、活跃访客与本次运行的累计连接、上级修改开关及是否可编辑、热加载错误、版本、配置文件、运行时长 |
 | GET | `/api/settings` | 查看本节点的全部配置项（含 Token 明文，`[[proxies]]` 除外） |
 | GET | `/api/settings/export` | 下载磁盘上的 `ht.toml`（含注释和 Token 明文），可作为备份 |
-| GET | `/api/proxies` | 列出本地 `[[proxies]]`（含 `auth_header` 明文和来源）；带 `?node=` 或 `?session=` 时列出该下游节点的服务 |
+| GET | `/api/proxies` | 列出本地 `[[proxies]]`（含 `x-auth` 明文和来源）；带 `?node=` 或 `?session=` 时列出该下游节点的服务 |
 | GET | `/api/routes` | 查看当前生效的路由表（本地服务在前，下游 v4 路由在后，均按域名排序） |
 | GET | `/api/sessions` | 列出已连接的下游节点：会话号、节点、网关转发的来源 IP、TCP 对端、角色、连接时长、所属域名、是否可管理/可写与服务来源 |
 | PUT | `/api/settings` | 替换本节点配置并写回 `ht.toml`；`?dry_run=true` 只检查是否需要重启，`?restart=true` 在需要时立即重建运行时。响应含 `restart_required`、`restart_triggered`、`saved` 和 `settings` |
 | POST | `/api/restart` | 按磁盘上的 `ht.toml` 立即重建监听器和上游会话；`ht` 进程本身不退出 |
 | POST | `/api/proxies/{name}/probe` | 从本节点拨号测试该服务的 `local_addr`，3 秒超时；返回 `ok`、`latency_ms` 和错误信息 |
-| PUT | `/api/proxies/{name}` | 新增或替换本地服务，可设置/清除 `auth_header`；带 `?node=`/`?session=` 时写入下游节点 |
+| PUT | `/api/proxies/{name}` | 新增或替换本地服务，可设置/清除 `x-auth`；带 `?node=`/`?session=` 时写入下游节点 |
 | PUT | `/api/settings/allow-upstream-modify` | 只开关本节点是否允许上级修改，请求体 `{"allowed":true}`；保存后立即重连上游会话 |
 | DELETE | `/api/proxies/{name}` | 删除本地服务；带 `?node=`/`?session=` 时删除下游节点的服务 |
 | DELETE | `/api/sessions/{id}` | 断开一个下游会话（节点会按自己的重连间隔重新连上） |
@@ -458,7 +458,7 @@ keepalive_interval = 15
 
 在“节点配置”中保存需要重建运行时的配置时，页面会先弹框提示，确认后才保存并立即重启运行时；取消则不会写入文件。页面上的“重启运行时”按钮也可以随时按磁盘上的 `ht.toml` 强制重建监听器和上游会话。这里的“重启”不会退出 `ht` 进程，只重建监听器和上游会话，期间现有连接会短暂断开。
 
-`GET /api/proxies` 会以明文返回 `auth_header`，管理响应带 `Cache-Control: no-store`；管理面仍必须通过 HTTPS/TLS 访问，且前置代理不要记录响应体。`PUT` 是整体替换：省略、`null` 或空字符串都会关闭该服务的访客认证，管理页会回填当前值。代理管理的帧结构已携带 `auth_header`，同一控制面的所有节点必须运行同一版本；入口会拒绝管理不支持该能力的旧下游并返回 `409`。详见 [docs/management-api.md](./docs/management-api.md)。
+`GET /api/proxies` 会以明文返回 `x-auth`，管理响应带 `Cache-Control: no-store`；管理面仍必须通过 HTTPS/TLS 访问，且前置代理不要记录响应体。`PUT` 是整体替换：省略、`null` 或空字符串都会关闭该服务的访客认证，管理页会回填当前值。代理管理的帧结构已携带 `x-auth`，同一控制面的所有节点必须运行同一版本；入口会拒绝管理不支持该能力的旧下游并返回 `409`。详见 [docs/management-api.md](./docs/management-api.md)。
 
 ## 错误响应与排查
 
@@ -478,7 +478,7 @@ docker logs ht 2>&1 | grep 0123456789abcdef
 | 状态 | 含义 |
 | --- | --- |
 | `400` / `408` / `431` | 访客请求头无法解析、读取超时或过大 |
-| `401` | 本地服务配置了 `auth_header`，但访客缺少或带错 `X-HTTP-TUNNEL-TOKEN` |
+| `401` | 本地服务配置了 `x-auth`，但访客缺少或带错 `X-Auth` |
 | `404` | 没有任何路由匹配该 `Host`，或 `[server].domain` 上的路径不存在 |
 | `502` | 匹配到了隧道，但隧道背后的本地服务连不上 |
 | `503` | 隧道会话无法打开流（正在关闭、流或会话达到上限、会话已断开） |

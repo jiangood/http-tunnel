@@ -47,24 +47,24 @@ Every API call uses a Bearer token, which is also the listener `token`:
 | GET | `/api/status` | Name, transport, upstream, connectivity, proxy count, session count, active/total visitors, reload status, `allow_upstream_modify` and whether it is editable, version, config path, uptime |
 | GET | `/api/settings` | Every setting of the local node, including tokens; `[[proxies]]` is excluded |
 | GET | `/api/settings/export` | Download the on-disk `ht.toml` as `text/toml` with a `Content-Disposition` attachment; comments and tokens are included |
-| GET | `/api/proxies` | List local `[[proxies]]` as `name`/`domain`/`local_addr`/`auth_header`/`source`; with `?node=` or `?session=`, list the proxies of that downstream node |
+| GET | `/api/proxies` | List local `[[proxies]]` as `name`/`domain`/`local_addr`/`x-auth`/`source`; with `?node=` or `?session=`, list the proxies of that downstream node |
 | GET | `/api/routes` | The effective routing table, including v4 owners |
 | GET | `/api/sessions` | The connected downstream v4 sessions: session id, node, version, peer address, forwarded client address, role, uptime, owned domains, `manageable`, `writable` and `proxy_source` |
 | PUT | `/api/settings` | Replace every setting of the local node and write it to `ht.toml`; `?dry_run=true` only checks, `?restart=true` rebuilds the runtime when needed |
 | POST | `/api/restart` | Rebuild the listener and upstream session from the `ht.toml` on disk |
 | POST | `/api/proxies/{name}/probe` | Dial the saved `local_addr` of a local proxy with a 3 s timeout; returns `ok`, `latency_ms` and an optional `error` |
-| PUT | `/api/proxies/{name}` | Create or replace a local proxy, including its `auth_header`; with `?node=`/`?session=`, write it on that downstream node |
+| PUT | `/api/proxies/{name}` | Create or replace a local proxy, including its `x-auth`; with `?node=`/`?session=`, write it on that downstream node |
 | PUT | `/api/settings/allow-upstream-modify` | Allow or forbid the next hop from changing this process's local proxies; body `{"allowed":true}` |
 | DELETE | `/api/proxies/{name}` | Delete a local proxy; with `?node=`/`?session=`, delete it on that downstream node |
 | DELETE | `/api/sessions/{id}` | Close one downstream session |
 
-`GET /api/proxies` returns the visitor token in `auth_header`; the field is
+`GET /api/proxies` returns the visitor token in `x-auth`; the field is
 `null` when authentication is off:
 
 ```json
 [
-  {"name":"app","domain":"app.example.com","local_addr":"127.0.0.1:3000","auth_header":"visitor-secret","source":"file"},
-  {"name":"nas","domain":"nas.example.com","local_addr":"127.0.0.1:80","auth_header":null,"source":"file"}
+  {"name":"app","domain":"app.example.com","local_addr":"127.0.0.1:3000","x-auth":"visitor-secret","source":"file"},
+  {"name":"nas","domain":"nas.example.com","local_addr":"127.0.0.1:80","x-auth":null,"source":"file"}
 ]
 ```
 
@@ -122,22 +122,22 @@ curl -H "Host: edge.lan" -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:7777/api/proxies
 curl -X PUT -H "Host: edge.lan" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"domain":"nas.example.com","local_addr":"127.0.0.1:80","auth_header":"visitor-secret"}' \
+  -d '{"domain":"nas.example.com","local_addr":"127.0.0.1:80","x-auth":"visitor-secret"}' \
   http://127.0.0.1:7777/api/proxies/nas
 ```
 
 `GET /api/proxies` returns the visitor token **in plain text** in
-`auth_header` (`null` when authentication is off). The management responses are
+`x-auth` (`null` when authentication is off). The management responses are
 sent with `Cache-Control: no-store`, but the whole management plane must still
 be reached over HTTPS/TLS: anyone who can read the API response or the management
 token can use the tunnel. A front proxy must not log response bodies.
 
-`PUT` replaces the whole entry. Omitting `auth_header`, sending `null`, or
+`PUT` replaces the whole entry. Omitting `x-auth`, sending `null`, or
 sending an empty string disables visitor authentication; a non-empty value sets
 or rotates it. The value is trimmed and may not contain line breaks or exceed
 8192 bytes. The web page pre-fills the current value, so editing a domain or
 address from the page keeps the token; scripts that change only
-`domain`/`local_addr` must include the current `auth_header` to keep it.
+`domain`/`local_addr` must include the current `x-auth` to keep it.
 
 A change is validated locally, written atomically to `ht.toml`, applied to the
 running server's proxy list, and published on the route watch. An upstream
@@ -328,7 +328,7 @@ The response is the same array as the local endpoint. Each session listed by
   is off.
 
 `[upstream].allow_modify` is `false` by default. The entry may list a downstream
-node's services (including `auth_header`) but a `PUT` or `DELETE` returns `409`.
+node's services (including `x-auth`) but a `PUT` or `DELETE` returns `409`.
 The node can turn the switch on or off from its own management page, which writes
 `[upstream].allow_modify` to its `ht.toml` and reconnects its upstream session at
 once so the new capability is announced. The routes of that node are withdrawn
@@ -339,7 +339,7 @@ own management page: the change is validated, written atomically to that node's
 `ht.toml`, applied to its running proxy list, and published on its route watch.
 The entry node therefore sees the added or withdrawn route without a restart.
 
-The proxy management frames carry `auth_header` now, which is a wire-format
+The proxy management frames carry `x-auth` now, which is a wire-format
 change inside v4. All nodes on one control plane must run the same release. A
 new entry node refuses management of a downstream that does not advertise
 `CAP_PROXY_AUTH` and answers `409` with an upgrade hint, instead of letting the
@@ -349,7 +349,7 @@ Remote management is off by default when both processes are built with the
 `management` feature. A node opts in with `[upstream].allow_modify = true` or
 with its own management page; only then may the previous hop edit its `ht.toml`.
 Anyone who can reach the entry `[server].domain` and knows its token can still
-list the connected downstream nodes' services, including `auth_header`; run only
+list the connected downstream nodes' services, including `x-auth`; run only
 trusted nodes on that control plane, or build without `management` to remove the
 feature.
 
@@ -359,7 +359,7 @@ Failures:
 | --- | --- |
 | `400` | The session id is not a number, `node` and `session` disagree, or the input is invalid |
 | `404` | No session matches the selector, or the proxy does not exist on the node |
-| `409` | The node is not manageable, does not allow upstream writes (`[upstream].allow_modify = false`), is a legacy read-only peer, predates the `auth_header` wire shape, or several sessions share the name |
+| `409` | The node is not manageable, does not allow upstream writes (`[upstream].allow_modify = false`), is a legacy read-only peer, predates the `x-auth` wire shape, or several sessions share the name |
 | `502` | The node rejected the change (for example a domain conflict or an unwritable file) |
 | `504` | The node did not answer within 10 seconds; the change may still have been applied |
 

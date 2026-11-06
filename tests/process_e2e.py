@@ -2,7 +2,7 @@
 """Process-level E2E smoke test for the universal `ht` executable.
 
 Starts real `ht` processes and local HTTP backends, then checks the embedded
-ingress, a leaf with local `[[proxies]]`, the X-HTTP-TUNNEL-TOKEN gate, the
+ingress, a leaf with local `[[proxies]]`, the X-Auth gate, the
 management API, and a route-mirroring relay chain. Only Python's standard
 library is required.
 """
@@ -31,7 +31,7 @@ class BackendHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         payload = json.dumps({
             "authorization": self.headers.get("Authorization"),
-            "tunnel_token": self.headers.get("X-HTTP-TUNNEL-TOKEN"),
+            "tunnel_token": self.headers.get("X-Auth"),
             "path": self.path,
         }).encode()
         self.send_response(200)
@@ -142,7 +142,7 @@ def check_web_management(port):
 def request(port, host, token=None, path="/e2e"):
     headers = {"Host": host}
     if token is not None:
-        headers["X-HTTP-TUNNEL-TOKEN"] = token
+        headers["X-Auth"] = token
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}",
         headers=headers,
@@ -254,7 +254,7 @@ token = "{TOKEN}"
 name = "server-backend"
 domain = "server.e2e.test"
 local_addr = "127.0.0.1:{server_backend.server_port}"
-auth_header = "{SERVER_AUTH}"
+x-auth = "{SERVER_AUTH}"
 """)
         server = start_ht(work, "ingress")
         processes.append(server)
@@ -276,7 +276,7 @@ token = "{TOKEN}"
 name = "client-backend"
 domain = "client.e2e.test"
 local_addr = "127.0.0.1:{client_backend.server_port}"
-auth_header = "{CLIENT_AUTH}"
+x-auth = "{CLIENT_AUTH}"
 
 [upstream]
 url = "ws://127.0.0.1:{server_port}"
@@ -312,7 +312,7 @@ retry_interval = 1
                 f"{host}: the token must be stripped before the backend, "
                 f"got {body['tunnel_token']!r}"
             )
-            print(f"PASS {host}: real ht ingress/leaf gated the request by X-HTTP-TUNNEL-TOKEN")
+            print(f"PASS {host}: real ht ingress/leaf gated the request by X-Auth")
 
         for host in ("server.e2e.test", "client.e2e.test"):
             try:
@@ -320,7 +320,7 @@ retry_interval = 1
             except urllib.error.HTTPError as exc:
                 assert exc.code == 401, f"{host}: expected 401 without the token, got {exc.code}"
                 body = exc.read().decode()
-                assert "Missing X-HTTP-TUNNEL-TOKEN header" in body, (
+                assert "Missing X-Auth header" in body, (
                     f"{host}: unexpected 401 body {body!r}"
                 )
             else:
@@ -332,7 +332,7 @@ retry_interval = 1
             except urllib.error.HTTPError as exc:
                 assert exc.code == 401, f"{host}: expected 401 for a wrong token, got {exc.code}"
                 body = exc.read().decode()
-                assert "Invalid X-HTTP-TUNNEL-TOKEN header" in body, (
+                assert "Invalid X-Auth header" in body, (
                     f"{host}: unexpected 401 body {body!r}"
                 )
             else:
@@ -365,7 +365,7 @@ token = "{TOKEN}"
 name = "chain-backend"
 domain = "chain.e2e.test"
 local_addr = "127.0.0.1:{client_backend.server_port}"
-auth_header = "{CLIENT_AUTH}"
+x-auth = "{CLIENT_AUTH}"
 
 [upstream]
 url = "ws://127.0.0.1:{node_port}"

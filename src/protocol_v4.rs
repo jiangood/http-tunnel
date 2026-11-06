@@ -37,7 +37,7 @@ pub const CAP_PROXY_ADMIN: u32 = 1 << 0;
 /// The peer also allows its local `[[proxies]]` to be changed.
 pub const CAP_PROXY_WRITE: u32 = 1 << 1;
 /// The peer speaks the `ProxyEntry`/`ProxyOp::Put` shape that carries
-/// `auth_header`. It is a wire-format change, so an upstream refuses proxy
+/// `x-auth`. It is a wire-format change, so an upstream refuses proxy
 /// management on a peer that does not announce it instead of causing a decode
 /// failure.
 pub const CAP_PROXY_AUTH: u32 = 1 << 2;
@@ -75,7 +75,7 @@ pub struct ProxyEntry {
     pub domain: String,
     pub local_addr: String,
     /// The visitor token of this proxy, if authentication is enabled
-    pub auth_header: Option<MaskedString>,
+    pub x_auth: Option<MaskedString>,
 }
 
 /// A management operation the upstream asks a downstream node to perform on its
@@ -88,7 +88,7 @@ pub enum ProxyOp {
         domain: String,
         local_addr: String,
         /// Replace the whole entry, so `None` disables visitor authentication
-        auth_header: Option<MaskedString>,
+        x_auth: Option<MaskedString>,
     },
     Delete {
         name: String,
@@ -180,7 +180,7 @@ pub enum SessionFrame {
         stream_id: u32,
         domain: String,
         /// The visitor's prefetched HTTP header. The downstream applies its
-        /// `auth_header`, if any, before connecting.
+        /// `x-auth`, if any, before connecting.
         header: Vec<u8>,
         trace_id: Vec<u8>,
         hop: u8,
@@ -344,7 +344,7 @@ mod tests {
                     name: "nas".to_string(),
                     domain: "nas.example.com".to_string(),
                     local_addr: "127.0.0.1:80".to_string(),
-                    auth_header: Some(MaskedString::from("visitor-secret")),
+                    x_auth: Some(MaskedString::from("visitor-secret")),
                 },
             },
             SessionFrame::ProxyResponse {
@@ -353,7 +353,7 @@ mod tests {
                     name: "nas".to_string(),
                     domain: "nas.example.com".to_string(),
                     local_addr: "127.0.0.1:80".to_string(),
-                    auth_header: Some(MaskedString::from("visitor-secret")),
+                    x_auth: Some(MaskedString::from("visitor-secret")),
                 }],
                 error: None,
             },

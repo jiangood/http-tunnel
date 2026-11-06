@@ -35,14 +35,14 @@ pub async fn connect_local(addr: &str) -> Result<BoxLocalIo> {
     )?))
 }
 
-/// The request header a visitor must present when a tunnel sets `auth_header`.
+/// The request header a visitor must present when a tunnel sets `x-auth`.
 ///
 /// It's a custom header on purpose: applications routinely use `Authorization`
 /// for their own authentication, so checking that header would conflict with
 /// them. The name is matched case-insensitively, as HTTP requires.
-pub const AUTH_HEADER_NAME: &str = "X-HTTP-TUNNEL-TOKEN";
+pub const AUTH_HEADER_NAME: &str = "X-Auth";
 
-/// The result of checking a request against the `auth_header` of a tunnel.
+/// The result of checking a request against the `x-auth` of a tunnel.
 #[derive(Debug)]
 pub enum AuthOutcome {
     /// The request may be forwarded. Its head has the auth header removed.
@@ -57,9 +57,9 @@ pub enum AuthOutcome {
 /// reveals whether the header was present, never the secret itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthFailure {
-    /// The request carried no `X-HTTP-TUNNEL-TOKEN` at all.
+    /// The request carried no `X-Auth` at all.
     Missing,
-    /// The request carried an `X-HTTP-TUNNEL-TOKEN` that did not match.
+    /// The request carried an `X-Auth` that did not match.
     Invalid,
 }
 
@@ -67,20 +67,20 @@ impl AuthFailure {
     /// The plain-text body of the `401` that is sent to the visitor.
     pub fn message(self) -> &'static str {
         match self {
-            AuthFailure::Missing => "Missing X-HTTP-TUNNEL-TOKEN header\n",
-            AuthFailure::Invalid => "Invalid X-HTTP-TUNNEL-TOKEN header\n",
+            AuthFailure::Missing => "Missing X-Auth header\n",
+            AuthFailure::Invalid => "Invalid X-Auth header\n",
         }
     }
 }
 
-/// Check `X-HTTP-TUNNEL-TOKEN` of a request head against the optional secret of
+/// Check `X-Auth` of a request head against the optional secret of
 /// a tunnel, and strip the header before the request is forwarded.
 ///
 /// With no secret configured the request passes through untouched. Otherwise the
-/// request must send `X-HTTP-TUNNEL-TOKEN: <secret>`; the header is always
+/// request must send `X-Auth: <secret>`; the header is always
 /// removed from the forwarded head, so the secret never reaches the backend.
 /// The `Authorization` header is left alone, whatever the application makes of it.
-pub fn gate_auth_header(header: &[u8], auth: Option<&str>) -> AuthOutcome {
+pub fn gate_x_auth(header: &[u8], auth: Option<&str>) -> AuthOutcome {
     let Some(auth) = auth else {
         return AuthOutcome::Allowed(header.to_vec());
     };
@@ -351,62 +351,62 @@ mod tests {
     }
 
     #[test]
-    fn test_gate_auth_header_passes_through_when_disabled() {
+    fn test_gate_x_auth_passes_through_when_disabled() {
         // Without a secret the request is forwarded byte for byte, even an
         // `Authorization` that another application would use.
         let head = b"GET / HTTP/1.1\r\nHost: a.test\r\nAuthorization: Bearer app\r\n\r\n";
-        assert_eq!(allowed(gate_auth_header(head, None)), head);
+        assert_eq!(allowed(gate_x_auth(head, None)), head);
     }
 
     #[test]
-    fn test_gate_auth_header_accepts_and_strips_the_token() {
+    fn test_gate_x_auth_accepts_and_strips_the_token() {
         let head =
-            b"GET / HTTP/1.1\r\nHost: a.test\r\nX-HTTP-TUNNEL-TOKEN: s3cret\r\nAccept: */*\r\n\r\n";
-        let out = String::from_utf8(allowed(gate_auth_header(head, Some("s3cret")))).unwrap();
+            b"GET / HTTP/1.1\r\nHost: a.test\r\nX-Auth: s3cret\r\nAccept: */*\r\n\r\n";
+        let out = String::from_utf8(allowed(gate_x_auth(head, Some("s3cret")))).unwrap();
         assert!(out.contains("Host: a.test\r\n"));
         assert!(out.contains("Accept: */*\r\n"));
-        assert!(!out.to_lowercase().contains("x-http-tunnel-token"));
+        assert!(!out.to_lowercase().contains("x-auth"));
         assert!(out.ends_with("\r\n\r\n"));
     }
 
     #[test]
-    fn test_gate_auth_header_name_is_case_insensitive() {
-        let head = b"GET / HTTP/1.1\r\nhost: a.test\r\nx-http-tunnel-token: abc\r\n\r\n";
+    fn test_gate_x_auth_name_is_case_insensitive() {
+        let head = b"GET / HTTP/1.1\r\nhost: a.test\r\nx-auth: abc\r\n\r\n";
         assert!(matches!(
-            gate_auth_header(head, Some("abc")),
+            gate_x_auth(head, Some("abc")),
             AuthOutcome::Allowed(_)
         ));
     }
 
     #[test]
-    fn test_gate_auth_header_tolerates_value_whitespace() {
-        let head = b"GET / HTTP/1.1\r\nHost: a.test\r\nX-HTTP-TUNNEL-TOKEN:   abc \r\n\r\n";
+    fn test_gate_x_auth_tolerates_value_whitespace() {
+        let head = b"GET / HTTP/1.1\r\nHost: a.test\r\nX-Auth:   abc \r\n\r\n";
         assert!(matches!(
-            gate_auth_header(head, Some("abc")),
+            gate_x_auth(head, Some("abc")),
             AuthOutcome::Allowed(_)
         ));
     }
 
     #[test]
-    fn test_gate_auth_header_reports_the_reason() {
+    fn test_gate_x_auth_reports_the_reason() {
         // No header at all: the visitor is told it is missing
         let missing = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n";
         assert_eq!(
-            rejected(gate_auth_header(missing, Some("s3cret"))),
+            rejected(gate_x_auth(missing, Some("s3cret"))),
             AuthFailure::Missing
         );
 
         // A header that does not match: the visitor is told it is invalid
-        let wrong = b"GET / HTTP/1.1\r\nHost: a.test\r\nX-HTTP-TUNNEL-TOKEN: nope\r\n\r\n";
+        let wrong = b"GET / HTTP/1.1\r\nHost: a.test\r\nX-Auth: nope\r\n\r\n";
         assert_eq!(
-            rejected(gate_auth_header(wrong, Some("s3cret"))),
+            rejected(gate_x_auth(wrong, Some("s3cret"))),
             AuthFailure::Invalid
         );
 
         // An incomplete head cannot be inspected, so it is reported as missing
         let partial = b"GET / HTTP/1.1\r\nHost: a.test\r\n";
         assert_eq!(
-            rejected(gate_auth_header(partial, Some("s3cret"))),
+            rejected(gate_x_auth(partial, Some("s3cret"))),
             AuthFailure::Missing
         );
     }
@@ -415,10 +415,10 @@ mod tests {
     fn test_auth_failure_messages_name_the_header() {
         assert!(AuthFailure::Missing
             .message()
-            .contains("X-HTTP-TUNNEL-TOKEN"));
+            .contains("X-Auth"));
         assert!(AuthFailure::Invalid
             .message()
-            .contains("X-HTTP-TUNNEL-TOKEN"));
+            .contains("X-Auth"));
         assert!(AuthFailure::Missing.message().ends_with('\n'));
         assert!(AuthFailure::Invalid.message().ends_with('\n'));
     }
@@ -478,9 +478,9 @@ mod tests {
     }
 
     #[test]
-    fn test_gate_auth_header_keeps_the_body_and_the_authorization() {
-        let head = b"POST / HTTP/1.1\r\nHost: a.test\r\nAuthorization: Bearer app\r\nX-HTTP-TUNNEL-TOKEN: s\r\n\r\nhello";
-        let out = String::from_utf8(allowed(gate_auth_header(head, Some("s")))).unwrap();
+    fn test_gate_x_auth_keeps_the_body_and_the_authorization() {
+        let head = b"POST / HTTP/1.1\r\nHost: a.test\r\nAuthorization: Bearer app\r\nX-Auth: s\r\n\r\nhello";
+        let out = String::from_utf8(allowed(gate_x_auth(head, Some("s")))).unwrap();
         assert!(out.contains("Authorization: Bearer app\r\n"));
         assert!(out.ends_with("\r\n\r\nhello"));
     }

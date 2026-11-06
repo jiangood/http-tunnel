@@ -240,7 +240,8 @@ struct ProxyView {
     local_addr: String,
     /// The visitor token, in plain text. The management response is always
     /// `no-store`, and the whole management plane is meant to run behind TLS.
-    auth_header: Option<String>,
+    #[serde(rename = "x-auth")]
+    x_auth: Option<String>,
     /// `file` for this node; a legacy downstream peer may still report `env`
     source: &'static str,
 }
@@ -250,7 +251,7 @@ fn proxy_view(proxy: &ServerProxyEntry, source: &'static str) -> ProxyView {
         name: proxy.name.clone(),
         domain: proxy.domain.clone(),
         local_addr: proxy.local_addr.clone(),
-        auth_header: proxy.auth_header.as_deref().map(str::to_string),
+        x_auth: proxy.x_auth.as_deref().map(str::to_string),
         source,
     }
 }
@@ -293,8 +294,8 @@ struct PutProxy {
     local_addr: String,
     /// PUT replaces the whole entry: an omitted, `null` or empty value disables
     /// visitor authentication.
-    #[serde(default)]
-    auth_header: Option<String>,
+    #[serde(default, rename = "x-auth")]
+    x_auth: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -466,8 +467,8 @@ fn parse_session_id(id: &str) -> std::result::Result<u64, ApiError> {
 /// Trim an incoming visitor token and turn an empty value into "no auth".
 ///
 /// The length limit keeps an API call from writing an arbitrarily large header
-/// into `ht.toml`; line breaks would break the `X-HTTP-TUNNEL-TOKEN` header.
-fn normalize_auth_header(
+/// into `ht.toml`; line breaks would break the `X-Auth` header.
+fn normalize_x_auth(
     value: Option<String>,
 ) -> std::result::Result<Option<MaskedString>, ApiError> {
     let Some(value) = value else {
@@ -480,19 +481,19 @@ fn normalize_auth_header(
     if value.contains('\r') || value.contains('\n') {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
-            "The `auth_header` must not contain line breaks".to_string(),
+            "The `x-auth` must not contain line breaks".to_string(),
         ));
     }
     if value.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
-            "The `auth_header` must not contain control characters".to_string(),
+            "The `x-auth` must not contain control characters".to_string(),
         ));
     }
     if value.len() > 8192 {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
-            "The `auth_header` must not exceed 8192 bytes".to_string(),
+            "The `x-auth` must not exceed 8192 bytes".to_string(),
         ));
     }
     Ok(Some(MaskedString::from(value)))
@@ -776,13 +777,13 @@ async fn put_proxy(
     let PutProxy {
         domain,
         local_addr,
-        auth_header,
+        x_auth,
     } = body;
-    let auth_header = normalize_auth_header(auth_header)?;
+    let x_auth = normalize_x_auth(x_auth)?;
     if node.is_none() && session.is_none() {
         state
             .management
-            .put_proxy(name.clone(), domain, local_addr, auth_header.clone())
+            .put_proxy(name.clone(), domain, local_addr, x_auth.clone())
             .await
             .map_err(|e| ApiError::from_reason(format!("{:#}", e)))?;
         return match state
@@ -807,7 +808,7 @@ async fn put_proxy(
             name.clone(),
             domain,
             local_addr,
-            auth_header,
+            x_auth,
         )
         .await
         .map_err(ApiError::from_session)?;

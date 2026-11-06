@@ -564,7 +564,7 @@ pub(crate) async fn run_router(
                     route_rx,
                     RouteTarget {
                         local_addr: target.clone(),
-                        auth_header: None,
+                        x_auth: None,
                         internal: true,
                     },
                 ),
@@ -767,7 +767,7 @@ async fn direct_route_map(state: &ServerState) -> RouteMap {
                 proxy.domain.clone(),
                 RouteTarget {
                     local_addr: proxy.local_addr.clone(),
-                    auth_header: proxy.auth_header.clone(),
+                    x_auth: proxy.x_auth.clone(),
                     internal: false,
                 },
             )
@@ -853,13 +853,13 @@ async fn run_proxy_admin(
                 name,
                 domain,
                 local_addr,
-                auth_header,
+                x_auth,
                 reply,
             } => {
                 let result: Result<Vec<crate::config::ServerProxyEntry>> = async {
                     ensure_upstream_may_modify(&management)?;
                     management
-                        .put_proxy(name, domain, local_addr, auth_header)
+                        .put_proxy(name, domain, local_addr, x_auth)
                         .await?;
                     Ok(management.proxies().await)
                 }

@@ -224,8 +224,37 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
   </section>
 
   <section class="card">
-    <h2>节点配置</h2>
+    <div class="card-head">
+      <h2>节点配置</h2>
+      <div class="row-actions">
+        <button class="btn small" type="button" id="settings-restart">重启运行时</button>
+        <button class="btn primary small" type="button" id="settings-edit">编辑配置</button>
+      </div>
+    </div>
+    <div class="meta" id="settings-meta">
+      <div><span class="k">名称</span><span class="v" id="s-name">—</span></div>
+      <div><span class="k">服务端 [server]</span><span class="v" id="s-server">—</span></div>
+      <div><span class="k">监听</span><span class="v mono" id="s-listen">—</span></div>
+      <div><span class="k">[server].domain</span><span class="v mono" id="s-server-domain">—</span></div>
+      <div><span class="k">[server].token</span><span class="v" id="s-server-token">—</span></div>
+      <div><span class="k">服务端保活间隔（秒）</span><span class="v mono" id="s-server-keepalive">—</span></div>
+      <div><span class="k">待握手升级上限</span><span class="v mono" id="s-server-handshakes">—</span></div>
+      <div><span class="k">v4 会话上限</span><span class="v mono" id="s-server-sessions">—</span></div>
+      <div><span class="k">上游地址</span><span class="v mono" id="s-upstream-url">—</span></div>
+      <div><span class="k">上游 Token</span><span class="v" id="s-upstream-token">—</span></div>
+      <div><span class="k">重连间隔（秒）</span><span class="v mono" id="s-upstream-retry">—</span></div>
+      <div><span class="k">上游保活间隔（秒）</span><span class="v mono" id="s-upstream-keepalive">—</span></div>
+      <div><span class="k">上级修改</span><span class="v" id="s-upstream-modify">—</span></div>
+    </div>
+    <p class="hint">默认只展示当前配置，修改请点击“编辑配置”在弹窗中操作。配置只来自 <code>ht.toml</code>，保存后会原子写回该文件。只改“上级修改”会立即应用；修改 <code>[server]</code>、Token、上游、重连/保活间隔或并发上限时会先弹框确认，确认后立即重启运行时（重建监听器和上游会话），现有连接和下游会话会短暂断开。取消“启用 [server]”后本节点不再监听任何端口，管理页也会随这个监听器一起消失。生成的配置默认 <code>[server].bind = "0.0.0.0"</code>，监听所有网卡；只允许本机 Nginx/Caddy 反代时改成 <code>127.0.0.1</code>。<code>0.0.0.0</code> 会把端口暴露给所有可达网络，公网部署务必设置强 Token 并用防火墙限制来源。更改 Token 后需要用新 Token 重新登录。<code>[[proxies]]</code> 请在节点卡片的“管理服务”中维护。</p>
+  </section>
+
+  <dialog class="modal wide" id="settings-dialog" closedby="none" aria-labelledby="settings-dialog-title">
     <form id="settings-form" autocomplete="off">
+      <div class="modal-head">
+        <h2 id="settings-dialog-title">编辑节点配置</h2>
+        <button class="btn small icon" type="button" id="settings-dialog-close" aria-label="关闭">✕</button>
+      </div>
       <div class="grid">
         <fieldset>
           <legend>基本</legend>
@@ -284,14 +313,14 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
           <label class="check"><input name="allow_upstream_modify" type="checkbox"> 允许上一跳通过 v4 管理通道修改本节点的 <code>[[proxies]]</code></label>
         </fieldset>
       </div>
-      <div class="actions">
+      <p class="hint" id="settings-dialog-hint">配置只来自 <code>ht.toml</code>，保存后会原子写回该文件。只改“上级修改”会立即应用；修改 <code>[server]</code>、Token、上游、重连/保活间隔或并发上限时会先弹框确认，确认后立即重启运行时。</p>
+      <div class="modal-foot">
+        <span class="muted" id="settings-status"></span>
+        <button class="btn" type="button" id="settings-cancel">取消</button>
         <button class="btn primary" type="submit" id="settings-save">保存配置</button>
-        <button class="btn" type="button" id="settings-restart">重启运行时</button>
-        <span class="muted" id="settings-status">加载中…</span>
       </div>
     </form>
-    <p class="hint">配置只来自 <code>ht.toml</code>，保存后会原子写回该文件。只改“上级修改”会立即应用；修改 <code>[server]</code>、Token、上游、重连/保活间隔或并发上限时会先弹框确认，确认后立即重启运行时（重建监听器和上游会话），现有连接和下游会话会短暂断开。取消“启用 [server]”后本节点不再监听任何端口，管理页也会随这个监听器一起消失。生成的配置默认 <code>[server].bind = "0.0.0.0"</code>，监听所有网卡；只允许本机 Nginx/Caddy 反代时改成 <code>127.0.0.1</code>。<code>0.0.0.0</code> 会把端口暴露给所有可达网络，公网部署务必设置强 Token 并用防火墙限制来源。更改 Token 后需要用新 Token 重新登录。<code>[[proxies]]</code> 请在节点卡片的“管理服务”中维护。</p>
-  </section>
+  </dialog>
 
   <section class="card">
     <h2>接口列表</h2>
@@ -304,12 +333,12 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/status</td><td class="muted">Bearer</td><td class="muted">进程状态：名称、传输、上游、连通性、服务数、下游节点数、活跃访客与本次运行的累计连接、上级修改开关及是否可编辑、热加载错误、版本、配置文件、运行时长</td></tr>
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/settings</td><td class="muted">Bearer</td><td class="muted">本节点的全部配置项（含 Token 明文），<code>[[proxies]]</code> 除外</td></tr>
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/settings/export</td><td class="muted">Bearer</td><td class="muted">下载磁盘上的 <code>ht.toml</code>（含注释和 Token 明文）</td></tr>
-          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/proxies</td><td class="muted">Bearer</td><td class="muted">列出本地服务、<code>auth_header</code> 明文及来源；加 <code>?node=</code> 或 <code>?session=</code> 时列出该下游节点自己的服务</td></tr>
+          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/proxies</td><td class="muted">Bearer</td><td class="muted">列出本地服务、<code>x-auth</code> 明文及来源；加 <code>?node=</code> 或 <code>?session=</code> 时列出该下游节点自己的服务</td></tr>
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/routes</td><td class="muted">Bearer</td><td class="muted">生效中的路由表，包含 v4 会话</td></tr>
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/sessions</td><td class="muted">Bearer</td><td class="muted">已连接的下游节点：会话号、节点、版本、网关转发的来源 IP、TCP 对端、角色、连接时长、所属域名与是否可管理</td></tr>
           <tr><td><span class="tag method-put">PUT</span></td><td class="mono">/api/settings</td><td class="muted">Bearer</td><td class="muted">替换本节点配置并写回 <code>ht.toml</code>；<code>?dry_run=true</code> 只检查是否需要重启，<code>?restart=true</code> 在需要时立即重建运行时。响应含 <code>restart_required</code>、<code>restart_triggered</code>、<code>saved</code> 和 <code>settings</code></td></tr>
           <tr><td><span class="tag method-post">POST</span></td><td class="mono">/api/restart</td><td class="muted">Bearer</td><td class="muted">按磁盘上的 <code>ht.toml</code> 立即重建监听器和上游会话，进程本身不退出</td></tr>
-          <tr><td><span class="tag method-put">PUT</span></td><td class="mono">/api/proxies/{name}</td><td class="muted">Bearer</td><td class="muted">新增或替换服务，请求体 <code>{"domain":"…","local_addr":"…","auth_header":"…"}</code>；省略或 <code>null</code> 表示关闭访客认证。带 <code>?node=</code>/<code>?session=</code> 时写入下游节点</td></tr>
+          <tr><td><span class="tag method-put">PUT</span></td><td class="mono">/api/proxies/{name}</td><td class="muted">Bearer</td><td class="muted">新增或替换服务，请求体 <code>{"domain":"…","local_addr":"…","x-auth":"…"}</code>；省略或 <code>null</code> 表示关闭访客认证。带 <code>?node=</code>/<code>?session=</code> 时写入下游节点</td></tr>
           <tr><td><span class="tag method-post">POST</span></td><td class="mono">/api/proxies/{name}/probe</td><td class="muted">Bearer</td><td class="muted">从本节点拨号测试该服务的 <code>local_addr</code>，3 秒超时；返回 <code>ok</code>、<code>latency_ms</code> 和错误信息。仅支持本节点服务</td></tr>
           <tr><td><span class="tag method-put">PUT</span></td><td class="mono">/api/settings/allow-upstream-modify</td><td class="muted">Bearer</td><td class="muted">只开关本节点是否允许上级修改本地服务，请求体 <code>{"allowed":true}</code>；保存后立即重连上游会话，无上游时返回 <code>409</code></td></tr>
           <tr><td><span class="tag method-delete">DELETE</span></td><td class="mono">/api/proxies/{name}</td><td class="muted">Bearer</td><td class="muted">删除服务；带 <code>?node=</code>/<code>?session=</code> 时删除下游节点的服务</td></tr>
@@ -318,7 +347,7 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
         </tbody>
       </table>
     </div>
-    <p class="hint">所有 <code>/api/*</code> 使用 <code>Authorization: Bearer &lt;token&gt;</code>；页面本身使用 HTTP Basic，用户名 <code>ht</code>，密码为 token。错误响应为 <code>{"error":"…","request_id":"…"}</code>。下游参数 <code>node</code> 与 <code>session</code> 可同时给出，必须指向同一会话；不给出时只操作本进程。管理响应带 <code>Cache-Control: no-store</code>，但 <code>auth_header</code> 以明文返回，管理面必须通过 HTTPS 访问；同一控制面的节点需运行同一版本。</p>
+    <p class="hint">所有 <code>/api/*</code> 使用 <code>Authorization: Bearer &lt;token&gt;</code>；页面本身使用 HTTP Basic，用户名 <code>ht</code>，密码为 token。错误响应为 <code>{"error":"…","request_id":"…"}</code>。下游参数 <code>node</code> 与 <code>session</code> 可同时给出，必须指向同一会话；不给出时只操作本进程。管理响应带 <code>Cache-Control: no-store</code>，但 <code>x-auth</code> 以明文返回，管理面必须通过 HTTPS 访问；同一控制面的节点需运行同一版本。</p>
   </section>
 
   <section class="card">
@@ -343,7 +372,7 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
           <tr><td class="mono strong">[upstream].allow_modify</td><td class="mono muted">false</td><td class="muted">是否允许上一跳通过 v4 管理通道修改本节点的 <code>[[proxies]]</code>；关闭时上级仍可列出服务</td></tr>
           <tr><td class="mono strong">[upstream].retry_interval</td><td class="mono muted">1</td><td class="muted">重连上一跳的间隔（秒）</td></tr>
           <tr><td class="mono strong">[upstream].keepalive_interval</td><td class="mono muted">15</td><td class="muted">上游 WebSocket ping 间隔（秒），<code>0</code> 关闭保活</td></tr>
-          <tr><td class="mono strong">[[proxies]]</td><td class="muted">空</td><td class="muted">本节点直接服务的本地服务，字段为 <code>name</code>、<code>domain</code>、<code>local_addr</code> 和可选的 <code>auth_header</code></td></tr>
+          <tr><td class="mono strong">[[proxies]]</td><td class="muted">空</td><td class="muted">本节点直接服务的本地服务，字段为 <code>name</code>、<code>domain</code>、<code>local_addr</code> 和可选的 <code>x-auth</code></td></tr>
         </tbody>
       </table>
     </div>
@@ -376,7 +405,7 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
       </fieldset>
       <fieldset class="span2">
         <legend>访客认证（可选）</legend>
-        <label>X-HTTP-TUNNEL-TOKEN<input name="auth_header" autocomplete="new-password" spellcheck="false" placeholder="留空表示关闭认证；编辑时会回填当前密钥"></label>
+        <label>X-Auth<input name="x_auth" autocomplete="new-password" spellcheck="false" placeholder="留空表示关闭认证；编辑时会回填当前密钥"></label>
       </fieldset>
     </div>
     <p class="hint" id="dialog-hint">名称只允许字母、数字、点、下划线和短横线。密钥会以明文显示，管理面必须通过 HTTPS 访问。</p>
@@ -871,8 +900,49 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
 
   $("settings-form").elements.server_enabled.addEventListener("change", syncServerFields);
 
+  function tokenState(value) {
+    return value ? '<span class="tag">已设置</span>' : '<span class="muted">未设置</span>';
+  }
+
+  function renderSettingsMeta(settings) {
+    $("s-name").textContent = settings.name || "—";
+    if (settings.server) {
+      $("s-server").innerHTML = '<span class="tag local">已启用</span>';
+      $("s-listen").textContent = (settings.server.bind || "127.0.0.1") + ":" + settings.server.port;
+      $("s-server-domain").textContent = settings.server.domain || "—";
+      $("s-server-token").innerHTML = tokenState(settings.server.token);
+      $("s-server-keepalive").textContent = settings.server.keepalive_interval;
+      $("s-server-handshakes").textContent = settings.server.max_pending_handshakes;
+      $("s-server-sessions").textContent = settings.server.max_sessions;
+    } else {
+      $("s-server").innerHTML = '<span class="tag env">未启用</span>';
+      $("s-listen").textContent = "—";
+      $("s-server-domain").textContent = "—";
+      $("s-server-token").innerHTML = tokenState(null);
+      $("s-server-keepalive").textContent = "—";
+      $("s-server-handshakes").textContent = "—";
+      $("s-server-sessions").textContent = "—";
+    }
+    if (settings.upstream) {
+      $("s-upstream-url").textContent = settings.upstream.url;
+      $("s-upstream-token").innerHTML = tokenState(settings.upstream.token);
+      $("s-upstream-retry").textContent = settings.upstream.retry_interval;
+      $("s-upstream-keepalive").textContent = settings.upstream.keepalive_interval;
+      $("s-upstream-modify").innerHTML = settings.upstream.allow_modify
+        ? '<span class="tag local">允许</span>'
+        : '<span class="tag env">禁止</span>';
+    } else {
+      $("s-upstream-url").textContent = "—";
+      $("s-upstream-token").innerHTML = tokenState(null);
+      $("s-upstream-retry").textContent = "—";
+      $("s-upstream-keepalive").textContent = "—";
+      $("s-upstream-modify").innerHTML = '<span class="muted" title="没有 [upstream]，本进程是独立入口">无上游</span>';
+    }
+  }
+
   function renderSettings(settings) {
     settingsCache = settings;
+    renderSettingsMeta(settings);
     var form = $("settings-form");
     form.elements.name.value = settings.name || "";
     form.elements.server_enabled.checked = !!settings.server;
@@ -983,6 +1053,7 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
       if (!result) { return; }
       settingsCache = result.settings;
       renderSettings(result.settings);
+      closeSettingsDialog();
       if (result.restart_triggered) {
         $("settings-status").textContent = "已保存，正在重启运行时…";
         toast("已保存，正在重启运行时");
@@ -1003,6 +1074,28 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
     }).then(function () {
       button.disabled = false;
     });
+  });
+
+  var settingsDialog = $("settings-dialog");
+
+  function closeSettingsDialog() {
+    if (settingsDialog.open) { settingsDialog.close(); }
+  }
+
+  $("settings-edit").addEventListener("click", function () {
+    // 弹窗每次打开都回填最近一次拉到的配置，避免残留上一次未保存的修改。
+    if (settingsCache) { renderSettings(settingsCache); }
+    settingsDialog.showModal();
+    $("settings-form").elements.name.focus();
+  });
+
+  $("settings-dialog-close").addEventListener("click", closeSettingsDialog);
+  $("settings-cancel").addEventListener("click", closeSettingsDialog);
+
+  settingsDialog.addEventListener("close", function () {
+    settingsDirty = false;
+    $("settings-status").textContent = "";
+    if (settingsCache) { renderSettings(settingsCache); }
   });
 
   $("settings-restart").addEventListener("click", function () {
@@ -1340,7 +1433,7 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
     form.elements.name.value = proxy ? proxy.name : "";
     form.elements.domain.value = proxy ? proxy.domain : "";
     form.elements.local_addr.value = proxy ? proxy.local_addr : "";
-    form.elements.auth_header.value = proxy && proxy.auth_header ? proxy.auth_header : "";
+    form.elements.x_auth.value = proxy && proxy["x-auth"] ? proxy["x-auth"] : "";
     var where = dialogScope ? "下游节点 " + dialogScope.node + " 的本地服务" : "本节点服务";
     $("dialog-title").textContent = (proxy ? "编辑" : "新增") + where;
     $("dialog-hint").textContent = proxy
@@ -1369,7 +1462,7 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
     var name = String(fields.get("name") || "").trim();
     var domain = String(fields.get("domain") || "").trim();
     var localAddr = String(fields.get("local_addr") || "").trim();
-    var authHeader = String(fields.get("auth_header") || "").trim();
+    var authHeader = String(fields.get("x_auth") || "").trim();
     if (!name || !domain || !localAddr) { return; }
 
     var scope = dialogScope;
@@ -1380,7 +1473,7 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
       body: JSON.stringify({
         domain: domain,
         local_addr: localAddr,
-        auth_header: authHeader || null
+        "x-auth": authHeader || null
       })
     }).then(function () {
       toast((editing ? "已更新 " : "已新增 ") + name);
@@ -1533,7 +1626,7 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
         '<td class="strong">' + esc(proxy.name) + "</td>" +
         '<td class="mono">' + esc(proxy.domain) + "</td>" +
         '<td class="mono muted">' + esc(proxy.local_addr) + "</td>" +
-        '<td>' + (proxy.auth_header
+        '<td>' + (proxy["x-auth"]
           ? '<span class="tag">已启用</span>'
           : '<span class="muted">—</span>') + "</td>" +
         actionCell +

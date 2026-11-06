@@ -68,9 +68,9 @@ pub struct ServerProxyEntry {
     pub domain: String,
     /// The address of the local service, a TCP address or a `unix://` path
     pub local_addr: String,
-    /// When set, a visitor must present `X-HTTP-TUNNEL-TOKEN: <value>`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_header: Option<MaskedString>,
+    /// When set, a visitor must present `X-Auth: <value>`
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "x-auth")]
+    pub x_auth: Option<MaskedString>,
 }
 
 /// The listener side of the process.
@@ -306,26 +306,26 @@ impl Config {
 
     /// Replace the local service of the given name, or add it.
     ///
-    /// The call replaces the whole entry: `auth_header` is stored as given, so
+    /// The call replaces the whole entry: `x-auth` is stored as given, so
     /// `None` turns visitor authentication off.
     pub fn set_proxy(
         &mut self,
         name: String,
         domain: String,
         local_addr: String,
-        auth_header: Option<MaskedString>,
+        x_auth: Option<MaskedString>,
     ) {
         match self.proxies.iter_mut().find(|entry| entry.name == name) {
             Some(entry) => {
                 entry.domain = domain;
                 entry.local_addr = local_addr;
-                entry.auth_header = auth_header;
+                entry.x_auth = x_auth;
             }
             None => self.proxies.push(ServerProxyEntry {
                 name,
                 domain,
                 local_addr,
-                auth_header,
+                x_auth,
             }),
         }
     }
@@ -493,12 +493,12 @@ impl Config {
                 }
             }
             if entry
-                .auth_header
+                .x_auth
                 .as_ref()
                 .is_some_and(|value| value.contains('\r') || value.contains('\n'))
             {
                 bail!(
-                    "The `auth_header` of the local service `{}` must not contain line breaks",
+                    "The `x-auth` of the local service `{}` must not contain line breaks",
                     entry.name
                 );
             }
@@ -530,7 +530,7 @@ impl Config {
                 name,
                 domain,
                 local_addr: local_addr.to_string(),
-                auth_header: entry.auth_header,
+                x_auth: entry.x_auth,
             });
         }
         config.proxies = entries;
@@ -775,14 +775,14 @@ fn merge_into_toml(existing: &str, config: &Config) -> Result<String> {
                 "local_addr",
                 toml_edit::value(proxy.local_addr.clone()),
             );
-            match &proxy.auth_header {
-                Some(auth_header) => set_table_item(
+            match &proxy.x_auth {
+                Some(x_auth) => set_table_item(
                     &mut table,
-                    "auth_header",
-                    toml_edit::value(String::from(&**auth_header)),
+                    "x-auth",
+                    toml_edit::value(String::from(&**x_auth)),
                 ),
                 None => {
-                    table.remove("auth_header");
+                    table.remove("x-auth");
                 }
             }
             merged.push(table);
@@ -1418,7 +1418,7 @@ retry_interval = 7
         );
         Config::validate(&mut cfg)?;
         assert_eq!(
-            cfg.proxies[0].auth_header.as_deref(),
+            cfg.proxies[0].x_auth.as_deref(),
             Some("visitor-secret")
         );
 
@@ -1430,7 +1430,7 @@ retry_interval = 7
             None,
         );
         Config::validate(&mut cfg)?;
-        assert!(cfg.proxies[0].auth_header.is_none());
+        assert!(cfg.proxies[0].x_auth.is_none());
         Ok(())
     }
 
@@ -1935,7 +1935,7 @@ local_addr = "127.0.0.1:81"
         assert!(saved.contains("## keep this service"), "{}", saved);
         assert!(saved.contains("local_addr = \"127.0.0.1:90\""), "{}", saved);
         assert!(
-            saved.contains("auth_header = \"visitor-secret\""),
+            saved.contains("x-auth = \"visitor-secret\""),
             "{}",
             saved
         );

@@ -21,7 +21,7 @@ use crate::transport::websocket::{connect_websocket_v4, BoxedIo};
 #[derive(Debug, Clone)]
 pub(crate) struct RouteTarget {
     pub(crate) local_addr: String,
-    pub(crate) auth_header: Option<MaskedString>,
+    pub(crate) x_auth: Option<MaskedString>,
     /// Whether `local_addr` is this process's own embedded listener (a relay
     /// mirrors its route set to loopback). Such a hop carries the visitor's
     /// request id across in a private header.
@@ -40,7 +40,7 @@ pub(crate) enum ProxyAdminRequest {
         name: String,
         domain: String,
         local_addr: String,
-        auth_header: Option<MaskedString>,
+        x_auth: Option<MaskedString>,
         reply: oneshot::Sender<Result<Vec<ServerProxyEntry>>>,
     },
     Delete {
@@ -521,12 +521,12 @@ async fn handle_proxy_request(
             name,
             domain,
             local_addr,
-            auth_header,
+            x_auth,
         } => ProxyAdminRequest::Put {
             name,
             domain,
             local_addr,
-            auth_header,
+            x_auth,
             reply,
         },
         p4::ProxyOp::Delete { name } => ProxyAdminRequest::Delete { name, reply },
@@ -543,7 +543,7 @@ async fn handle_proxy_request(
                 name: proxy.name,
                 domain: proxy.domain,
                 local_addr: proxy.local_addr,
-                auth_header: proxy.auth_header,
+                x_auth: proxy.x_auth,
             })
             .collect()),
         Ok(Ok(Err(error))) => Err(format!("{:#}", error)),
@@ -637,7 +637,7 @@ async fn run_client_stream(
     out_tx: mpsc::Sender<SessionFrame>,
     closed_tx: mpsc::UnboundedSender<u32>,
 ) {
-    let request = match crate::helper::gate_auth_header(&header, target.auth_header.as_deref()) {
+    let request = match crate::helper::gate_x_auth(&header, target.x_auth.as_deref()) {
         crate::helper::AuthOutcome::Allowed(request) => request,
         crate::helper::AuthOutcome::Unauthorized(failure) => {
             warn!(

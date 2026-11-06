@@ -151,7 +151,7 @@ The upstream side opens a stream for each visitor. The downstream side connects
 to the `local_addr` of the matched route and pipes bytes in both directions.
 
 - `OpenStream.header` carries the visitor's prefetched HTTP request head. The
-  downstream applies the route's `auth_header`, if configured, before
+  downstream applies the route's `x-auth`, if configured, before
   connecting.
 - `StreamData { fin: true }` half-closes that direction. A stream ends when both
   directions are finished or one side resets it.
@@ -202,8 +202,8 @@ same session. This is an optional capability, not a new protocol version:
   session when the switch changes, so the next `Hello` carries the new value
   immediately.
 - `CAP_PROXY_AUTH` (`1 << 2`) is set when the node speaks the proxy frame shape
-  that carries `auth_header`. This is a wire-format change, not a new frame:
-  `ProxyEntry` gained `auth_header` and `ProxyOp::Put` gained `auth_header`.
+  that carries `x-auth`. This is a wire-format change, not a new frame:
+  `ProxyEntry` gained `x-auth` and `ProxyOp::Put` gained `x-auth`.
   All nodes on one control plane must run the same release. An upstream refuses
   proxy management of a peer without this capability and reports a `409`
   instead of sending a frame the peer cannot decode.
@@ -214,11 +214,11 @@ same session. This is an optional capability, not a new protocol version:
 - The server only sends `ProxyRequest` to a session that announced
   `CAP_PROXY_ADMIN`. Older peers send `capabilities = 0` and are never sent
   management frames.
-- `ProxyOp` is `List`, `Put { name, domain, local_addr, auth_header }` or
-  `Delete { name }`. `auth_header` is the visitor token (`X-HTTP-TUNNEL-TOKEN`)
+- `ProxyOp` is `List`, `Put { name, domain, local_addr, x-auth }` or
+  `Delete { name }`. `x-auth` is the visitor token (`X-Auth`)
   or `None` when authentication is off; `Put` replaces the whole entry.
   `ProxyResponse` carries the node's current proxy list, including each entry's
-  `auth_header`, and an optional error string. The request id correlates the
+  `x-auth`, and an optional error string. The request id correlates the
   response with the pending request.
 - The capability bits are advisory. The node itself rejects `Put` and `Delete`
   when `[upstream].allow_modify` is off, even if an upstream sends the frame

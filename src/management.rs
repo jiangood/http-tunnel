@@ -59,7 +59,7 @@ pub(crate) enum SessionAdminError {
     BadRequest(String),
     NotManageable,
     ReadOnly,
-    /// The downstream node predates the `auth_header` wire shape
+    /// The downstream node predates the `x-auth` wire shape
     Unsupported(String),
     Timeout,
     Downstream(String),
@@ -425,7 +425,7 @@ impl ManagementState {
         }
         if target.capabilities & protocol_v4::CAP_PROXY_AUTH == 0 {
             return Err(SessionAdminError::Unsupported(
-                "The downstream node does not support `auth_header` management; upgrade it so \
+                "The downstream node does not support `x-auth` management; upgrade it so \
                  both ends use the same proxy wire shape"
                     .to_string(),
             ));
@@ -457,7 +457,7 @@ impl ManagementState {
                     name: proxy.name,
                     domain: proxy.domain,
                     local_addr: proxy.local_addr,
-                    auth_header: proxy.auth_header,
+                    x_auth: proxy.x_auth,
                 })
                 .collect()),
             Ok(Ok(Err(error))) => {
@@ -497,7 +497,7 @@ impl ManagementState {
         name: String,
         domain: String,
         local_addr: String,
-        auth_header: Option<MaskedString>,
+        x_auth: Option<MaskedString>,
     ) -> std::result::Result<SessionProxySnapshot, SessionAdminError> {
         let name = crate::config::validate_name(&name)
             .map_err(|error| SessionAdminError::BadRequest(format!("{:#}", error)))?;
@@ -513,7 +513,7 @@ impl ManagementState {
                     name,
                     domain,
                     local_addr,
-                    auth_header,
+                    x_auth,
                 },
             )
             .await?;
@@ -729,7 +729,7 @@ impl ManagementState {
         name: String,
         domain: String,
         local_addr: String,
-        auth_header: Option<MaskedString>,
+        x_auth: Option<MaskedString>,
     ) -> Result<()> {
         if local_addr.trim().is_empty() {
             bail!("The `local_addr` must not be empty");
@@ -739,7 +739,7 @@ impl ManagementState {
 
         let effective = self
             .update_config(|config| {
-                config.set_proxy(name, domain, local_addr, auth_header);
+                config.set_proxy(name, domain, local_addr, x_auth);
                 Ok(())
             })
             .await?;
@@ -908,7 +908,7 @@ local_addr = "127.0.0.1:80"
     }
 
     #[tokio::test]
-    async fn test_api_sets_and_clears_the_auth_header() -> Result<()> {
+    async fn test_api_sets_and_clears_the_x_auth() -> Result<()> {
         let path = std::env::temp_dir().join(format!(
             "http-tunnel-management-{}-auth-header.toml",
             std::process::id()
@@ -940,15 +940,15 @@ local_addr = "127.0.0.1:80"
             .await?;
 
         let proxies = state.proxies().await;
-        assert_eq!(proxies[0].auth_header.as_deref(), Some("visitor-secret"));
+        assert_eq!(proxies[0].x_auth.as_deref(), Some("visitor-secret"));
         let saved = std::fs::read_to_string(&path)?;
         assert!(
-            saved.contains("auth_header = \"visitor-secret\""),
+            saved.contains("x-auth = \"visitor-secret\""),
             "{}",
             saved
         );
 
-        // A PUT without auth_header replaces the entry and disables the gate
+        // A PUT without x-auth replaces the entry and disables the gate
         state
             .put_proxy(
                 "nas".to_string(),
@@ -957,15 +957,15 @@ local_addr = "127.0.0.1:80"
                 None,
             )
             .await?;
-        assert!(state.proxies().await[0].auth_header.is_none());
+        assert!(state.proxies().await[0].x_auth.is_none());
         let saved = std::fs::read_to_string(&path)?;
         let _ = std::fs::remove_file(&path);
-        assert!(!saved.contains("auth_header"), "{}", saved);
+        assert!(!saved.contains("x-auth"), "{}", saved);
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_api_rejects_an_auth_header_with_line_breaks() -> Result<()> {
+    async fn test_api_rejects_an_x_auth_with_line_breaks() -> Result<()> {
         let path = std::env::temp_dir().join(format!(
             "http-tunnel-management-{}-auth-newline.toml",
             std::process::id()
@@ -990,7 +990,7 @@ token = "file-token"
                 Some(MaskedString::from("bad\r\nheader")),
             )
             .await
-            .expect_err("a line break in auth_header must be rejected");
+            .expect_err("a line break in x-auth must be rejected");
         let _ = std::fs::remove_file(&path);
         assert!(
             format!("{:#}", err).contains("must not contain line breaks"),

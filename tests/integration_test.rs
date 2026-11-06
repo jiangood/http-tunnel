@@ -320,12 +320,12 @@ async fn http_echo_hitter(addr: &'static str, host: &'static str) -> Result<()> 
     Ok(())
 }
 
-/// Send one visitor request with an optional `X-HTTP-TUNNEL-TOKEN` and return
+/// Send one visitor request with an optional `X-Auth` and return
 /// the status line and the first chunk of the response.
 async fn visitor_status(addr: &str, host: &str, token: Option<&str>) -> Result<(u16, String)> {
     let mut conn = TcpStream::connect(addr).await?;
     let auth = token
-        .map(|token| format!("X-HTTP-TUNNEL-TOKEN: {}\r\n", token))
+        .map(|token| format!("X-Auth: {}\r\n", token))
         .unwrap_or_default();
     let request = format!(
         "GET / HTTP/1.1\r\nHost: {}\r\n{}Connection: close\r\n\r\n",
@@ -955,13 +955,13 @@ async fn management_api_manages_proxies() -> Result<()> {
         "/api/proxies/echo",
         Some(MANAGEMENT_TOKEN),
         Some(
-            r#"{"domain":"echo.test","local_addr":"127.0.0.1:8093","auth_header":"visitor-secret"}"#,
+            r#"{"domain":"echo.test","local_addr":"127.0.0.1:8093","x-auth":"visitor-secret"}"#,
         ),
     )
     .await?;
     assert_eq!(status, 201, "unexpected response: {}", body);
     assert!(
-        body.contains("\"auth_header\":\"visitor-secret\""),
+        body.contains("\"x-auth\":\"visitor-secret\""),
         "unexpected body: {}",
         body
     );
@@ -976,7 +976,7 @@ async fn management_api_manages_proxies() -> Result<()> {
     .await?;
     assert_eq!(status, 200, "unexpected response: {}", body);
     assert!(
-        body.contains("\"auth_header\":\"visitor-secret\""),
+        body.contains("\"x-auth\":\"visitor-secret\""),
         "the API should return the visitor token: {}",
         body
     );
@@ -998,12 +998,12 @@ async fn management_api_manages_proxies() -> Result<()> {
     .await?;
     assert_eq!(status, 200, "the visitor token should be accepted");
     assert!(
-        !response.contains("X-HTTP-TUNNEL-TOKEN"),
+        !response.contains("X-Auth"),
         "the token must be stripped before the backend: {}",
         response
     );
 
-    info!("replacing the proxy without auth_header clears the gate");
+    info!("replacing the proxy without x-auth clears the gate");
     let (status, body) = api_request(
         MANAGEMENT_ADDR,
         "PUT",
@@ -1014,12 +1014,12 @@ async fn management_api_manages_proxies() -> Result<()> {
     .await?;
     assert_eq!(status, 201, "unexpected response: {}", body);
     assert!(
-        body.contains("\"auth_header\":null"),
+        body.contains("\"x-auth\":null"),
         "unexpected body: {}",
         body
     );
     let (status, _) = visitor_status(MANAGEMENT_HTTP_ENTRY_ADDR, "echo.test", None).await?;
-    assert_eq!(status, 200, "clearing auth_header should reopen the proxy");
+    assert_eq!(status, 200, "clearing x-auth should reopen the proxy");
 
     info!("the management API now reports the client as connected");
     let (status, body) = api_request(
@@ -1312,7 +1312,7 @@ async fn management_api_manages_downstream_proxies() -> Result<()> {
     time::sleep(Duration::from_millis(500)).await;
     http_echo_hitter(DOWNSTREAM_HTTP_ENTRY_ADDR, DOWNSTREAM_HOST).await?;
 
-    info!("the entry sets auth_header on the downstream proxy");
+    info!("the entry sets x-auth on the downstream proxy");
     let (status, body) = api_request(
         DOWNSTREAM_HTTP_ENTRY_ADDR,
         "PUT",
@@ -1322,13 +1322,13 @@ async fn management_api_manages_downstream_proxies() -> Result<()> {
         ),
         Some(DOWNSTREAM_TOKEN),
         Some(
-            r#"{"domain":"remote.test","local_addr":"127.0.0.1:8094","auth_header":"remote-visitor"}"#,
+            r#"{"domain":"remote.test","local_addr":"127.0.0.1:8094","x-auth":"remote-visitor"}"#,
         ),
     )
     .await?;
     assert_eq!(status, 201, "unexpected response: {}", body);
     assert!(
-        body.contains("\"auth_header\":\"remote-visitor\""),
+        body.contains("\"x-auth\":\"remote-visitor\""),
         "unexpected body: {}",
         body
     );
@@ -1346,7 +1346,7 @@ async fn management_api_manages_downstream_proxies() -> Result<()> {
     .await?;
     assert_eq!(status, 200, "the downstream gate must accept the token");
     assert!(
-        !response.contains("X-HTTP-TUNNEL-TOKEN"),
+        !response.contains("X-Auth"),
         "the downstream token must be stripped: {}",
         response
     );
@@ -1361,7 +1361,7 @@ async fn management_api_manages_downstream_proxies() -> Result<()> {
     .await?;
     assert_eq!(status, 200, "unexpected response: {}", body);
     assert!(
-        body.contains("\"auth_header\":\"remote-visitor\""),
+        body.contains("\"x-auth\":\"remote-visitor\""),
         "the downstream list should return the visitor token: {}",
         body
     );
@@ -1374,8 +1374,8 @@ async fn management_api_manages_downstream_proxies() -> Result<()> {
         written
     );
     assert!(
-        written.contains("auth_header = \"remote-visitor\""),
-        "the downstream auth_header wasn't written: {}",
+        written.contains("x-auth = \"remote-visitor\""),
+        "the downstream x-auth wasn't written: {}",
         written
     );
 

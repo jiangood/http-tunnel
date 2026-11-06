@@ -5,7 +5,7 @@
 ### Local service / proxy
 The entry in `[[proxies]]` that maps a domain to a local TCP address or Unix
 Socket. The same entry is used whether the process is an ingress, a relay or a
-leaf. It optionally carries an `auth_header` gate.
+leaf. It optionally carries an `x-auth` gate.
 
 ### Listener / embedded server
 The optional `[server]` table. When present, the process runs an embedded HTTP
@@ -84,7 +84,7 @@ local target, while the wildcard binds map to `127.0.0.1` or `::1`. Without
 The embedded server accepts visitors on one port. It reads the request line and
 `Host`, resolves a local proxy first and then a downstream session, and either
 connects to the local service or opens a stream. The visitor's prefetched header
-is sent in `OpenStream`; the downstream applies the route's `auth_header`, writes
+is sent in `OpenStream`; the downstream applies the route's `x-auth`, writes
 the header and pipes the rest. The response comes back over the same stream.
 
 The proxy list is held behind an `RwLock` in `ServerState`, so the management API

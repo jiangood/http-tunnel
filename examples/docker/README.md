@@ -77,7 +77,7 @@ token = "与服务端 token 相同"
 name = "docker"
 domain = "docker.example.com"
 local_addr = "unix:///var/run/docker.sock"
-auth_header = "demo-visitor-token"
+x-auth = "demo-visitor-token"
 ```
 
 ```sh
@@ -90,17 +90,17 @@ docker compose up -d
 ```sh
 curl -sS \
   -H "Host: docker.example.com" \
-  -H "X-HTTP-TUNNEL-TOKEN: demo-visitor-token" \
+  -H "X-Auth: demo-visitor-token" \
   http://<入口地址>:7777/version
 ```
 
-返回 `ApiVersion` / `MinAPIVersion` 就说明 Docker API 已经穿过隧道。`auth_header` 校验通过后，`X-HTTP-TUNNEL-TOKEN` 会在转发给 Docker daemon 之前被移除。
+返回 `ApiVersion` / `MinAPIVersion` 就说明 Docker API 已经穿过隧道。`x-auth` 校验通过后，`X-Auth` 会在转发给 Docker daemon 之前被移除。
 
 Docker CLI 也可以直接连：
 
 ```sh
 export DOCKER_HOST=tcp://docker.example.com:7777
-export DOCKER_CUSTOM_HEADERS="X-HTTP-TUNNEL-TOKEN=demo-visitor-token"
+export DOCKER_CUSTOM_HEADERS="X-Auth=demo-visitor-token"
 docker ps
 ```
 
@@ -110,7 +110,7 @@ docker ps
 
 ```json
 // ~/.docker-tunnel/config.json
-{"HttpHeaders":{"X-HTTP-TUNNEL-TOKEN":"demo-visitor-token"}}
+{"HttpHeaders":{"X-Auth":"demo-visitor-token"}}
 ```
 
 ```sh
@@ -119,7 +119,7 @@ export DOCKER_HOST=tcp://docker.example.com:7777
 docker ps
 ```
 
-> Docker API 等价于宿主机 root。公网部署必须加 TLS 并设置 `auth_header`，最好只通过 VPN、WireGuard 或内网访问；不要把未加认证的入口直接暴露到公网。
+> Docker API 等价于宿主机 root。公网部署必须加 TLS 并设置 `x-auth`，最好只通过 VPN、WireGuard 或内网访问；不要把未加认证的入口直接暴露到公网。
 
 ### Windows / Docker Desktop
 
@@ -139,7 +139,7 @@ Get-NetTCPConnection -LocalPort 2375 -State Listen | Select-Object LocalAddress,
 name = "docker"
 domain = "docker.example.com"
 local_addr = "host.docker.internal:2375"
-auth_header = "demo-visitor-token"
+x-auth = "demo-visitor-token"
 ```
 
 Windows 原生 `ht.exe` 不在容器里时，`local_addr` 直接用 `127.0.0.1:2375`。
