@@ -12,8 +12,11 @@ use tokio::{
 pub fn ingress_config(listen_port: u16, control_host: &str, token: &str) -> Config {
     let mut config = Config::default();
     config.name = "test-ingress".to_string();
-    config.listen_port = listen_port;
-    config.control_host = Some(control_host.to_string());
+    config.server = Some(http_tunnel::ServerConfig {
+        port: listen_port,
+        bind: "127.0.0.1".to_string(),
+        domain: Some(control_host.to_string()),
+    });
     config.token = Some(MaskedString::from(token));
     config
 }

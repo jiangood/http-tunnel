@@ -70,7 +70,7 @@ fn find_proxy<'a>(proxies: &'a [ServerProxyEntry], host: &str) -> Option<&'a Ser
 ///
 /// Only the first request of a connection is inspected, so routing is connection-level.
 pub(crate) async fn serve(
-    l: TcpListener,
+    l: Arc<TcpListener>,
     state: Arc<ServerState>,
     management: Option<crate::server::Management>,
     mut shutdown_rx: broadcast::Receiver<bool>,
@@ -163,14 +163,18 @@ async fn handle_visitor(
     // A relay hands the visitor to its own embedded listener over loopback,
     // carrying the id it was given in a private header. Adopting it keeps one
     // request id across every hop, the logs and the page the visitor sees.
-    if let Some(id) = crate::helper::take_request_id(&mut prefetched, addr.ip().is_loopback()) {
+    let trusted_request_id = addr.ip().is_loopback()
+        || state
+            .bind_ip
+            .is_some_and(|ip| !ip.is_unspecified() && ip == addr.ip());
+    if let Some(id) = crate::helper::take_request_id(&mut prefetched, trusted_request_id) {
         request_id = id;
     }
 
     // Reserve the configured server Host for the internal WebSocket transport
     // and the management page/API. Host is a routing key only; the token in the
     // `Authorization` header authenticates both.
-    if state.control_host == host {
+    if state.control_host.as_deref() == Some(host.as_str()) {
         let path = parse_request_path(&prefetched).unwrap_or_default();
         if path == crate::protocol_v4::V4_PATH {
             // A gateway in front of us (SafeLine, nginx, a cloud load balancer)
@@ -235,6 +239,12 @@ async fn handle_visitor(
         .await;
         return Ok(());
     }
+
+    // From here on this is a visitor request or a `404`, never the reserved
+    // control host. Track it separately from the drain counter so the
+    // dashboard never counts the management request that is reading it.
+    let visitor = state.visitor_activity.guard();
+    state.count_visitor();
 
     if let Some(proxy) = {
         let proxies = state.proxies.read().await;
@@ -322,6 +332,7 @@ async fn handle_visitor(
                 );
                 tokio::spawn(async move {
                     let _activity = activity;
+                    let _visitor = visitor;
                     crate::server::relay(io, stream, request_id).await;
                 });
                 return Ok(());

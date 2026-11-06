@@ -34,18 +34,17 @@ pub const MAX_ROUTES_PER_SESSION: usize = 256;
 pub const MAX_STREAMS_PER_SESSION: usize = 256;
 /// The peer accepts proxy management requests from its upstream.
 pub const CAP_PROXY_ADMIN: u32 = 1 << 0;
-/// The peer also allows its local `[[proxies]]` to be changed. It is cleared
-/// when `HT_PROXIES` owns the list, so the upstream can list but not edit it.
+/// The peer also allows its local `[[proxies]]` to be changed.
 pub const CAP_PROXY_WRITE: u32 = 1 << 1;
 /// The peer speaks the `ProxyEntry`/`ProxyOp::Put` shape that carries
 /// `auth_header`. It is a wire-format change, so an upstream refuses proxy
 /// management on a peer that does not announce it instead of causing a decode
 /// failure.
 pub const CAP_PROXY_AUTH: u32 = 1 << 2;
-/// The peer's local `[[proxies]]` come from `HT_PROXIES`, so they are
-/// environment-managed and cannot be written even when it allows management.
-/// It lets an upstream tell "HT_PROXIES read-only" apart from "the node turned
-/// `allow_upstream_modify` off".
+/// A legacy bit: older peers announced that their local `[[proxies]]` came
+/// from the removed `HT_PROXIES` environment variable and were therefore
+/// read-only. Current peers never set it, but an upstream still recognizes it
+/// so it can list those older nodes without trying to write them.
 pub const CAP_PROXY_ENV: u32 = 1 << 3;
 
 /// The role announced in `Hello`. It is advisory: authentication and ACLs

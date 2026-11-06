@@ -22,7 +22,7 @@ The session endpoint is:
 /_http-tunnel/v4/connect
 ```
 
-It is available only on the reserved `control_host` of the listener. There is no
+It is available only on the reserved `[server].domain` of the listener. There is no
 version preamble and no fallback: any other path on that Host is either the
 management interface or a `404`.
 
@@ -69,7 +69,7 @@ client                                            server
 - `role` is advisory for logging. Routing and authorization use the token and
   the advertised prefixes, not the role.
 - `proof = SHA-256(token || nonce || node_id || server_id)`. The server id is
-  its reserved `control_host`; the nonce is a fresh 32-byte random value per
+  its reserved `[server].domain`; the nonce is a fresh 32-byte random value per
   session.
 - A wrong version, an empty node id, a malformed frame or a bad proof ends the
   handshake with an `Error` frame.
@@ -133,7 +133,7 @@ Current rejection reasons:
 | Reason | Meaning |
 | --- | --- |
 | `InvalidPrefix` | The prefix is not a valid exact or `*.suffix` domain |
-| `ReservedHost` | The prefix overlaps the server's reserved `control_host` |
+| `ReservedHost` | The prefix overlaps the server's reserved `[server].domain` |
 | `TooManyRoutes` | The session would exceed `MAX_ROUTES_PER_SESSION` (256) |
 | `Conflict` | Another session already owns the prefix |
 
@@ -197,19 +197,19 @@ same session. This is an optional capability, not a new protocol version:
   understands management requests. It is announced even when writes are
   disabled, so the upstream can still list the services.
 - `CAP_PROXY_WRITE` (`1 << 1`) is also set when the node allows changes. It is
-  cleared by default (`allow_upstream_modify = false`) and when `HT_PROXIES`
-  owns the list. The node reconnects its session when the switch changes, so the
-  next `Hello` carries the new value immediately.
+  cleared by default (`[upstream].allow_modify = false`). The node reconnects its
+  session when the switch changes, so the next `Hello` carries the new value
+  immediately.
 - `CAP_PROXY_AUTH` (`1 << 2`) is set when the node speaks the proxy frame shape
   that carries `auth_header`. This is a wire-format change, not a new frame:
   `ProxyEntry` gained `auth_header` and `ProxyOp::Put` gained `auth_header`.
   All nodes on one control plane must run the same release. An upstream refuses
   proxy management of a peer without this capability and reports a `409`
   instead of sending a frame the peer cannot decode.
-- `CAP_PROXY_ENV` (`1 << 3`) is set when the node's local services come from
-  `HT_PROXIES`. It distinguishes an environment-managed read-only list from a
-  list that is read-only only because `allow_upstream_modify` is off; the
-  management page uses it for the `proxy_source` field.
+- `CAP_PROXY_ENV` (`1 << 3`) is a legacy bit. Older nodes set it when their
+  local services came from the removed `HT_PROXIES` environment variable; current
+  nodes never set it. An upstream still recognizes it so it can list those older
+  nodes as read-only (`proxy_source = "env"`).
 - The server only sends `ProxyRequest` to a session that announced
   `CAP_PROXY_ADMIN`. Older peers send `capabilities = 0` and are never sent
   management frames.
@@ -220,9 +220,8 @@ same session. This is an optional capability, not a new protocol version:
   `auth_header`, and an optional error string. The request id correlates the
   response with the pending request.
 - The capability bits are advisory. The node itself rejects `Put` and `Delete`
-  when `allow_upstream_modify` is off or `HT_PROXIES` owns the list, even if an
-  upstream sends the frame without the advertised capability. `List` is always
-  allowed.
+  when `[upstream].allow_modify` is off, even if an upstream sends the frame
+  without the advertised capability. `List` is always allowed.
 
 The downstream executes the operation with its local management state: validate,
 write its `ht.toml` atomically, replace the running proxy list, and publish the
@@ -257,6 +256,6 @@ These are roadmap items, not behavior to rely on.
 - `src/node.rs`: the universal router: embedded server plus one optional
   upstream session.
 - `src/server.rs`: shared state, dynamic proxy list, activity drain and shutdown.
-- `src/management.rs` / `src/management_api.rs`: runtime proxy management and
-  the web page/API.
-- `src/config_env.rs`: `ht.toml` loading and the `HT_*` environment overlay.
+- `src/management.rs` / `src/management_api.rs`: runtime proxy and settings
+  management and the web page/API.
+- `src/config.rs`: `ht.toml` parsing, validation and atomic saving.

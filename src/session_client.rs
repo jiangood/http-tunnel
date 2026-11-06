@@ -57,9 +57,6 @@ pub(crate) struct SessionArgs {
     pub(crate) role: Role,
     pub(crate) keepalive_interval: u64,
     pub(crate) retry_interval: u64,
-    /// Whether the local `[[proxies]]` come from `HT_PROXIES`. It is announced
-    /// with `CAP_PROXY_ENV`, and such a node never advertises `CAP_PROXY_WRITE`.
-    pub(crate) proxies_managed: bool,
     /// The live `allow_upstream_modify` switch. A change reconnects the session
     /// so that the next hop learns the new capability bits immediately. `None`
     /// in a build without the management feature.
@@ -176,16 +173,13 @@ impl std::error::Error for ReconnectRequested {}
 ///
 /// `CAP_PROXY_ADMIN` and `CAP_PROXY_AUTH` are always announced when the local
 /// management worker exists: the next hop may still list the services.
-/// `CAP_PROXY_WRITE` depends on `allow_upstream_modify` and is absent when
-/// `HT_PROXIES` owns the list, which is announced with `CAP_PROXY_ENV`.
+/// `CAP_PROXY_WRITE` depends on `allow_upstream_modify`.
 fn proxy_capabilities(args: &SessionArgs) -> u32 {
     if args.proxy_admin.is_none() {
         return 0;
     }
     let mut capabilities = p4::CAP_PROXY_ADMIN | p4::CAP_PROXY_AUTH;
-    if args.proxies_managed {
-        capabilities |= p4::CAP_PROXY_ENV;
-    } else if args
+    if args
         .allow_upstream_modify
         .as_ref()
         .map(|rx| *rx.borrow())
@@ -425,14 +419,12 @@ async fn run_once(
                                 .as_ref()
                                 .map(|rx| *rx.borrow())
                                 .unwrap_or(false);
-                            let proxies_managed = args.proxies_managed;
                             let out = out_tx.clone();
                             tokio::spawn(async move {
                                 let (proxies, error) = match handle_proxy_request(
                                     admin,
                                     op,
                                     allow_upstream_modify,
-                                    proxies_managed,
                                 )
                                 .await
                                 {
@@ -508,22 +500,16 @@ async fn handle_proxy_request(
     admin: Option<mpsc::Sender<ProxyAdminRequest>>,
     op: p4::ProxyOp,
     allow_upstream_modify: bool,
-    proxies_managed: bool,
 ) -> std::result::Result<Vec<p4::ProxyEntry>, String> {
     let Some(admin) = admin else {
         return Err("the downstream node does not support remote proxy management".to_string());
     };
     let write = matches!(op, p4::ProxyOp::Put { .. } | p4::ProxyOp::Delete { .. });
     if write {
-        if proxies_managed {
-            return Err(
-                "the local services are managed by HT_PROXIES and cannot be changed".to_string(),
-            );
-        }
         if !allow_upstream_modify {
             return Err(
                 "the node does not allow its upstream to modify its local services; \
-                 set `allow_upstream_modify = true` on that node"
+                 set `[upstream].allow_modify = true` on that node"
                     .to_string(),
             );
         }

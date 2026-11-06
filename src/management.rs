@@ -6,24 +6,48 @@
 //! so an upstream session mirrors it immediately.
 
 use crate::config::{Config, ConfigSource, MaskedString, ServerProxyEntry};
-use crate::config_env::EnvConfig;
 use crate::protocol_v4;
+use crate::reload::ReloadMarker;
 use crate::server::{ServerState, SessionLookupError, SessionTarget};
 use crate::session_server::SessionControl;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use serde::Serialize;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, watch, RwLock};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, RwLock};
 use tokio::time;
 use tracing::info;
 
+/// How long a local service probe may take before it is reported as a timeout.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The result of changing this node's configuration.
+pub(crate) struct SettingsOutcome {
+    /// The configuration after the change
+    pub(crate) config: Config,
+    /// Whether the process still has to rebuild its listener or upstream
+    /// session before the new configuration is active
+    pub(crate) restart_required: bool,
+}
+
+/// The result of dialling one local service from this node's perspective.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ProbeOutcome {
+    pub(crate) name: String,
+    pub(crate) local_addr: String,
+    pub(crate) ok: bool,
+    pub(crate) latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+}
+
 /// The local services of one downstream node, as returned by its session.
 pub(crate) struct SessionProxySnapshot {
-    /// `file` when the downstream reads `[[proxies]]` from `ht.toml`, `env`
-    /// when `HT_PROXIES` owns them.
+    /// `file` for a current downstream node, `env` for a legacy peer that
+    /// still reported environment-managed proxies.
     pub(crate) proxy_source: &'static str,
     pub(crate) proxies: Vec<ServerProxyEntry>,
 }
@@ -62,8 +86,7 @@ impl fmt::Display for SessionAdminError {
             SessionAdminError::ReadOnly => write!(
                 f,
                 "The downstream node does not allow its upstream to modify its local services: \
-                 set `allow_upstream_modify = true` on that node (or remove `HT_PROXIES`, which \
-                 keeps them read-only) and restart it"
+                 set `[upstream].allow_modify = true` on that node and restart it"
             ),
             SessionAdminError::Unsupported(message) => write!(f, "{}", message),
             SessionAdminError::Timeout => write!(
@@ -86,8 +109,9 @@ impl std::error::Error for SessionAdminError {}
 /// The state behind the web management page and administration API.
 pub(crate) struct ManagementState {
     config: RwLock<Config>,
-    persisted: RwLock<Config>,
-    env: EnvConfig,
+    /// Serializes read-modify-write configuration changes from the API, so two
+    /// concurrent requests cannot overwrite each other.
+    updates: Mutex<()>,
     config_path: PathBuf,
     server: Arc<ServerState>,
     /// Whether the upstream session is established. A standalone ingress has
@@ -105,6 +129,21 @@ pub(crate) struct ManagementState {
     allow_upstream_modify: watch::Sender<bool>,
     /// When the management state was created, for the uptime of the console
     started: Instant,
+    /// Tells the configuration watcher which file writes already took effect.
+    reload: Arc<ReloadMarker>,
+    /// The shared outcome of the most recent configuration watch/apply attempt.
+    reload_status: Arc<crate::reload::ReloadStatus>,
+    /// Reports a configuration applied live to the supervisor, together with
+    /// the generation that applied it. The supervisor keeps its baseline in
+    /// sync with the running process and ignores writes that raced with a
+    /// reload.
+    live: mpsc::Sender<(u64, Config)>,
+    /// Asks the supervisor to rebuild the listener and upstream session with
+    /// the given configuration, even when it equals the running one. The id
+    /// makes a request from a replaced generation harmless.
+    restart: mpsc::Sender<(u64, Config)>,
+    /// The generation this management state belongs to.
+    generation: u64,
 }
 
 impl ManagementState {
@@ -112,36 +151,36 @@ impl ManagementState {
         config: Config,
         server: Arc<ServerState>,
         connected: Arc<AtomicBool>,
+        reload: Arc<ReloadMarker>,
+        reload_status: Arc<crate::reload::ReloadStatus>,
+        generation: u64,
+        live: mpsc::Sender<(u64, Config)>,
+        restart: mpsc::Sender<(u64, Config)>,
     ) -> ManagementState {
-        let source = &config.source;
-        let config_path = source
+        let config_path = config
+            .source
             .path
             .clone()
             .unwrap_or_else(|| PathBuf::from("ht.toml"));
-        let env = source.env.clone();
-        let mut persisted = source
-            .persisted
-            .as_deref()
-            .cloned()
-            .unwrap_or_else(|| config.clone());
-        persisted.source = ConfigSource::default();
 
         let name = config.name.clone();
-        let server_addr = config.upstream_addr().unwrap_or_else(|| {
-            crate::helper::to_bind_addr(crate::helper::DEFAULT_BIND_HOST, config.listen_port)
-        });
+        let server_addr = config
+            .upstream_addr()
+            .unwrap_or_else(|| match config.listen_port() {
+                Some(port) => crate::helper::to_bind_addr(config.bind_host(), port),
+                None => "disabled".to_string(),
+            });
         let transport = if config.upstream.is_some() {
             config.transport_name().to_string()
         } else {
             "ingress".to_string()
         };
         let upstream_configured = config.upstream.is_some();
-        let (allow_upstream_modify, _) = watch::channel(config.allow_upstream_modify);
+        let (allow_upstream_modify, _) = watch::channel(config.allow_modify());
 
         ManagementState {
             config: RwLock::new(config),
-            persisted: RwLock::new(persisted),
-            env,
+            updates: Mutex::new(()),
             config_path,
             server,
             connected,
@@ -151,6 +190,11 @@ impl ManagementState {
             upstream_configured,
             allow_upstream_modify,
             started: Instant::now(),
+            reload,
+            reload_status,
+            live,
+            restart,
+            generation,
         }
     }
 
@@ -174,13 +218,7 @@ impl ManagementState {
         self.connected.load(Ordering::Relaxed)
     }
 
-    /// Whether the proxies come from `HT_PROXIES` and thus cannot be changed
-    /// through the API
-    pub(crate) fn proxies_managed(&self) -> bool {
-        self.env.proxies_managed()
-    }
-
-    /// Whether the next hop may change the local `[[proxies]]`.
+    /// The next hop may change the local `[[proxies]]`.
     pub(crate) fn allow_upstream_modify(&self) -> bool {
         *self.allow_upstream_modify.borrow()
     }
@@ -191,13 +229,9 @@ impl ManagementState {
         self.allow_upstream_modify.subscribe()
     }
 
-    /// Whether the web page may change the switch: it needs a next hop, must
-    /// not be overridden by `HT_ALLOW_UPSTREAM_MODIFY`, and must not already be
-    /// forced read-only by `HT_PROXIES`.
+    /// Whether the web page may change the switch: it needs a next hop.
     pub(crate) fn allow_upstream_modify_editable(&self) -> bool {
         self.upstream_configured
-            && !self.env.allow_upstream_modify_managed()
-            && !self.proxies_managed()
     }
 
     /// The configuration file the API writes back to
@@ -205,14 +239,57 @@ impl ManagementState {
         &self.config_path
     }
 
+    /// The current configuration file content, used by the export endpoint.
+    /// It returns the file as-is so that comments and formatting survive a
+    /// backup; when the file is absent (a library caller built the config in
+    /// memory), it falls back to the normalized TOML.
+    pub(crate) async fn export_toml(&self) -> Result<String> {
+        match Config::read(&self.config_path).await? {
+            Some(content) => Ok(content),
+            None => self.config_snapshot().await.to_toml(),
+        }
+    }
+
+    /// Read and validate the configuration file without changing anything.
+    pub(crate) async fn config_from_disk(&self) -> Result<Config> {
+        let source = Config::read(&self.config_path).await?.ok_or_else(|| {
+            anyhow!(
+                "The configuration file {:?} does not exist",
+                self.config_path
+            )
+        })?;
+        let mut config = Config::parse(&source)
+            .with_context(|| format!("The configuration {:?} is invalid", self.config_path))?;
+        config.source = ConfigSource {
+            path: Some(self.config_path.clone()),
+        };
+        Ok(config)
+    }
+
+    /// Ask the supervisor to rebuild the runtime after a short delay, so the
+    /// management response that requested the restart can be flushed first.
+    pub(crate) fn schedule_restart(&self, config: Config) {
+        let restart = self.restart.clone();
+        let generation = self.generation;
+        tokio::spawn(async move {
+            time::sleep(Duration::from_millis(500)).await;
+            let _ = restart.send((generation, config)).await;
+        });
+    }
+
     /// Seconds since the process started, shown by the management page
     pub(crate) fn uptime(&self) -> u64 {
         self.started.elapsed().as_secs()
     }
 
-    /// The `HT_*` variables the environment sets, with their values omitted
-    pub(crate) fn env_vars(&self) -> Vec<(&'static str, bool)> {
-        self.env.describe()
+    /// The outcome of the most recent configuration watch/apply attempt.
+    pub(crate) fn reload_status(&self) -> crate::reload::ReloadSnapshot {
+        self.reload_status.snapshot()
+    }
+
+    /// A snapshot of the running configuration.
+    pub(crate) async fn config_snapshot(&self) -> Config {
+        self.config.read().await.clone()
     }
 
     /// The local services the process is serving, sorted by name
@@ -237,6 +314,51 @@ impl ManagementState {
     /// The number of connected v4 sessions and the configured limit.
     pub(crate) fn session_count(&self) -> (usize, usize) {
         self.server.session_count()
+    }
+
+    /// The active visitor connections and the lifetime total, shown by the
+    /// dashboard.
+    pub(crate) fn visitor_stats(&self) -> (usize, u64) {
+        self.server.visitor_stats()
+    }
+
+    /// Dial one saved local service from this node's perspective and report
+    /// whether the target is reachable. A connection failure is a probe result,
+    /// not an API error; only an unknown name is.
+    pub(crate) async fn probe_proxy(&self, name: &str) -> Result<ProbeOutcome> {
+        let name = name.trim();
+        let proxy = self
+            .proxies()
+            .await
+            .into_iter()
+            .find(|proxy| proxy.name == name)
+            .ok_or_else(|| anyhow!("No such a local service `{}`", name))?;
+
+        let started = Instant::now();
+        let (ok, error) = match time::timeout(
+            PROBE_TIMEOUT,
+            crate::helper::connect_local(&proxy.local_addr),
+        )
+        .await
+        {
+            Ok(Ok(_)) => (true, None),
+            Ok(Err(error)) => (false, Some(format!("{:#}", error))),
+            Err(_) => (
+                false,
+                Some(format!(
+                    "Timed out after {} seconds",
+                    PROBE_TIMEOUT.as_secs()
+                )),
+            ),
+        };
+
+        Ok(ProbeOutcome {
+            name: proxy.name,
+            local_addr: proxy.local_addr,
+            ok,
+            latency_ms: started.elapsed().as_millis() as u64,
+            error,
+        })
     }
 
     /// Resolve a downstream target from the optional `node` and `session`
@@ -450,52 +572,154 @@ impl ManagementState {
         }
     }
 
-    /// Apply a change to the persisted configuration, save it, and recompute the
-    /// effective configuration with the environment overlay.
+    /// Persist a configuration change and apply it to the running generation.
     ///
-    /// The file is written first, so that a failed write leaves the runtime
-    /// untouched. The environment values are reapplied afterwards: they win at
-    /// runtime but must not end up in the file.
-    ///
-    /// The caller applies the runtime side effects of the returned effective
-    /// configuration, because a proxy change and a settings change publish
-    /// different things.
-    async fn update_persisted<F>(&self, change: F) -> Result<Config>
+    /// The file is written first, so a failed write leaves the runtime
+    /// untouched. This path is only used for changes the running generation can
+    /// take over without restarting its listener and upstream session.
+    async fn persist_and_apply_live(&self, mut config: Config) -> Result<Config> {
+        config.source = ConfigSource {
+            path: Some(self.config_path.clone()),
+        };
+        // Validate after the change, so that a name or domain clash is rejected
+        // before anything is written.
+        Config::validate(&mut config)?;
+
+        // Mark the configuration before the write. The watcher may notice the
+        // new file before the runtime update below, and this mark tells it that
+        // the process itself already applied the change.
+        self.reload.mark_self_write(config.clone()).await;
+        if let Err(err) = config.save(&self.config_path).await {
+            self.reload.clear().await;
+            return Err(err);
+        }
+
+        *self.config.write().await = config.clone();
+        self.server.set_proxies(config.proxies.clone()).await;
+        if self.allow_upstream_modify() != config.allow_modify() {
+            self.allow_upstream_modify
+                .send_replace(config.allow_modify());
+        }
+        // Keep the supervisor's baseline equal to what is running, so a later
+        // external edit is compared against the applied configuration. This is
+        // best-effort: a full channel only costs an unnecessary later restart.
+        let _ = self.live.try_send((self.generation, config.clone()));
+        Ok(config)
+    }
+
+    /// Persist a change of `[[proxies]]` or `allow_upstream_modify` live.
+    async fn update_config<F>(&self, change: F) -> Result<Config>
     where
         F: FnOnce(&mut Config) -> Result<()>,
     {
-        let mut persisted = self.persisted.write().await;
-        let mut candidate = persisted.clone();
+        let _guard = self.updates.lock().await;
+        let mut candidate = self.config.read().await.clone();
+        candidate.source = ConfigSource::default();
         change(&mut candidate)?;
-        // Validate after the change, so that a name or domain clash is rejected
-        // before anything is written
-        Config::validate(&mut candidate)?;
-        candidate.save(&self.config_path).await?;
-
-        let mut effective = candidate.clone();
-        self.env.apply(&mut effective);
-        Config::validate(&mut effective)?;
-        effective.source = ConfigSource {
-            path: Some(self.config_path.clone()),
-            persisted: Some(Box::new(candidate.clone())),
-            env: self.env.clone(),
-            env_only: false,
-        };
-
-        *persisted = candidate;
-        *self.config.write().await = effective.clone();
-        Ok(effective)
+        self.persist_and_apply_live(candidate).await
     }
 
-    /// Reject a proxy change that `HT_PROXIES` owns.
-    fn ensure_proxies_editable(&self) -> Result<()> {
-        if self.env.proxies_managed() {
-            bail!(
-                "The local services are managed by HT_PROXIES; change that environment \
-                 variable and restart ht"
-            );
+    /// Validate a settings change and report whether it needs a rebuild,
+    /// without writing anything.
+    pub(crate) async fn preview_settings<F>(&self, change: F) -> Result<SettingsOutcome>
+    where
+        F: FnOnce(&mut Config) -> Result<()>,
+    {
+        let _guard = self.updates.lock().await;
+        let current = self.config.read().await.clone();
+        let mut candidate = current.clone();
+        candidate.source = ConfigSource::default();
+        change(&mut candidate)?;
+        Config::validate(&mut candidate)?;
+
+        let restart_required = !crate::reload::same_effective_config(&current, &candidate)
+            && !crate::reload::only_live_fields_changed(&current, &candidate);
+        Ok(SettingsOutcome {
+            config: candidate,
+            restart_required,
+        })
+    }
+
+    /// Change this node's full configuration.
+    ///
+    /// A change of `[[proxies]]` or `allow_upstream_modify` is applied live. A
+    /// change of any other field is written to `ht.toml` and applied by the
+    /// configuration watcher, which rebuilds the listener and upstream session.
+    /// The caller learns whether the running generation was already updated.
+    pub(crate) async fn update_settings<F>(
+        &self,
+        change: F,
+        trigger_restart: bool,
+    ) -> Result<SettingsOutcome>
+    where
+        F: FnOnce(&mut Config) -> Result<()>,
+    {
+        let _guard = self.updates.lock().await;
+        let current = self.config.read().await.clone();
+        let mut candidate = current.clone();
+        candidate.source = ConfigSource::default();
+        change(&mut candidate)?;
+        Config::validate(&mut candidate)?;
+
+        if crate::reload::same_effective_config(&current, &candidate) {
+            return Ok(SettingsOutcome {
+                config: current,
+                restart_required: false,
+            });
         }
-        Ok(())
+
+        if crate::reload::only_live_fields_changed(&current, &candidate) {
+            let applied = self.persist_and_apply_live(candidate).await?;
+            return Ok(SettingsOutcome {
+                config: applied,
+                restart_required: false,
+            });
+        }
+
+        // The watcher sees the new file and starts a new generation through the
+        // normal reload path. Keep the management copy on the saved content so
+        // a proxy edit made before that reload cannot write the old settings
+        // back to the file. The listener keeps running the old generation until
+        // the watcher restarts it.
+        candidate.source = ConfigSource {
+            path: Some(self.config_path.clone()),
+        };
+        // When the caller is about to request the rebuild itself, mark the
+        // write so the file watcher does not start a second one.
+        if trigger_restart {
+            self.reload.mark_self_write(candidate.clone()).await;
+        }
+        if let Err(err) = candidate.save(&self.config_path).await {
+            if trigger_restart {
+                self.reload.clear().await;
+            }
+            return Err(err);
+        }
+        *self.config.write().await = candidate.clone();
+        Ok(SettingsOutcome {
+            config: candidate,
+            restart_required: true,
+        })
+    }
+
+    /// Apply a configuration file change that only touches the live fields.
+    ///
+    /// The supervisor uses this for an external edit of `[[proxies]]` or
+    /// `allow_upstream_modify`, so adding a local service does not restart the
+    /// listener and drop the visitors that are currently connected.
+    #[cfg(feature = "client")]
+    pub(crate) async fn apply_reloaded_config(&self, config: Config) {
+        *self.config.write().await = config.clone();
+        self.server.set_proxies(config.proxies.clone()).await;
+        if self.allow_upstream_modify() != config.allow_modify() {
+            self.allow_upstream_modify
+                .send_replace(config.allow_modify());
+        }
+        info!(
+            proxies = config.proxies.len(),
+            allow_upstream_modify = config.allow_modify(),
+            "The configuration file changed; applied the local services and switch"
+        );
     }
 
     /// Create or replace the local service of the given name, persist the
@@ -507,7 +731,6 @@ impl ManagementState {
         local_addr: String,
         auth_header: Option<MaskedString>,
     ) -> Result<()> {
-        self.ensure_proxies_editable()?;
         if local_addr.trim().is_empty() {
             bail!("The `local_addr` must not be empty");
         }
@@ -515,32 +738,33 @@ impl ManagementState {
             .ok_or_else(|| anyhow!("The domain `{}` is invalid", domain))?;
 
         let effective = self
-            .update_persisted(|config| {
+            .update_config(|config| {
                 config.set_proxy(name, domain, local_addr, auth_header);
                 Ok(())
             })
             .await?;
-        let proxy_count = effective.proxies.len();
-        self.server.set_proxies(effective.proxies).await;
-        info!(proxies = proxy_count, "The local services were updated");
+        info!(
+            proxies = effective.proxies.len(),
+            "The local services were updated"
+        );
         Ok(())
     }
 
     /// Delete the local service of the given name, persist the configuration,
     /// and apply the change.
     pub(crate) async fn delete_proxy(&self, name: &str) -> Result<()> {
-        self.ensure_proxies_editable()?;
         let effective = self
-            .update_persisted(|config| {
+            .update_config(|config| {
                 if !config.remove_proxy(name.trim()) {
                     bail!("No such a local service `{}`", name);
                 }
                 Ok(())
             })
             .await?;
-        let proxy_count = effective.proxies.len();
-        self.server.set_proxies(effective.proxies).await;
-        info!(proxies = proxy_count, "The local services were updated");
+        info!(
+            proxies = effective.proxies.len(),
+            "The local services were updated"
+        );
         Ok(())
     }
 
@@ -550,32 +774,19 @@ impl ManagementState {
         if !self.upstream_configured {
             bail!("No upstream is configured; this node is a standalone ingress");
         }
-        if self.env.allow_upstream_modify_managed() {
-            bail!(
-                "The switch is set by HT_ALLOW_UPSTREAM_MODIFY; change that environment \
-                 variable and restart ht"
-            );
-        }
-        if self.proxies_managed() {
-            bail!(
-                "The local services are managed by HT_PROXIES and are already read-only; \
-                 change that environment variable and restart ht"
-            );
-        }
 
         let effective = self
-            .update_persisted(|config| {
-                config.allow_upstream_modify = allowed;
+            .update_config(|config| {
+                let upstream = config
+                    .upstream
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("No upstream is configured"))?;
+                upstream.allow_modify = allowed;
                 Ok(())
             })
             .await?;
-        // Do not reconnect the upstream when the value did not actually change.
-        if self.allow_upstream_modify() != effective.allow_upstream_modify {
-            self.allow_upstream_modify
-                .send_replace(effective.allow_upstream_modify);
-        }
         info!(
-            allow_upstream_modify = effective.allow_upstream_modify,
+            allow_upstream_modify = effective.allow_modify(),
             "The upstream proxy modification switch was updated"
         );
         Ok(())
@@ -630,36 +841,44 @@ mod tests {
         let config = {
             let mut config = loaded;
             config.source.path = Some(path);
-            config.source.env_only = false;
-            if config.source.persisted.is_none() {
-                let mut baseline = config.clone();
-                baseline.source = ConfigSource::default();
-                config.source.persisted = Some(Box::new(baseline));
-            }
             config
         };
         let server = Arc::new(ServerState::new(
             MaskedString::from("token"),
             config.name.clone(),
-            "control.test".to_string(),
+            config.bind_host().parse().ok(),
+            config.entry_domain().map(str::to_string),
             config.server_limits(),
             routes,
             config.proxies.clone(),
         ));
-        ManagementState::new(config, server, Arc::new(AtomicBool::new(true)))
+        let (live, _live_rx) = mpsc::channel(8);
+        let (restart, _restart_rx) = mpsc::channel(1);
+        ManagementState::new(
+            config,
+            server,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(ReloadMarker::default()),
+            Arc::new(crate::reload::ReloadStatus::new()),
+            0,
+            live,
+            restart,
+        )
     }
 
     #[tokio::test]
-    async fn test_api_edits_persist_only_the_file_baseline() -> Result<()> {
+    async fn test_api_edits_persist_to_the_file() -> Result<()> {
         let path = std::env::temp_dir().join(format!(
             "http-tunnel-management-{}-baseline.toml",
             std::process::id()
         ));
         let persisted = Config::parse(
             r#"
-control_host = "control.example.com"
 name = "file"
 token = "file-token"
+
+[server]
+domain = "control.example.com"
 
 [[proxies]]
 name = "nas"
@@ -667,18 +886,7 @@ domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
 "#,
         )?;
-        let env = EnvConfig::from_lookup(|key| {
-            Ok(match key {
-                crate::config_env::ENV_TOKEN => Some("env-token".to_string()),
-                _ => None,
-            })
-        })?;
-        let mut effective = persisted.clone();
-        env.apply(&mut effective);
-        Config::validate(&mut effective)?;
-        effective.source.env = env;
-        effective.source.persisted = Some(Box::new(persisted.clone()));
-        let state = state(effective, path.clone());
+        let state = state(persisted, path.clone());
 
         state
             .put_proxy(
@@ -692,10 +900,7 @@ local_addr = "127.0.0.1:80"
         let saved = std::fs::read_to_string(&path)?;
         let _ = std::fs::remove_file(&path);
 
-        // The environment token wins at runtime but is never written to disk
         assert!(saved.contains("file-token"), "{}", saved);
-        assert!(!saved.contains("env-token"), "{}", saved);
-        // The new local service is persisted under [[proxies]]
         assert!(saved.contains("git.example.com"), "{}", saved);
         assert!(saved.contains("[[proxies]]"), "{}", saved);
         assert_eq!(state.proxies().await.len(), 2);
@@ -710,9 +915,11 @@ local_addr = "127.0.0.1:80"
         ));
         let persisted = Config::parse(
             r#"
-control_host = "control.example.com"
 name = "file"
 token = "file-token"
+
+[server]
+domain = "control.example.com"
 
 [[proxies]]
 name = "nas"
@@ -765,9 +972,11 @@ local_addr = "127.0.0.1:80"
         ));
         let persisted = Config::parse(
             r#"
-control_host = "control.example.com"
 name = "file"
 token = "file-token"
+
+[server]
+domain = "control.example.com"
 "#,
         )?;
         std::fs::write(&path, persisted.to_toml()?)?;
@@ -799,7 +1008,7 @@ token = "file-token"
             std::process::id()
         ));
         let persisted =
-            Config::parse("control_host = \"control.example.com\"\ntoken = \"secret\"\n")?;
+            Config::parse("token = \"secret\"\n\n[server]\ndomain = \"control.example.com\"\n")?;
         let _ = std::fs::remove_file(&path);
         let state = state(persisted, path.clone());
 
@@ -821,7 +1030,7 @@ token = "file-token"
             std::process::id()
         ));
         let persisted = Config::parse(
-            "control_host = \"control.example.com\"\ntoken = \"secret\"\n\n\
+            "token = \"secret\"\n\n[server]\ndomain = \"control.example.com\"\n\n\
              [upstream]\nurl = \"ws://upstream.test:7777\"\ntoken = \"secret\"\n",
         )?;
         let _ = std::fs::remove_file(&path);
@@ -837,110 +1046,56 @@ token = "file-token"
 
         let saved = std::fs::read_to_string(&path)?;
         let _ = std::fs::remove_file(&path);
-        assert!(saved.contains("allow_upstream_modify = true"), "{}", saved);
+        assert!(saved.contains("allow_modify = true"), "{}", saved);
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_allow_upstream_modify_environment_wins() -> Result<()> {
+    async fn test_settings_are_persisted_and_live_when_only_the_switch_changes() -> Result<()> {
         let path = std::env::temp_dir().join(format!(
-            "http-tunnel-management-{}-upstream-env.toml",
+            "http-tunnel-management-{}-settings.toml",
             std::process::id()
         ));
-        let env = EnvConfig::from_lookup(|key| {
-            Ok(match key {
-                crate::config_env::ENV_ALLOW_UPSTREAM_MODIFY => Some("true".to_string()),
-                _ => None,
-            })
-        })?;
-        let mut effective = Config::parse(
-            "control_host = \"control.example.com\"\ntoken = \"secret\"\n\n\
+        let persisted = Config::parse(
+            "token = \"secret\"\n\n[server]\ndomain = \"control.example.com\"\n\n\
              [upstream]\nurl = \"ws://upstream.test:7777\"\ntoken = \"secret\"\n",
         )?;
-        env.apply(&mut effective);
-        effective.source.env = env;
-        let state = state(effective, path.clone());
+        std::fs::write(&path, persisted.to_toml()?)?;
+        let state = state(persisted, path.clone());
 
-        assert!(state.allow_upstream_modify());
-        assert!(!state.allow_upstream_modify_editable());
-        let err = state
-            .set_allow_upstream_modify(false)
-            .await
-            .expect_err("the environment owns the switch");
-        assert!(
-            format!("{:#}", err).contains("HT_ALLOW_UPSTREAM_MODIFY"),
-            "{}",
-            err
-        );
-        assert!(!path.exists(), "a rejected change must not write a config");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_allow_upstream_modify_is_disabled_by_environment_proxies() -> Result<()> {
-        let path = std::env::temp_dir().join(format!(
-            "http-tunnel-management-{}-upstream-proxies.toml",
-            std::process::id()
-        ));
-        let env = EnvConfig::from_lookup(|key| {
-            Ok(match key {
-                crate::config_env::ENV_PROXIES => Some("[]".to_string()),
-                _ => None,
-            })
-        })?;
-        let mut effective = Config::parse(
-            "control_host = \"control.example.com\"\ntoken = \"secret\"\n\n\
-             [upstream]\nurl = \"ws://upstream.test:7777\"\ntoken = \"secret\"\n",
-        )?;
-        env.apply(&mut effective);
-        effective.source.env = env;
-        let state = state(effective, path.clone());
-
-        assert!(!state.allow_upstream_modify_editable());
-        let err = state
-            .set_allow_upstream_modify(true)
-            .await
-            .expect_err("HT_PROXIES already makes the list read-only");
-        assert!(format!("{:#}", err).contains("HT_PROXIES"), "{}", err);
-        assert!(!path.exists(), "a rejected change must not write a config");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_environment_proxies_are_read_only() -> Result<()> {
-        let path = std::env::temp_dir().join(format!(
-            "http-tunnel-management-{}-read-only.toml",
-            std::process::id()
-        ));
-        let env = EnvConfig::from_lookup(|key| {
-            Ok(match key {
-                crate::config_env::ENV_PROXIES => Some(
-                    r#"[{name="nas",domain="nas.example.com",local_addr="127.0.0.1:80"}]"#
-                        .to_string(),
-                ),
-                _ => None,
-            })
-        })?;
-        let mut effective = Config::default();
-        env.apply(&mut effective);
-        effective.control_host = Some("control.example.com".to_string());
-        effective.token = Some(MaskedString::from("secret"));
-        Config::validate(&mut effective)?;
-        effective.source.env = env;
-        let state = state(effective, path.clone());
-
-        assert!(state.proxies_managed());
-        let err = state
-            .put_proxy(
-                "git".to_string(),
-                "git.example.com".to_string(),
-                "127.0.0.1:81".to_string(),
-                None,
+        let outcome = state
+            .update_settings(
+                |config| {
+                    config
+                        .upstream
+                        .as_mut()
+                        .expect("the test config has an upstream")
+                        .allow_modify = true;
+                    Ok(())
+                },
+                false,
             )
-            .await
-            .expect_err("the proxies of the environment must not be changed");
-        assert!(format!("{:#}", err).contains("HT_PROXIES"), "{}", err);
-        assert!(!path.exists(), "no configuration file must be created");
+            .await?;
+        assert!(!outcome.restart_required);
+        assert!(state.allow_upstream_modify());
+        let saved = std::fs::read_to_string(&path)?;
+        assert!(saved.contains("allow_modify = true"), "{}", saved);
+
+        let outcome = state
+            .update_settings(
+                |config| {
+                    config.name = "renamed".to_string();
+                    Ok(())
+                },
+                false,
+            )
+            .await?;
+        assert!(outcome.restart_required);
+        // The running generation keeps the old name until the watcher reloads.
+        assert_eq!(state.name(), "ht");
+        let saved = std::fs::read_to_string(&path)?;
+        let _ = std::fs::remove_file(&path);
+        assert!(saved.contains("name = \"renamed\""), "{}", saved);
         Ok(())
     }
 
@@ -952,9 +1107,11 @@ token = "file-token"
         ));
         let persisted = Config::parse(
             r#"
-control_host = "control.example.com"
 name = "file"
 token = "file-token"
+
+[server]
+domain = "control.example.com"
 
 [[proxies]]
 name = "nas"

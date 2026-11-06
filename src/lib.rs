@@ -1,14 +1,18 @@
 mod config;
-mod config_env;
 mod constants;
 mod helper;
 #[cfg(any(feature = "server", feature = "client"))]
 mod protocol_v4;
+#[cfg(any(
+    all(feature = "server", feature = "client"),
+    all(feature = "server", feature = "management")
+))]
+mod reload;
 mod transport;
 
 pub use config::{
-    Config, GeneratedConfigError, MaskedString, ServerLimits, ServerProxyEntry, UpstreamConfig,
-    DEFAULT_LISTEN_PORT,
+    Config, GeneratedConfigError, MaskedString, ServerConfig, ServerLimits, ServerProxyEntry,
+    UpstreamConfig, DEFAULT_LISTEN_PORT,
 };
 
 use anyhow::Result;
@@ -39,12 +43,16 @@ mod management_api;
 #[cfg(all(feature = "server", feature = "client"))]
 mod node;
 
-/// Load `ht.toml` and overlay the `HT_*` environment.
+/// Load `ht.toml`. The file is the only source of configuration.
 pub async fn load_config(path: &Path) -> Result<Config> {
-    config_env::load(path).await
+    Config::from_file(path).await
 }
 
 /// Run the universal process from an already-loaded configuration.
+///
+/// A configuration loaded from a file keeps watching it: a valid change is
+/// applied without exiting the process (see `docs/internals.md`). A
+/// configuration built in memory has no file to watch.
 #[allow(unused_variables)]
 pub async fn run(config: Config, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
     // Raise `nofile` limit on linux and mac
@@ -57,6 +65,6 @@ pub async fn run(config: Config, shutdown_rx: broadcast::Receiver<bool>) -> Resu
     #[cfg(all(feature = "server", feature = "client"))]
     {
         debug!(?config, "Starting the universal process");
-        node::run_router(config, shutdown_rx).await
+        node::run(config, shutdown_rx).await
     }
 }

@@ -4,7 +4,7 @@ use rand::Rng;
 use std::time::{Duration, Instant};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     sync::broadcast,
     time,
 };
@@ -20,6 +20,10 @@ const HTTP_ENTRY_PORT: u16 = 2334;
 const WS_HTTP_ENTRY_ADDR: &str = "127.0.0.1:2336";
 const WS_HTTP_ENTRY_PORT: u16 = 2336;
 const WS_ECHO_SERVER_ADDR: &str = "127.0.0.1:8081";
+const DIRECT_HTTP_ENTRY_PORT: u16 = 2494;
+const DIRECT_ENTRY_ADDR: &str = "127.0.0.1:2494";
+const DIRECT_ECHO_SERVER_ADDR: &str = "127.0.0.1:8096";
+const DIRECT_HOST: &str = "direct.test";
 const CONTROL_HOST: &str = "127.0.0.1";
 const LEAF_NAME: &str = "home";
 const LEAF_TOKEN: &str = "a_secret_token";
@@ -67,10 +71,9 @@ fn write_leaf_config(
     // The leaf listens on an ephemeral port unless the test needs a fixed one
     // to reach its management interface.
     let content = format!(
-        "listen_port = {}\ncontrol_host = \"127.0.0.1\"\n\
-         name = \"{}\"\ntoken = \"{}\"\n{}\
+        "name = \"{}\"\ntoken = \"{}\"\n\n[server]\nport = {}\ndomain = \"127.0.0.1\"\n{}\
          \n[upstream]\nurl = \"ws://{}:{}\"\ntoken = \"{}\"\n",
-        listen_port, name, token, proxies_toml, upstream_host, upstream_port, token
+        name, token, listen_port, proxies_toml, upstream_host, upstream_port, token
     );
 
     let path = std::env::temp_dir().join(file);
@@ -78,19 +81,19 @@ fn write_leaf_config(
     Ok(path.to_str().unwrap().to_string())
 }
 
-/// Add `allow_upstream_modify = true` to a config written by
-/// [`write_leaf_config`]. The field is top-level, so it must be inserted before
-/// the `[upstream]` table.
+/// Add `allow_modify = true` to the `[upstream]` table of a config written by
+/// [`write_leaf_config`].
 fn enable_upstream_modify(path: &str) -> Result<()> {
     let content = std::fs::read_to_string(path)?;
-    let marker = "\n[upstream]";
+    let marker = "[upstream]\n";
     let index = content
         .find(marker)
         .unwrap_or_else(|| panic!("no [upstream] table in {}", path));
-    let mut updated = String::with_capacity(content.len() + 32);
-    updated.push_str(&content[..index]);
-    updated.push_str("\nallow_upstream_modify = true");
-    updated.push_str(&content[index..]);
+    let insert_at = index + marker.len();
+    let mut updated = String::with_capacity(content.len() + 24);
+    updated.push_str(&content[..insert_at]);
+    updated.push_str("allow_modify = true\n");
+    updated.push_str(&content[insert_at..]);
     std::fs::write(path, updated)?;
     Ok(())
 }
@@ -232,6 +235,61 @@ async fn http_routing() -> Result<()> {
 
     let _ = tokio::join!(server, client);
 
+    Ok(())
+}
+
+/// A leaf with no `[server]` never binds a port. The v4 stream must connect
+/// straight to the local proxy target instead of a loopback listener.
+#[tokio::test]
+async fn leaf_without_server_connects_directly_to_local_proxies() -> Result<()> {
+    init();
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(DIRECT_ECHO_SERVER_ADDR).await {
+            panic!("Failed to run the echo server for testing: {:?}", e);
+        }
+    });
+
+    let path = std::env::temp_dir().join(format!(
+        "http_tunnel_direct_leaf_{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        format!(
+            "name = \"direct-leaf\"\nretry_interval = 1\n\n\
+             [[proxies]]\nname = \"echo\"\ndomain = \"{DIRECT_HOST}\"\n\
+             local_addr = \"{DIRECT_ECHO_SERVER_ADDR}\"\n\n\
+             [upstream]\nurl = \"ws://127.0.0.1:{DIRECT_HTTP_ENTRY_PORT}\"\n\
+             token = \"{LEAF_TOKEN}\"\n"
+        ),
+    )?;
+
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+
+    let server = tokio::spawn(async move {
+        run_http_tunnel_server(
+            DIRECT_HTTP_ENTRY_PORT,
+            "127.0.0.1",
+            LEAF_TOKEN,
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_tcp(DIRECT_ENTRY_ADDR, Duration::from_secs(10)).await?;
+
+    let client = tokio::spawn(async move {
+        run_http_tunnel_from_config(path.to_str().unwrap(), client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_echo(DIRECT_ENTRY_ADDR, DIRECT_HOST, Duration::from_secs(20)).await?;
+
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server);
     Ok(())
 }
 
@@ -704,6 +762,53 @@ async fn management_api_manages_proxies() -> Result<()> {
     assert_eq!(status, 200, "unexpected response: {}", body);
     assert!(body.contains("home"), "unexpected body: {}", body);
 
+    info!("the management API exposes the node settings");
+    let (status, body) = api_request(
+        MANAGEMENT_ADDR,
+        "GET",
+        "/api/settings",
+        Some(MANAGEMENT_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(
+        body.contains("\"name\":\"home\""),
+        "unexpected body: {}",
+        body
+    );
+    assert!(body.contains("\"upstream\""), "unexpected body: {}", body);
+    assert!(body.contains(MANAGEMENT_TOKEN), "unexpected body: {}", body);
+    assert!(!body.contains("\"proxies\""), "unexpected body: {}", body);
+
+    info!("a settings dry run reports the restart without writing the file");
+    let changed = body.replace("\"name\":\"home\"", "\"name\":\"renamed\"");
+    let (status, preview) = api_request(
+        MANAGEMENT_ADDR,
+        "PUT",
+        "/api/settings?dry_run=true",
+        Some(MANAGEMENT_TOKEN),
+        Some(&changed),
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", preview);
+    assert!(
+        preview.contains("\"restart_required\":true"),
+        "unexpected body: {}",
+        preview
+    );
+    assert!(
+        preview.contains("\"saved\":false"),
+        "unexpected body: {}",
+        preview
+    );
+    let saved = std::fs::read_to_string(&config_path)?;
+    assert!(
+        saved.contains("name = \"home\""),
+        "a dry run must not write the config: {}",
+        saved
+    );
+
     info!("the management API has no tunnel yet");
     let (status, body) = api_request(
         MANAGEMENT_ADDR,
@@ -748,6 +853,100 @@ async fn management_api_manages_proxies() -> Result<()> {
     http_echo_hitter(MANAGEMENT_HTTP_ENTRY_ADDR, "echo.test")
         .await
         .unwrap();
+
+    info!("the status counts the visitor connection");
+    let (status, body) = api_request(
+        MANAGEMENT_ADDR,
+        "GET",
+        "/api/status",
+        Some(MANAGEMENT_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(
+        body.contains("\"total_visitors\":"),
+        "the dashboard should expose the visitor total: {}",
+        body
+    );
+
+    info!("the probe dials the saved local service");
+    let (status, body) = api_request(
+        MANAGEMENT_ADDR,
+        "POST",
+        "/api/proxies/echo/probe",
+        Some(MANAGEMENT_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(body.contains("\"ok\":true"), "unexpected body: {}", body);
+    assert!(
+        body.contains("\"latency_ms\":"),
+        "unexpected body: {}",
+        body
+    );
+
+    let (status, _) = api_request(
+        MANAGEMENT_ADDR,
+        "POST",
+        "/api/proxies/no-such-service/probe",
+        Some(MANAGEMENT_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 404, "an unknown service must be a 404");
+
+    info!("the probe reports an unreachable target without failing the API");
+    let closed_port = unused_port()?;
+    let body = format!(
+        r#"{{"domain":"probe-fail.test","local_addr":"127.0.0.1:{}"}}"#,
+        closed_port
+    );
+    let (status, _) = api_request(
+        MANAGEMENT_ADDR,
+        "PUT",
+        "/api/proxies/probe-fail",
+        Some(MANAGEMENT_TOKEN),
+        Some(&body),
+    )
+    .await?;
+    assert_eq!(status, 201);
+    let (status, body) = api_request(
+        MANAGEMENT_ADDR,
+        "POST",
+        "/api/proxies/probe-fail/probe",
+        Some(MANAGEMENT_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(body.contains("\"ok\":false"), "unexpected body: {}", body);
+    let (status, _) = api_request(
+        MANAGEMENT_ADDR,
+        "DELETE",
+        "/api/proxies/probe-fail",
+        Some(MANAGEMENT_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 204);
+
+    info!("the configuration can be exported as a backup");
+    let (status, body) = api_request(
+        MANAGEMENT_ADDR,
+        "GET",
+        "/api/settings/export",
+        Some(MANAGEMENT_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(body.contains("echo.test"), "unexpected body: {}", body);
+    assert!(body.contains("token ="), "unexpected body: {}", body);
+    let (status, _) =
+        api_request(MANAGEMENT_ADDR, "GET", "/api/settings/export", None, None).await?;
+    assert_eq!(status, 401, "export must require the token");
 
     info!("the management API enables visitor authentication");
     let (status, body) = api_request(
@@ -968,6 +1167,35 @@ async fn management_api_manages_proxies() -> Result<()> {
         "the fallback should carry a request id: {}",
         body
     );
+
+    info!("the management API restarts the runtime");
+    let (status, body) = api_request(
+        MANAGEMENT_ADDR,
+        "POST",
+        "/api/restart",
+        Some(MANAGEMENT_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(
+        body.contains("\"restarting\":true"),
+        "unexpected body: {}",
+        body
+    );
+
+    info!("the restarted runtime answers again on the same port");
+    time::sleep(Duration::from_secs(2)).await;
+    let (status, body) = api_request(
+        MANAGEMENT_ADDR,
+        "GET",
+        "/api/status",
+        Some(MANAGEMENT_TOKEN),
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "unexpected response: {}", body);
+    assert!(body.contains("home"), "unexpected body: {}", body);
 
     info!("shutdown the server and the client");
     server_shutdown_tx.send(true)?;
@@ -1294,7 +1522,6 @@ const SECURE_LEAF_PORT: u16 = 2485;
 const SECURE_LEAF_ADDR: &str = "127.0.0.1:2485";
 const SECURE_TOKEN: &str = "a_secure_token";
 const SECURE_NODE: &str = "secure-leaf";
-const SECURE_HOST: &str = "secure.test";
 
 /// Poll `/api/sessions` until the node's session reports the expected
 /// `writable` value, and return its current session id. The switch takes effect
@@ -1431,7 +1658,7 @@ async fn management_api_respects_allow_upstream_modify() -> Result<()> {
     let writable_after =
         wait_for_writable(SECURE_HTTP_ENTRY_ADDR, SECURE_TOKEN, SECURE_NODE, true).await?;
     info!(%writable_after, "the reconnected session now allows writes");
-    assert!(std::fs::read_to_string(&config_path)?.contains("allow_upstream_modify = true"));
+    assert!(std::fs::read_to_string(&config_path)?.contains("allow_modify = true"));
 
     let (status, body) = api_request(
         SECURE_HTTP_ENTRY_ADDR,
@@ -1551,9 +1778,9 @@ const OCCUPIED_HTTP_TEST_HTTP_PORT: u16 = 2476;
 async fn server_fails_when_listen_port_cannot_be_bound() -> Result<()> {
     init();
 
-    // Bind every interface, which is what the listener always does.
+    // Occupy the exact loopback address the test helper binds.
     let _occupied =
-        tokio::net::TcpListener::bind(("0.0.0.0", OCCUPIED_HTTP_TEST_HTTP_PORT)).await?;
+        tokio::net::TcpListener::bind(("127.0.0.1", OCCUPIED_HTTP_TEST_HTTP_PORT)).await?;
     let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
     let err = time::timeout(
@@ -1570,7 +1797,7 @@ async fn server_fails_when_listen_port_cannot_be_bound() -> Result<()> {
     .expect_err("server must fail when listen_port cannot be bound");
 
     assert!(
-        format!("{:#}", err).contains("listen_port"),
+        format!("{:#}", err).contains("[server].port"),
         "unexpected error: {:#}",
         err
     );
@@ -1862,9 +2089,8 @@ fn write_node_config(
     proxies: &[(&str, &str)],
 ) -> Result<String> {
     let mut content = format!(
-        "name = \"{}\"\nlisten_port = {}\ncontrol_host = \"127.0.0.1\"\n\
-         token = \"{}\"\n",
-        name, listen_port, token
+        "name = \"{}\"\ntoken = \"{}\"\n\n[server]\nport = {}\ndomain = \"127.0.0.1\"\n",
+        name, token, listen_port
     );
     for (domain, local_addr) in proxies {
         let proxy_name = domain.split('.').next().unwrap_or(domain);
@@ -2480,5 +2706,291 @@ async fn node_chain_forwards_websocket_upgrades() -> Result<()> {
     node_a_shutdown_tx.send(true)?;
     ingress_shutdown_tx.send(true)?;
     let _ = tokio::join!(node_b, node_a, ingress);
+    Ok(())
+}
+
+/// Bind an ephemeral loopback port, then release it for the process under test.
+fn unused_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// Write an ingress configuration with zero or one local service.
+fn write_reload_config(
+    path: &std::path::Path,
+    listen_port: u16,
+    proxy: Option<(&str, &str)>,
+) -> Result<()> {
+    write_reload_config_named(path, listen_port, "reload-test", proxy)
+}
+
+fn write_reload_config_named(
+    path: &std::path::Path,
+    listen_port: u16,
+    name: &str,
+    proxy: Option<(&str, &str)>,
+) -> Result<()> {
+    let mut content = format!(
+        "name = \"{}\"\ntoken = \"reload-secret\"\n\n[server]\nport = {}\ndomain = \"127.0.0.1\"\n",
+        name, listen_port
+    );
+    if let Some((domain, local_addr)) = proxy {
+        content.push_str(&format!(
+            "\n[[proxies]]\nname = \"backend\"\ndomain = \"{}\"\nlocal_addr = \"{}\"\n",
+            domain, local_addr
+        ));
+    }
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
+/// Send one visitor request and read the status line of whatever answers.
+async fn reload_status(addr: &str, host: &str) -> Result<u16> {
+    let mut conn = TcpStream::connect(addr).await?;
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        host
+    );
+    conn.write_all(request.as_bytes()).await?;
+    let mut response = Vec::new();
+    let _ = time::timeout(Duration::from_secs(5), conn.read_to_end(&mut response)).await;
+    let text = String::from_utf8_lossy(&response);
+    Ok(text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .unwrap_or(0))
+}
+
+/// Poll until `addr` answers `host` with `expected`, hiding startup and reload
+/// races from the test.
+async fn wait_for_reload_status(
+    addr: &str,
+    host: &str,
+    expected: u16,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let std::result::Result::Ok(status) = reload_status(addr, host).await {
+            if status == expected {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("{} did not answer {} within {:?}", addr, expected, timeout);
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Editing `ht.toml` must change the running process without restarting it.
+///
+/// A proxy-only edit is applied live; a listener-port edit has to rebuild the
+/// listener and upstream session, which this test observes on the new port.
+#[tokio::test]
+async fn config_file_changes_are_hot_reloaded() -> Result<()> {
+    init();
+
+    // A tiny HTTP backend. It answers every request with a fixed 200.
+    let backend = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_addr = backend.local_addr()?.to_string();
+    tokio::spawn(async move {
+        while let std::result::Result::Ok((mut stream, _)) = backend.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nbackend",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let path = std::env::temp_dir().join(format!(
+        "http-tunnel-hot-reload-{}.toml",
+        std::process::id()
+    ));
+    let port = unused_port()?;
+    write_reload_config(&path, port, Some(("reload.test", &backend_addr)))?;
+
+    let (stop_tx, stop_rx) = broadcast::channel(1);
+    let path_string = path.to_str().unwrap().to_string();
+    let node = tokio::spawn(async move {
+        run_http_tunnel_from_config(&path_string, stop_rx)
+            .await
+            .unwrap();
+    });
+
+    let addr = format!("127.0.0.1:{}", port);
+    wait_for_reload_status(&addr, "reload.test", 200, Duration::from_secs(10)).await?;
+
+    // Removing the proxy is a live change: the same listener answers 404 now.
+    write_reload_config(&path, port, None)?;
+    wait_for_reload_status(&addr, "reload.test", 404, Duration::from_secs(10)).await?;
+
+    // Changing the port rebuilds the listener and keeps the process alive.
+    let mut new_port = unused_port()?;
+    while new_port == port {
+        new_port = unused_port()?;
+    }
+    write_reload_config(&path, new_port, Some(("reload.test", &backend_addr)))?;
+    let new_addr = format!("127.0.0.1:{}", new_port);
+    wait_for_reload_status(&new_addr, "reload.test", 200, Duration::from_secs(15)).await?;
+
+    // A same-port change also rebuilds the server, but the listener socket is
+    // reused, so the port keeps answering throughout the reload.
+    write_reload_config_named(
+        &path,
+        new_port,
+        "reload-test-2",
+        Some(("reload-2.test", &backend_addr)),
+    )?;
+    wait_for_reload_status(&new_addr, "reload-2.test", 200, Duration::from_secs(10)).await?;
+    wait_for_reload_status(&new_addr, "reload.test", 404, Duration::from_secs(10)).await?;
+
+    info!("an invalid file is visible in /api/status while the old config keeps serving");
+    std::fs::write(&path, "listen_port = not-a-port\n")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, body) =
+            api_request(&new_addr, "GET", "/api/status", Some("reload-secret"), None).await?;
+        if status == 200 && body.contains("last_reload_error") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("the invalid configuration was not reported: {}", body);
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+    wait_for_reload_status(&new_addr, "reload-2.test", 200, Duration::from_secs(5)).await?;
+
+    info!("fixing the file clears the reload error");
+    write_reload_config_named(
+        &path,
+        new_port,
+        "reload-test-2",
+        Some(("reload-2.test", &backend_addr)),
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, body) =
+            api_request(&new_addr, "GET", "/api/status", Some("reload-secret"), None).await?;
+        if status == 200 && !body.contains("last_reload_error") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("the reload error was not cleared: {}", body);
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+
+    stop_tx.send(true)?;
+    let _ = time::timeout(Duration::from_secs(10), node).await;
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+/// Changing `bind_host` on the same port releases the old listener before it
+/// binds the new address, and a bad address rolls back to the running config.
+#[tokio::test]
+async fn bind_host_changes_are_hot_reloaded_and_rolled_back() -> Result<()> {
+    init();
+
+    let backend = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_addr = backend.local_addr()?.to_string();
+    tokio::spawn(async move {
+        while let std::result::Result::Ok((mut stream, _)) = backend.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nbackend",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let path = std::env::temp_dir().join(format!(
+        "http-tunnel-bind-host-reload-{}.toml",
+        std::process::id()
+    ));
+    let port = unused_port()?;
+    let addr = format!("127.0.0.1:{}", port);
+    let write = |bind_host: &str| -> Result<()> {
+        std::fs::write(
+            &path,
+            format!(
+                "name = \"bind-test\"\ntoken = \"bind-secret\"\n\n[server]\nport = {}\n\
+                 bind = \"{}\"\ndomain = \"127.0.0.1\"\n\n\
+                 [[proxies]]\nname = \"backend\"\ndomain = \"bind.test\"\n\
+                 local_addr = \"{}\"\n",
+                port, bind_host, backend_addr
+            ),
+        )?;
+        Ok(())
+    };
+
+    write("127.0.0.1")?;
+    let (stop_tx, stop_rx) = broadcast::channel(1);
+    let path_string = path.to_str().unwrap().to_string();
+    let node = tokio::spawn(async move {
+        run_http_tunnel_from_config(&path_string, stop_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_reload_status(&addr, "bind.test", 200, Duration::from_secs(10)).await?;
+
+    // A same-port bind-address change goes through the stop/rebind path.
+    write("0.0.0.0")?;
+    wait_for_reload_status(&addr, "bind.test", 200, Duration::from_secs(10)).await?;
+
+    info!("an unusable bind address rolls back to the previous listener");
+    write("192.0.2.1")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, body) =
+            api_request(&addr, "GET", "/api/status", Some("bind-secret"), None).await?;
+        if status == 200 && body.contains("last_reload_error") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("the bad bind_host was not reported: {}", body);
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+    wait_for_reload_status(&addr, "bind.test", 200, Duration::from_secs(5)).await?;
+
+    write("0.0.0.0")?;
+    wait_for_reload_status(&addr, "bind.test", 200, Duration::from_secs(10)).await?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = api_request(&addr, "GET", "/api/status", Some("bind-secret"), None).await;
+        let (status, body) = match response {
+            std::result::Result::Ok(pair) => pair,
+            std::result::Result::Err(_) => {
+                if Instant::now() >= deadline {
+                    anyhow::bail!("the listener did not come back after the bind change");
+                }
+                time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        if status == 200 && !body.contains("last_reload_error") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("the bind error was not cleared: {}", body);
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+
+    stop_tx.send(true)?;
+    let _ = time::timeout(Duration::from_secs(10), node).await;
+    let _ = std::fs::remove_file(&path);
     Ok(())
 }

@@ -3,7 +3,7 @@ use crate::session_server::{SessionControl, V4SessionHandle};
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,9 +58,10 @@ pub(crate) struct SessionSnapshot {
     pub(crate) manageable: bool,
     /// Whether the session allows its local services to be changed as well
     pub(crate) writable: bool,
-    /// Where the session's local services come from: `file` when it reads its
-    /// `ht.toml`, `env` when `HT_PROXIES` owns them. Unlike `writable`, it does
-    /// not change when the node turns `allow_upstream_modify` off.
+    /// Where the session's local services come from: `file` for a current
+    /// node; an older downstream peer that reported `CAP_PROXY_ENV` is `env`.
+    /// Unlike `writable`, it does not change when the node turns
+    /// `allow_upstream_modify` off.
     pub(crate) proxy_source: &'static str,
 }
 
@@ -148,6 +149,7 @@ impl RouteSnapshot {
 #[derive(Clone, Default)]
 pub(crate) struct ActivityTracker {
     active: Arc<AtomicUsize>,
+    total: Arc<AtomicU64>,
 }
 
 impl ActivityTracker {
@@ -159,8 +161,18 @@ impl ActivityTracker {
         }
     }
 
+    /// Count one visitor connection that reached routing. This excludes the
+    /// management page and the v4 upgrade endpoint on the reserved host.
+    pub(crate) fn count_visitor(&self) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn active(&self) -> usize {
         self.active.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn total(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
     }
 
     /// Wait until no visitor is being served, up to `timeout`.
@@ -194,8 +206,13 @@ pub(crate) struct ServerState {
     // The configured node name, named in gateway errors so an operator can tell
     // which hop of a chain failed
     pub(crate) node_name: String,
-    // Reserved HTTP Host for the WebSocket transport; never a business tunnel
-    pub(crate) control_host: String,
+    // The specific local address the listener is bound to, if any. The internal
+    // relay hop uses this address when `[server].bind` is not a wildcard, so the
+    // request-id header may come from it as well as from loopback.
+    pub(crate) bind_ip: Option<IpAddr>,
+    // Reserved HTTP Host for the WebSocket transport and management page; never
+    // a business tunnel. `None` disables the control plane.
+    pub(crate) control_host: Option<String>,
     // The configurable capacity and keepalive settings
     pub(crate) limits: ServerLimits,
     // WebSocket upgrades that are still waiting for their session handshake
@@ -211,13 +228,17 @@ pub(crate) struct ServerState {
     pub(crate) v4_shutdown: broadcast::Sender<bool>,
     pub(crate) next_v4_session_id: AtomicU64,
     // The domains this server can advertise upstream: its downstream routes
-    // plus its local proxies, excluding `control_host`.
+    // plus its local proxies, excluding `[server].domain`.
     pub(crate) routes: watch::Sender<BTreeSet<String>>,
     // The local services served by this process. The administration API can
     // replace this list at runtime.
     pub(crate) proxies: RwLock<Vec<ServerProxyEntry>>,
-    // The visitors that are currently being served
+    // The visitors that are currently being served, including the ones still
+    // reading their header. Shutdown drains this set.
     pub(crate) activity: ActivityTracker,
+    // Visitor connections that passed the reserved control host. This excludes
+    // management and v4 sessions, so the dashboard reports real visitors.
+    pub(crate) visitor_activity: ActivityTracker,
     // Routes that a v4 session stopped owning recently, for `404` diagnostics
     pub(crate) recent_withdrawals: RwLock<HashMap<String, RecentWithdrawal>>,
 }
@@ -233,7 +254,7 @@ pub(crate) type Management = ();
 /// `routes`. A relay subscribes to that watch to advertise its downstream routes
 /// and local proxies to its next hop.
 pub(crate) async fn run_server_with_listener_and_state(
-    http_listener: TcpListener,
+    http_listener: Arc<TcpListener>,
     state: Arc<ServerState>,
     management: Option<Management>,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -252,7 +273,8 @@ impl ServerState {
     pub(crate) fn new(
         token: MaskedString,
         node_name: String,
-        control_host: String,
+        bind_ip: Option<IpAddr>,
+        control_host: Option<String>,
         limits: ServerLimits,
         routes: watch::Sender<BTreeSet<String>>,
         proxies: Vec<ServerProxyEntry>,
@@ -261,6 +283,7 @@ impl ServerState {
         ServerState {
             token,
             node_name,
+            bind_ip,
             control_host,
             pending_connections: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
             limits,
@@ -273,6 +296,7 @@ impl ServerState {
             routes,
             proxies: RwLock::new(proxies),
             activity: ActivityTracker::default(),
+            visitor_activity: ActivityTracker::default(),
             recent_withdrawals: RwLock::new(HashMap::new()),
         }
     }
@@ -282,6 +306,21 @@ impl ServerState {
     pub(crate) async fn set_proxies(&self, proxies: Vec<ServerProxyEntry>) {
         *self.proxies.write().await = proxies;
         self.refresh_routes().await;
+    }
+
+    /// Count a visitor connection that passed the reserved control host and
+    /// reached routing, including requests that end in `401`/`404`.
+    pub(crate) fn count_visitor(&self) {
+        self.visitor_activity.count_visitor();
+    }
+
+    /// The active visitor connections and the total since this generation
+    /// started, as shown by `GET /api/status`.
+    pub(crate) fn visitor_stats(&self) -> (usize, u64) {
+        (
+            self.visitor_activity.active(),
+            self.visitor_activity.total(),
+        )
     }
 
     /// Recompute the advertised route set as the union of the local proxy
@@ -313,7 +352,11 @@ impl ServerState {
             let Some(domain) = crate::helper::normalize_domain(&proxy.domain) else {
                 continue;
             };
-            if domain_overlaps_control_host(&domain, &self.control_host) {
+            if self
+                .control_host
+                .as_deref()
+                .is_some_and(|control| domain_overlaps_control_host(&domain, control))
+            {
                 continue;
             }
             table.push(RouteSnapshot {
@@ -326,7 +369,11 @@ impl ServerState {
             });
         }
         for (domain, handle) in v4_routes.iter() {
-            if domain_overlaps_control_host(domain, &self.control_host) {
+            if self
+                .control_host
+                .as_deref()
+                .is_some_and(|control| domain_overlaps_control_host(domain, control))
+            {
                 continue;
             }
             table.push(RouteSnapshot {
@@ -530,7 +577,7 @@ impl ServerState {
 impl Server {
     async fn run(
         &mut self,
-        http_listener: TcpListener,
+        http_listener: Arc<TcpListener>,
         mut shutdown_rx: broadcast::Receiver<bool>,
     ) -> Result<()> {
         let mut http_task = tokio::spawn(crate::http::serve(

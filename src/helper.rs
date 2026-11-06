@@ -256,13 +256,9 @@ pub fn feature_not_compile(feature: &str) -> ! {
     )
 }
 
-/// The default address a listener binds: all interfaces.
-pub const DEFAULT_BIND_HOST: &str = "0.0.0.0";
-
-/// The `control_host` a leaf or relay reserves when none is configured. The
-/// upstream tunnel forwards visitors to `127.0.0.1`, so this is also the Host
-/// that reaches the embedded listener from the upstream session.
-pub const CONTROL_HOST_FALLBACK: &str = "127.0.0.1";
+/// The default address a listener binds: loopback. A server that must be
+/// reachable from another machine sets `[server].bind` explicitly.
+pub const DEFAULT_BIND_HOST: &str = "127.0.0.1";
 
 /// Format the socket address of the listener, which binds every interface.
 pub fn to_bind_addr(host: &str, port: u16) -> String {

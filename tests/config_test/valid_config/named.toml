@@ -1,9 +1,11 @@
 # Every local service is a table with its own `name`, `domain` and
 # `local_addr`. The `name` identifies it within the process and is what the
 # administration API addresses; the `domain` is the `Host` it serves.
-control_host = "control.example.com"
 name = "home"
 token = "use_a_secret_that_only_you_know"
+
+[server]
+domain = "control.example.com"
 
 [[proxies]]
 name = "nas"

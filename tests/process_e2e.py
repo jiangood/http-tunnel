@@ -2,9 +2,9 @@
 """Process-level E2E smoke test for the universal `ht` executable.
 
 Starts real `ht` processes and local HTTP backends, then checks the embedded
-ingress, a leaf with local `[[proxies]]`, the X-HTTP-TUNNEL-TOKEN gate, an
-environment-only process using HT_* variables, and a route-mirroring relay
-chain. Only Python's standard library is required.
+ingress, a leaf with local `[[proxies]]`, the X-HTTP-TUNNEL-TOKEN gate, the
+management API, and a route-mirroring relay chain. Only Python's standard
+library is required.
 """
 import base64
 import json
@@ -63,7 +63,7 @@ def wait_for_port(port, process, label, timeout=15):
     raise TimeoutError(f"{label} did not listen on port {port} in {timeout}s")
 
 
-def check_web_management(port, read_only=False):
+def check_web_management(port):
     base = f"http://127.0.0.1:{port}/"
     try:
         urllib.request.urlopen(base, timeout=3)
@@ -82,8 +82,7 @@ def check_web_management(port, read_only=False):
         assert f'name="ht-token" content="{TOKEN}"' in page, "the page must receive the API token"
         assert "<script" in page.lower(), "the page must render itself in the browser"
         assert "/api/status" in page
-        if read_only:
-            assert "HT_PROXIES" in page, "the page must explain that the environment manages the proxies"
+        assert "/api/settings" in page, "the page must expose the settings editor"
 
     # The API is Bearer-only, and the page is Basic-only: neither credential
     # opens the other resource.
@@ -108,7 +107,36 @@ def check_web_management(port, read_only=False):
     )
     with urllib.request.urlopen(api_req, timeout=3) as response:
         assert response.status == 200
-    print("PASS web management: Basic-only page, Bearer-only API, token handed to the page")
+        status = json.loads(response.read())
+        assert "total_visitors" in status, "status must expose visitor statistics"
+        assert "last_reload_success_seconds_ago" in status
+
+    export_req = urllib.request.Request(
+        base + "api/settings/export", headers={"Authorization": f"Bearer {TOKEN}"}
+    )
+    with urllib.request.urlopen(export_req, timeout=3) as response:
+        exported = response.read().decode()
+        assert response.status == 200
+        assert "[server]" in exported, "export must return the configuration file"
+        assert "token" in exported, "export must include the listener token"
+
+    proxies_req = urllib.request.Request(
+        base + "api/proxies", headers={"Authorization": f"Bearer {TOKEN}"}
+    )
+    with urllib.request.urlopen(proxies_req, timeout=3) as response:
+        proxies = json.loads(response.read())
+    if proxies:
+        probe_req = urllib.request.Request(
+            base + f"api/proxies/{proxies[0]['name']}/probe",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(probe_req, timeout=5) as response:
+            probe = json.loads(response.read())
+            assert probe["ok"] is True, f"local service probe failed: {probe}"
+    print(
+        "PASS web management: Basic-only page, Bearer-only API, stats/export/probe"
+    )
 
 
 def request(port, host, token=None, path="/e2e"):
@@ -216,9 +244,11 @@ def main():
     try:
         # Phase 1: a standalone ingress with one local proxy.
         (work / "ht.toml").write_text(f"""name = "e2e-ingress"
-listen_port = {server_port}
-control_host = "127.0.0.1"
 token = "{TOKEN}"
+
+[server]
+port = {server_port}
+domain = "127.0.0.1"
 
 [[proxies]]
 name = "server-backend"
@@ -230,15 +260,18 @@ auth_header = "{SERVER_AUTH}"
         processes.append(server)
         wait_for_port(server_port, server, "ht ingress listener")
 
-        # A leaf always runs its own listener (here an ephemeral port)
-        # and dials the ingress. Its local services are [[proxies]].
+        # This leaf keeps a listener for the management-page checks and dials the
+        # ingress. The chain leaf below exercises the listener-less mode.
         leaf_work = Path(tempfile.mkdtemp(prefix="http-tunnel-e2e-leaf-"))
         work_dirs.append(leaf_work)
         (leaf_work / "ht.toml").write_text(f"""name = "e2e-leaf"
-listen_port = {leaf_port}
-control_host = "127.0.0.1"
 token = "{TOKEN}"
 retry_interval = 1
+
+[server]
+port = {leaf_port}
+bind = "127.0.0.1"
+domain = "127.0.0.1"
 
 [[proxies]]
 name = "client-backend"
@@ -306,91 +339,27 @@ token = "{TOKEN}"
                 raise AssertionError(f"{host}: a wrong token must get 401")
             print(f"PASS {host}: a wrong token is answered with 401 (invalid)")
 
-        # Phase 2: the same ingress, a leaf configured only by HT_* variables
-        # and with no ht.toml file.
-        stop(leaf, processes)
-
-        env_work = Path(tempfile.mkdtemp(prefix="http-tunnel-e2e-env-"))
-        work_dirs.append(env_work)
-        env_leaf_port = free_port()
-        while env_leaf_port in (server_port, leaf_port):
-            env_leaf_port = free_port()
-        env = os.environ.copy()
-        env.update(
-            {
-                "HT_UPSTREAM_URL": f"ws://127.0.0.1:{server_port}",
-                "HT_NAME": "e2e-env-leaf",
-                "HT_TOKEN": TOKEN,
-                "HT_LISTEN_PORT": str(env_leaf_port),
-                "HT_CONTROL_HOST": "127.0.0.1",
-                "HT_RETRY_INTERVAL": "1",
-                "HT_PROXIES": (
-                    f'[{{name="client-backend",domain="env-client.e2e.test",'
-                    f'local_addr="127.0.0.1:{client_backend.server_port}",'
-                    f'auth_header="{CLIENT_AUTH}"}}]'
-                ),
-            }
-        )
-
-        leaf = subprocess.Popen(
-            [str(HT)], cwd=env_work, env=env, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True,
-        )
-        processes.append(leaf)
-        wait_for_port(env_leaf_port, leaf, "ht environment-only listener")
-        assert not (env_work / "ht.toml").exists(), (
-            "an environment-only process must not write ht.toml"
-        )
-        check_web_management(env_leaf_port, read_only=True)
-        body = wait_for_tunnel(server_port, leaf, "env-client.e2e.test", CLIENT_AUTH)
-        assert body["tunnel_token"] is None, (
-            "the token must be stripped before the backend, "
-            f"got {body['tunnel_token']!r}"
-        )
-
-        # The proxies of the environment are read-only through the API
-        api_req = urllib.request.Request(
-            f"http://127.0.0.1:{env_leaf_port}/api/proxies/extra",
-            method="PUT",
-            data=b'{"domain":"extra.e2e.test","local_addr":"127.0.0.1:1"}',
-            headers={
-                "Authorization": f"Bearer {TOKEN}",
-                "Content-Type": "application/json",
-            },
-        )
-        try:
-            urllib.request.urlopen(api_req, timeout=3)
-        except urllib.error.HTTPError as exc:
-            assert exc.code == 409, (
-                f"an environment-managed proxy must be read-only, got {exc.code}"
-            )
-        else:
-            raise AssertionError("an environment-managed proxy must be read-only")
-        print(
-            "PASS HT_PROXIES: an env-only leaf routes its proxy, writes no "
-            "ht.toml, and rejects API changes with 409"
-        )
-
-        # Phase 3: a real ht relay mirrors a real ht leaf to the ingress.
+        # Phase 2: a real ht relay mirrors a real ht leaf to the ingress.
         node_port = free_port()
-        while node_port in (server_port, leaf_port, env_leaf_port):
+        while node_port in (server_port, leaf_port):
             node_port = free_port()
         node_work = Path(tempfile.mkdtemp(prefix="http-tunnel-e2e-node-"))
         chain_work = Path(tempfile.mkdtemp(prefix="http-tunnel-e2e-chain-"))
         work_dirs.extend([node_work, chain_work])
         (node_work / "ht.toml").write_text(f"""name = "e2e-relay"
-listen_port = {node_port}
-control_host = "127.0.0.1"
 token = "{NODE_TOKEN}"
+
+[server]
+port = {node_port}
+domain = "127.0.0.1"
 
 [upstream]
 url = "ws://127.0.0.1:{server_port}"
 token = "{TOKEN}"
 """)
+        # The chain leaf has no [server] at all: it never binds a port and the
+        # v4 stream connects directly to each [[proxies]] target.
         (chain_work / "ht.toml").write_text(f"""name = "e2e-chain-leaf"
-listen_port = 0
-control_host = "127.0.0.1"
-token = "{NODE_TOKEN}"
 retry_interval = 1
 
 [[proxies]]

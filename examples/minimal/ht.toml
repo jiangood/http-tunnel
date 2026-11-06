@@ -1,21 +1,31 @@
-## ht 配置文件：保留 [upstream] 为客户端/中继，删除则为独立入口。
+## ht 配置文件
+##
+## 客户端模式：不写 [server]，进程只向上游拨出，不监听任何端口。
+## 服务端模式：取消 [server] 的注释即开启监听。
+## 中继模式：同时保留 [server] 和 [upstream]。
 
 name = "edge"
-listen_port = 7777
-control_host = "edge.lan"
-token = "replace-with-the-downstream-secret"
 
-## 是否允许上一跳修改本节点的 [[proxies]]。默认 false：上级只能查看。
-## 本节点管理页顶部也可以切换；切换会立即重连上游会话。
-allow_upstream_modify = false
+## 服务端模式（可选）。
+## bind 默认 127.0.0.1，只监听本机；Docker、局域网中继或直接公网访问时改成 0.0.0.0。
+## domain 是入口 Host（原 control_host）；省略时只监听访客路由，
+## 不启用管理页/API 和下游 v4 入口。
+# [server]
+# port = 7777
+# bind = "127.0.0.1"
+# domain = "edge.lan"
 
-## 本进程代理的本地服务
+## 客户端/中继模式：填写上一跳。
+## 没有 [server] 时，本进程的本地服务由 v4 流直接连接，不占监听端口。
+[upstream]
+url = "wss://control.example.com:443"
+token = "replace-with-the-upstream-secret"
+
+## 是否允许上一跳通过 v4 管理通道修改本节点 [[proxies]]，默认 false。
+allow_modify = false
+
+## 本进程直接服务的本地服务。
 [[proxies]]
 name = "nas"
 domain = "nas.example.com"
 local_addr = "127.0.0.1:80"
-
-## 有 [upstream] 时，本进程的本地服务与下游路由总是镜像给上一跳。
-[upstream]
-url = "wss://control.example.com:443"
-token = "replace-with-the-upstream-secret"

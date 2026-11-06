@@ -151,7 +151,9 @@ pub(crate) async fn accept(
 
     let mut nonce = vec![0u8; 32];
     rand::thread_rng().fill_bytes(&mut nonce);
-    let server_id = state.control_host.clone();
+    // The v4 endpoint is unreachable when no control host is configured, so a
+    // missing value here never reaches a real handshake.
+    let server_id = state.control_host.clone().unwrap_or_default();
     p4::write_frame(
         &mut conn,
         &SessionFrame::Challenge {
@@ -518,7 +520,11 @@ async fn apply_routes(
             });
             continue;
         };
-        if crate::config::domain_overlaps_control_host(&prefix, &state.control_host) {
+        if state
+            .control_host
+            .as_deref()
+            .is_some_and(|control| crate::config::domain_overlaps_control_host(&prefix, control))
+        {
             rejected.push(RouteRejection {
                 prefix,
                 reason: RouteError::ReservedHost,

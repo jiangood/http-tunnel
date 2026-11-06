@@ -1,19 +1,20 @@
 //! Management API and minimal server-rendered web UI of the universal process.
 
-use crate::config::{MaskedString, ServerProxyEntry};
+use crate::config::{Config, MaskedString, ServerConfig, ServerProxyEntry, UpstreamConfig};
 use crate::management::{ManagementState, SessionAdminError};
 use anyhow::{Context, Result};
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
-use axum::http::header::{AUTHORIZATION, CACHE_CONTROL};
+use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use hyper::service::Service as _;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::TcpStream;
 use tracing::warn;
 
@@ -54,7 +55,7 @@ pub(crate) async fn serve_connection(
     Ok(())
 }
 
-/// The management router. It is mounted on the reserved `control_host` of the
+/// The management router. It is mounted on the reserved `[server].domain` of the
 /// main listener, not on a listener of its own.
 fn build_router(token: String, management: Arc<ManagementState>) -> Router {
     let state = Arc::new(ApiState {
@@ -66,9 +67,13 @@ fn build_router(token: String, management: Arc<ManagementState>) -> Router {
         .route("/status", get(status))
         .route("/proxies", get(list_proxies))
         .route("/proxies/:name", put(put_proxy).delete(delete_proxy))
+        .route("/proxies/:name/probe", post(probe_proxy))
         .route("/routes", get(list_routes))
         .route("/sessions", get(list_sessions))
         .route("/sessions/:id", delete(delete_session))
+        .route("/settings", get(get_settings).put(put_settings))
+        .route("/settings/export", get(export_settings))
+        .route("/restart", post(restart))
         .route(
             "/settings/allow-upstream-modify",
             put(put_allow_upstream_modify),
@@ -236,8 +241,7 @@ struct ProxyView {
     /// The visitor token, in plain text. The management response is always
     /// `no-store`, and the whole management plane is meant to run behind TLS.
     auth_header: Option<String>,
-    /// `file` when the proxy comes from `ht.toml`, `env` when `HT_PROXIES`
-    /// replaces the whole list
+    /// `file` for this node; a legacy downstream peer may still report `env`
     source: &'static str,
 }
 
@@ -252,36 +256,35 @@ fn proxy_view(proxy: &ServerProxyEntry, source: &'static str) -> ProxyView {
 }
 
 #[derive(Serialize)]
-struct EnvVarView {
-    name: &'static str,
-    set: bool,
-}
-
-#[derive(Serialize)]
 struct StatusView {
     name: String,
     transport: String,
     remote: String,
     connected: bool,
     proxies: usize,
-    /// Whether `HT_PROXIES` owns the local services, in which case the page
-    /// hides the form instead of letting every submit fail with `409`
-    proxies_managed: bool,
     /// Whether the next hop may change this process's local services
     allow_upstream_modify: bool,
     /// Whether the page may change [`allow_upstream_modify`]. It is false
-    /// without an upstream, when `HT_ALLOW_UPSTREAM_MODIFY` owns the value, or
-    /// when `HT_PROXIES` already makes the service list read-only.
+    /// without an upstream.
     allow_upstream_modify_editable: bool,
     /// The number of downstream v4 sessions connected right now
     sessions: usize,
     /// The configured limit for those sessions
     sessions_max: usize,
+    /// Visitor connections currently accepted and being served
+    active_visitors: usize,
+    /// Visitor connections routed since the current runtime started
+    total_visitors: u64,
+    /// Why the most recent configuration file change was not applied, if any
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_reload_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_reload_error_seconds_ago: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_reload_success_seconds_ago: Option<u64>,
     version: &'static str,
     config_path: String,
     uptime_seconds: u64,
-    /// Every known `HT_*` variable with whether it is set; values are omitted
-    env_vars: Vec<EnvVarView>,
 }
 
 #[derive(Deserialize)]
@@ -302,6 +305,91 @@ struct PutAllowUpstreamModify {
 #[derive(Serialize)]
 struct AllowUpstreamModifyView {
     allow_upstream_modify: bool,
+}
+
+/// Every editable setting of one node. `[[proxies]]` has its own endpoints
+/// because each entry is added and removed independently.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsBody {
+    name: String,
+    #[serde(default)]
+    server: Option<ServerBody>,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    upstream: Option<UpstreamBody>,
+    retry_interval: u64,
+    keepalive_interval: u64,
+    max_pending_handshakes: usize,
+    max_sessions: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerBody {
+    port: u16,
+    bind: String,
+    #[serde(default)]
+    domain: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamBody {
+    url: String,
+    token: String,
+    #[serde(default)]
+    allow_modify: bool,
+}
+
+#[derive(Serialize)]
+struct SettingsApplyView {
+    /// Whether the listener or the upstream session still has to be rebuilt
+    /// before the saved configuration is active
+    restart_required: bool,
+    /// Whether this response scheduled a runtime rebuild
+    restart_triggered: bool,
+    /// Whether the request wrote the configuration file. A dry run does not.
+    saved: bool,
+    settings: SettingsBody,
+}
+
+/// The optional modifiers of `PUT /api/settings`.
+#[derive(Deserialize, Default)]
+struct SettingsQuery {
+    /// Validate and compare without writing anything
+    #[serde(default)]
+    dry_run: bool,
+    /// Rebuild the runtime immediately when the change needs it
+    #[serde(default)]
+    restart: bool,
+}
+
+#[derive(Serialize)]
+struct RestartView {
+    restarting: bool,
+}
+
+fn settings_body(config: &Config) -> SettingsBody {
+    SettingsBody {
+        name: config.name.clone(),
+        server: config.server.as_ref().map(|server| ServerBody {
+            port: server.port,
+            bind: server.bind.clone(),
+            domain: server.domain.clone(),
+        }),
+        token: config.token.as_deref().map(str::to_string),
+        upstream: config.upstream.as_ref().map(|upstream| UpstreamBody {
+            url: upstream.url.clone(),
+            token: upstream.token.to_string(),
+            allow_modify: upstream.allow_modify,
+        }),
+        retry_interval: config.retry_interval,
+        keepalive_interval: config.keepalive_interval,
+        max_pending_handshakes: config.max_pending_handshakes,
+        max_sessions: config.max_sessions,
+    }
 }
 
 /// The optional downstream selector of the proxy endpoints. Without either
@@ -453,9 +541,6 @@ impl ApiError {
     fn from_reason(reason: String) -> ApiError {
         let status = if reason.contains("No such") {
             StatusCode::NOT_FOUND
-        } else if reason.contains("HT_PROXIES") {
-            // The local services come from the environment and cannot change
-            StatusCode::CONFLICT
         } else if reason.contains("Failed to") {
             StatusCode::INTERNAL_SERVER_ERROR
         } else {
@@ -482,26 +567,31 @@ impl ApiError {
 async fn status(State(state): State<Arc<ApiState>>) -> Json<StatusView> {
     let proxies = state.management.proxies().await.len();
     let (sessions, sessions_max) = state.management.session_count();
+    let (active_visitors, total_visitors) = state.management.visitor_stats();
+    let reload = state.management.reload_status();
+    let now = Instant::now();
     Json(StatusView {
         name: state.management.name().to_string(),
         transport: state.management.transport().to_string(),
         remote: state.management.server_addr().to_string(),
         connected: state.management.connected(),
         proxies,
-        proxies_managed: state.management.proxies_managed(),
         allow_upstream_modify: state.management.allow_upstream_modify(),
         allow_upstream_modify_editable: state.management.allow_upstream_modify_editable(),
         sessions,
         sessions_max,
+        active_visitors,
+        total_visitors,
+        last_reload_error: reload.last_error,
+        last_reload_error_seconds_ago: reload
+            .last_error_at
+            .map(|at| now.duration_since(at).as_secs()),
+        last_reload_success_seconds_ago: reload
+            .last_success_at
+            .map(|at| now.duration_since(at).as_secs()),
         version: env!("CARGO_PKG_VERSION"),
         config_path: state.management.config_path().display().to_string(),
         uptime_seconds: state.management.uptime(),
-        env_vars: state
-            .management
-            .env_vars()
-            .into_iter()
-            .map(|(name, set)| EnvVarView { name, set })
-            .collect(),
     })
 }
 
@@ -524,6 +614,104 @@ async fn put_allow_upstream_modify(
     }))
 }
 
+/// Every setting of this node, including the secrets (the page is served only
+/// after Basic authentication with the same token, and every response is
+/// `no-store`).
+async fn get_settings(State(state): State<Arc<ApiState>>) -> Json<SettingsBody> {
+    Json(settings_body(&state.management.config_snapshot().await))
+}
+
+fn apply_settings_body(config: &mut Config, body: SettingsBody) {
+    config.name = body.name;
+    config.server = body.server.map(|server| ServerConfig {
+        port: server.port,
+        bind: server.bind,
+        domain: server.domain,
+    });
+    config.token = body.token.map(MaskedString::from);
+    config.upstream = body.upstream.map(|upstream| UpstreamConfig {
+        url: upstream.url,
+        token: MaskedString::from(upstream.token),
+        allow_modify: upstream.allow_modify,
+    });
+    config.retry_interval = body.retry_interval;
+    config.keepalive_interval = body.keepalive_interval;
+    config.max_pending_handshakes = body.max_pending_handshakes;
+    config.max_sessions = body.max_sessions;
+}
+
+/// Replace every setting of this node.
+///
+/// `[[proxies]]` is not part of the body: it has its own endpoints. A change
+/// that only touches `[upstream].allow_modify` is applied live; anything else is
+/// persisted and picked up by the configuration watcher, which rebuilds the
+/// listener and upstream session. The response says whether that is necessary.
+///
+/// `?dry_run=true` validates and compares without writing. The page uses it to
+/// ask the operator before saving a change that needs a rebuild.
+/// `?restart=true` schedules that rebuild immediately instead of leaving it to
+/// the file watcher.
+async fn put_settings(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<SettingsQuery>,
+    Json(body): Json<SettingsBody>,
+) -> Result<Json<SettingsApplyView>, ApiError> {
+    if query.dry_run {
+        let outcome = state
+            .management
+            .preview_settings(|config| {
+                apply_settings_body(config, body);
+                Ok(())
+            })
+            .await
+            .map_err(|error| ApiError::from_reason(format!("{:#}", error)))?;
+        return Ok(Json(SettingsApplyView {
+            restart_required: outcome.restart_required,
+            restart_triggered: false,
+            saved: false,
+            settings: settings_body(&outcome.config),
+        }));
+    }
+
+    let outcome = state
+        .management
+        .update_settings(
+            |config| {
+                apply_settings_body(config, body);
+                Ok(())
+            },
+            query.restart,
+        )
+        .await
+        .map_err(|error| ApiError::from_reason(format!("{:#}", error)))?;
+
+    let restart_triggered = query.restart && outcome.restart_required;
+    if restart_triggered {
+        state.management.schedule_restart(outcome.config.clone());
+    }
+
+    Ok(Json(SettingsApplyView {
+        restart_required: outcome.restart_required,
+        restart_triggered,
+        saved: true,
+        settings: settings_body(&outcome.config),
+    }))
+}
+
+/// Rebuild the listener and upstream session from the configuration on disk.
+///
+/// The process itself keeps running. The response is sent before the runtime is
+/// stopped, so the page can show a message while the connection may drop.
+async fn restart(State(state): State<Arc<ApiState>>) -> Result<Json<RestartView>, ApiError> {
+    let config = state
+        .management
+        .config_from_disk()
+        .await
+        .map_err(|error| ApiError::from_reason(format!("{:#}", error)))?;
+    state.management.schedule_restart(config);
+    Ok(Json(RestartView { restarting: true }))
+}
+
 async fn list_proxies(
     State(state): State<Arc<ApiState>>,
     scope: std::result::Result<Query<ProxyScope>, QueryRejection>,
@@ -531,18 +719,13 @@ async fn list_proxies(
     let scope = query_scope(scope)?;
     let (node, session) = proxy_scope(&scope)?;
     if node.is_none() && session.is_none() {
-        let source = if state.management.proxies_managed() {
-            "env"
-        } else {
-            "file"
-        };
         return Ok(Json(
             state
                 .management
                 .proxies()
                 .await
                 .iter()
-                .map(|proxy| proxy_view(proxy, source))
+                .map(|proxy| proxy_view(proxy, "file"))
                 .collect(),
         ));
     }
@@ -630,6 +813,52 @@ async fn put_proxy(
         Some(proxy) => Ok((StatusCode::CREATED, Json(proxy_view(proxy, source))).into_response()),
         None => Ok(StatusCode::CREATED.into_response()),
     }
+}
+
+/// Dial one local service and report reachability. The probe is deliberately
+/// local-only: a downstream probe would need a new v4 frame and capability bit.
+async fn probe_proxy(
+    State(state): State<Arc<ApiState>>,
+    scope: std::result::Result<Query<ProxyScope>, QueryRejection>,
+    Path(name): Path<String>,
+) -> Result<Json<crate::management::ProbeOutcome>, ApiError> {
+    let scope = query_scope(scope)?;
+    let (node, session) = proxy_scope(&scope)?;
+    if node.is_some() || session.is_some() {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "The probe endpoint only supports local services".to_string(),
+        ));
+    }
+    state
+        .management
+        .probe_proxy(&name)
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::from_reason(format!("{:#}", error)))
+}
+
+/// Download the configuration file as it is on disk, comments included.
+async fn export_settings(State(state): State<Arc<ApiState>>) -> Result<Response, ApiError> {
+    let body = state
+        .management
+        .export_toml()
+        .await
+        .map_err(|error| ApiError::from_reason(format!("{:#}", error)))?;
+    Ok((
+        [
+            (
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/toml; charset=utf-8"),
+            ),
+            (
+                CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"ht.toml\""),
+            ),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 async fn delete_proxy(

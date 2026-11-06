@@ -2,9 +2,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
+use std::io::ErrorKind;
+use std::net::IpAddr;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use toml_edit::{ArrayOfTables, DocumentMut, Item};
 
 /// The interval between retries to connect to the upstream
 const DEFAULT_RETRY_INTERVAL_SECS: u64 = 1;
@@ -95,11 +98,44 @@ pub struct ServerProxyEntry {
     pub auth_header: Option<MaskedString>,
 }
 
+/// The listener side of the process.
+///
+/// The table is the server-mode switch: without it the process never binds a
+/// port and only dials `[upstream]`. When it is present, the embedded HTTP
+/// listener serves local proxies; `domain` additionally enables the control
+/// plane (the management page/API and the downstream v4 entrypoint).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServerConfig {
+    /// The listener port. `0` picks an ephemeral port.
+    #[serde(default = "default_listen_port")]
+    pub port: u16,
+    /// The local address the listener binds. `127.0.0.1` (the default) keeps it
+    /// local; `0.0.0.0` accepts every interface.
+    #[serde(default = "default_bind_host")]
+    pub bind: String,
+    /// The exact Host reserved for the control plane: the v4 session endpoint
+    /// and the management page/API. Omitted means the listener serves visitors
+    /// only and has no control plane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig {
+            port: default_listen_port(),
+            bind: default_bind_host(),
+            domain: None,
+        }
+    }
+}
+
 /// The next hop towards the public ingress.
 ///
-/// Without this table the process is a standalone ingress: it only runs its
-/// embedded server. With it, the process also dials the next hop with one v4
-/// session and mirrors its route set there.
+/// Without this table the process is a standalone ingress when `[server]` is
+/// present. With it, the process also dials the next hop with one v4 session and
+/// mirrors its route set there.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
@@ -108,6 +144,10 @@ pub struct UpstreamConfig {
     pub url: String,
     /// The shared token of the next hop.
     pub token: MaskedString,
+    /// Whether the next hop may change this process's `[[proxies]]` over the
+    /// v4 session. Off unless the file opts in.
+    #[serde(default)]
+    pub allow_modify: bool,
 }
 
 impl UpstreamConfig {
@@ -130,41 +170,29 @@ impl UpstreamConfig {
 
 /// The metadata of how a configuration was loaded. It is never serialized.
 ///
-/// The administration API uses it to persist a change to the same file and to
-/// keep environment values out of that file.
+/// The administration API uses it to persist a change to the same file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ConfigSource {
     /// The file the configuration came from, if any
     pub(crate) path: Option<PathBuf>,
-    /// The file baseline without the environment overlay
-    pub(crate) persisted: Option<Box<Config>>,
-    /// The environment settings that win over the file
-    pub(crate) env: crate::config_env::EnvConfig,
-    /// Whether the process started without a configuration file
-    pub(crate) env_only: bool,
 }
 
 /// The configuration of the universal `ht` process.
 ///
-/// One file describes both roles: the embedded listener/server (always running)
-/// and one optional upstream session. Local services are declared once under
-/// `[[proxies]]`, whether they are served directly by an ingress or advertised
-/// to an upper hop by a leaf or relay.
+/// One file describes both roles: an optional listener/server (`[server]`) and
+/// one optional upstream session (`[upstream]`). Local services are declared
+/// once under `[[proxies]]`, whether they are served directly by an ingress or
+/// advertised to an upper hop by a leaf or relay.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// The identity of the process, used for logging and the v4 node id
     #[serde(default = "default_name")]
     pub name: String,
-    /// The listener port. `0` picks an ephemeral port and is only allowed when
-    /// `[upstream]` is present.
-    #[serde(default = "default_listen_port")]
-    pub listen_port: u16,
-    /// The exact Host reserved for the control plane: the v4 session endpoint
-    /// and the management page/API. It is
-    /// required without `[upstream]`, and defaults to `127.0.0.1` with it.
+    /// The server side. The table's presence enables the listener; without it
+    /// the process is a client/leaf only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control_host: Option<String>,
+    pub server: Option<ServerConfig>,
     /// The shared token of downstream peers. When omitted with `[upstream]`, the
     /// upstream token is used for the listener too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -188,11 +216,6 @@ pub struct Config {
     /// WebSocket ping interval in secs. `0` disables keepalive pings.
     #[serde(default = "default_keepalive_interval")]
     pub keepalive_interval: u64,
-    /// Whether the next hop may change this process's local `[[proxies]]` over
-    /// the v4 session. It is off by default: the next hop may still list them
-    /// when the `management` feature is enabled.
-    #[serde(default)]
-    pub allow_upstream_modify: bool,
     /// Load metadata, never written to TOML.
     #[serde(skip)]
     pub(crate) source: ConfigSource,
@@ -202,8 +225,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             name: default_name(),
-            listen_port: default_listen_port(),
-            control_host: None,
+            server: None,
             token: None,
             proxies: Vec::new(),
             upstream: None,
@@ -211,7 +233,6 @@ impl Default for Config {
             max_pending_handshakes: default_max_pending_handshakes(),
             max_sessions: default_max_sessions(),
             keepalive_interval: default_keepalive_interval(),
-            allow_upstream_modify: false,
             source: ConfigSource::default(),
         }
     }
@@ -228,11 +249,34 @@ impl Config {
             .or_else(|| self.upstream.as_ref().map(|upstream| &upstream.token))
     }
 
-    /// The resolved `control_host`, which validation always fills in.
-    pub fn control_host(&self) -> &str {
-        self.control_host
-            .as_deref()
-            .unwrap_or(crate::helper::CONTROL_HOST_FALLBACK)
+    /// The listener port, or `None` when `[server]` is absent.
+    pub fn listen_port(&self) -> Option<u16> {
+        self.server.as_ref().map(|server| server.port)
+    }
+
+    /// The listener bind address. Falls back to the safe loopback default when
+    /// the listener is disabled, where the value is not used.
+    pub fn bind_host(&self) -> &str {
+        self.server
+            .as_ref()
+            .map(|server| server.bind.as_str())
+            .unwrap_or(crate::helper::DEFAULT_BIND_HOST)
+    }
+
+    /// The reserved entry Host (the old `control_host`), or `None` when the
+    /// listener has no control plane.
+    pub fn entry_domain(&self) -> Option<&str> {
+        self.server
+            .as_ref()
+            .and_then(|server| server.domain.as_deref())
+    }
+
+    /// Whether the next hop may change this process's local `[[proxies]]`.
+    pub fn allow_modify(&self) -> bool {
+        self.upstream
+            .as_ref()
+            .map(|upstream| upstream.allow_modify)
+            .unwrap_or(false)
     }
 
     /// The runtime limits of the embedded server.
@@ -327,9 +371,6 @@ impl Config {
                 let mut config = Config::parse(&s)
                     .with_context(|| format!("The configuration {:?} is invalid", path))?;
                 config.source.path = Some(path.to_path_buf());
-                let mut persisted = config.clone();
-                persisted.source = ConfigSource::default();
-                config.source.persisted = Some(Box::new(persisted));
                 Ok(config)
             }
             None => Err(Config::bootstrap_example(path).await),
@@ -350,8 +391,8 @@ impl Config {
     pub(crate) async fn bootstrap_example(path: &Path) -> anyhow::Error {
         match fs::write(path, DEFAULT_CONFIG).await {
             Ok(()) => anyhow::Error::new(GeneratedConfigError::new(format!(
-                "已生成 {:?}。请修改 `control_host` 和 `token`，客户端或中继再补充 \
-                 `[upstream]`，然后重新启动 ht。",
+                "已生成 {:?}。请填写 `[upstream].token`；作为服务端使用时再取消 \
+                 `[server]` 的注释，然后重新启动 ht。",
                 path
             ))),
             Err(e) => anyhow::Error::new(e)
@@ -363,7 +404,7 @@ impl Config {
     ///
     /// The rules keep the process from becoming an accidental open relay or a
     /// self-loop: the tokens must be set, the local routes must not overlap the
-    /// reserved `control_host`, and the upstream must not point back at this
+    /// reserved `[server].domain`, and the upstream must not point back at this
     /// process's own listener.
     pub fn validate(config: &mut Config) -> Result<()> {
         let name = config.name.trim();
@@ -376,34 +417,59 @@ impl Config {
         config.name = name.to_string();
 
         let has_upstream = config.upstream.is_some();
-        if config.listen_port == 0 && !has_upstream {
+        if config.server.is_none() && !has_upstream {
             bail!(
-                "`listen_port` may only be 0 when `[upstream]` is present: a standalone \
-                 ingress has no upstream endpoint to discover its ephemeral port"
+                "`[server]` is required without `[upstream]`: a standalone ingress must \
+                 listen on a port"
             );
         }
 
-        let mut control_host = match config.control_host.take() {
-            Some(host) => host,
-            None if has_upstream => crate::helper::CONTROL_HOST_FALLBACK.to_string(),
-            None => bail!(
-                "`control_host` is required without `[upstream]`: it is the reserved Host of \
-                 the v4 session endpoint"
-            ),
-        };
-        let normalized = crate::helper::normalize_domain(&control_host)
-            .ok_or_else(|| anyhow!("Invalid control_host"))?;
-        if normalized.starts_with("*.") {
-            bail!("control_host must be an exact hostname, not a wildcard");
-        }
-        control_host = normalized;
-        config.control_host = Some(control_host.clone());
+        let server_domain = match config.server.as_mut() {
+            Some(server) => {
+                if server.port == 0 && !has_upstream {
+                    bail!(
+                        "`[server].port` may only be 0 when `[upstream]` is present: a \
+                         standalone ingress has no upstream endpoint to discover its \
+                         ephemeral port"
+                    );
+                }
+                let bind = server.bind.trim();
+                let bind_ip: IpAddr = bind.parse().map_err(|_| {
+                    anyhow!(
+                        "`[server].bind` must be an IP address such as `0.0.0.0`, \
+                         `127.0.0.1`, `::` or `::1`, not `{}`",
+                        bind
+                    )
+                })?;
+                server.bind = bind_ip.to_string();
 
-        let listener_token = config
-            .listener_token()
-            .ok_or_else(|| anyhow!("Set a strong shared `token` for the listener"))?;
-        if is_placeholder_token(listener_token) {
-            bail!("Set a strong, non-placeholder `token`");
+                match server.domain.take() {
+                    Some(host) => {
+                        let normalized = crate::helper::normalize_domain(&host)
+                            .ok_or_else(|| anyhow!("Invalid `[server].domain`"))?;
+                        if normalized.starts_with("*.") {
+                            bail!("`[server].domain` must be an exact hostname, not a wildcard");
+                        }
+                        server.domain = Some(normalized.clone());
+                        Some(normalized)
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
+        let server_port = config.server.as_ref().map(|server| server.port);
+
+        // The listener token protects the control plane. A listener without a
+        // domain serves visitors only, and a client without a listener has no
+        // control plane at all, so neither needs a token.
+        if server_domain.is_some() {
+            let listener_token = config
+                .listener_token()
+                .ok_or_else(|| anyhow!("Set a strong shared `token` for the listener"))?;
+            if is_placeholder_token(listener_token) {
+                bail!("Set a strong, non-placeholder `token`");
+            }
         }
 
         let limits = config.server_limits();
@@ -449,12 +515,14 @@ impl Config {
                 .ok_or_else(|| anyhow!("The domain `{}` is invalid", entry.domain))?;
             let name = validate_name(&entry.name)?;
 
-            if domain_overlaps_control_host(&domain, &control_host) {
-                bail!(
-                    "The local service domain `{}` overlaps the reserved control_host `{}`",
-                    domain,
-                    control_host
-                );
+            if let Some(control_domain) = server_domain.as_deref() {
+                if domain_overlaps_control_host(&domain, control_domain) {
+                    bail!(
+                        "The local service domain `{}` overlaps the reserved `[server].domain` `{}`",
+                        domain,
+                        control_domain
+                    );
+                }
             }
             if domains.insert(domain.clone(), ()).is_some() {
                 bail!("The domain `{}` is defined more than once", domain);
@@ -485,19 +553,26 @@ impl Config {
             bail!("Set a strong, non-placeholder `[upstream].token` for the next hop");
         }
 
-        // A same-port endpoint with the reserved host or a loopback/unspecified
-        // address dials this process's own listener. A port of 0 is resolved at
-        // startup, after the listener has picked the actual port.
-        if config.listen_port != 0
-            && port == config.listen_port
-            && (host.eq_ignore_ascii_case(&control_host) || is_local_host(&host))
-        {
-            bail!(
-                "`[upstream].url` points at this process's own listener ({}:{}); configure \
-                 the next hop instead of itself",
-                host,
-                port
-            );
+        // A same-port endpoint with the reserved host, the bind address or a
+        // loopback/unspecified address dials this process's own listener. A
+        // port of 0 is resolved at startup, after the listener has picked the
+        // actual port.
+        if let Some(server_port) = server_port {
+            if server_port != 0
+                && port == server_port
+                && (server_domain
+                    .as_deref()
+                    .is_some_and(|domain| host.eq_ignore_ascii_case(domain))
+                    || host.eq_ignore_ascii_case(config.bind_host())
+                    || is_local_host(&host))
+            {
+                bail!(
+                    "`[upstream].url` points at this process's own listener ({}:{}); configure \
+                     the next hop instead of itself",
+                    host,
+                    port
+                );
+            }
         }
 
         Ok(())
@@ -510,8 +585,36 @@ impl Config {
 
     /// Write the configuration back to the file atomically, so that a change made
     /// through the administration API survives a restart.
+    ///
+    /// When the file already exists, the new values are merged into its
+    /// `toml_edit` document instead of replacing the whole text. That keeps the
+    /// comments and layout an operator wrote around the settings and unchanged
+    /// `[[proxies]]` entries. A file that cannot be parsed is overwritten with
+    /// the normalized TOML, because refusing to save would leave an invalid
+    /// file in place.
     pub async fn save(&self, path: &Path) -> Result<()> {
-        let s = self.to_toml()?;
+        let existing = match fs::read_to_string(path).await {
+            Ok(content) => Some(content),
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(err).with_context(|| format!("Failed to read the config {:?}", path))
+            }
+        };
+        let s = match existing {
+            Some(existing) => match merge_into_toml(&existing, self) {
+                Ok(merged) => merged,
+                Err(err) => {
+                    tracing::warn!(
+                        path = ?path,
+                        "Failed to preserve the configuration file layout; writing the \
+                         normalized configuration instead: {:#}",
+                        err
+                    );
+                    self.to_toml()?
+                }
+            },
+            None => self.to_toml()?,
+        };
         let tmp = path.with_extension("toml.tmp");
         fs::write(&tmp, s.as_bytes())
             .await
@@ -523,11 +626,177 @@ impl Config {
     }
 }
 
+/// Merge the effective values of `config` into an existing TOML document.
+///
+/// Scalars, the `[server]` table and the `[upstream]` table are updated in
+/// place, so their comments survive. `[[proxies]]` entries are matched by
+/// `name`: an existing entry keeps
+/// its comments while its fields are replaced, new entries are appended, and
+/// removed entries disappear. The result is validated before it is returned.
+fn merge_into_toml(existing: &str, config: &Config) -> Result<String> {
+    let mut doc: DocumentMut = existing
+        .parse()
+        .context("Failed to parse the existing configuration for a format-preserving save")?;
+
+    set_item(&mut doc, "name", toml_edit::value(config.name.clone()));
+    // These keys now live in `[server]` and `[upstream]`; a save rewrites an
+    // old file into the grouped layout.
+    for legacy in [
+        "listen_port",
+        "bind_host",
+        "control_host",
+        "allow_upstream_modify",
+    ] {
+        doc.remove(legacy);
+    }
+
+    match &config.server {
+        Some(server) => {
+            let mut table = toml_edit::Table::new();
+            table.insert("port", toml_edit::value(server.port as i64));
+            table.insert("bind", toml_edit::value(server.bind.clone()));
+            if let Some(domain) = &server.domain {
+                table.insert("domain", toml_edit::value(domain.clone()));
+            }
+            if let Some(old) = doc.get_mut("server").and_then(Item::as_table_mut) {
+                set_table_item(old, "port", toml_edit::value(server.port as i64));
+                set_table_item(old, "bind", toml_edit::value(server.bind.clone()));
+                match &server.domain {
+                    Some(domain) => {
+                        set_table_item(old, "domain", toml_edit::value(domain.clone()));
+                    }
+                    None => {
+                        old.remove("domain");
+                    }
+                }
+            } else {
+                set_item(&mut doc, "server", Item::Table(table));
+            }
+        }
+        None => {
+            doc.remove("server");
+        }
+    }
+
+    if let Some(token) = &config.token {
+        set_item(&mut doc, "token", toml_edit::value(String::from(&**token)));
+    } else {
+        doc.remove("token");
+    }
+    set_item(
+        &mut doc,
+        "retry_interval",
+        toml_edit::value(config.retry_interval as i64),
+    );
+    set_item(
+        &mut doc,
+        "keepalive_interval",
+        toml_edit::value(config.keepalive_interval as i64),
+    );
+    set_item(
+        &mut doc,
+        "max_pending_handshakes",
+        toml_edit::value(config.max_pending_handshakes as i64),
+    );
+    set_item(
+        &mut doc,
+        "max_sessions",
+        toml_edit::value(config.max_sessions as i64),
+    );
+
+    match &config.upstream {
+        Some(upstream) => {
+            let mut table = toml_edit::Table::new();
+            table.insert("url", toml_edit::value(upstream.url.clone()));
+            table.insert("token", toml_edit::value(String::from(&*upstream.token)));
+            table.insert("allow_modify", toml_edit::value(upstream.allow_modify));
+            if let Some(old) = doc.get_mut("upstream").and_then(Item::as_table_mut) {
+                set_table_item(old, "url", toml_edit::value(upstream.url.clone()));
+                set_table_item(
+                    old,
+                    "token",
+                    toml_edit::value(String::from(&*upstream.token)),
+                );
+                set_table_item(old, "allow_modify", toml_edit::value(upstream.allow_modify));
+            } else {
+                set_item(&mut doc, "upstream", Item::Table(table));
+            }
+        }
+        None => {
+            doc.remove("upstream");
+        }
+    }
+
+    if config.proxies.is_empty() {
+        doc.remove("proxies");
+    } else {
+        let mut old_by_name: BTreeMap<String, toml_edit::Table> = BTreeMap::new();
+        if let Some(old_tables) = doc.get("proxies").and_then(Item::as_array_of_tables) {
+            for table in old_tables.iter() {
+                if let Some(name) = table.get("name").and_then(Item::as_str) {
+                    old_by_name.insert(name.to_string(), table.clone());
+                }
+            }
+        }
+
+        let mut merged = ArrayOfTables::new();
+        for proxy in &config.proxies {
+            let mut table = old_by_name
+                .remove(&proxy.name)
+                .unwrap_or_else(toml_edit::Table::new);
+            set_table_item(&mut table, "name", toml_edit::value(proxy.name.clone()));
+            set_table_item(&mut table, "domain", toml_edit::value(proxy.domain.clone()));
+            set_table_item(
+                &mut table,
+                "local_addr",
+                toml_edit::value(proxy.local_addr.clone()),
+            );
+            match &proxy.auth_header {
+                Some(auth_header) => set_table_item(
+                    &mut table,
+                    "auth_header",
+                    toml_edit::value(String::from(&**auth_header)),
+                ),
+                None => {
+                    table.remove("auth_header");
+                }
+            }
+            merged.push(table);
+        }
+        set_item(&mut doc, "proxies", Item::ArrayOfTables(merged));
+    }
+
+    let merged = doc.to_string();
+    Config::parse(&merged).with_context(|| "The merged configuration is invalid")?;
+    Ok(merged)
+}
+
+/// Set one document item, preserving the key's own comments when it exists.
+fn set_item(doc: &mut DocumentMut, key: &str, item: Item) {
+    if let Some((_, current)) = doc.get_key_value_mut(key) {
+        *current = item;
+    } else {
+        doc.insert(key, item);
+    }
+}
+
+/// Set one field of a table, preserving the field key's own comments.
+fn set_table_item(table: &mut toml_edit::Table, key: &str, item: Item) {
+    if let Some((_, current)) = table.get_key_value_mut(key) {
+        *current = item;
+    } else {
+        table.insert(key, item);
+    }
+}
+
 fn default_name() -> String {
     "ht".to_string()
 }
 fn default_listen_port() -> u16 {
     DEFAULT_LISTEN_PORT
+}
+fn default_bind_host() -> String {
+    crate::helper::DEFAULT_BIND_HOST.to_string()
 }
 fn default_retry_interval() -> u64 {
     DEFAULT_RETRY_INTERVAL_SECS
@@ -542,29 +811,35 @@ fn default_keepalive_interval() -> u64 {
     DEFAULT_KEEPALIVE_INTERVAL_SECS
 }
 
-/// The keys that were renamed in 2.0, with their replacement, when the parse
-/// failed. It turns a generic `unknown field` error into a migration hint.
+/// The keys that were renamed or moved into a table, with their replacement,
+/// when the parse failed. It turns a generic `unknown field` error into a
+/// migration hint.
 fn legacy_config_hint(source: &str) -> Option<String> {
     let value: toml::Value = toml::from_str(source).ok()?;
     let table = value.as_table()?;
     let mut hints = Vec::new();
     for (old, new) in [
-        ("server_port", "listen_port"),
-        ("server_host", "control_host"),
+        ("server_port", "[server].port"),
+        ("listen_port", "[server].port"),
+        ("server_host", "[server].domain"),
+        ("control_host", "[server].domain"),
+        ("bind_host", "[server].bind"),
+        ("allow_upstream_modify", "[upstream].allow_modify"),
+        ("listener", "[server]"),
     ] {
         if table.contains_key(old) {
             hints.push(format!("`{}` -> `{}`", old, new));
         }
     }
-    if table.contains_key("bind_host") {
-        hints.push("`bind_host` was removed; the listener always binds 0.0.0.0".to_string());
-    }
-    if table
-        .get("upstream")
-        .and_then(toml::Value::as_table)
-        .is_some_and(|upstream| upstream.contains_key("server"))
-    {
-        hints.push("`[upstream].server` -> `[upstream].url`".to_string());
+    if let Some(upstream) = table.get("upstream").and_then(toml::Value::as_table) {
+        if upstream.contains_key("server") {
+            hints.push("`[upstream].server` -> `[upstream].url`".to_string());
+        }
+        if upstream.contains_key("allow_upstream_modify") {
+            hints.push(
+                "`[upstream].allow_upstream_modify` -> `[upstream].allow_modify`".to_string(),
+            );
+        }
     }
     if let Some(upstream) = table.get("upstream").and_then(toml::Value::as_table) {
         for removed in ["mirror", "claim"] {
@@ -856,7 +1131,7 @@ mod tests {
     #[test]
     fn test_upstream_url_validation() -> Result<()> {
         let ws = router(
-            "control_host = \"control.test\"\ntoken = \"secret\"\n\n[upstream]\n\
+            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[upstream]\n\
              url = \"ws://example.com\"\ntoken = \"secret\"\n",
         );
         assert_eq!(ws.upstream.as_ref().unwrap().url, "ws://example.com:80");
@@ -864,12 +1139,12 @@ mod tests {
         assert!(!ws.tls());
 
         assert!(Config::parse(
-            "control_host = \"control.test\"\ntoken = \"secret\"\n\n[upstream]\n\
+            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[upstream]\n\
              url = \"udp://example.com\"\ntoken = \"secret\"\n"
         )
         .is_err());
         assert!(Config::parse(
-            "control_host = \"control.test\"\ntoken = \"secret\"\n\n[upstream]\n\
+            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[upstream]\n\
              url = \"example.com:443\"\ntoken = \"secret\"\n"
         )
         .is_err());
@@ -879,7 +1154,7 @@ mod tests {
     #[test]
     fn test_upstream_addr() -> Result<()> {
         let cfg = router(
-            "control_host = \"control.test\"\ntoken = \"secret\"\n\n[upstream]\n\
+            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[upstream]\n\
              url = \"wss://example.com:2333\"\ntoken = \"secret\"\n",
         );
         assert_eq!(
@@ -888,7 +1163,7 @@ mod tests {
         );
 
         let cfg = router(
-            "control_host = \"control.test\"\ntoken = \"secret\"\n\n[upstream]\n\
+            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[upstream]\n\
              url = \"wss://[::1]\"\ntoken = \"secret\"\n",
         );
         assert_eq!(
@@ -911,7 +1186,7 @@ mod tests {
             "wss://user@example.com",
         ] {
             let source = format!(
-                "control_host = \"control.test\"\ntoken = \"secret\"\n\n[upstream]\n\
+                "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[upstream]\n\
                  url = {:?}\ntoken = \"secret\"\n",
                 url
             );
@@ -925,24 +1200,39 @@ mod tests {
             (
                 "server_port = 7777\ncontrol_host = \"control.test\"\ntoken = \"secret\"\n",
                 "server_port",
-                "listen_port",
+                "[server].port",
             ),
             (
                 "server_host = \"control.test\"\ntoken = \"secret\"\n",
                 "server_host",
-                "control_host",
+                "[server].domain",
             ),
             (
-                "control_host = \"control.test\"\ntoken = \"secret\"\n\n[upstream]\n\
+                "listen_port = 7777\ntoken = \"secret\"\n",
+                "listen_port",
+                "[server].port",
+            ),
+            (
+                "bind_host = \"0.0.0.0\"\ntoken = \"secret\"\n",
+                "bind_host",
+                "[server].bind",
+            ),
+            (
+                "control_host = \"control.test\"\ntoken = \"secret\"\n",
+                "control_host",
+                "[server].domain",
+            ),
+            (
+                "allow_upstream_modify = true\n\n[upstream]\nurl = \"ws://a.test:7777\"\n\
+                 token = \"secret\"\n",
+                "allow_upstream_modify",
+                "[upstream].allow_modify",
+            ),
+            (
+                "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[upstream]\n\
                  server = \"ws://a.test:7777\"\ntoken = \"secret\"\n",
                 "[upstream].server",
                 "[upstream].url",
-            ),
-            (
-                "bind_host = \"127.0.0.1\"\ncontrol_host = \"control.test\"\n\
-                 token = \"secret\"\n",
-                "bind_host",
-                "removed",
             ),
         ] {
             let err = format!("{:#}", Config::parse(source).unwrap_err());
@@ -995,10 +1285,12 @@ mod tests {
     #[test]
     fn test_resolved_proxies() -> Result<()> {
         let s = r#"
-control_host = "control.test"
 name = "edge"
 token = "secret"
 retry_interval = 7
+
+[server]
+domain = "control.test"
 
 [[proxies]]
 name = "nas"
@@ -1024,7 +1316,7 @@ local_addr = "127.0.0.1:81"
 
     #[test]
     fn test_set_and_remove_proxy() -> Result<()> {
-        let mut cfg = router("control_host = \"control.test\"\ntoken = \"secret\"\n");
+        let mut cfg = router("token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n");
 
         cfg.set_proxy(
             "nas".to_string(),
@@ -1057,7 +1349,7 @@ local_addr = "127.0.0.1:81"
 
     #[test]
     fn test_set_proxy_replaces_the_whole_entry() -> Result<()> {
-        let mut cfg = router("control_host = \"control.test\"\ntoken = \"secret\"\n");
+        let mut cfg = router("token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n");
 
         cfg.set_proxy(
             "docker".to_string(),
@@ -1085,7 +1377,7 @@ local_addr = "127.0.0.1:81"
 
     #[test]
     fn test_set_proxy_adds_and_keeps_names_distinct() -> Result<()> {
-        let mut cfg = router("control_host = \"control.test\"\ntoken = \"secret\"\n");
+        let mut cfg = router("token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n");
 
         cfg.set_proxy(
             "app-1".to_string(),
@@ -1120,9 +1412,10 @@ local_addr = "127.0.0.1:81"
     fn test_defaults() -> Result<()> {
         let cfg = Config::default();
         assert_eq!(cfg.name, "ht");
-        assert_eq!(cfg.listen_port, DEFAULT_LISTEN_PORT);
+        assert!(cfg.server.is_none());
+        assert_eq!(cfg.bind_host(), "127.0.0.1");
         assert_eq!(cfg.retry_interval, DEFAULT_RETRY_INTERVAL_SECS);
-        assert!(!cfg.allow_upstream_modify);
+        assert!(!cfg.allow_modify());
         assert!(cfg.proxies.is_empty());
         Ok(())
     }
@@ -1130,40 +1423,39 @@ local_addr = "127.0.0.1:81"
     #[test]
     fn test_allow_upstream_modify_is_opt_in() -> Result<()> {
         // The security-sensitive switch is off unless the file opts in.
-        let cfg = router("control_host = \"control.test\"\ntoken = \"secret\"\n");
-        assert!(!cfg.allow_upstream_modify);
+        let cfg = router(
+            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n\
+             [upstream]\nurl = \"ws://a.test:7777\"\ntoken = \"upstream-secret\"\n",
+        );
+        assert!(!cfg.allow_modify());
 
         let cfg = router(
-            "control_host = \"control.test\"\ntoken = \"secret\"\n\
-             allow_upstream_modify = true\n",
+            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n\
+             [upstream]\nurl = \"ws://a.test:7777\"\ntoken = \"upstream-secret\"\n\
+             allow_modify = true\n",
         );
-        assert!(cfg.allow_upstream_modify);
-        assert!(cfg.to_toml()?.contains("allow_upstream_modify = true"));
+        assert!(cfg.allow_modify());
+        assert!(cfg.to_toml()?.contains("allow_modify = true"));
         Ok(())
     }
 
     #[test]
     fn test_token_falls_back_to_the_upstream_token() -> Result<()> {
-        let cfg = router(
-            "control_host = \"control.test\"\n\n[upstream]\nurl = \"ws://a.test:7777\"\n\
-             token = \"upstream-secret\"\n",
-        );
+        let cfg = router("[upstream]\nurl = \"ws://a.test:7777\"\ntoken = \"upstream-secret\"\n");
         assert!(cfg.token.is_none());
         assert_eq!(&**cfg.listener_token().unwrap(), "upstream-secret");
         let dumped = cfg.to_toml()?;
-        assert!(
-            !dumped.contains("token = \"upstream-secret\"\ncontrol_host"),
-            "{}",
-            dumped
-        );
+        assert!(!dumped.contains("[server]"), "{}", dumped);
         Ok(())
     }
 
     #[test]
     fn test_rejects_an_empty_local_addr() {
         let s = r#"
-control_host = "control.test"
 token = "secret"
+
+[server]
+domain = "control.test"
 
 [[proxies]]
 name = "foo"
@@ -1182,7 +1474,7 @@ local_addr = ""
             "HTTPS://nas.example.com",
         ] {
             let s = format!(
-                "control_host = \"control.test\"\ntoken = \"secret\"\n\n[[proxies]]\n\
+                "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[[proxies]]\n\
                  name = \"foo\"\ndomain = \"foo.example.com\"\nlocal_addr = {:?}\n",
                 local_addr
             );
@@ -1199,8 +1491,10 @@ local_addr = ""
     #[test]
     fn test_accepts_a_unix_socket_and_trims_local_addr() -> Result<()> {
         let s = r#"
-control_host = "control.test"
 token = "secret"
+
+[server]
+domain = "control.test"
 
 [[proxies]]
 name = "docker"
@@ -1221,8 +1515,10 @@ local_addr = "  127.0.0.1:80  "
     #[test]
     fn test_rejects_an_invalid_domain() {
         let s = r#"
-control_host = "control.test"
 token = "secret"
+
+[server]
+domain = "control.test"
 
 [[proxies]]
 name = "foo"
@@ -1235,8 +1531,10 @@ local_addr = "127.0.0.1:80"
     #[test]
     fn test_rejects_a_duplicated_domain() {
         let s = r#"
-control_host = "control.test"
 token = "secret"
+
+[server]
+domain = "control.test"
 
 [[proxies]]
 name = "foo1"
@@ -1254,8 +1552,10 @@ local_addr = "127.0.0.1:81"
     #[test]
     fn test_rejects_an_unknown_field() {
         let s = r#"
-control_host = "control.test"
 token = "secret"
+
+[server]
+domain = "control.test"
 tokenz = "oops"
 "#;
         assert!(Config::parse(s).is_err());
@@ -1264,8 +1564,10 @@ tokenz = "oops"
     #[test]
     fn test_rejects_a_duplicated_name() {
         let s = r#"
-control_host = "control.test"
 token = "secret"
+
+[server]
+domain = "control.test"
 
 [[proxies]]
 name = "nas"
@@ -1283,8 +1585,10 @@ local_addr = "127.0.0.1:81"
     #[test]
     fn test_rejects_a_missing_name() {
         let s = r#"
-control_host = "control.test"
 token = "secret"
+
+[server]
+domain = "control.test"
 
 [[proxies]]
 domain = "foo.example.com"
@@ -1296,8 +1600,10 @@ local_addr = "127.0.0.1:80"
     #[test]
     fn test_rejects_a_missing_domain() {
         let s = r#"
-control_host = "control.test"
 token = "secret"
+
+[server]
+domain = "control.test"
 
 [[proxies]]
 name = "nas"
@@ -1309,8 +1615,10 @@ local_addr = "127.0.0.1:80"
     #[test]
     fn test_rejects_an_invalid_name() {
         let s = r#"
-control_host = "control.test"
 token = "secret"
+
+[server]
+domain = "control.test"
 
 [[proxies]]
 name = "nas/../etc"
@@ -1324,10 +1632,12 @@ local_addr = "127.0.0.1:80"
     fn test_config_roundtrip() -> Result<()> {
         let s = r#"
 name = "edge"
-listen_port = 7777
-control_host = "control.test"
 token = "secret"
 retry_interval = 2
+
+[server]
+port = 7777
+domain = "control.test"
 
 [[proxies]]
 name = "nas"
@@ -1364,8 +1674,9 @@ token = "upstream-secret"
     #[test]
     fn test_config_roundtrip_without_optional_fields() -> Result<()> {
         let s = r#"
-control_host = "control.test"
 token = "secret"
+
+[server]
 
 [[proxies]]
 name = "foo1"
@@ -1374,7 +1685,8 @@ local_addr = "127.0.0.1:80"
 "#;
         let cfg = router(s);
         let dumped = cfg.to_toml()?;
-        assert!(!dumped.contains("[upstream]"));
+        assert!(!dumped.contains("[upstream]"), "{}", dumped);
+        assert!(!dumped.contains("[server]\ndomain"), "{}", dumped);
         let reparsed = Config::parse(&dumped)?;
         assert_eq!(cfg, reparsed);
         Ok(())
@@ -1408,31 +1720,25 @@ local_addr = "127.0.0.1:80"
     }
 
     #[tokio::test]
-    async fn test_control_host_defaults_to_loopback_with_upstream() -> Result<()> {
+    async fn test_server_domain_is_opt_in() -> Result<()> {
         let path = std::env::temp_dir().join(format!(
-            "http-tunnel-control-host-{}.toml",
+            "http-tunnel-server-domain-{}.toml",
             std::process::id()
         ));
 
-        // Without upstream, the reserved Host is required.
-        std::fs::write(&path, "listen_port = 8080\ntoken = \"a_secret_token\"\n")?;
+        // A server without a domain is a listener-only ingress: no control
+        // plane, and therefore no token requirement.
+        std::fs::write(&path, "[server]\nport = 8080\n")?;
+        let cfg = Config::from_file(&path).await?;
+        assert_eq!(cfg.entry_domain(), None);
+        assert_eq!(cfg.listen_port(), Some(8080));
+
+        // Adding a domain enables the control plane, which needs a token.
+        std::fs::write(&path, "[server]\nport = 8080\ndomain = \"control.test\"\n")?;
         let err = Config::from_file(&path)
             .await
-            .expect_err("a missing control_host must be rejected");
-        assert!(
-            format!("{:#}", err).contains("control_host"),
-            "unexpected error: {:#}",
-            err
-        );
-
-        // With upstream it defaults to loopback.
-        std::fs::write(
-            &path,
-            "listen_port = 8080\ntoken = \"a_secret_token\"\n\n[upstream]\n\
-             url = \"ws://a.test:7777\"\ntoken = \"upstream-secret\"\n",
-        )?;
-        let cfg = Config::from_file(&path).await?;
-        assert_eq!(cfg.control_host(), "127.0.0.1");
+            .expect_err("the control plane needs a token");
+        assert!(format!("{:#}", err).contains("token"), "{:#}", err);
 
         // The generated template must not start with its placeholder token
         std::fs::write(&path, DEFAULT_CONFIG)?;
@@ -1446,22 +1752,119 @@ local_addr = "127.0.0.1:80"
     }
 
     #[tokio::test]
-    async fn test_bind_host_is_not_a_config_field() {
+    async fn test_server_bind_is_an_ip_address() {
         let path =
             std::env::temp_dir().join(format!("http-tunnel-bind-host-{}.toml", std::process::id()));
-        let base = "listen_port = 8080\ncontrol_host = \"control.example.com\"\n\
-                    token = \"a_secret_token\"\n";
-        std::fs::write(&path, format!("{}bind_host = \"127.0.0.1\"\n", base)).unwrap();
+        let base = "token = \"a_secret_token\"\n\n[server]\nport = 8080\n\
+                    domain = \"control.example.com\"\n";
+
+        std::fs::write(&path, format!("{}bind = \"127.0.0.1\"\n", base)).unwrap();
+        let config = Config::from_file(&path).await.unwrap();
+        assert_eq!(config.bind_host(), "127.0.0.1");
+
+        std::fs::write(&path, format!("{}bind = \"::1\"\n", base)).unwrap();
+        let config = Config::from_file(&path).await.unwrap();
+        assert_eq!(config.bind_host(), "::1");
+
+        std::fs::write(&path, format!("{}bind = \"localhost\"\n", base)).unwrap();
         let err = Config::from_file(&path)
             .await
-            .expect_err("bind_host was removed from the configuration");
+            .expect_err("a hostname must be rejected");
         assert!(
-            format!("{:#}", err).contains("bind_host"),
+            format!("{:#}", err).contains("[server].bind"),
             "unexpected error: {:#}",
             err
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_save_preserves_comments_and_updates_proxies() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "http-tunnel-comment-save-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"## top comment
+name = "edge"
+token = "secret"
+
+[server]
+port = 8080
+bind = "0.0.0.0"
+domain = "control.test"
+
+## keep this service
+[[proxies]]
+name = "keep"
+domain = "keep.test"
+local_addr = "127.0.0.1:80"
+
+## remove this service
+[[proxies]]
+name = "remove"
+domain = "remove.test"
+local_addr = "127.0.0.1:81"
+"#,
+        )?;
+
+        let mut config = Config::from_file(&path).await?;
+        config.set_proxy(
+            "keep".to_string(),
+            "keep.test".to_string(),
+            "127.0.0.1:90".to_string(),
+            Some(MaskedString::from("visitor-secret")),
+        );
+        config.set_proxy(
+            "new".to_string(),
+            "new.test".to_string(),
+            "127.0.0.1:82".to_string(),
+            None,
+        );
+        assert!(config.remove_proxy("remove"));
+        config.save(&path).await?;
+
+        let saved = std::fs::read_to_string(&path)?;
+        assert!(saved.contains("## top comment"), "{}", saved);
+        assert!(saved.contains("## keep this service"), "{}", saved);
+        assert!(saved.contains("local_addr = \"127.0.0.1:90\""), "{}", saved);
+        assert!(
+            saved.contains("auth_header = \"visitor-secret\""),
+            "{}",
+            saved
+        );
+        assert!(saved.contains("new.test"), "{}", saved);
+        assert!(!saved.contains("remove.test"), "{}", saved);
+
+        let reloaded = Config::from_file(&path).await?;
+        assert_eq!(reloaded.proxies.len(), 2);
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_save_keeps_working_when_the_file_is_invalid() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "http-tunnel-invalid-save-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "this is not toml = [")?;
+        let mut config = Config::parse(
+            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\
+             bind = \"127.0.0.1\"\n",
+        )?;
+        config.source.path = Some(path.clone());
+        config.save(&path).await?;
+
+        let saved = std::fs::read_to_string(&path)?;
+        assert!(saved.contains("domain = \"control.test\""), "{}", saved);
+        assert!(saved.contains("bind = \"127.0.0.1\""), "{}", saved);
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 
     #[test]
@@ -1499,7 +1902,7 @@ local_addr = "127.0.0.1:80"
                 continue;
             };
             assert!(
-                rest.contains(" = ") || rest.starts_with("[["),
+                rest.contains(" = ") || rest.starts_with('['),
                 "documentation must start with ##, not a single #: {:?}",
                 line
             );
@@ -1511,13 +1914,13 @@ local_addr = "127.0.0.1:80"
         let example = DEFAULT_CONFIG;
         let mut cfg: Config = toml::from_str(example)?;
         assert!(Config::validate(&mut cfg).is_err());
-        cfg.token = Some(MaskedString::from("downstream-secret"));
         cfg.upstream.as_mut().unwrap().token = MaskedString::from("upstream-secret");
         Config::validate(&mut cfg)?;
         assert_eq!(cfg.name, "edge");
-        assert_eq!(cfg.listen_port, 7777);
+        // The template is a client: `[server]` stays commented out.
+        assert!(cfg.server.is_none());
         assert_eq!(cfg.proxies.len(), 1);
-        // The commented standalone section is inactive
+        assert_eq!(disabled_settings(example, "# [server]"), 1);
         assert_eq!(disabled_settings(example, "# [upstream]"), 0);
         assert_comment_convention(example);
         Ok(())
@@ -1525,9 +1928,11 @@ local_addr = "127.0.0.1:80"
 
     const LEAF_CONFIG: &str = r#"
 name = "relay-b"
-listen_port = 9001
-control_host = "b.lan"
 token = "downstream-secret"
+
+[server]
+port = 9001
+domain = "b.lan"
 
 [[proxies]]
 name = "local"
@@ -1557,8 +1962,8 @@ token = "upstream-secret"
     #[test]
     fn test_upstream_url_gets_its_defaults() -> Result<()> {
         let config = router(
-            "name = \"b\"\nlisten_port = 9001\ncontrol_host = \"b.lan\"\n\
-             token = \"downstream-secret\"\n\n[upstream]\nurl = \"wss://a.lan\"\n\
+            "name = \"b\"\ntoken = \"downstream-secret\"\n\n[server]\nport = 9001\n\
+             domain = \"b.lan\"\n\n[upstream]\nurl = \"wss://a.lan\"\n\
              token = \"upstream-secret\"\n",
         );
         let upstream = config.upstream.as_ref().unwrap();
@@ -1570,8 +1975,8 @@ token = "upstream-secret"
     #[test]
     fn test_ingress_without_upstream_is_valid() -> Result<()> {
         let config = router(
-            "name = \"ingress\"\nlisten_port = 9001\ncontrol_host = \"ingress.lan\"\n\
-             token = \"downstream-secret\"\n",
+            "name = \"ingress\"\ntoken = \"downstream-secret\"\n\n[server]\nport = 9001\n\
+             domain = \"ingress.lan\"\n",
         );
         assert!(config.upstream.is_none());
         Ok(())
@@ -1580,8 +1985,8 @@ token = "upstream-secret"
     #[test]
     fn test_rejects_an_upstream_pointing_at_itself() {
         let mut config: Config = toml::from_str(
-            "name = \"b\"\nlisten_port = 9001\ncontrol_host = \"b.lan\"\n\
-             token = \"downstream-secret\"\n\n[upstream]\nurl = \"ws://b.lan:9001\"\n\
+            "name = \"b\"\ntoken = \"downstream-secret\"\n\n[server]\nport = 9001\n\
+             domain = \"b.lan\"\n\n[upstream]\nurl = \"ws://b.lan:9001\"\n\
              token = \"upstream-secret\"\n",
         )
         .unwrap();
@@ -1593,8 +1998,8 @@ token = "upstream-secret"
             "ws://[::1]:9001",
         ] {
             let mut config: Config = toml::from_str(&format!(
-                "name = \"b\"\nlisten_port = 9001\ncontrol_host = \"b.lan\"\n\
-                 token = \"downstream-secret\"\n\n[upstream]\nurl = \"{}\"\n\
+                "name = \"b\"\ntoken = \"downstream-secret\"\n\n[server]\nport = 9001\n\
+                 domain = \"b.lan\"\n\n[upstream]\nurl = \"{}\"\n\
                  token = \"upstream-secret\"\n",
                 url
             ))
@@ -1608,8 +2013,8 @@ token = "upstream-secret"
 
         // Loopback on another port is a legitimate first hop
         assert!(Config::parse(
-            "name = \"b\"\nlisten_port = 9001\ncontrol_host = \"b.lan\"\n\
-             token = \"downstream-secret\"\n\n[upstream]\nurl = \"ws://127.0.0.1:7777\"\n\
+            "name = \"b\"\ntoken = \"downstream-secret\"\n\n[server]\nport = 9001\n\
+             domain = \"b.lan\"\n\n[upstream]\nurl = \"ws://127.0.0.1:7777\"\n\
              token = \"upstream-secret\"\n"
         )
         .is_ok());
@@ -1618,12 +2023,12 @@ token = "upstream-secret"
     #[test]
     fn test_listen_port_zero_requires_upstream() {
         assert!(Config::parse(
-            "listen_port = 0\ncontrol_host = \"ingress.lan\"\ntoken = \"downstream-secret\"\n"
+            "token = \"downstream-secret\"\n\n[server]\nport = 0\ndomain = \"ingress.lan\"\n"
         )
         .is_err());
 
         assert!(Config::parse(
-            "listen_port = 0\ncontrol_host = \"leaf.lan\"\ntoken = \"downstream-secret\"\n\n\
+            "token = \"downstream-secret\"\n\n[server]\nport = 0\ndomain = \"leaf.lan\"\n\n\
              [upstream]\nurl = \"ws://a.lan:7777\"\ntoken = \"upstream-secret\"\n"
         )
         .is_ok());
@@ -1664,8 +2069,8 @@ token = "upstream-secret"
             "claim = \"*.b.relay.example.com\"",
         ] {
             let s = format!(
-                "name = \"b\"\nlisten_port = 9001\ncontrol_host = \"b.lan\"\n\
-                 token = \"downstream-secret\"\n\n[upstream]\nurl = \"ws://a.lan:7777\"\n\
+                "name = \"b\"\ntoken = \"downstream-secret\"\n\n[server]\nport = 9001\n\
+                 domain = \"b.lan\"\n\n[upstream]\nurl = \"ws://a.lan:7777\"\n\
                  token = \"upstream-secret\"\n{}\n",
                 stale
             );
@@ -1677,8 +2082,8 @@ token = "upstream-secret"
         let err = format!(
             "{:#}",
             Config::parse(
-                "name = \"b\"\nlisten_port = 9001\ncontrol_host = \"b.lan\"\n\
-                 token = \"downstream-secret\"\nmax_mirrored_routes = 0\n\n\
+                "name = \"b\"\ntoken = \"downstream-secret\"\nmax_mirrored_routes = 0\n\n\
+                 [server]\nport = 9001\ndomain = \"b.lan\"\n\n\
                  [upstream]\nurl = \"ws://a.lan:7777\"\ntoken = \"upstream-secret\"\n",
             )
             .unwrap_err()
