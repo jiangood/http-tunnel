@@ -1,0 +1,17 @@
+## 内网客户端：不写 [server]，完全不监听端口，只主动连接上一跳。
+## 公网正式部署建议用 wss://；本机联调可临时改成 ws://<入口地址>:7777。
+## [upstream].url 的主机名必须与入口的 [server].domain 完全一致。
+
+name = "home"
+
+[[proxies]]
+name = "app"
+domain = "app.example.com"
+# local_addr 在容器内解析：127.0.0.1 是容器自己。
+# 宿主机服务用 host.docker.internal:<端口>，同一 compose 的服务用服务名。
+local_addr = "host.docker.internal:3000"
+
+[upstream]
+url = "wss://control.example.com:443"
+# 与服务端的 [server].token 相同；部署前请替换。
+token = "demo-listener-token"

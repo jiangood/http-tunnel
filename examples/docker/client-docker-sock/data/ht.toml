@@ -1,0 +1,17 @@
+## 通过隧道代理 Docker API。
+## Docker API 等价于宿主机 root：必须设置 auth_header，并优先只在内网/VPN 中暴露。
+
+name = "docker-leaf"
+
+[[proxies]]
+name = "docker"
+domain = "docker.example.com"
+# ht 必须是 Linux 容器才能使用 Unix Socket；Windows 原生 ht.exe 不支持。
+local_addr = "unix:///var/run/docker.sock"
+# 访客必须携带 X-HTTP-TUNNEL-TOKEN: <这个值>，ht 会在转发前删除该头。
+auth_header = "demo-visitor-token"
+
+[upstream]
+url = "wss://control.example.com:443"
+# 与服务端的 [server].token 相同；部署前请替换。
+token = "demo-listener-token"

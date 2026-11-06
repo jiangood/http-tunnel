@@ -1,0 +1,13 @@
+## 公网入口：只监听，不向上游拨出。
+## Token 建议用 `openssl rand -hex 16` 生成，客户端的 [upstream].token 必须相同。
+
+name = "ingress"
+
+[server]
+port = 7777
+# 容器内必须监听 0.0.0.0，否则端口映射无法访问。
+bind = "0.0.0.0"
+# 保留域名：管理页/API 和下游 v4 会话都走这里，不能与任何 [[proxies]].domain 相同。
+domain = "control.example.com"
+# 示例 Token；部署前请换成 `openssl rand -hex 16` 的输出。
+token = "demo-listener-token"
