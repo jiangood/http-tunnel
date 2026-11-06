@@ -875,10 +875,10 @@ mod tests {
         let persisted = Config::parse(
             r#"
 name = "file"
-token = "file-token"
 
 [server]
 domain = "control.example.com"
+token = "file-token"
 
 [[proxies]]
 name = "nas"
@@ -916,10 +916,10 @@ local_addr = "127.0.0.1:80"
         let persisted = Config::parse(
             r#"
 name = "file"
-token = "file-token"
 
 [server]
 domain = "control.example.com"
+token = "file-token"
 
 [[proxies]]
 name = "nas"
@@ -973,10 +973,10 @@ local_addr = "127.0.0.1:80"
         let persisted = Config::parse(
             r#"
 name = "file"
-token = "file-token"
 
 [server]
 domain = "control.example.com"
+token = "file-token"
 "#,
         )?;
         std::fs::write(&path, persisted.to_toml()?)?;
@@ -1008,7 +1008,7 @@ domain = "control.example.com"
             std::process::id()
         ));
         let persisted =
-            Config::parse("token = \"secret\"\n\n[server]\ndomain = \"control.example.com\"\n")?;
+            Config::parse("[server]\ndomain = \"control.example.com\"\ntoken = \"secret\"\n")?;
         let _ = std::fs::remove_file(&path);
         let state = state(persisted, path.clone());
 
@@ -1030,7 +1030,7 @@ domain = "control.example.com"
             std::process::id()
         ));
         let persisted = Config::parse(
-            "token = \"secret\"\n\n[server]\ndomain = \"control.example.com\"\n\n\
+            "[server]\ndomain = \"control.example.com\"\ntoken = \"secret\"\n\n\
              [upstream]\nurl = \"ws://upstream.test:7777\"\ntoken = \"secret\"\n",
         )?;
         let _ = std::fs::remove_file(&path);
@@ -1057,7 +1057,7 @@ domain = "control.example.com"
             std::process::id()
         ));
         let persisted = Config::parse(
-            "token = \"secret\"\n\n[server]\ndomain = \"control.example.com\"\n\n\
+            "[server]\ndomain = \"control.example.com\"\ntoken = \"secret\"\n\n\
              [upstream]\nurl = \"ws://upstream.test:7777\"\ntoken = \"secret\"\n",
         )?;
         std::fs::write(&path, persisted.to_toml()?)?;
@@ -1108,10 +1108,10 @@ domain = "control.example.com"
         let persisted = Config::parse(
             r#"
 name = "file"
-token = "file-token"
 
 [server]
 domain = "control.example.com"
+token = "file-token"
 
 [[proxies]]
 name = "nas"

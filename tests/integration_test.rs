@@ -71,9 +71,9 @@ fn write_leaf_config(
     // The leaf listens on an ephemeral port unless the test needs a fixed one
     // to reach its management interface.
     let content = format!(
-        "name = \"{}\"\ntoken = \"{}\"\n\n[server]\nport = {}\ndomain = \"127.0.0.1\"\n{}\
+        "name = \"{}\"\n\n[server]\nport = {}\ndomain = \"127.0.0.1\"\ntoken = \"{}\"\n{}\
          \n[upstream]\nurl = \"ws://{}:{}\"\ntoken = \"{}\"\n",
-        name, token, listen_port, proxies_toml, upstream_host, upstream_port, token
+        name, listen_port, token, proxies_toml, upstream_host, upstream_port, token
     );
 
     let path = std::env::temp_dir().join(file);
@@ -257,11 +257,11 @@ async fn leaf_without_server_connects_directly_to_local_proxies() -> Result<()> 
     std::fs::write(
         &path,
         format!(
-            "name = \"direct-leaf\"\nretry_interval = 1\n\n\
+            "name = \"direct-leaf\"\n\n\
              [[proxies]]\nname = \"echo\"\ndomain = \"{DIRECT_HOST}\"\n\
              local_addr = \"{DIRECT_ECHO_SERVER_ADDR}\"\n\n\
              [upstream]\nurl = \"ws://127.0.0.1:{DIRECT_HTTP_ENTRY_PORT}\"\n\
-             token = \"{LEAF_TOKEN}\"\n"
+             token = \"{LEAF_TOKEN}\"\nretry_interval = 1\n"
         ),
     )?;
 
@@ -2089,8 +2089,8 @@ fn write_node_config(
     proxies: &[(&str, &str)],
 ) -> Result<String> {
     let mut content = format!(
-        "name = \"{}\"\ntoken = \"{}\"\n\n[server]\nport = {}\ndomain = \"127.0.0.1\"\n",
-        name, token, listen_port
+        "name = \"{}\"\n\n[server]\nport = {}\ndomain = \"127.0.0.1\"\ntoken = \"{}\"\n",
+        name, listen_port, token
     );
     for (domain, local_addr) in proxies {
         let proxy_name = domain.split('.').next().unwrap_or(domain);
@@ -2731,7 +2731,7 @@ fn write_reload_config_named(
     proxy: Option<(&str, &str)>,
 ) -> Result<()> {
     let mut content = format!(
-        "name = \"{}\"\ntoken = \"reload-secret\"\n\n[server]\nport = {}\ndomain = \"127.0.0.1\"\n",
+        "name = \"{}\"\n\n[server]\nport = {}\ndomain = \"127.0.0.1\"\ntoken = \"reload-secret\"\n",
         name, listen_port
     );
     if let Some((domain, local_addr)) = proxy {
@@ -2925,8 +2925,8 @@ async fn bind_host_changes_are_hot_reloaded_and_rolled_back() -> Result<()> {
         std::fs::write(
             &path,
             format!(
-                "name = \"bind-test\"\ntoken = \"bind-secret\"\n\n[server]\nport = {}\n\
-                 bind = \"{}\"\ndomain = \"127.0.0.1\"\n\n\
+                "name = \"bind-test\"\n\n[server]\nport = {}\n\
+                 bind = \"{}\"\ndomain = \"127.0.0.1\"\ntoken = \"bind-secret\"\n\n\
                  [[proxies]]\nname = \"backend\"\ndomain = \"bind.test\"\n\
                  local_addr = \"{}\"\n",
                 port, bind_host, backend_addr

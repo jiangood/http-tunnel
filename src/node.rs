@@ -457,10 +457,16 @@ pub(crate) async fn run_router(
     let actual_port = bound_addr.map(|addr| addr.port());
     let local_target = bound_addr.map(local_target_addr);
 
-    if let (Some(token), Some(upstream)) = (&config.token, &config.upstream) {
+    if let (Some(token), Some(upstream)) = (
+        config
+            .server
+            .as_ref()
+            .and_then(|server| server.token.as_ref()),
+        &config.upstream,
+    ) {
         if token == &upstream.token {
             warn!(
-                "The downstream `token` and `[upstream].token` are the same; use a different \
+                "The downstream `[server].token` and `[upstream].token` are the same; use a different \
                  token per hop so that each hop has its own trust boundary"
             );
         }
@@ -647,8 +653,8 @@ async fn run_relay(
         token: upstream.token.clone(),
         node_id: config.name.clone(),
         role: Role::Node,
-        keepalive_interval: config.keepalive_interval,
-        retry_interval: config.retry_interval,
+        keepalive_interval: upstream.keepalive_interval,
+        retry_interval: upstream.retry_interval,
         allow_upstream_modify,
         proxy_admin,
         routes,

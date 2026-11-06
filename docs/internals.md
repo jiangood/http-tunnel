@@ -97,8 +97,9 @@ A stream whose downstream cannot reach its `local_addr` is reset with
 session dies is closed and the visitor gets a `503`/`504` instead of hanging. A
 duplicate advertisement from another session is rejected with `Conflict`.
 
-Each WebSocket bridge sends a protocol ping every `keepalive_interval` seconds
-(15 by default) and gives up after three intervals without any inbound frame, so
+Each WebSocket bridge sends a protocol ping every `[server].keepalive_interval`
+or `[upstream].keepalive_interval` seconds (15 by default) and gives up after
+three intervals without any inbound frame, so
 a silently dropped session is detected within 45 seconds. v4 relies on that
 keepalive; there is no separate application heartbeat.
 

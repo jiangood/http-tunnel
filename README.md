@@ -48,12 +48,12 @@
 
 ```toml
 name = "edge"
-token = "把 openssl rand -hex 16 的输出填在这里"
 
 [server]
 port = 7777
 bind = "0.0.0.0"
 domain = "control.example.com"
+token = "把 openssl rand -hex 16 的输出填在这里"
 
 [[proxies]]
 name = "app"
@@ -61,7 +61,7 @@ domain = "app.example.com"
 local_addr = "127.0.0.1:3000"
 ```
 
-把 `app.example.com` 的 A 记录指向服务器后访问 `http://app.example.com:7777`；未配置 DNS 时可用 `curl -H "Host: app.example.com" http://127.0.0.1:7777/` 验证。管理页在 `http://control.example.com:7777/`，用户名 `ht`，密码是 `token`。
+把 `app.example.com` 的 A 记录指向服务器后访问 `http://app.example.com:7777`；未配置 DNS 时可用 `curl -H "Host: app.example.com" http://127.0.0.1:7777/` 验证。管理页在 `http://control.example.com:7777/`，用户名 `ht`，密码是 `[server].token`。
 
 要点：
 
@@ -84,12 +84,12 @@ local_addr = "127.0.0.1:3000"
 
 ```toml
 name = "ingress"
-token = "把 openssl rand -hex 16 的输出填在这里（客户端用同一个）"
 
 [server]
 port = 7777
 bind = "0.0.0.0"
 domain = "control.example.com"
+token = "把 openssl rand -hex 16 的输出填在这里（客户端用同一个）"
 ```
 
 客户端 `ht.toml`：
@@ -111,7 +111,7 @@ token = "与服务端 token 相同"
 
 要点：
 
-- 服务端的 `token` 与客户端的 `[upstream].token` 必须一致；客户端不写 `[server]`，也不写顶层 `token`（需要监听时才设置）。
+- 服务端的 `[server].token` 与客户端的 `[upstream].token` 必须一致；客户端不写 `[server]`，也不写 `[server].token`（需要监听时才设置）。
 - 客户端完全不监听端口；服务端不需要写 `[[proxies]]`，它按 `Host` 把请求转给已连接客户端声明的域名。
 - 没有域名时，把服务端的 `[server].domain` 和客户端的 `[upstream].url` 改成同一个 IP，两边主机名必须一致；同时在服务端放行 `7777`（以及 TLS 的 `443`）。
 
@@ -131,12 +131,12 @@ token = "与服务端 token 相同"
 
 ```toml
 name = "relay-a"
-token = "中继密钥（客户端使用）"
 
 [server]
 port = 7777
 bind = "0.0.0.0"
 domain = "a.lan"
+token = "中继密钥（客户端使用）"
 
 [upstream]
 url = "wss://control.example.com:443"
@@ -175,19 +175,32 @@ curl -i -H "Host: app.example.com" http://127.0.0.1:7777/
 
 ## 配置参考
 
-| 键 | 说明 |
-| --- | --- |
-| `name` | 进程名称，默认 `ht` |
-| `[server]` | 服务端模式开关；不写这个表就完全不监听，只作为客户端向上游拨出 |
-| `[server].port` | 唯一的 HTTP 入口端口，访客、下游 v4 会话和管理页/API 共用；`0` 为临时端口，仅在有 `[upstream]` 时允许；默认 `7777` |
-| `[server].bind` | 监听地址，IPv4/IPv6 字面量，默认 `127.0.0.1`；Docker、局域网中继或直接公网访问时设为 `0.0.0.0` |
-| `[server].domain` | 入口 Host（原 `control_host`），启用管理页/API 和下游 v4 入口；省略时只监听访客路由。不能是泛域名，也不能与任何 `[[proxies]]` 域名重叠 |
-| `token` | 下游对等节点使用的监听 Token；有 `[upstream]` 且省略时复用 `[upstream].token` |
-| `retry_interval` / `keepalive_interval` | 重连上一跳的间隔秒数 / WebSocket ping 间隔秒数（`0` 关闭保活） |
-| `[upstream]` | 上一跳：`url` 为不带路径的 `ws://` / `wss://` 地址，`token` 为共享密钥；省略即服务端入口 |
-| `[upstream].allow_modify` | 是否允许上一跳通过 v4 管理通道修改本节点的 `[[proxies]]`，默认 `false`；关闭时上级仍可列出服务但不能增删改。没有 `[server]` 时没有管理页，只能在配置文件里切换 |
-| `max_pending_handshakes` / `max_sessions` | 待握手升级数上限 / v4 会话上限 |
-| `[[proxies]]` | 本进程直接服务的本地服务，字段见[转发配置](#转发配置) |
+下表列出 `ht.toml` 的全部配置项，`[[proxies]]` 可重复出现：
+
+| 键 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `name` | 否 | `ht` | 进程名称，用于日志和 v4 节点标识；顶层唯一的标量配置 |
+| `[server]` | 条件 | 无 | 服务端模式开关；不写就完全不监听、只作为客户端向上游拨出。没有 `[upstream]` 时必须写 |
+| `[server].port` | 否 | `7777` | 唯一的 HTTP 入口端口，访客、下游 v4 会话和管理页/API 共用；`0` 为临时端口，仅在有 `[upstream]` 时允许 |
+| `[server].bind` | 否 | `127.0.0.1` | 监听地址，IPv4/IPv6 字面量；Docker、局域网中继或直接公网访问时设为 `0.0.0.0` |
+| `[server].domain` | 否 | 无 | 入口 Host（原 `control_host`），启用管理页/API 和下游 v4 入口；省略时只监听访客路由。不能是泛域名，也不能与任何 `[[proxies]]` 域名重叠 |
+| `[server].token` | 条件 | 无 | 下游对等节点使用的监听 Token；设置 `[server].domain` 时必须，省略时复用 `[upstream].token` |
+| `[server].max_pending_handshakes` | 否 | `256` | 待完成 v4 握手的升级数上限 |
+| `[server].max_sessions` | 否 | `256` | v4 会话上限（每个下游进程 1 条） |
+| `[server].keepalive_interval` | 否 | `15` | 服务端 WebSocket ping 间隔（秒），`0` 关闭保活 |
+| `[upstream]` | 条件 | 无 | 上一跳；省略即服务端入口。写入时必须提供 `url` 和 `token` |
+| `[upstream].url` | 是（写 `[upstream]` 时） | 无 | 上一跳地址，不带路径的 `ws://` / `wss://` URL |
+| `[upstream].token` | 是（写 `[upstream]` 时） | 无 | 与上一跳共享的 Token，必须与上一跳的 `[server].token` 一致 |
+| `[upstream].allow_modify` | 否 | `false` | 是否允许上一跳通过 v4 管理通道修改本节点的 `[[proxies]]`；关闭时上级仍可列出服务但不能增删改。没有 `[server]` 时没有管理页，只能在配置文件里切换 |
+| `[upstream].retry_interval` | 否 | `1` | 重连上一跳的间隔（秒） |
+| `[upstream].keepalive_interval` | 否 | `15` | 上游 WebSocket ping 间隔（秒），`0` 关闭保活 |
+| `[[proxies]]` | 否 | 无 | 本进程直接服务的本地服务，可写多条；字段见下面几行 |
+| `[[proxies]].name` | 是 | 无 | 规则名称，进程内唯一 |
+| `[[proxies]].domain` | 是 | 无 | 要匹配的域名，支持如 `*.example.com` 的泛域名 |
+| `[[proxies]].local_addr` | 是 | 无 | 本地目标地址，可使用 TCP 地址或 Unix Socket |
+| `[[proxies]].auth_header` | 否 | 无 | 设置后访客必须携带 `X-HTTP-TUNNEL-TOKEN: <密钥>`，否则返回 `401` |
+
+表中“条件”表示按角色判断：`[server]` 与 `[upstream]` 至少要有一个；设置 `[server].domain` 时必须提供 `[server].token`（可直接复用 `[upstream].token`）。未列出的旧键会在启动时被拒绝。
 
 `[server]` 默认只监听 `127.0.0.1`。只允许本机 Nginx/Caddy 反代时保持默认即可；Docker 发布端口、局域网中继或不用反代直接公网访问时改成 `0.0.0.0`。`[server].port = 0` 的实际端口见启动日志，管理页也使用它。以上所有配置项和 `[[proxies]]` 都可以在管理页修改，保存后写回同一个 `ht.toml`。没有 `[server]` 时管理页不可达，只能通过配置文件或上游的 v4 管理通道维护 `[[proxies]]`。
 
@@ -196,7 +209,7 @@ curl -i -H "Host: app.example.com" http://127.0.0.1:7777/
 进程运行时会以约 1 秒的间隔检查 `ht.toml`，内容变化后自动应用，不需要重启：
 
 - `[[proxies]]` 和 `[upstream].allow_modify` 直接应用到运行中的进程：监听端口和上游会话都不断开，新增或删除服务会立即通告给上一跳。
-- 其他配置项（`name`、`token`、`[server]`、`[upstream]` 的地址/Token、重连/保活间隔、并发上限）会重建进程内的监听逻辑和上游会话：`[server].port` 和 `[server].bind` 都不变时复用已绑定的监听 socket，端口不会暂时拒绝连接；端口变化时先绑定新端口，成功后再停止旧监听；只有 `bind` 在同一个端口上变化时，会先停止旧监听、释放地址再绑定新地址，失败则回滚到原地址继续服务。新增或删除整个 `[server]` 同样走这条路径。旧会话先撤销路由并等待在途访客（最多 30 秒），随后按新配置重新监听/连接并重新通告路由。`ht` 进程本身不退出。
+- 其他配置项（`name`、`[server]`、`[upstream]` 的地址/Token、重连/保活间隔、并发上限）会重建进程内的监听逻辑和上游会话：`[server].port` 和 `[server].bind` 都不变时复用已绑定的监听 socket，端口不会暂时拒绝连接；端口变化时先绑定新端口，成功后再停止旧监听；只有 `bind` 在同一个端口上变化时，会先停止旧监听、释放地址再绑定新地址，失败则回滚到原地址继续服务。新增或删除整个 `[server]` 同样走这条路径。旧会话先撤销路由并等待在途访客（最多 30 秒），随后按新配置重新监听/连接并重新通告路由。`ht` 进程本身不退出。
 - 正在编辑时写出的半成品或非法内容只会记录一条警告，继续使用上一份有效配置；保存完整后下一次检查会生效。最近一次热加载失败的原因和发生时间会显示在管理页顶部，也会出现在 `/api/status` 的 `last_reload_error`、`last_reload_error_seconds_ago` 和 `last_reload_success_seconds_ago` 中。
 - 管理页/API 写回 `ht.toml` 时，只改 `[[proxies]]` 或 `[upstream].allow_modify` 会在线应用，不会触发重建；改动其他配置项则按上面的热加载流程重建。
 
@@ -218,7 +231,7 @@ curl -i -H "Host: app.example.com" http://127.0.0.1:7777/
 - 旧部署中的 `HT_*` 变量会被忽略，请把需要的值迁移到 `ht.toml`。
 - `[[proxies]]` 可以在管理页“管理服务”中增删改，其他配置项在“节点配置”中修改。
 
-### 从 1.x / 2.x 迁移
+### 从 1.x / 2.x / 3.x 迁移
 
 监听端与控制面的配置现在按角色分组，旧键会在启动时被拒绝并给出迁移提示：
 
@@ -229,6 +242,13 @@ curl -i -H "Host: app.example.com" http://127.0.0.1:7777/
 | `bind_host` | `[server].bind` |
 | `allow_upstream_modify` | `[upstream].allow_modify` |
 | `[upstream].server` | `[upstream].url` |
+| 顶层 `token` | `[server].token` |
+| 顶层 `retry_interval` | `[upstream].retry_interval` |
+| 顶层 `keepalive_interval` | `[server].keepalive_interval` 和 `[upstream].keepalive_interval` |
+| 顶层 `max_pending_handshakes` | `[server].max_pending_handshakes` |
+| 顶层 `max_sessions` | `[server].max_sessions` |
+
+现在顶层只保留 `name`（以及 `[server]`、`[upstream]`、`[[proxies]]` 三个表）；出现旧位置的其他键会在启动时被拒绝并给出迁移提示。
 
 3.0 移除了全部 `HT_*` 环境变量（包括 `HT_PROXIES`、`HT_TOKEN`、`HT_UPSTREAM_URL` 等）。请把变量值写入 `ht.toml` 的对应键后再启动。
 
@@ -241,7 +261,7 @@ curl -i -H "Host: app.example.com" http://127.0.0.1:7777/
 | `wss://control.example.com`（推荐） | TLS WebSocket，默认端口 443，公网部署必须使用 |
 | `ws://127.0.0.1:7777` | 明文 WebSocket，默认端口 80，仅适合可信网络或本地测试 |
 
-`wss` 依赖可信的 TLS 终止层（Nginx、Caddy、云负载均衡或安全网关）提供服务端证书，`ht` 自身不申请证书。Nginx 示例（`proxy_read_timeout` 必须大于 `keepalive_interval`）：
+`wss` 依赖可信的 TLS 终止层（Nginx、Caddy、云负载均衡或安全网关）提供服务端证书，`ht` 自身不申请证书。Nginx 示例（`proxy_read_timeout` 必须大于 `[server].keepalive_interval` / `[upstream].keepalive_interval`）：
 
 ```nginx
 server {
@@ -278,14 +298,7 @@ server {
 
 ## 转发配置
 
-所有本地服务都使用 `[[proxies]]`：
-
-| 字段 | 说明 |
-| --- | --- |
-| `name` | 规则名称，进程内唯一 |
-| `domain` | 要匹配的域名，支持如 `*.example.com` 的泛域名 |
-| `local_addr` | 本地目标地址，可使用 TCP 地址或 Unix Socket |
-| `auth_header` | 可选；设置后访客必须携带 `X-HTTP-TUNNEL-TOKEN: <密钥>`，否则返回 `401` |
+所有本地服务都使用 `[[proxies]]`，各字段（`name`、`domain`、`local_addr`、`auth_header`）的必填项和默认值见[配置参考](#配置参考)。
 
 `local_addr` 是原始 TCP 地址（`127.0.0.1:3000`）或 Unix Socket（`unix:///var/run/docker.sock`），不是 URL：写成 `http://127.0.0.1:3000` 会在启动或保存规则时报错。
 
@@ -338,12 +351,12 @@ services:
 
 ```toml
 name = "ingress"
-token = "demo-listener-token"
 
 [server]
 port = 7777
 bind = "0.0.0.0"
 domain = "ingress"
+token = "demo-listener-token"
 ```
 
 `leaf/ht.toml`（本机，不写 `[server]`，全程只拨出）：
@@ -475,22 +488,29 @@ docker compose run --rm probe -sS `
 ## 资源限制与保活
 
 ```toml
+[server]
 # 已认证但尚未完成 v4 握手的升级数
 max_pending_handshakes = 256
 # v4 会话上限（每个下游进程 1 条）
 max_sessions = 256
-# WebSocket ping 间隔（秒），0 关闭
+# 服务端 WebSocket ping 间隔（秒），0 关闭
+keepalive_interval = 15
+
+[upstream]
+# 重连上一跳的间隔（秒）
+retry_interval = 1
+# 上游 WebSocket ping 间隔（秒），0 关闭
 keepalive_interval = 15
 ```
 
 - 未认证的升级在 `Authorization: Bearer` 校验失败时直接返回 `401`，不会占用上述额度。
-- 超过 `max_pending_handshakes` 时返回 `503`；升级握手最长等待 10 秒，v4 会话握手最长等待 5 秒。
+- 超过 `[server].max_pending_handshakes` 时返回 `503`；升级握手最长等待 10 秒，v4 会话握手最长等待 5 秒。
 - 单个 WebSocket 帧/消息最大 1 MiB；流数据帧为 64 KiB，每个方向有 256 KiB 的初始窗口，接收方消费后发送窗口更新。
-- 每个 WebSocket 连接每 `keepalive_interval` 秒发送一次 ping；连续 3 个间隔没有收到任何帧就关闭连接。
+- 每个 WebSocket 连接每 `keepalive_interval` 秒发送一次 ping；连续 3 个间隔没有收到任何帧就关闭连接。服务端和上游分别使用 `[server].keepalive_interval` 与 `[upstream].keepalive_interval`。
 
 ## Web 管理
 
-配置了 `[server].domain` 时管理页面与 API 开启，和访客、v4 会话共用 `[server].port`，只在保留的 `[server].domain` 上可达。浏览器打开 `http://<server.domain>:<server.port>/`，HTTP Basic 用户名填 `ht`，密码填 `token`；页面是一个内联 CSS/JS 的单页控制台，本身不做服务端渲染，所有数据都通过 `/api/*`（Bearer token）获取，可查看状态、活跃访客与本次运行的累计连接、热加载错误、编辑本节点全部配置、管理本地服务、筛选路由表、查看下游节点（含来源 IP）、接口列表和 `ht.toml` 配置项参考。节点卡片中本节点和下游节点的每一行都有“管理服务”，点开后可在弹窗内查看，本节点服务还可以一键“测试”`local_addr` 是否可达，或在允许时增删改该节点自己的 `[[proxies]]`；下游节点行还可以“断开”当前会话。顶部“导出配置”会下载包含注释和 Token 明文的 `ht.toml`；保存配置时会保留文件里的注释和未修改服务的说明。
+配置了 `[server].domain` 时管理页面与 API 开启，和访客、v4 会话共用 `[server].port`，只在保留的 `[server].domain` 上可达。浏览器打开 `http://<server.domain>:<server.port>/`，HTTP Basic 用户名填 `ht`，密码填 `[server].token`；页面是一个内联 CSS/JS 的单页控制台，本身不做服务端渲染，所有数据都通过 `/api/*`（Bearer token）获取，可查看状态、活跃访客与本次运行的累计连接、热加载错误、编辑本节点全部配置、管理本地服务、筛选路由表、查看下游节点（含来源 IP）、接口列表和 `ht.toml` 配置项参考。节点卡片中本节点和下游节点的每一行都有“管理服务”，点开后可在弹窗内查看，本节点服务还可以一键“测试”`local_addr` 是否可达，或在允许时增删改该节点自己的 `[[proxies]]`；下游节点行还可以“断开”当前会话。顶部“导出配置”会下载包含注释和 Token 明文的 `ht.toml`；保存配置时会保留文件里的注释和未修改服务的说明。
 
 **上级修改默认关闭。** 下游节点的 `[[proxies]]` 默认只能由本机管理页修改；上一跳仍可列出这些服务（包括 `auth_header` 明文），但写入会返回 `409`。下游节点可以在自己的管理页顶部“上级修改”中切换，切换会立即重连上游会话以重新上报能力位，期间该节点的路由会短暂撤销并重新通告。独立入口没有上游，页面显示“无上游”。
 

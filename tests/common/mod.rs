@@ -16,8 +16,9 @@ pub fn ingress_config(listen_port: u16, control_host: &str, token: &str) -> Conf
         port: listen_port,
         bind: "127.0.0.1".to_string(),
         domain: Some(control_host.to_string()),
+        token: Some(MaskedString::from(token)),
+        ..Default::default()
     });
-    config.token = Some(MaskedString::from(token));
     config
 }
 
@@ -45,9 +46,13 @@ pub async fn run_http_tunnel_server_with_limits(
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let mut config = ingress_config(listen_port, control_host, token);
-    config.max_pending_handshakes = limits.max_pending_handshakes;
-    config.max_sessions = limits.max_sessions;
-    config.keepalive_interval = limits.keepalive_interval;
+    let server = config
+        .server
+        .as_mut()
+        .expect("the ingress always has a server");
+    server.max_pending_handshakes = limits.max_pending_handshakes;
+    server.max_sessions = limits.max_sessions;
+    server.keepalive_interval = limits.keepalive_interval;
     http_tunnel::run(config, shutdown_rx).await
 }
 

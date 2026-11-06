@@ -316,13 +316,7 @@ struct SettingsBody {
     #[serde(default)]
     server: Option<ServerBody>,
     #[serde(default)]
-    token: Option<String>,
-    #[serde(default)]
     upstream: Option<UpstreamBody>,
-    retry_interval: u64,
-    keepalive_interval: u64,
-    max_pending_handshakes: usize,
-    max_sessions: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -332,6 +326,11 @@ struct ServerBody {
     bind: String,
     #[serde(default)]
     domain: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+    keepalive_interval: u64,
+    max_pending_handshakes: usize,
+    max_sessions: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -341,6 +340,8 @@ struct UpstreamBody {
     token: String,
     #[serde(default)]
     allow_modify: bool,
+    retry_interval: u64,
+    keepalive_interval: u64,
 }
 
 #[derive(Serialize)]
@@ -378,17 +379,18 @@ fn settings_body(config: &Config) -> SettingsBody {
             port: server.port,
             bind: server.bind.clone(),
             domain: server.domain.clone(),
+            token: server.token.as_deref().map(str::to_string),
+            keepalive_interval: server.keepalive_interval,
+            max_pending_handshakes: server.max_pending_handshakes,
+            max_sessions: server.max_sessions,
         }),
-        token: config.token.as_deref().map(str::to_string),
         upstream: config.upstream.as_ref().map(|upstream| UpstreamBody {
             url: upstream.url.clone(),
             token: upstream.token.to_string(),
             allow_modify: upstream.allow_modify,
+            retry_interval: upstream.retry_interval,
+            keepalive_interval: upstream.keepalive_interval,
         }),
-        retry_interval: config.retry_interval,
-        keepalive_interval: config.keepalive_interval,
-        max_pending_handshakes: config.max_pending_handshakes,
-        max_sessions: config.max_sessions,
     }
 }
 
@@ -627,17 +629,18 @@ fn apply_settings_body(config: &mut Config, body: SettingsBody) {
         port: server.port,
         bind: server.bind,
         domain: server.domain,
+        token: server.token.map(MaskedString::from),
+        keepalive_interval: server.keepalive_interval,
+        max_pending_handshakes: server.max_pending_handshakes,
+        max_sessions: server.max_sessions,
     });
-    config.token = body.token.map(MaskedString::from);
     config.upstream = body.upstream.map(|upstream| UpstreamConfig {
         url: upstream.url,
         token: MaskedString::from(upstream.token),
         allow_modify: upstream.allow_modify,
+        retry_interval: upstream.retry_interval,
+        keepalive_interval: upstream.keepalive_interval,
     });
-    config.retry_interval = body.retry_interval;
-    config.keepalive_interval = body.keepalive_interval;
-    config.max_pending_handshakes = body.max_pending_handshakes;
-    config.max_sessions = body.max_sessions;
 }
 
 /// Replace every setting of this node.

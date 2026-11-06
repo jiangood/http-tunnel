@@ -1,11 +1,13 @@
 name = "edge" # The name of the process
-token = "use_a_secret_that_only_you_know" # The listener token for downstream peers
-retry_interval = 1 # The interval between retries to connect to the next hop
 
 [server] # Remove this table to run as a client that never listens
 port = 7777 # The listener port, shared by visitors and v4 sessions
 bind = "127.0.0.1" # Use 0.0.0.0 for Docker or a LAN relay
 domain = "control.example.com" # The reserved Host of the WebSocket endpoint
+token = "use_a_secret_that_only_you_know" # The listener token for downstream peers
+keepalive_interval = 15 # WebSocket ping interval of the listener, in secs
+max_pending_handshakes = 256 # Concurrent upgrades still waiting for ClientHello
+max_sessions = 256 # Concurrent v4 sessions
 
 [[proxies]] # Each local service is a table with its own name, domain and local_addr
 name = "nas"
@@ -25,3 +27,5 @@ local_addr = "127.0.0.1:80"
 [upstream] # Remove this table to run as a standalone ingress
 url = "wss://upper.example.com:443" # The next hop
 token = "use_a_different_secret_per_hop"
+retry_interval = 1 # The interval between retries to connect to the next hop
+keepalive_interval = 15 # WebSocket ping interval of the upstream session, in secs

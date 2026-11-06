@@ -1,8 +1,8 @@
 name = "home"
-token = "secret"
 
 [server]
 domain = "control.example.com"
+token = "secret"
 
 [[proxies]]
 name = "nas"

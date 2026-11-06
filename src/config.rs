@@ -119,6 +119,20 @@ pub struct ServerConfig {
     /// only and has no control plane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
+    /// The shared token downstream peers authenticate with. When omitted with
+    /// `[upstream]`, the upstream token is reused for the listener too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<MaskedString>,
+    /// The number of authenticated WebSocket upgrades that may wait for their
+    /// `ClientHello` at the same time.
+    #[serde(default = "default_max_pending_handshakes")]
+    pub max_pending_handshakes: usize,
+    /// The number of v4 sessions accepted at once.
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
+    /// WebSocket ping interval in secs. `0` disables keepalive pings.
+    #[serde(default = "default_keepalive_interval")]
+    pub keepalive_interval: u64,
 }
 
 impl Default for ServerConfig {
@@ -127,6 +141,10 @@ impl Default for ServerConfig {
             port: default_listen_port(),
             bind: default_bind_host(),
             domain: None,
+            token: None,
+            max_pending_handshakes: default_max_pending_handshakes(),
+            max_sessions: default_max_sessions(),
+            keepalive_interval: default_keepalive_interval(),
         }
     }
 }
@@ -136,7 +154,7 @@ impl Default for ServerConfig {
 /// Without this table the process is a standalone ingress when `[server]` is
 /// present. With it, the process also dials the next hop with one v4 session and
 /// mirrors its route set there.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     /// The WebSocket endpoint of the next hop, e.g. `ws://a.lan:7777` or
@@ -148,6 +166,25 @@ pub struct UpstreamConfig {
     /// v4 session. Off unless the file opts in.
     #[serde(default)]
     pub allow_modify: bool,
+    /// The interval between retries to reach the next hop, in secs.
+    #[serde(default = "default_retry_interval")]
+    pub retry_interval: u64,
+    /// WebSocket ping interval of the upstream session in secs. `0` disables
+    /// keepalive pings.
+    #[serde(default = "default_keepalive_interval")]
+    pub keepalive_interval: u64,
+}
+
+impl Default for UpstreamConfig {
+    fn default() -> Self {
+        UpstreamConfig {
+            url: String::new(),
+            token: MaskedString::default(),
+            allow_modify: false,
+            retry_interval: default_retry_interval(),
+            keepalive_interval: default_keepalive_interval(),
+        }
+    }
 }
 
 impl UpstreamConfig {
@@ -182,7 +219,8 @@ pub(crate) struct ConfigSource {
 /// One file describes both roles: an optional listener/server (`[server]`) and
 /// one optional upstream session (`[upstream]`). Local services are declared
 /// once under `[[proxies]]`, whether they are served directly by an ingress or
-/// advertised to an upper hop by a leaf or relay.
+/// advertised to an upper hop by a leaf or relay. The root table only carries
+/// `name`; every other scalar setting lives in `[server]` or `[upstream]`.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -193,29 +231,12 @@ pub struct Config {
     /// the process is a client/leaf only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<ServerConfig>,
-    /// The shared token of downstream peers. When omitted with `[upstream]`, the
-    /// upstream token is used for the listener too.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<MaskedString>,
     /// Local services served by this process.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxies: Vec<ServerProxyEntry>,
     /// The next hop. Remove this table to run as a standalone ingress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<UpstreamConfig>,
-    /// The interval between retries to reach the upstream, in secs.
-    #[serde(default = "default_retry_interval")]
-    pub retry_interval: u64,
-    /// The number of authenticated WebSocket upgrades that may wait for their
-    /// `ClientHello` at the same time.
-    #[serde(default = "default_max_pending_handshakes")]
-    pub max_pending_handshakes: usize,
-    /// The number of v4 sessions accepted at once.
-    #[serde(default = "default_max_sessions")]
-    pub max_sessions: usize,
-    /// WebSocket ping interval in secs. `0` disables keepalive pings.
-    #[serde(default = "default_keepalive_interval")]
-    pub keepalive_interval: u64,
     /// Load metadata, never written to TOML.
     #[serde(skip)]
     pub(crate) source: ConfigSource,
@@ -226,13 +247,8 @@ impl Default for Config {
         Config {
             name: default_name(),
             server: None,
-            token: None,
             proxies: Vec::new(),
             upstream: None,
-            retry_interval: default_retry_interval(),
-            max_pending_handshakes: default_max_pending_handshakes(),
-            max_sessions: default_max_sessions(),
-            keepalive_interval: default_keepalive_interval(),
             source: ConfigSource::default(),
         }
     }
@@ -241,11 +257,12 @@ impl Default for Config {
 impl Config {
     /// The token the embedded listener authenticates downstream peers with.
     ///
-    /// When the top-level `token` is omitted and `[upstream]` is present, the
+    /// When `[server].token` is omitted and `[upstream]` is present, the
     /// upstream token is reused for the listener.
     pub fn listener_token(&self) -> Option<&MaskedString> {
-        self.token
+        self.server
             .as_ref()
+            .and_then(|server| server.token.as_ref())
             .or_else(|| self.upstream.as_ref().map(|upstream| &upstream.token))
     }
 
@@ -281,10 +298,13 @@ impl Config {
 
     /// The runtime limits of the embedded server.
     pub fn server_limits(&self) -> ServerLimits {
-        ServerLimits {
-            max_pending_handshakes: self.max_pending_handshakes,
-            max_sessions: self.max_sessions,
-            keepalive_interval: self.keepalive_interval,
+        match self.server.as_ref() {
+            Some(server) => ServerLimits {
+                max_pending_handshakes: server.max_pending_handshakes,
+                max_sessions: server.max_sessions,
+                keepalive_interval: server.keepalive_interval,
+            },
+            None => ServerLimits::default(),
         }
     }
 
@@ -646,18 +666,17 @@ fn merge_into_toml(existing: &str, config: &Config) -> Result<String> {
         "bind_host",
         "control_host",
         "allow_upstream_modify",
+        "token",
+        "retry_interval",
+        "keepalive_interval",
+        "max_pending_handshakes",
+        "max_sessions",
     ] {
         doc.remove(legacy);
     }
 
     match &config.server {
         Some(server) => {
-            let mut table = toml_edit::Table::new();
-            table.insert("port", toml_edit::value(server.port as i64));
-            table.insert("bind", toml_edit::value(server.bind.clone()));
-            if let Some(domain) = &server.domain {
-                table.insert("domain", toml_edit::value(domain.clone()));
-            }
             if let Some(old) = doc.get_mut("server").and_then(Item::as_table_mut) {
                 set_table_item(old, "port", toml_edit::value(server.port as i64));
                 set_table_item(old, "bind", toml_edit::value(server.bind.clone()));
@@ -669,7 +688,48 @@ fn merge_into_toml(existing: &str, config: &Config) -> Result<String> {
                         old.remove("domain");
                     }
                 }
+                match &server.token {
+                    Some(token) => {
+                        set_table_item(old, "token", toml_edit::value(String::from(&**token)))
+                    }
+                    None => {
+                        old.remove("token");
+                    }
+                }
+                set_table_item(
+                    old,
+                    "max_pending_handshakes",
+                    toml_edit::value(server.max_pending_handshakes as i64),
+                );
+                set_table_item(
+                    old,
+                    "max_sessions",
+                    toml_edit::value(server.max_sessions as i64),
+                );
+                set_table_item(
+                    old,
+                    "keepalive_interval",
+                    toml_edit::value(server.keepalive_interval as i64),
+                );
             } else {
+                let mut table = toml_edit::Table::new();
+                table.insert("port", toml_edit::value(server.port as i64));
+                table.insert("bind", toml_edit::value(server.bind.clone()));
+                if let Some(domain) = &server.domain {
+                    table.insert("domain", toml_edit::value(domain.clone()));
+                }
+                if let Some(token) = &server.token {
+                    table.insert("token", toml_edit::value(String::from(&**token)));
+                }
+                table.insert(
+                    "max_pending_handshakes",
+                    toml_edit::value(server.max_pending_handshakes as i64),
+                );
+                table.insert("max_sessions", toml_edit::value(server.max_sessions as i64));
+                table.insert(
+                    "keepalive_interval",
+                    toml_edit::value(server.keepalive_interval as i64),
+                );
                 set_item(&mut doc, "server", Item::Table(table));
             }
         }
@@ -678,38 +738,8 @@ fn merge_into_toml(existing: &str, config: &Config) -> Result<String> {
         }
     }
 
-    if let Some(token) = &config.token {
-        set_item(&mut doc, "token", toml_edit::value(String::from(&**token)));
-    } else {
-        doc.remove("token");
-    }
-    set_item(
-        &mut doc,
-        "retry_interval",
-        toml_edit::value(config.retry_interval as i64),
-    );
-    set_item(
-        &mut doc,
-        "keepalive_interval",
-        toml_edit::value(config.keepalive_interval as i64),
-    );
-    set_item(
-        &mut doc,
-        "max_pending_handshakes",
-        toml_edit::value(config.max_pending_handshakes as i64),
-    );
-    set_item(
-        &mut doc,
-        "max_sessions",
-        toml_edit::value(config.max_sessions as i64),
-    );
-
     match &config.upstream {
         Some(upstream) => {
-            let mut table = toml_edit::Table::new();
-            table.insert("url", toml_edit::value(upstream.url.clone()));
-            table.insert("token", toml_edit::value(String::from(&*upstream.token)));
-            table.insert("allow_modify", toml_edit::value(upstream.allow_modify));
             if let Some(old) = doc.get_mut("upstream").and_then(Item::as_table_mut) {
                 set_table_item(old, "url", toml_edit::value(upstream.url.clone()));
                 set_table_item(
@@ -718,7 +748,29 @@ fn merge_into_toml(existing: &str, config: &Config) -> Result<String> {
                     toml_edit::value(String::from(&*upstream.token)),
                 );
                 set_table_item(old, "allow_modify", toml_edit::value(upstream.allow_modify));
+                set_table_item(
+                    old,
+                    "retry_interval",
+                    toml_edit::value(upstream.retry_interval as i64),
+                );
+                set_table_item(
+                    old,
+                    "keepalive_interval",
+                    toml_edit::value(upstream.keepalive_interval as i64),
+                );
             } else {
+                let mut table = toml_edit::Table::new();
+                table.insert("url", toml_edit::value(upstream.url.clone()));
+                table.insert("token", toml_edit::value(String::from(&*upstream.token)));
+                table.insert("allow_modify", toml_edit::value(upstream.allow_modify));
+                table.insert(
+                    "retry_interval",
+                    toml_edit::value(upstream.retry_interval as i64),
+                );
+                table.insert(
+                    "keepalive_interval",
+                    toml_edit::value(upstream.keepalive_interval as i64),
+                );
                 set_item(&mut doc, "upstream", Item::Table(table));
             }
         }
@@ -826,6 +878,14 @@ fn legacy_config_hint(source: &str) -> Option<String> {
         ("bind_host", "[server].bind"),
         ("allow_upstream_modify", "[upstream].allow_modify"),
         ("listener", "[server]"),
+        ("token", "[server].token"),
+        ("retry_interval", "[upstream].retry_interval"),
+        (
+            "keepalive_interval",
+            "[server].keepalive_interval / [upstream].keepalive_interval",
+        ),
+        ("max_pending_handshakes", "[server].max_pending_handshakes"),
+        ("max_sessions", "[server].max_sessions"),
     ] {
         if table.contains_key(old) {
             hints.push(format!("`{}` -> `{}`", old, new));
@@ -1131,7 +1191,7 @@ mod tests {
     #[test]
     fn test_upstream_url_validation() -> Result<()> {
         let ws = router(
-            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[upstream]\n\
+            "[server]\ndomain = \"control.test\"\ntoken = \"secret\"\n\n[upstream]\n\
              url = \"ws://example.com\"\ntoken = \"secret\"\n",
         );
         assert_eq!(ws.upstream.as_ref().unwrap().url, "ws://example.com:80");
@@ -1139,12 +1199,12 @@ mod tests {
         assert!(!ws.tls());
 
         assert!(Config::parse(
-            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[upstream]\n\
+            "[server]\ndomain = \"control.test\"\ntoken = \"secret\"\n\n[upstream]\n\
              url = \"udp://example.com\"\ntoken = \"secret\"\n"
         )
         .is_err());
         assert!(Config::parse(
-            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[upstream]\n\
+            "[server]\ndomain = \"control.test\"\ntoken = \"secret\"\n\n[upstream]\n\
              url = \"example.com:443\"\ntoken = \"secret\"\n"
         )
         .is_err());
@@ -1154,7 +1214,7 @@ mod tests {
     #[test]
     fn test_upstream_addr() -> Result<()> {
         let cfg = router(
-            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[upstream]\n\
+            "[server]\ndomain = \"control.test\"\ntoken = \"secret\"\n\n[upstream]\n\
              url = \"wss://example.com:2333\"\ntoken = \"secret\"\n",
         );
         assert_eq!(
@@ -1163,7 +1223,7 @@ mod tests {
         );
 
         let cfg = router(
-            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[upstream]\n\
+            "[server]\ndomain = \"control.test\"\ntoken = \"secret\"\n\n[upstream]\n\
              url = \"wss://[::1]\"\ntoken = \"secret\"\n",
         );
         assert_eq!(
@@ -1186,7 +1246,7 @@ mod tests {
             "wss://user@example.com",
         ] {
             let source = format!(
-                "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[upstream]\n\
+                "[server]\ndomain = \"control.test\"\ntoken = \"secret\"\n\n[upstream]\n\
                  url = {:?}\ntoken = \"secret\"\n",
                 url
             );
@@ -1229,7 +1289,7 @@ mod tests {
                 "[upstream].allow_modify",
             ),
             (
-                "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[upstream]\n\
+                "[server]\ndomain = \"control.test\"\ntoken = \"secret\"\n\n[upstream]\n\
                  server = \"ws://a.test:7777\"\ntoken = \"secret\"\n",
                 "[upstream].server",
                 "[upstream].url",
@@ -1252,7 +1312,6 @@ mod tests {
             // The shipped template carries placeholder tokens, so the strict
             // validation must reject it until it is edited.
             assert!(Config::validate(&mut config).is_err(), "{:?} is valid", p);
-            config.token = Some(MaskedString::from("downstream-test-token"));
             config.upstream.as_mut().unwrap().token = MaskedString::from("upstream-test-token");
             Config::validate(&mut config)?;
             assert_eq!(config.name, "edge");
@@ -1286,11 +1345,10 @@ mod tests {
     fn test_resolved_proxies() -> Result<()> {
         let s = r#"
 name = "edge"
-token = "secret"
-retry_interval = 7
 
 [server]
 domain = "control.test"
+token = "secret"
 
 [[proxies]]
 name = "nas"
@@ -1301,6 +1359,11 @@ local_addr = "127.0.0.1:80"
 name = "foo2"
 domain = "foo2.example.com"
 local_addr = "127.0.0.1:81"
+
+[upstream]
+url = "ws://a.test:7777"
+token = "upstream-secret"
+retry_interval = 7
 "#;
         let cfg = router(s);
         assert_eq!(cfg.proxies.len(), 2);
@@ -1310,13 +1373,13 @@ local_addr = "127.0.0.1:81"
         assert_eq!(cfg.proxies[1].name, "foo2");
         assert_eq!(cfg.proxies[1].domain, "foo2.example.com");
         assert_eq!(cfg.proxies[1].local_addr, "127.0.0.1:81");
-        assert_eq!(cfg.retry_interval, 7);
+        assert_eq!(cfg.upstream.as_ref().unwrap().retry_interval, 7);
         Ok(())
     }
 
     #[test]
     fn test_set_and_remove_proxy() -> Result<()> {
-        let mut cfg = router("token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n");
+        let mut cfg = router("[server]\ndomain = \"control.test\"\ntoken = \"secret\"\n");
 
         cfg.set_proxy(
             "nas".to_string(),
@@ -1349,7 +1412,7 @@ local_addr = "127.0.0.1:81"
 
     #[test]
     fn test_set_proxy_replaces_the_whole_entry() -> Result<()> {
-        let mut cfg = router("token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n");
+        let mut cfg = router("[server]\ndomain = \"control.test\"\ntoken = \"secret\"\n");
 
         cfg.set_proxy(
             "docker".to_string(),
@@ -1377,7 +1440,7 @@ local_addr = "127.0.0.1:81"
 
     #[test]
     fn test_set_proxy_adds_and_keeps_names_distinct() -> Result<()> {
-        let mut cfg = router("token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n");
+        let mut cfg = router("[server]\ndomain = \"control.test\"\ntoken = \"secret\"\n");
 
         cfg.set_proxy(
             "app-1".to_string(),
@@ -1414,7 +1477,11 @@ local_addr = "127.0.0.1:81"
         assert_eq!(cfg.name, "ht");
         assert!(cfg.server.is_none());
         assert_eq!(cfg.bind_host(), "127.0.0.1");
-        assert_eq!(cfg.retry_interval, DEFAULT_RETRY_INTERVAL_SECS);
+        assert_eq!(cfg.server_limits(), ServerLimits::default());
+        assert_eq!(
+            UpstreamConfig::default().retry_interval,
+            DEFAULT_RETRY_INTERVAL_SECS
+        );
         assert!(!cfg.allow_modify());
         assert!(cfg.proxies.is_empty());
         Ok(())
@@ -1424,13 +1491,13 @@ local_addr = "127.0.0.1:81"
     fn test_allow_upstream_modify_is_opt_in() -> Result<()> {
         // The security-sensitive switch is off unless the file opts in.
         let cfg = router(
-            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n\
+            "[server]\ndomain = \"control.test\"\ntoken = \"secret\"\n\n\
              [upstream]\nurl = \"ws://a.test:7777\"\ntoken = \"upstream-secret\"\n",
         );
         assert!(!cfg.allow_modify());
 
         let cfg = router(
-            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n\
+            "[server]\ndomain = \"control.test\"\ntoken = \"secret\"\n\n\
              [upstream]\nurl = \"ws://a.test:7777\"\ntoken = \"upstream-secret\"\n\
              allow_modify = true\n",
         );
@@ -1442,7 +1509,7 @@ local_addr = "127.0.0.1:81"
     #[test]
     fn test_token_falls_back_to_the_upstream_token() -> Result<()> {
         let cfg = router("[upstream]\nurl = \"ws://a.test:7777\"\ntoken = \"upstream-secret\"\n");
-        assert!(cfg.token.is_none());
+        assert!(cfg.server.is_none());
         assert_eq!(&**cfg.listener_token().unwrap(), "upstream-secret");
         let dumped = cfg.to_toml()?;
         assert!(!dumped.contains("[server]"), "{}", dumped);
@@ -1452,10 +1519,9 @@ local_addr = "127.0.0.1:81"
     #[test]
     fn test_rejects_an_empty_local_addr() {
         let s = r#"
-token = "secret"
-
 [server]
 domain = "control.test"
+token = "secret"
 
 [[proxies]]
 name = "foo"
@@ -1474,7 +1540,7 @@ local_addr = ""
             "HTTPS://nas.example.com",
         ] {
             let s = format!(
-                "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\n[[proxies]]\n\
+                "[server]\ndomain = \"control.test\"\ntoken = \"secret\"\n\n[[proxies]]\n\
                  name = \"foo\"\ndomain = \"foo.example.com\"\nlocal_addr = {:?}\n",
                 local_addr
             );
@@ -1491,10 +1557,9 @@ local_addr = ""
     #[test]
     fn test_accepts_a_unix_socket_and_trims_local_addr() -> Result<()> {
         let s = r#"
-token = "secret"
-
 [server]
 domain = "control.test"
+token = "secret"
 
 [[proxies]]
 name = "docker"
@@ -1515,10 +1580,9 @@ local_addr = "  127.0.0.1:80  "
     #[test]
     fn test_rejects_an_invalid_domain() {
         let s = r#"
-token = "secret"
-
 [server]
 domain = "control.test"
+token = "secret"
 
 [[proxies]]
 name = "foo"
@@ -1531,10 +1595,9 @@ local_addr = "127.0.0.1:80"
     #[test]
     fn test_rejects_a_duplicated_domain() {
         let s = r#"
-token = "secret"
-
 [server]
 domain = "control.test"
+token = "secret"
 
 [[proxies]]
 name = "foo1"
@@ -1552,10 +1615,9 @@ local_addr = "127.0.0.1:81"
     #[test]
     fn test_rejects_an_unknown_field() {
         let s = r#"
-token = "secret"
-
 [server]
 domain = "control.test"
+token = "secret"
 tokenz = "oops"
 "#;
         assert!(Config::parse(s).is_err());
@@ -1564,10 +1626,9 @@ tokenz = "oops"
     #[test]
     fn test_rejects_a_duplicated_name() {
         let s = r#"
-token = "secret"
-
 [server]
 domain = "control.test"
+token = "secret"
 
 [[proxies]]
 name = "nas"
@@ -1585,10 +1646,9 @@ local_addr = "127.0.0.1:81"
     #[test]
     fn test_rejects_a_missing_name() {
         let s = r#"
-token = "secret"
-
 [server]
 domain = "control.test"
+token = "secret"
 
 [[proxies]]
 domain = "foo.example.com"
@@ -1600,10 +1660,9 @@ local_addr = "127.0.0.1:80"
     #[test]
     fn test_rejects_a_missing_domain() {
         let s = r#"
-token = "secret"
-
 [server]
 domain = "control.test"
+token = "secret"
 
 [[proxies]]
 name = "nas"
@@ -1615,10 +1674,9 @@ local_addr = "127.0.0.1:80"
     #[test]
     fn test_rejects_an_invalid_name() {
         let s = r#"
-token = "secret"
-
 [server]
 domain = "control.test"
+token = "secret"
 
 [[proxies]]
 name = "nas/../etc"
@@ -1632,12 +1690,11 @@ local_addr = "127.0.0.1:80"
     fn test_config_roundtrip() -> Result<()> {
         let s = r#"
 name = "edge"
-token = "secret"
-retry_interval = 2
 
 [server]
 port = 7777
 domain = "control.test"
+token = "secret"
 
 [[proxies]]
 name = "nas"
@@ -1652,6 +1709,7 @@ local_addr = "127.0.0.1:81"
 [upstream]
 url = "ws://a.test:7777"
 token = "upstream-secret"
+retry_interval = 2
 "#;
         let cfg = router(s);
         let dumped = cfg.to_toml()?;
@@ -1674,9 +1732,8 @@ token = "upstream-secret"
     #[test]
     fn test_config_roundtrip_without_optional_fields() -> Result<()> {
         let s = r#"
-token = "secret"
-
 [server]
+token = "secret"
 
 [[proxies]]
 name = "foo1"
@@ -1755,8 +1812,9 @@ local_addr = "127.0.0.1:80"
     async fn test_server_bind_is_an_ip_address() {
         let path =
             std::env::temp_dir().join(format!("http-tunnel-bind-host-{}.toml", std::process::id()));
-        let base = "token = \"a_secret_token\"\n\n[server]\nport = 8080\n\
-                    domain = \"control.example.com\"\n";
+        let base = "[server]\nport = 8080\n\
+                    domain = \"control.example.com\"\n\
+                    token = \"a_secret_token\"\n";
 
         std::fs::write(&path, format!("{}bind = \"127.0.0.1\"\n", base)).unwrap();
         let config = Config::from_file(&path).await.unwrap();
@@ -1789,12 +1847,12 @@ local_addr = "127.0.0.1:80"
             &path,
             r#"## top comment
 name = "edge"
-token = "secret"
 
 [server]
 port = 8080
 bind = "0.0.0.0"
 domain = "control.test"
+token = "secret"
 
 ## keep this service
 [[proxies]]
@@ -1853,7 +1911,7 @@ local_addr = "127.0.0.1:81"
         ));
         std::fs::write(&path, "this is not toml = [")?;
         let mut config = Config::parse(
-            "token = \"secret\"\n\n[server]\ndomain = \"control.test\"\n\
+            "[server]\ndomain = \"control.test\"\ntoken = \"secret\"\n\
              bind = \"127.0.0.1\"\n",
         )?;
         config.source.path = Some(path.clone());
@@ -1928,11 +1986,11 @@ local_addr = "127.0.0.1:81"
 
     const LEAF_CONFIG: &str = r#"
 name = "relay-b"
-token = "downstream-secret"
 
 [server]
 port = 9001
 domain = "b.lan"
+token = "downstream-secret"
 
 [[proxies]]
 name = "local"
@@ -1962,8 +2020,8 @@ token = "upstream-secret"
     #[test]
     fn test_upstream_url_gets_its_defaults() -> Result<()> {
         let config = router(
-            "name = \"b\"\ntoken = \"downstream-secret\"\n\n[server]\nport = 9001\n\
-             domain = \"b.lan\"\n\n[upstream]\nurl = \"wss://a.lan\"\n\
+            "name = \"b\"\n\n[server]\nport = 9001\n\
+             domain = \"b.lan\"\ntoken = \"downstream-secret\"\n\n[upstream]\nurl = \"wss://a.lan\"\n\
              token = \"upstream-secret\"\n",
         );
         let upstream = config.upstream.as_ref().unwrap();
@@ -1975,8 +2033,8 @@ token = "upstream-secret"
     #[test]
     fn test_ingress_without_upstream_is_valid() -> Result<()> {
         let config = router(
-            "name = \"ingress\"\ntoken = \"downstream-secret\"\n\n[server]\nport = 9001\n\
-             domain = \"ingress.lan\"\n",
+            "name = \"ingress\"\n\n[server]\nport = 9001\n\
+             domain = \"ingress.lan\"\ntoken = \"downstream-secret\"\n",
         );
         assert!(config.upstream.is_none());
         Ok(())
@@ -1985,8 +2043,8 @@ token = "upstream-secret"
     #[test]
     fn test_rejects_an_upstream_pointing_at_itself() {
         let mut config: Config = toml::from_str(
-            "name = \"b\"\ntoken = \"downstream-secret\"\n\n[server]\nport = 9001\n\
-             domain = \"b.lan\"\n\n[upstream]\nurl = \"ws://b.lan:9001\"\n\
+            "name = \"b\"\n\n[server]\nport = 9001\n\
+             domain = \"b.lan\"\ntoken = \"downstream-secret\"\n\n[upstream]\nurl = \"ws://b.lan:9001\"\n\
              token = \"upstream-secret\"\n",
         )
         .unwrap();
@@ -1998,8 +2056,8 @@ token = "upstream-secret"
             "ws://[::1]:9001",
         ] {
             let mut config: Config = toml::from_str(&format!(
-                "name = \"b\"\ntoken = \"downstream-secret\"\n\n[server]\nport = 9001\n\
-                 domain = \"b.lan\"\n\n[upstream]\nurl = \"{}\"\n\
+                "name = \"b\"\n\n[server]\nport = 9001\n\
+                 domain = \"b.lan\"\ntoken = \"downstream-secret\"\n\n[upstream]\nurl = \"{}\"\n\
                  token = \"upstream-secret\"\n",
                 url
             ))
@@ -2013,8 +2071,8 @@ token = "upstream-secret"
 
         // Loopback on another port is a legitimate first hop
         assert!(Config::parse(
-            "name = \"b\"\ntoken = \"downstream-secret\"\n\n[server]\nport = 9001\n\
-             domain = \"b.lan\"\n\n[upstream]\nurl = \"ws://127.0.0.1:7777\"\n\
+            "name = \"b\"\n\n[server]\nport = 9001\n\
+             domain = \"b.lan\"\ntoken = \"downstream-secret\"\n\n[upstream]\nurl = \"ws://127.0.0.1:7777\"\n\
              token = \"upstream-secret\"\n"
         )
         .is_ok());
@@ -2023,12 +2081,12 @@ token = "upstream-secret"
     #[test]
     fn test_listen_port_zero_requires_upstream() {
         assert!(Config::parse(
-            "token = \"downstream-secret\"\n\n[server]\nport = 0\ndomain = \"ingress.lan\"\n"
+            "[server]\nport = 0\ndomain = \"ingress.lan\"\ntoken = \"downstream-secret\"\n"
         )
         .is_err());
 
         assert!(Config::parse(
-            "token = \"downstream-secret\"\n\n[server]\nport = 0\ndomain = \"leaf.lan\"\n\n\
+            "[server]\nport = 0\ndomain = \"leaf.lan\"\ntoken = \"downstream-secret\"\n\n\
              [upstream]\nurl = \"ws://a.lan:7777\"\ntoken = \"upstream-secret\"\n"
         )
         .is_ok());
@@ -2043,10 +2101,11 @@ token = "upstream-secret"
 
         // Both tokens are required, and the placeholders are not secrets
         let mut config = router(LEAF_CONFIG);
-        config.token = Some(MaskedString::from(""));
+        config.server.as_mut().unwrap().token = Some(MaskedString::from(""));
         assert!(Config::validate(&mut config).is_err());
         let mut config = router(LEAF_CONFIG);
-        config.token = Some(MaskedString::from("replace-with-a-long-random-secret"));
+        config.server.as_mut().unwrap().token =
+            Some(MaskedString::from("replace-with-a-long-random-secret"));
         assert!(Config::validate(&mut config).is_err());
         let mut config = router(LEAF_CONFIG);
         config.upstream.as_mut().unwrap().token = MaskedString::from("");
@@ -2069,8 +2128,8 @@ token = "upstream-secret"
             "claim = \"*.b.relay.example.com\"",
         ] {
             let s = format!(
-                "name = \"b\"\ntoken = \"downstream-secret\"\n\n[server]\nport = 9001\n\
-                 domain = \"b.lan\"\n\n[upstream]\nurl = \"ws://a.lan:7777\"\n\
+                "name = \"b\"\n\n[server]\nport = 9001\n\
+                 domain = \"b.lan\"\ntoken = \"downstream-secret\"\n\n[upstream]\nurl = \"ws://a.lan:7777\"\n\
                  token = \"upstream-secret\"\n{}\n",
                 stale
             );
@@ -2083,7 +2142,7 @@ token = "upstream-secret"
             "{:#}",
             Config::parse(
                 "name = \"b\"\ntoken = \"downstream-secret\"\nmax_mirrored_routes = 0\n\n\
-                 [server]\nport = 9001\ndomain = \"b.lan\"\n\n\
+                 [server]\nport = 9001\ndomain = \"b.lan\"\ntoken = \"downstream-secret\"\n\n\
                  [upstream]\nurl = \"ws://a.lan:7777\"\ntoken = \"upstream-secret\"\n",
             )
             .unwrap_err()

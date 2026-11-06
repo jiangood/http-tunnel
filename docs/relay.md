@@ -26,12 +26,12 @@ The roles are selected by the two tables:
 
 ```toml
 name = "relay-b"
-token = "downstream-secret"
 
 [server]
 port = 9001
 bind = "0.0.0.0"
 domain = "b.lan"
+token = "downstream-secret"
 
 [[proxies]]
 name = "local"
@@ -42,6 +42,8 @@ local_addr = "127.0.0.1:8080"
 url = "ws://a.lan:7777"
 token = "upstream-secret"
 allow_modify = false
+retry_interval = 1
+keepalive_interval = 15
 ```
 
 | Setting | Meaning |
@@ -50,9 +52,14 @@ allow_modify = false
 | `[server].port` | The listener port for visitors, downstream peers, and the WebSocket endpoint. Defaults to `7777`; `0` picks an ephemeral port and requires `[upstream]`. |
 | `[server].bind` | The listener address, an IPv4/IPv6 literal. Defaults to `127.0.0.1`; use `0.0.0.0` for Docker, a LAN relay, or direct public access. |
 | `[server].domain` | Exact Host reserved for the v4 session and management endpoint. Omit it to serve visitors only, with no control plane. |
-| `token` | Token for downstream peers. May be omitted with `[upstream]`, in which case the upstream token is reused. |
+| `[server].token` | Token for downstream peers. May be omitted with `[upstream]`, in which case the upstream token is reused. |
+| `[server].max_pending_handshakes` | Maximum concurrently unauthenticated upgrades. Defaults to `256`. |
+| `[server].max_sessions` | Maximum concurrent v4 sessions. Defaults to `256`. |
+| `[server].keepalive_interval` | WebSocket ping interval of the listener, in secs. Defaults to `15`; `0` disables keepalive. |
 | `[[proxies]]` | Local services served by this process. They take precedence over downstream session routes. |
 | `[upstream].allow_modify` | Whether the next hop may change the local `[[proxies]]` over v4. Defaults to `false`; the next hop may still list them. The node's own page can switch it at runtime. |
+| `[upstream].retry_interval` | Interval between reconnects to the next hop, in secs. Defaults to `1`. |
+| `[upstream].keepalive_interval` | WebSocket ping interval of the upstream session, in secs. Defaults to `15`; `0` disables keepalive. |
 | `[upstream]` | The next hop. Remove it to run as a standalone ingress. |
 
 ## Route advertisement

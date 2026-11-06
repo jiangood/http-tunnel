@@ -10,10 +10,15 @@ name = "edge"
 ## bind 默认 127.0.0.1，只监听本机；Docker、局域网中继或直接公网访问时改成 0.0.0.0。
 ## domain 是入口 Host（原 control_host）；省略时只监听访客路由，
 ## 不启用管理页/API 和下游 v4 入口。
+## 启用 domain 时必须提供 token（省略时复用 [upstream].token）。
 # [server]
 # port = 7777
 # bind = "127.0.0.1"
 # domain = "edge.lan"
+# token = "replace-with-the-downstream-secret"
+# keepalive_interval = 15
+# max_pending_handshakes = 256
+# max_sessions = 256
 
 ## 客户端/中继模式：填写上一跳。
 ## 没有 [server] 时，本进程的本地服务由 v4 流直接连接，不占监听端口。
@@ -23,6 +28,10 @@ token = "replace-with-the-upstream-secret"
 
 ## 是否允许上一跳通过 v4 管理通道修改本节点 [[proxies]]，默认 false。
 allow_modify = false
+
+## 重连上一跳的间隔（秒）与上游 WebSocket 保活间隔（秒）；0 关闭保活。
+retry_interval = 1
+keepalive_interval = 15
 
 ## 本进程直接服务的本地服务。
 [[proxies]]

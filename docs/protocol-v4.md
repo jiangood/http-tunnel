@@ -73,8 +73,9 @@ client                                            server
   session.
 - A wrong version, an empty node id, a malformed frame or a bad proof ends the
   handshake with an `Error` frame.
-- The server takes a session permit only after a successful `Auth`. A global
-  `max_pending_handshakes` budget bounds unauthenticated and slow upgrades.
+- The server takes a session permit only after a successful `Auth`. The
+  `[server].max_pending_handshakes` budget bounds unauthenticated and slow
+  upgrades.
 
 ## Framing
 
@@ -177,9 +178,9 @@ limit.
 
 ## Keepalive and shutdown
 
-- The WebSocket bridge sends a protocol-level ping every `keepalive_interval`
-  seconds (15 by default) and gives up after three intervals without any inbound
-  frame.
+- The WebSocket bridge sends a protocol-level ping every
+  `[server].keepalive_interval` / `[upstream].keepalive_interval` seconds (15 by
+  default) and gives up after three intervals without any inbound frame.
 - `Ping`/`Pong` frames are also supported at the session layer.
 - On shutdown the process sends `GoAway`, stops opening streams, withdraws its
   advertised routes, and drains in-flight visitors for up to 30 seconds.

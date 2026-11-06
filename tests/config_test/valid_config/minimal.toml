@@ -1,10 +1,10 @@
 # The server table is required without `[upstream]`. The process is a
 # standalone ingress here.
 name = "home"
-token = "use_a_secret_that_only_you_know"
 
 [server]
 domain = "control.example.com"
+token = "use_a_secret_that_only_you_know"
 
 [[proxies]]
 name = "nas"

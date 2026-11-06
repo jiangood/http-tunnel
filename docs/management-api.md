@@ -153,17 +153,22 @@ management response is `no-store`.
 ```json
 {
   "name":"home",
-  "server":{"port":7777,"bind":"127.0.0.1","domain":"127.0.0.1"},
-  "token":"secret",
+  "server":{
+    "port":7777,
+    "bind":"127.0.0.1",
+    "domain":"127.0.0.1",
+    "token":"secret",
+    "keepalive_interval":15,
+    "max_pending_handshakes":256,
+    "max_sessions":256
+  },
   "upstream":{
     "url":"wss://control.example.com:443",
     "token":"upstream-secret",
-    "allow_modify":false
-  },
-  "retry_interval":1,
-  "keepalive_interval":15,
-  "max_pending_handshakes":256,
-  "max_sessions":256
+    "allow_modify":false,
+    "retry_interval":1,
+    "keepalive_interval":15
+  }
 }
 ```
 
@@ -211,7 +216,7 @@ configuration on disk, regardless of whether it changed. It is the button behind
 "重启运行时" and returns `{"restarting":true}` before the runtime is stopped, so
 the HTTP response can be flushed first. The `ht` process itself never exits.
 
-Changing `token` changes the password of the management page; changing
+Changing `server.token` changes the password of the management page; changing
 `server.port` or `server.domain` moves the page. They take effect after the
 rebuild, so reload the page (and log in with the new token) after the response.
 Removing `server` or its `domain` also removes the management page.
@@ -367,7 +372,7 @@ curl -X DELETE -H "Host: edge.lan" -H "Authorization: Bearer $TOKEN" \
 
 A successful `DELETE /api/sessions/{id}` withdraws the session's routes, closes
 the connection and returns `204`. This is a temporary disconnect: the node
-reconnects according to its own `retry_interval`. Unknown or already closed
+reconnects according to its own `[upstream].retry_interval`. Unknown or already closed
 sessions return `404`.
 
 ## Errors

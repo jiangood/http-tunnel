@@ -271,11 +271,11 @@ mod tests {
 
     fn config_text(port: u16) -> String {
         format!(
-            "name = \"reload-test\"\n\
-             token = \"secret\"\n\n\
+            "name = \"reload-test\"\n\n\
              [server]\n\
              port = {}\n\
-             domain = \"control.example.com\"\n",
+             domain = \"control.example.com\"\n\
+             token = \"secret\"\n",
             port
         )
     }
@@ -387,8 +387,9 @@ mod tests {
     #[cfg(all(feature = "management", feature = "client"))]
     #[test]
     fn test_only_allow_modify_is_live() {
-        let source = "name = \"leaf\"\ntoken = \"secret\"\n\n\
-                      [server]\nport = 17001\ndomain = \"127.0.0.1\"\n\n\
+        let source = "name = \"leaf\"\n\n\
+                      [server]\nport = 17001\ndomain = \"127.0.0.1\"\n\
+                      token = \"secret\"\n\n\
                       [upstream]\nurl = \"ws://a.test:7777\"\ntoken = \"upstream-secret\"\n";
         let running = Config::parse(source).unwrap();
         let mut next = running.clone();
@@ -446,6 +447,9 @@ mod tests {
     #[test]
     fn test_config_text_is_valid() {
         let config = Config::parse(&config_text(17001)).unwrap();
-        assert_eq!(config.token, Some(MaskedString::from("secret")));
+        assert_eq!(
+            config.server.as_ref().unwrap().token,
+            Some(MaskedString::from("secret"))
+        );
     }
 }

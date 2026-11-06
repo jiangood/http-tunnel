@@ -248,8 +248,20 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
           <label>domain<input name="server_domain" placeholder="入口 Host（原 control_host）；留空则不启用管理页/API 和 v4 入口"></label>
         </fieldset>
         <fieldset>
-          <legend>监听 Token</legend>
-          <label>token<input name="token" autocomplete="new-password" spellcheck="false" placeholder="留空时复用 [upstream].token"></label>
+          <legend>[server].token</legend>
+          <label>token<input name="server_token" autocomplete="new-password" spellcheck="false" placeholder="留空时复用 [upstream].token"></label>
+        </fieldset>
+        <fieldset>
+          <legend>服务端保活间隔（秒）</legend>
+          <label>[server].keepalive_interval<input name="server_keepalive_interval" type="number" min="0" required></label>
+        </fieldset>
+        <fieldset>
+          <legend>待握手升级上限</legend>
+          <label>[server].max_pending_handshakes<input name="server_max_pending_handshakes" type="number" min="1" required></label>
+        </fieldset>
+        <fieldset>
+          <legend>v4 会话上限</legend>
+          <label>[server].max_sessions<input name="server_max_sessions" type="number" min="1" required></label>
         </fieldset>
         <fieldset>
           <legend>上游地址</legend>
@@ -261,19 +273,11 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
         </fieldset>
         <fieldset>
           <legend>重连间隔（秒）</legend>
-          <label>retry_interval<input name="retry_interval" type="number" min="0" required></label>
+          <label>[upstream].retry_interval<input name="upstream_retry_interval" type="number" min="0" required></label>
         </fieldset>
         <fieldset>
-          <legend>保活间隔（秒）</legend>
-          <label>keepalive_interval<input name="keepalive_interval" type="number" min="0" required></label>
-        </fieldset>
-        <fieldset>
-          <legend>待握手升级上限</legend>
-          <label>max_pending_handshakes<input name="max_pending_handshakes" type="number" min="1" required></label>
-        </fieldset>
-        <fieldset>
-          <legend>v4 会话上限</legend>
-          <label>max_sessions<input name="max_sessions" type="number" min="1" required></label>
+          <legend>上游保活间隔（秒）</legend>
+          <label>[upstream].keepalive_interval<input name="upstream_keepalive_interval" type="number" min="0" required></label>
         </fieldset>
         <fieldset class="span2" id="settings-switch-box">
           <legend>上级修改</legend>
@@ -286,7 +290,7 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
         <span class="muted" id="settings-status">加载中…</span>
       </div>
     </form>
-    <p class="hint">配置只来自 <code>ht.toml</code>，保存后会原子写回该文件。只改“上级修改”会立即应用；修改 <code>[server]</code>、Token、上游、重连/保活间隔或并发上限时会先弹框确认，确认后立即重启运行时（重建监听器和上游会话），现有连接和下游会话会短暂断开。取消“启用 [server]”后本节点不再监听任何端口，管理页也会随这个监听器一起消失。默认 <code>bind = 127.0.0.1</code> 只允许本机访问；Docker、局域网中继或直接公网访问时改成 <code>0.0.0.0</code>。更改 Token 后需要用新 Token 重新登录。<code>[[proxies]]</code> 请在节点卡片的“管理服务”中维护。</p>
+    <p class="hint">配置只来自 <code>ht.toml</code>，保存后会原子写回该文件。只改“上级修改”会立即应用；修改 <code>[server]</code>、Token、上游、重连/保活间隔或并发上限时会先弹框确认，确认后立即重启运行时（重建监听器和上游会话），现有连接和下游会话会短暂断开。取消“启用 [server]”后本节点不再监听任何端口，管理页也会随这个监听器一起消失。默认 <code>[server].bind = "127.0.0.1"</code> 只允许本机访问；Docker、局域网中继或直接公网访问时改成 <code>0.0.0.0</code>。更改 Token 后需要用新 Token 重新登录。<code>[[proxies]]</code> 请在节点卡片的“管理服务”中维护。</p>
   </section>
 
   <section class="card">
@@ -330,14 +334,15 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
           <tr><td class="mono strong">[server].port</td><td class="mono muted">7777</td><td class="muted">唯一入口端口，访客、v4 会话和管理页/API 共用；<code>0</code> 为临时端口，仅在有 <code>[upstream]</code> 时允许</td></tr>
           <tr><td class="mono strong">[server].bind</td><td class="mono muted">127.0.0.1</td><td class="muted">监听地址，必须是 IPv4/IPv6 字面量；Docker、局域网中继或直接公网访问时改成 <code>0.0.0.0</code></td></tr>
           <tr><td class="mono strong">[server].domain</td><td class="muted">无</td><td class="muted">入口 Host（原 <code>control_host</code>），启用管理页/API 和下游 v4 入口；省略时只监听访客路由。不能是泛域名，也不能与任何 <code>[[proxies]]</code> 域名重叠</td></tr>
-          <tr><td class="mono strong">token</td><td class="muted">无</td><td class="muted">下游对等节点的共享 Token，同时是页面 Basic 密码；有 <code>[upstream]</code> 且省略时复用 <code>[upstream].token</code></td></tr>
+          <tr><td class="mono strong">[server].token</td><td class="muted">无</td><td class="muted">下游对等节点的共享 Token，同时是页面 Basic 密码；有 <code>[upstream]</code> 且省略时复用 <code>[upstream].token</code></td></tr>
+          <tr><td class="mono strong">[server].keepalive_interval</td><td class="mono muted">15</td><td class="muted">服务端 WebSocket ping 间隔（秒），<code>0</code> 关闭保活</td></tr>
+          <tr><td class="mono strong">[server].max_pending_handshakes</td><td class="mono muted">256</td><td class="muted">同时等待 <code>ClientHello</code> 的已认证升级数上限</td></tr>
+          <tr><td class="mono strong">[server].max_sessions</td><td class="mono muted">256</td><td class="muted">同时接受的 v4 会话上限</td></tr>
           <tr><td class="mono strong">[upstream].url</td><td class="muted">无</td><td class="muted">上一跳地址，<code>ws://</code> 或 <code>wss://</code>，不带路径；省略即服务端入口</td></tr>
           <tr><td class="mono strong">[upstream].token</td><td class="muted">无</td><td class="muted">上一跳的共享 Token，可与本机监听 token 不同</td></tr>
           <tr><td class="mono strong">[upstream].allow_modify</td><td class="mono muted">false</td><td class="muted">是否允许上一跳通过 v4 管理通道修改本节点的 <code>[[proxies]]</code>；关闭时上级仍可列出服务</td></tr>
-          <tr><td class="mono strong">retry_interval</td><td class="mono muted">1</td><td class="muted">重连上一跳的间隔（秒）</td></tr>
-          <tr><td class="mono strong">keepalive_interval</td><td class="mono muted">15</td><td class="muted">WebSocket ping 间隔（秒），<code>0</code> 关闭保活</td></tr>
-          <tr><td class="mono strong">max_pending_handshakes</td><td class="mono muted">256</td><td class="muted">同时等待 <code>ClientHello</code> 的已认证升级数上限</td></tr>
-          <tr><td class="mono strong">max_sessions</td><td class="mono muted">256</td><td class="muted">同时接受的 v4 会话上限</td></tr>
+          <tr><td class="mono strong">[upstream].retry_interval</td><td class="mono muted">1</td><td class="muted">重连上一跳的间隔（秒）</td></tr>
+          <tr><td class="mono strong">[upstream].keepalive_interval</td><td class="mono muted">15</td><td class="muted">上游 WebSocket ping 间隔（秒），<code>0</code> 关闭保活</td></tr>
           <tr><td class="mono strong">[[proxies]]</td><td class="muted">空</td><td class="muted">本节点直接服务的本地服务，字段为 <code>name</code>、<code>domain</code>、<code>local_addr</code> 和可选的 <code>auth_header</code></td></tr>
         </tbody>
       </table>
@@ -858,6 +863,10 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
     form.elements.server_port.disabled = !enabled;
     form.elements.server_bind.disabled = !enabled;
     form.elements.server_domain.disabled = !enabled;
+    form.elements.server_token.disabled = !enabled;
+    form.elements.server_keepalive_interval.disabled = !enabled;
+    form.elements.server_max_pending_handshakes.disabled = !enabled;
+    form.elements.server_max_sessions.disabled = !enabled;
   }
 
   $("settings-form").elements.server_enabled.addEventListener("change", syncServerFields);
@@ -870,13 +879,14 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
     form.elements.server_port.value = settings.server ? settings.server.port : "";
     form.elements.server_bind.value = settings.server ? settings.server.bind : "127.0.0.1";
     form.elements.server_domain.value = settings.server && settings.server.domain ? settings.server.domain : "";
-    form.elements.token.value = settings.token || "";
+    form.elements.server_token.value = settings.server && settings.server.token ? settings.server.token : "";
+    form.elements.server_keepalive_interval.value = settings.server ? settings.server.keepalive_interval : 15;
+    form.elements.server_max_pending_handshakes.value = settings.server ? settings.server.max_pending_handshakes : 256;
+    form.elements.server_max_sessions.value = settings.server ? settings.server.max_sessions : 256;
     form.elements.upstream_url.value = settings.upstream ? settings.upstream.url : "";
     form.elements.upstream_token.value = settings.upstream ? settings.upstream.token : "";
-    form.elements.retry_interval.value = settings.retry_interval;
-    form.elements.keepalive_interval.value = settings.keepalive_interval;
-    form.elements.max_pending_handshakes.value = settings.max_pending_handshakes;
-    form.elements.max_sessions.value = settings.max_sessions;
+    form.elements.upstream_retry_interval.value = settings.upstream ? settings.upstream.retry_interval : 1;
+    form.elements.upstream_keepalive_interval.value = settings.upstream ? settings.upstream.keepalive_interval : 15;
     form.elements.allow_upstream_modify.checked = !!(settings.upstream && settings.upstream.allow_modify);
     $("settings-switch-box").hidden = !settings.upstream;
     syncServerFields();
@@ -916,28 +926,29 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
         ? {
             port: Number(serverPort),
             bind: text("server_bind") || "127.0.0.1",
-            domain: text("server_domain") || null
+            domain: text("server_domain") || null,
+            token: text("server_token") || null,
+            keepalive_interval: number("server_keepalive_interval"),
+            max_pending_handshakes: number("server_max_pending_handshakes"),
+            max_sessions: number("server_max_sessions")
           }
         : null,
-      token: text("token") || null,
       upstream: upstreamUrl
         ? {
             url: upstreamUrl,
             token: text("upstream_token"),
-            allow_modify: !!fields.get("allow_upstream_modify")
+            allow_modify: !!fields.get("allow_upstream_modify"),
+            retry_interval: number("upstream_retry_interval"),
+            keepalive_interval: number("upstream_keepalive_interval")
           }
-        : null,
-      retry_interval: number("retry_interval"),
-      keepalive_interval: number("keepalive_interval"),
-      max_pending_handshakes: number("max_pending_handshakes"),
-      max_sessions: number("max_sessions")
+        : null
     };
     if (!body.name) {
       toast("名称不能为空", "error");
       return;
     }
 
-    var oldToken = settingsCache ? settingsCache.token : null;
+    var oldToken = settingsCache && settingsCache.server ? settingsCache.server.token : null;
     var button = $("settings-save");
     button.disabled = true;
     $("settings-status").textContent = "检查配置…";
@@ -978,7 +989,8 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
       } else {
         toast("已保存并生效");
       }
-      if (oldToken !== null && result.settings.token !== oldToken) {
+      var newToken = result.settings.server ? result.settings.server.token : null;
+      if (oldToken !== null && newToken !== oldToken) {
         toast("Token 已更改，请用新 Token 重新登录", "error");
       }
       // The periodic refresh picks up the new generation once it is running.
