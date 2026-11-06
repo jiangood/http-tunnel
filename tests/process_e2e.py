@@ -244,11 +244,11 @@ def main():
     try:
         # Phase 1: a standalone ingress with one local proxy.
         (work / "ht.toml").write_text(f"""name = "e2e-ingress"
-token = "{TOKEN}"
 
 [server]
 port = {server_port}
 domain = "127.0.0.1"
+token = "{TOKEN}"
 
 [[proxies]]
 name = "server-backend"
@@ -265,13 +265,12 @@ auth_header = "{SERVER_AUTH}"
         leaf_work = Path(tempfile.mkdtemp(prefix="http-tunnel-e2e-leaf-"))
         work_dirs.append(leaf_work)
         (leaf_work / "ht.toml").write_text(f"""name = "e2e-leaf"
-token = "{TOKEN}"
-retry_interval = 1
 
 [server]
 port = {leaf_port}
 bind = "127.0.0.1"
 domain = "127.0.0.1"
+token = "{TOKEN}"
 
 [[proxies]]
 name = "client-backend"
@@ -282,6 +281,7 @@ auth_header = "{CLIENT_AUTH}"
 [upstream]
 url = "ws://127.0.0.1:{server_port}"
 token = "{TOKEN}"
+retry_interval = 1
 """)
 
         leaf = start_ht(leaf_work, "leaf")
@@ -347,11 +347,11 @@ token = "{TOKEN}"
         chain_work = Path(tempfile.mkdtemp(prefix="http-tunnel-e2e-chain-"))
         work_dirs.extend([node_work, chain_work])
         (node_work / "ht.toml").write_text(f"""name = "e2e-relay"
-token = "{NODE_TOKEN}"
 
 [server]
 port = {node_port}
 domain = "127.0.0.1"
+token = "{NODE_TOKEN}"
 
 [upstream]
 url = "ws://127.0.0.1:{server_port}"
@@ -360,7 +360,6 @@ token = "{TOKEN}"
         # The chain leaf has no [server] at all: it never binds a port and the
         # v4 stream connects directly to each [[proxies]] target.
         (chain_work / "ht.toml").write_text(f"""name = "e2e-chain-leaf"
-retry_interval = 1
 
 [[proxies]]
 name = "chain-backend"
@@ -371,6 +370,7 @@ auth_header = "{CLIENT_AUTH}"
 [upstream]
 url = "ws://127.0.0.1:{node_port}"
 token = "{NODE_TOKEN}"
+retry_interval = 1
 """)
 
         node = start_ht(node_work, "relay")
