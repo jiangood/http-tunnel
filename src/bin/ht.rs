@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use http_tunnel::{load_config, run, GeneratedConfigError};
+use http_tunnel::{load_config, run};
 use std::{
     fs::OpenOptions,
     path::PathBuf,
@@ -84,15 +84,18 @@ async fn main() -> Result<()> {
     if cli.background && !cli.background_child {
         return launch_background(&cli.config);
     }
-    let config = match load_config(&cli.config).await {
-        Ok(config) => config,
-        // Writing the example is the expected first run, not a failure.
-        Err(err) if err.downcast_ref::<GeneratedConfigError>().is_some() => {
-            println!("{err:#}");
-            return Ok(());
-        }
-        Err(err) => return Err(err),
-    };
+    // A missing file is a first start, not a failure: `load_config` writes the
+    // commented example and the process keeps running with it.
+    let generated = !cli.config.exists();
+    let config = load_config(&cli.config).await?;
+    if generated {
+        println!(
+            "未找到 {:?}，已生成默认配置并以服务端模式启动。\
+             需要管理页和下游 v4 入口时，请为 [server] 填写 domain 和 token；\
+             `ht` 会自动热加载保存后的配置。",
+            cli.config
+        );
+    }
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
     tokio::spawn(async move {

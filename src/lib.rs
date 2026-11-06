@@ -11,8 +11,8 @@ mod reload;
 mod transport;
 
 pub use config::{
-    Config, GeneratedConfigError, MaskedString, ServerConfig, ServerLimits, ServerProxyEntry,
-    UpstreamConfig, DEFAULT_LISTEN_PORT,
+    Config, MaskedString, ServerConfig, ServerLimits, ServerProxyEntry, UpstreamConfig,
+    DEFAULT_LISTEN_PORT,
 };
 
 use anyhow::Result;

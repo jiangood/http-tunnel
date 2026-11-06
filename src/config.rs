@@ -24,31 +24,6 @@ pub const DEFAULT_MAX_PENDING_HANDSHAKES: usize = 256;
 /// The default number of v4 sessions a server accepts at once.
 pub const DEFAULT_MAX_SESSIONS: usize = 256;
 
-/// The error returned when the missing configuration file was replaced by the
-/// commented example.
-///
-/// It is a successful bootstrap rather than a failure: the command-line
-/// program prints the guidance and exits with status 0, while library callers
-/// can still tell it apart from a real load error.
-#[derive(Debug)]
-pub struct GeneratedConfigError {
-    message: String,
-}
-
-impl GeneratedConfigError {
-    fn new(message: String) -> Self {
-        Self { message }
-    }
-}
-
-impl std::fmt::Display for GeneratedConfigError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for GeneratedConfigError {}
-
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
 #[derive(Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
@@ -384,17 +359,20 @@ impl Config {
     }
 
     /// Read the configuration file. If it is missing, write the commented
-    /// example and ask the user to edit it before starting.
+    /// example and continue with it, so the first start runs as a server
+    /// instead of exiting and asking for an edit.
     pub async fn from_file(path: &Path) -> Result<Config> {
-        match Config::read(path).await? {
-            Some(s) => {
-                let mut config = Config::parse(&s)
-                    .with_context(|| format!("The configuration {:?} is invalid", path))?;
-                config.source.path = Some(path.to_path_buf());
-                Ok(config)
+        let source = match Config::read(path).await? {
+            Some(s) => s,
+            None => {
+                Config::write_example(path).await?;
+                DEFAULT_CONFIG.to_string()
             }
-            None => Err(Config::bootstrap_example(path).await),
-        }
+        };
+        let mut config = Config::parse(&source)
+            .with_context(|| format!("The configuration {:?} is invalid", path))?;
+        config.source.path = Some(path.to_path_buf());
+        Ok(config)
     }
 
     /// Read the configuration file, `None` when it does not exist.
@@ -406,18 +384,11 @@ impl Config {
         }
     }
 
-    /// Write the commented example and return the error that asks the user to
-    /// edit it before the first start.
-    pub(crate) async fn bootstrap_example(path: &Path) -> anyhow::Error {
-        match fs::write(path, DEFAULT_CONFIG).await {
-            Ok(()) => anyhow::Error::new(GeneratedConfigError::new(format!(
-                "已生成 {:?}。请填写 `[upstream].token`；作为服务端使用时再取消 \
-                 `[server]` 的注释，然后重新启动 ht。",
-                path
-            ))),
-            Err(e) => anyhow::Error::new(e)
-                .context(format!("Failed to generate default config {:?}", path)),
-        }
+    /// Write the commented example that a first start uses.
+    pub(crate) async fn write_example(path: &Path) -> Result<()> {
+        fs::write(path, DEFAULT_CONFIG)
+            .await
+            .with_context(|| format!("Failed to generate the default config {:?}", path))
     }
 
     /// Validate a configuration and normalize it in place.
@@ -1309,10 +1280,8 @@ mod tests {
         for p in paths {
             let s = fs::read_to_string(&p)?;
             let mut config: Config = toml::from_str(&s)?;
-            // The shipped template carries placeholder tokens, so the strict
-            // validation must reject it until it is edited.
-            assert!(Config::validate(&mut config).is_err(), "{:?} is valid", p);
-            config.upstream.as_mut().unwrap().token = MaskedString::from("upstream-test-token");
+            // The shipped template is a runnable server, so a first start can
+            // use it as-is instead of exiting for an edit.
             Config::validate(&mut config)?;
             assert_eq!(config.name, "edge");
         }
@@ -1797,14 +1766,47 @@ local_addr = "127.0.0.1:80"
             .expect_err("the control plane needs a token");
         assert!(format!("{:#}", err).contains("token"), "{:#}", err);
 
-        // The generated template must not start with its placeholder token
+        // The generated template runs as a listener without a control plane,
+        // so its placeholder domain/token comments are never validated.
         std::fs::write(&path, DEFAULT_CONFIG)?;
+        let cfg = Config::from_file(&path).await?;
+        assert_eq!(cfg.entry_domain(), None);
+        assert_eq!(cfg.listen_port(), Some(DEFAULT_LISTEN_PORT));
+
+        // Enabling the commented domain without replacing the placeholder token
+        // is still rejected.
+        let enabled = DEFAULT_CONFIG
+            .replace("# domain = \"edge.lan\"", "domain = \"edge.lan\"")
+            .replace(
+                "# token = \"replace-with-the-downstream-secret\"",
+                "token = \"replace-with-the-downstream-secret\"",
+            );
+        std::fs::write(&path, enabled)?;
         let err = Config::from_file(&path)
             .await
             .expect_err("the placeholder token must be rejected");
         assert!(format!("{:#}", err).contains("token"), "{:#}", err);
 
         let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_missing_config_is_generated_and_used() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("http-tunnel-bootstrap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("ht.toml");
+
+        // A missing file is generated and the process keeps starting with it.
+        let config = Config::from_file(&path).await?;
+        assert_eq!(config.listen_port(), Some(DEFAULT_LISTEN_PORT));
+        assert!(config.upstream.is_none());
+        assert_eq!(std::fs::read_to_string(&path)?, DEFAULT_CONFIG);
+        assert_eq!(config.source.path.as_deref(), Some(path.as_path()));
+
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 
@@ -1968,18 +1970,18 @@ local_addr = "127.0.0.1:81"
     }
 
     #[test]
-    fn test_config_example_is_valid_after_tokens_are_set() -> Result<()> {
+    fn test_config_example_is_a_runnable_server() -> Result<()> {
         let example = DEFAULT_CONFIG;
         let mut cfg: Config = toml::from_str(example)?;
-        assert!(Config::validate(&mut cfg).is_err());
-        cfg.upstream.as_mut().unwrap().token = MaskedString::from("upstream-secret");
         Config::validate(&mut cfg)?;
         assert_eq!(cfg.name, "edge");
-        // The template is a client: `[server]` stays commented out.
-        assert!(cfg.server.is_none());
+        // The template is a standalone ingress: `[server]` is active and
+        // `[upstream]` stays commented out.
+        assert!(cfg.server.is_some());
+        assert!(cfg.upstream.is_none());
         assert_eq!(cfg.proxies.len(), 1);
-        assert_eq!(disabled_settings(example, "# [server]"), 1);
-        assert_eq!(disabled_settings(example, "# [upstream]"), 0);
+        assert_eq!(disabled_settings(example, "# [server]"), 0);
+        assert_eq!(disabled_settings(example, "# [upstream]"), 1);
         assert_comment_convention(example);
         Ok(())
     }
