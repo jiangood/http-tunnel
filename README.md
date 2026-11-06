@@ -20,13 +20,99 @@
 
 ## 快速开始
 
-从 [Releases](https://github.com/jiangood/http-tunnel/releases) 下载 `ht`，放进空目录运行一次：
+下面用一台服务器和一个客户端跑通完整链路：服务器在公网监听，客户端在内网主动拨出，把内网机器的 `http://127.0.0.1:3000` 暴露成 `app.example.com`。
 
-```sh
-./ht
+```text
+访客 ──> 服务器 ht（control.example.com:7777）
+                ^ 客户端主动建立的 ws / wss 长连接
+                │
+         客户端 ht（app.example.com -> 127.0.0.1:3000）
 ```
 
-没有 `ht.toml` 时，程序会写出带注释的模板并以退出码 0 退出。按下面的场景改好配置，再运行 `./ht`。命令行只有 `ht [-c/--config ht.toml] [-b/--background]`，`-b` 把输出写入当前目录的 `ht.log`。
+`control.example.com` 是服务器的保留域名，只用于管理页和下游会话，不承载业务流量。Token 可用 `openssl rand -hex 16` 生成，两端必须一致；示例里的中文占位符都要替换。
+
+### 1. 准备
+
+从 [Releases](https://github.com/jiangood/http-tunnel/releases) 下载 `ht`，在服务器和内网机器上各放一份：
+
+```text
+server/ht.toml   # 公网服务器
+client/ht.toml   # 内网机器
+```
+
+没有 `ht.toml` 时直接运行 `./ht`，程序会写出带注释的默认配置并直接以服务端模式启动（默认监听 `127.0.0.1:7777`，`[upstream]` 默认注释掉），不会退出。按下面的内容改好配置后保存，运行中的 `ht` 会自动热加载。
+
+### 2. 服务端
+
+`server/ht.toml`：
+
+```toml
+name = "ingress"
+
+[server]
+port = 7777
+bind = "0.0.0.0"
+domain = "control.example.com"
+token = "把 openssl rand -hex 16 的输出填在这里（客户端用同一个）"
+```
+
+服务端不需要写 `[[proxies]]`：它按 `Host` 把访客请求转给已连接客户端声明的域名。`bind = "0.0.0.0"` 是为了让客户端能从公网连上；如果前面有同机的 Nginx/Caddy 反向代理，保持默认的 `127.0.0.1` 更安全。公网直连时记得放行 `7777/TCP`。
+
+### 3. 客户端
+
+`client/ht.toml`：
+
+```toml
+name = "home"
+
+[[proxies]]
+name = "app"
+domain = "app.example.com"
+local_addr = "127.0.0.1:3000"
+
+[upstream]
+url = "ws://control.example.com:7777"
+token = "与服务端 token 相同"
+```
+
+- `local_addr` 指向内网机器上已经在监听的服务；示例假设 `127.0.0.1:3000` 可访问。
+- 不写 `[server]`，客户端就完全不监听端口，只向上游拨出，内网不需要开放任何入站端口。
+- `[upstream].url` 里的主机名必须与服务器的 `[server].domain` 完全一致，否则 v4 握手会被拒绝。
+- 还没有 DNS 时，把两边的 `control.example.com` 都换成服务器的 IP，两处主机名保持相同即可。
+- 这里先用 `ws://` 验证链路；公网正式部署时换成 `wss://control.example.com`（默认 443），并在服务器前加 TLS 终止层，见[传输模式与 TLS](#传输模式与-tls)。
+
+### 4. 启动
+
+先启动服务端，再启动客户端：
+
+```sh
+# 公网服务器
+cd server && ./ht
+
+# 内网机器（另一个终端或另一台机器）
+cd client && ./ht
+```
+
+需要常驻时加 `-b`，输出写入当前目录的 `ht.log`；`-c` 可以指定别的配置文件。命令行只有 `ht [-c/--config ht.toml] [-b/--background]`。
+
+### 5. 验证
+
+```sh
+# 在服务器上，用 Host 头模拟 DNS 解析
+curl -i -H "Host: app.example.com" http://127.0.0.1:7777/
+
+# 或把 app.example.com 的 A 记录指向服务器后
+curl -i http://app.example.com:7777/
+```
+
+返回客户端 `127.0.0.1:3000` 的内容，就说明整条链路已经打通。管理页在 `http://control.example.com:7777/`，用户名 `ht`，密码是服务端的 token；域名还没解析时用 `curl -H "Host: control.example.com" http://127.0.0.1:7777/`。
+
+### 6. 下一步
+
+- 只有一台机器（入口和本地服务同机）：[单节点：入口 + 本地代理](#单节点入口--本地代理)
+- 客户端不能直接访问公网入口：[三个节点：服务端 + 中继 + 客户端](#三个节点服务端--中继--客户端)
+- 公网部署：补上 [TLS](#传输模式与-tls)，并给敏感服务的 `[[proxies]]` 加 `auth_header`
+- 连不上或返回错误：[验证与常见问题](#验证与常见问题)、[错误响应与排查](#错误响应与排查)
 
 ## 拓扑与配置
 
@@ -226,7 +312,7 @@ curl -i -H "Host: app.example.com" http://127.0.0.1:7777/
 
 3.0 起不再读取 `HT_*` 环境变量。`ht.toml` 是唯一的配置来源，管理页和 `/api/settings` 可以直接修改本节点的全部配置项并写回该文件：
 
-- 首次启动时如果 `ht.toml` 不存在，`ht` 仍会生成带注释的示例，并提示修改后重新启动。
+- 首次启动时如果 `ht.toml` 不存在，`ht` 会生成带注释的默认配置并直接以服务端模式启动，不退出；`[server]` 默认启用，`[upstream]` 默认注释掉。
 - 容器部署也只需要挂载配置文件；不再支持“只有环境变量、没有配置文件”的启动方式。
 - 旧部署中的 `HT_*` 变量会被忽略，请把需要的值迁移到 `ht.toml`。
 - `[[proxies]]` 可以在管理页“管理服务”中增删改，其他配置项在“节点配置”中修改。
