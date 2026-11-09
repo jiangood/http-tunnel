@@ -866,6 +866,61 @@ mod tests {
         )
     }
 
+    /// The route table carries an update time that moves when the effective
+    /// entry changes, and stays put when a later read sees the same entry.
+    #[tokio::test]
+    async fn test_route_update_time_tracks_changes() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "http-tunnel-management-{}-route-time.toml",
+            std::process::id()
+        ));
+        let config = Config::parse(
+            r#"
+name = "route-time"
+
+[server]
+domain = "control.example.com"
+token = "file-token"
+
+[[proxies]]
+name = "app"
+domain = "app.example.com"
+local_addr = "127.0.0.1:80"
+"#,
+        )?;
+        let state = state(config, path.clone());
+
+        let before = state.routes().await;
+        assert_eq!(before.len(), 1);
+        assert!(before[0].updated_at > 0, "the route needs a timestamp");
+
+        let repeated = state.routes().await;
+        assert_eq!(
+            before[0].updated_at, repeated[0].updated_at,
+            "an unchanged route must keep its timestamp"
+        );
+
+        // The clock has a one-second resolution, so wait long enough for the
+        // edit below to be distinguishable.
+        time::sleep(Duration::from_millis(1100)).await;
+        state
+            .put_proxy(
+                "app".to_string(),
+                "app.example.com".to_string(),
+                "127.0.0.1:81".to_string(),
+                None,
+            )
+            .await?;
+        let after = state.routes().await;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(after.len(), 1);
+        assert!(
+            after[0].updated_at > before[0].updated_at,
+            "editing the target should bump the timestamp"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_api_edits_persist_to_the_file() -> Result<()> {
         let path = std::env::temp_dir().join(format!(

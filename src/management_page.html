@@ -213,14 +213,15 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
             <th>会话</th>
             <th>来源</th>
             <th>目标地址</th>
+            <th>更新时间</th>
           </tr>
         </thead>
         <tbody id="route-body">
-          <tr><td colspan="7" class="empty">加载中…</td></tr>
+          <tr><td colspan="8" class="empty">加载中…</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="hint">本节点服务排在路由表前面，并优先于同名 v4 会话。“类型”区分本节点和下游节点；“来源”是各节点服务的配置来源，正常情况下都是 <code>ht.toml</code>，只有旧版本下游节点可能显示 <code>HT_PROXIES</code>。下游节点读取不到时显示“—”。下游路由的名称和目标地址从该节点的服务列表读取，读取不到时显示“—”或“下游转发”。新增、编辑或删除服务请在上方节点卡片的“管理服务”弹窗中操作。</p>
+    <p class="hint">本节点服务排在路由表前面，并优先于同名 v4 会话。“类型”区分本节点和下游节点；“来源”是各节点服务的配置来源，正常情况下都是 <code>ht.toml</code>，只有旧版本下游节点可能显示 <code>HT_PROXIES</code>。下游节点读取不到时显示“—”。下游路由的名称和目标地址从该节点的服务列表读取，读取不到时显示“—”或“下游转发”。“更新时间”是该路由行最近一次出现或发生变化的时间（域名、服务名、目标地址、<code>x-auth</code>，或下游会话与节点），未变化的行保持原时间；修改配置后可据此确认是否已经生效。新增、编辑或删除服务请在上方节点卡片的“管理服务”弹窗中操作。</p>
   </section>
 
   <section class="card">
@@ -334,7 +335,7 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/settings</td><td class="muted">Bearer</td><td class="muted">本节点的全部配置项（含 Token 明文），<code>[[proxies]]</code> 除外</td></tr>
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/settings/export</td><td class="muted">Bearer</td><td class="muted">下载磁盘上的 <code>ht.toml</code>（含注释和 Token 明文）</td></tr>
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/proxies</td><td class="muted">Bearer</td><td class="muted">列出本地服务、<code>x-auth</code> 明文及来源；加 <code>?node=</code> 或 <code>?session=</code> 时列出该下游节点自己的服务</td></tr>
-          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/routes</td><td class="muted">Bearer</td><td class="muted">生效中的路由表，包含 v4 会话</td></tr>
+          <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/routes</td><td class="muted">Bearer</td><td class="muted">生效中的路由表，包含 v4 会话和每行的更新时间</td></tr>
           <tr><td><span class="tag method-get">GET</span></td><td class="mono">/api/sessions</td><td class="muted">Bearer</td><td class="muted">已连接的下游节点：会话号、节点、版本、网关转发的来源 IP、TCP 对端、角色、连接时长、所属域名与是否可管理</td></tr>
           <tr><td><span class="tag method-put">PUT</span></td><td class="mono">/api/settings</td><td class="muted">Bearer</td><td class="muted">替换本节点配置并写回 <code>ht.toml</code>；<code>?dry_run=true</code> 只检查是否需要重启，<code>?restart=true</code> 在需要时立即重建运行时。响应含 <code>restart_required</code>、<code>restart_triggered</code>、<code>saved</code> 和 <code>settings</code></td></tr>
           <tr><td><span class="tag method-post">POST</span></td><td class="mono">/api/restart</td><td class="muted">Bearer</td><td class="muted">按磁盘上的 <code>ht.toml</code> 立即重建监听器和上游会话，进程本身不退出</td></tr>
@@ -561,6 +562,29 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
     var rest = total % 60;
     var pad = function (n) { return n < 10 ? "0" + n : String(n); };
     return (days ? days + " 天 " : "") + pad(hours) + ":" + pad(minutes) + ":" + pad(rest);
+  }
+
+  // 服务器给的 updated_at 是 Unix 秒；页面显示本地时间，标题里给出相对时间。
+  function routeTimeText(seconds) {
+    var value = Number(seconds);
+    if (!value) { return "—"; }
+    var date = new Date(value * 1000);
+    if (isNaN(date.getTime())) { return "—"; }
+    var pad = function (n) { return n < 10 ? "0" + n : String(n); };
+    return date.getFullYear() + "-" + pad(date.getMonth() + 1) + "-" +
+      pad(date.getDate()) + " " + pad(date.getHours()) + ":" +
+      pad(date.getMinutes()) + ":" + pad(date.getSeconds());
+  }
+
+  function routeAgeText(seconds) {
+    var value = Number(seconds);
+    if (!value) { return ""; }
+    var age = Math.max(0, Math.floor(Date.now() / 1000) - value);
+    if (age < 5) { return "刚刚"; }
+    if (age < 60) { return age + " 秒前"; }
+    if (age < 3600) { return Math.floor(age / 60) + " 分钟前"; }
+    if (age < 86400) { return Math.floor(age / 3600) + " 小时前"; }
+    return Math.floor(age / 86400) + " 天前";
   }
 
   // ---- IP 归属查询 -------------------------------------------------------
@@ -1277,6 +1301,10 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
     var target = local
       ? esc(route.target)
       : (remoteProxy ? esc(remoteProxy.local_addr) : '<span class="muted">下游转发</span>');
+    var updated = route.updated_at
+      ? '<span title="' + esc(routeAgeText(route.updated_at)) + '">' +
+        esc(routeTimeText(route.updated_at)) + "</span>"
+      : '<span class="muted">—</span>';
     return "<tr>" +
       '<td class="mono strong">' + esc(route.domain) + "</td>" +
       "<td>" + tag + "</td>" +
@@ -1285,6 +1313,7 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
       "<td>" + sessionCell + "</td>" +
       "<td class=\"nowrap\">" + source + "</td>" +
       '<td class="mono muted">' + target + "</td>" +
+      '<td class="mono nowrap">' + updated + "</td>" +
       "</tr>";
   }
 
@@ -1295,7 +1324,9 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
       route.node,
       route.name,
       route.session_id,
-      route.target
+      route.target,
+      routeTimeText(route.updated_at),
+      routeAgeText(route.updated_at)
     ];
     if (route.owner !== "local") {
       var session = sessionsCache.find(function (item) {
@@ -1327,11 +1358,11 @@ fieldset label.check{flex-direction:row;align-items:center;justify-content:flex-
       : rows.length;
     var body = $("route-body");
     if (!routesCache.length) {
-      body.innerHTML = '<tr><td colspan="7" class="empty">路由表为空：本节点还没有服务，也没有 v4 会话声明域名。</td></tr>';
+      body.innerHTML = '<tr><td colspan="8" class="empty">路由表为空：本节点还没有服务，也没有 v4 会话声明域名。</td></tr>';
       return;
     }
     if (!rows.length) {
-      body.innerHTML = '<tr><td colspan="7" class="empty">没有匹配的路由。</td></tr>';
+      body.innerHTML = '<tr><td colspan="8" class="empty">没有匹配的路由。</td></tr>';
       return;
     }
     body.innerHTML = rows.map(renderRouteRow).join("");

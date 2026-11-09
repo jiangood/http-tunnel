@@ -2,11 +2,11 @@ use crate::config::{domain_overlaps_control_host, MaskedString, ServerLimits, Se
 use crate::session_server::{SessionControl, V4SessionHandle};
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, watch, RwLock, Semaphore};
@@ -109,6 +109,30 @@ pub(crate) struct RouteSnapshot {
     pub(crate) session_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) node: Option<String>,
+    /// Unix seconds when this effective entry last appeared or changed. The
+    /// management page shows it so an operator can confirm that an edit has
+    /// taken effect. Unchanged entries keep their original timestamp.
+    pub(crate) updated_at: u64,
+}
+
+/// The identity of one effective route. `ServerState` keeps the last time each
+/// identity was seen; a changed identity (new domain, target, session, token…)
+/// starts a new timestamp, while an unchanged entry keeps the old one.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum RouteIdentity {
+    Local {
+        domain: String,
+        name: String,
+        target: String,
+        /// Not part of the visible row, but rotating the visitor token is still
+        /// a change an operator may want to see reflected by `updated_at`.
+        x_auth: Option<String>,
+    },
+    V4 {
+        domain: String,
+        session_id: u64,
+        node: String,
+    },
 }
 
 impl RouteSnapshot {
@@ -241,6 +265,9 @@ pub(crate) struct ServerState {
     pub(crate) visitor_activity: ActivityTracker,
     // Routes that a v4 session stopped owning recently, for `404` diagnostics
     pub(crate) recent_withdrawals: RwLock<HashMap<String, RecentWithdrawal>>,
+    // When each effective route last appeared or changed, for the updated-at
+    // column of the management page. Entries are pruned as routes disappear.
+    route_updated: RwLock<HashMap<RouteIdentity, SystemTime>>,
 }
 
 /// The management state of a build with the administration API. Builds without
@@ -298,6 +325,7 @@ impl ServerState {
             activity: ActivityTracker::default(),
             visitor_activity: ActivityTracker::default(),
             recent_withdrawals: RwLock::new(HashMap::new()),
+            route_updated: RwLock::new(HashMap::new()),
         }
     }
 
@@ -359,14 +387,24 @@ impl ServerState {
             {
                 continue;
             }
-            table.push(RouteSnapshot {
-                domain,
-                owner: "local",
-                name: Some(proxy.name.clone()),
-                target: Some(proxy.local_addr.clone()),
-                session_id: None,
-                node: None,
-            });
+            let identity = RouteIdentity::Local {
+                domain: domain.clone(),
+                name: proxy.name.clone(),
+                target: proxy.local_addr.clone(),
+                x_auth: proxy.x_auth.as_ref().map(|token| token.to_string()),
+            };
+            table.push((
+                RouteSnapshot {
+                    domain,
+                    owner: "local",
+                    name: Some(proxy.name.clone()),
+                    target: Some(proxy.local_addr.clone()),
+                    session_id: None,
+                    node: None,
+                    updated_at: 0,
+                },
+                identity,
+            ));
         }
         for (domain, handle) in v4_routes.iter() {
             if self
@@ -376,25 +414,53 @@ impl ServerState {
             {
                 continue;
             }
-            table.push(RouteSnapshot {
-                domain: domain.clone(),
-                owner: "v4",
-                name: None,
-                target: None,
-                session_id: Some(handle.session_id),
-                node: Some(handle.node_id.clone()),
-            });
+            table.push((
+                RouteSnapshot {
+                    domain: domain.clone(),
+                    owner: "v4",
+                    name: None,
+                    target: None,
+                    session_id: Some(handle.session_id),
+                    node: Some(handle.node_id.clone()),
+                    updated_at: 0,
+                },
+                RouteIdentity::V4 {
+                    domain: domain.clone(),
+                    session_id: handle.session_id,
+                    node: handle.node_id.clone(),
+                },
+            ));
         }
         // The local routes are what this process serves itself, so surface them
         // first; the downstream routes follow, sorted by domain. `local` sorts
         // before `v4` lexicographically too, but compare explicitly so a new
         // owner string does not silently reorder the table.
-        table.sort_by(|a, b| {
+        table.sort_by(|(a, _), (b, _)| {
             (a.owner != "local")
                 .cmp(&(b.owner != "local"))
                 .then_with(|| a.domain.cmp(&b.domain))
         });
-        table
+
+        // Stamp an identity the first time it appears and keep the stamp while
+        // the effective entry is unchanged. Withdrawing and later re-adding a
+        // route starts a new timestamp; so does changing its target or token.
+        let now = SystemTime::now();
+        let mut updated = self.route_updated.write().await;
+        let mut live = HashSet::with_capacity(table.len());
+        for (route, identity) in table.iter_mut() {
+            let since = *updated.entry(identity.clone()).or_insert(now);
+            route.updated_at = since
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            live.insert(identity.clone());
+        }
+        // Forget vanished routes so a later re-addition is not shown with the
+        // timestamp of the previous incarnation.
+        updated.retain(|identity, _| live.contains(identity));
+        drop(updated);
+
+        table.into_iter().map(|(route, _)| route).collect()
     }
 
     /// Up to `limit` entries of the effective route table, rendered compactly,

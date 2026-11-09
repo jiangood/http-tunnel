@@ -48,7 +48,7 @@ Every API call uses a Bearer token, which is also the listener `token`:
 | GET | `/api/settings` | Every setting of the local node, including tokens; `[[proxies]]` is excluded |
 | GET | `/api/settings/export` | Download the on-disk `ht.toml` as `text/toml` with a `Content-Disposition` attachment; comments and tokens are included |
 | GET | `/api/proxies` | List local `[[proxies]]` as `name`/`domain`/`local_addr`/`x-auth`/`source`; with `?node=` or `?session=`, list the proxies of that downstream node |
-| GET | `/api/routes` | The effective routing table, including v4 owners |
+| GET | `/api/routes` | The effective routing table, including v4 owners and each row's update time |
 | GET | `/api/sessions` | The connected downstream v4 sessions: session id, node, version, peer address, forwarded client address, role, uptime, owned domains, `manageable`, `writable` and `proxy_source` |
 | PUT | `/api/settings` | Replace every setting of the local node and write it to `ht.toml`; `?dry_run=true` only checks, `?restart=true` rebuilds the runtime when needed |
 | POST | `/api/restart` | Rebuild the listener and upstream session from the `ht.toml` on disk |
@@ -75,10 +75,17 @@ wins, but both entries are listed:
 
 ```json
 [
-  {"domain":"app.example.com","owner":"local","name":"app","target":"127.0.0.1:3000"},
-  {"domain":"svc.example.com","owner":"v4","session_id":3,"node":"home"}
+  {"domain":"app.example.com","owner":"local","name":"app","target":"127.0.0.1:3000","updated_at":1762749000},
+  {"domain":"svc.example.com","owner":"v4","session_id":3,"node":"home","updated_at":1762749180}
 ]
 ```
+
+`updated_at` is Unix seconds (the server's clock) and marks when that effective
+entry last appeared or changed. An unchanged row keeps its timestamp, so it
+stays put while the rest of the table is refreshed. A local route is considered
+changed when its domain, name, `local_addr` or `x-auth` changes; a v4 route when
+its domain, owning session or node changes. Withdrawing a route and adding it
+again later (or a session reconnecting with a new id) starts a new timestamp.
 
 `GET /api/sessions` lists the downstream nodes that are connected right now. One
 entry is one v4 session, so a node that reconnects appears with a new session id.

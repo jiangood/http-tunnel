@@ -1110,6 +1110,11 @@ async fn management_api_manages_proxies() -> Result<()> {
         "unexpected body: {}",
         body
     );
+    assert!(
+        body.contains("\"updated_at\":"),
+        "the route table should report when each route changed: {}",
+        body
+    );
 
     info!("the client wrote the change back to its config");
     let written = std::fs::read_to_string(&config_path)?;
