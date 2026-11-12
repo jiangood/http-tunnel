@@ -2,7 +2,7 @@ name: ht-client-docker-sock
 
 services:
   ht:
-    image: ${HT_IMAGE:-ghcr.io/jiangood/ht:latest}
+    image: ghcr.io/jiangood/ht:latest
     restart: unless-stopped
     stop_grace_period: 40s
     volumes:
