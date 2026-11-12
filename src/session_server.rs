@@ -258,6 +258,23 @@ async fn run_session(
             }
         }
     });
+    // `p4::read_frame` is not cancellation-safe: dropping it mid-frame loses the
+    // bytes it already consumed from `reader`, and the next read desyncs into
+    // payload bytes ("Invalid v4 frame"). A competing `select!` arm (a new
+    // visitor stream opening while a data frame is being read) does exactly
+    // that under real-network latency, so the reader must own the connection
+    // exclusively in a dedicated task; the session loop consumes frames from a
+    // channel, whose `recv()` is cancellation-safe.
+    let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Result<SessionFrame>>();
+    let _reader_task = tokio::spawn(async move {
+        loop {
+            let frame = p4::read_frame(&mut reader).await;
+            let stop = frame.is_err();
+            if in_tx.send(frame).is_err() || stop {
+                break;
+            }
+        }
+    });
 
     let (open_tx, mut open_rx) = mpsc::channel::<SessionCommand>(64);
     let handle = V4SessionHandle {
@@ -279,9 +296,9 @@ async fn run_session(
 
     loop {
         tokio::select! {
-            frame = p4::read_frame(&mut reader) => {
+            frame = in_rx.recv() => {
                 match frame {
-                    Ok(frame) => {
+                    Some(Ok(frame)) => {
                         match frame {
                             SessionFrame::Advertise { generation, routes } => {
                                 let ack = apply_routes(&state, &handle, &mut owned, generation, routes, Vec::new()).await;
@@ -347,10 +364,11 @@ async fn run_session(
                             }
                         }
                     }
-                    Err(err) => {
+                    Some(Err(err)) => {
                         warn!(session_id, "v4 session closed: {:#}", err);
                         break;
                     }
+                    None => break,
                 }
             }
             command = open_rx.recv() => {
