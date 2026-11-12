@@ -8,7 +8,7 @@
 | 客户端 | [client/compose.yaml](./client/compose.yaml) | [client/data/ht.toml](./client/data/ht.toml) | 内网节点，只向上游拨出 |
 | Docker Socket | [client-docker-sock/compose.yaml](./client-docker-sock/compose.yaml) | [client-docker-sock/data/ht.toml](./client-docker-sock/data/ht.toml) | 客户端挂载 `/var/run/docker.sock`，把 Docker API 暴露到隧道 |
 
-镜像统一为 `ghcr.io/jiangood/ht:latest`，角色完全由 `ht.toml` 决定。正式部署建议用 `HT_IMAGE` 固定版本，例如 `HT_IMAGE=ghcr.io/jiangood/ht:5.0.0`。
+镜像统一为 `ghcr.io/jiangood/ht:latest`，角色完全由 `ht.toml` 决定。正式部署建议用 `HT_IMAGE` 固定版本，例如 `HT_IMAGE=ghcr.io/jiangood/ht:5.1.0`。
 
 ## 服务端
 
