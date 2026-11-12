@@ -9,6 +9,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # buildx 默认会把构建记录(.dockerbuild)作为 artifact 上传,纯发布用不到
+  DOCKER_BUILD_SUMMARY: false
+  DOCKER_BUILD_RECORD_UPLOAD: false
 
 jobs:
   release:
@@ -70,6 +73,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: http-tunnel-${{ matrix.name }}
+          # artifact 只在同一次运行内被 docker job 下载使用,存 1 天足够,
+          # 避免默认 90 天的保留期持续占用 Actions 存储额度
+          retention-days: 1
           path: |
             target/${{ matrix.target }}/release/ht*
       - name: Package ht
