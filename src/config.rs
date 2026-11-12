@@ -1142,17 +1142,49 @@ fn generated_token() -> String {
         .collect()
 }
 
-/// The example with a fresh random `[server].token` enabled.
-///
-/// The shipped example keeps the token commented so it stays a readable
-/// template. The generated file activates it, so a first start never uses the
-/// documented placeholder as its secret.
+/// A best-effort local IPv4 of the default outbound route, used as the
+/// generated `[server].domain` so the management page opens at
+/// `http://<ip>:<port>` without any configuration. UDP `connect` only looks up
+/// the route and never sends a packet, so this works offline except when no
+/// route at all exists. `None` keeps the template commented.
+fn detect_local_ipv4() -> Option<String> {
+    use std::net::{SocketAddr, UdpSocket};
+
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()? {
+        SocketAddr::V4(addr) => Some(addr.ip().to_string()),
+        _ => None,
+    }
+}
+
+/// The example with a fresh random `[server].token` enabled, plus the local
+/// IPv4 as `[server].domain` when it can be detected.
 pub(crate) fn generated_config() -> String {
-    DEFAULT_CONFIG.replacen(
+    generated_config_with_domain(detect_local_ipv4().as_deref())
+}
+
+/// The example with a fresh random `[server].token`, and `[server].domain`
+/// activated with `domain` when available.
+///
+/// The shipped example keeps both keys commented so it stays a readable
+/// template. The generated file activates them, so a first start already
+/// serves the management page at `http://<ip>:<port>` and never uses the
+/// documented placeholder as its secret.
+pub(crate) fn generated_config_with_domain(domain: Option<&str>) -> String {
+    let mut config = DEFAULT_CONFIG.replacen(
         "# token = \"replace-with-the-downstream-secret\"",
         &format!("token = \"{}\"", generated_token()),
         1,
-    )
+    );
+    if let Some(domain) = domain {
+        config = config.replacen(
+            "# domain = \"edge.lan\"",
+            &format!("domain = \"{}\"", domain),
+            1,
+        );
+    }
+    config
 }
 
 #[cfg(test)]
@@ -1185,6 +1217,41 @@ mod tests {
 
     fn router(source: &str) -> Config {
         Config::parse(source).expect("the test source should be a valid config")
+    }
+
+    #[test]
+    fn test_generated_config_activates_domain_and_token() -> Result<()> {
+        let config = generated_config_with_domain(Some("192.168.1.10"));
+        assert!(config.contains("\ndomain = \"192.168.1.10\""));
+        assert!(!config.contains("# token = \"replace-with-the-downstream-secret\""));
+        // The generated file must parse as-is: an IP domain plus the random
+        // token satisfies the paired domain/token validation.
+        let parsed = Config::parse(&config)?;
+        assert_eq!(
+            parsed.server.as_ref().unwrap().domain.as_deref(),
+            Some("192.168.1.10")
+        );
+        assert!(parsed.listener_token().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn test_generated_config_without_detection_stays_commented() -> Result<()> {
+        let config = generated_config_with_domain(None);
+        assert!(config.contains("# domain = \"edge.lan\""));
+        // The token is still activated even when no IP is detected.
+        let parsed = Config::parse(&config)?;
+        assert_eq!(parsed.server.as_ref().unwrap().domain, None);
+        assert!(parsed.listener_token().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn test_detect_local_ipv4_is_a_plain_address() {
+        // Whatever the environment offers, it must be a bare IPv4 literal.
+        if let Some(ip) = detect_local_ipv4() {
+            assert!(ip.parse::<std::net::Ipv4Addr>().is_ok(), "{}", ip);
+        }
     }
 
     #[test]

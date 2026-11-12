@@ -1,6 +1,7 @@
 ## ht 配置文件
 ##
-## 首次启动自动生成：默认服务端模式，监听 0.0.0.0:7777，token 随机生成。
+## 首次启动自动生成：默认服务端模式，监听 0.0.0.0:7777，
+## token 随机生成，domain 自动填入探测到的本机 IP。
 ## 客户端模式：删除 [server]，再取消 [upstream] 的注释。
 ## 中继模式：同时保留 [server] 和取消注释的 [upstream]。
 
@@ -11,10 +12,13 @@ name = "edge"
 ## 仅本机反代时改 127.0.0.1，公网务必配强 token 和防火墙。
 ## domain 是入口 Host；启用后 token 保护管理页/API 和 v4 入口，
 ## token 首次生成时随机写入，下游节点需使用相同值。
+## 无 DNS 时 domain 可以填服务器 IP，此时管理页是明文 HTTP，
+## 建议仅在内网这样使用。
 [server]
 port = 7777
 bind = "0.0.0.0"
 # domain = "edge.lan"
+## 首次自动生成时会探测本机 IPv4 并填入，浏览器可直接用 IP 打开管理页。
 # token = "replace-with-the-downstream-secret"
 # keepalive_interval = 15
 # max_pending_handshakes = 256
