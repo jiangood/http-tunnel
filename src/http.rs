@@ -173,8 +173,12 @@ async fn handle_visitor(
 
     // Reserve the configured server Host for the internal WebSocket transport
     // and the management page/API. Host is a routing key only; the token in the
-    // `Authorization` header authenticates both.
-    if state.control_host.as_deref() == Some(host.as_str()) {
+    // `Authorization` header authenticates both. A LAN peer reaching the
+    // listener by an IP literal gets the control plane too, so the management
+    // page and a v4 session work without DNS at all.
+    let control_host = state.control_host.as_deref() == Some(host.as_str())
+        || (crate::helper::is_ip_host(&host) && crate::helper::is_lan_peer(addr.ip()));
+    if control_host {
         let path = parse_request_path(&prefetched).unwrap_or_default();
         if path == crate::protocol_v4::V4_PATH {
             // A gateway in front of us (SafeLine, nginx, a cloud load balancer)
@@ -191,7 +195,8 @@ async fn handle_visitor(
             // request. Do not include its lifetime in the visitor drain counter.
             drop(activity);
             if let Err(e) =
-                crate::session_server::accept(conn, addr, forwarded, peer_version, state).await
+                crate::session_server::accept(conn, addr, forwarded, peer_version, &host, state)
+                    .await
             {
                 warn!(
                     request_id = %request_id,

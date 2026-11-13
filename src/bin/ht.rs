@@ -114,24 +114,27 @@ async fn main() -> Result<()> {
     let generated = first_start(&cli.config).await?;
     let config = load_config(&cli.config).await?;
     if generated {
-        match config.entry_domain() {
-            // A detected local IP enables the control plane out of the box.
-            Some(domain) => println!(
-                "未找到 {:?} 或其内容为空，已生成默认配置并以服务端模式启动。\
-                 管理页: http://{}:{} ，用户名 ht，密码为 [server].token（见 {:?}）；\
-                 保存配置后 `ht` 会自动热加载。",
-                cli.config,
-                domain,
-                config.server.as_ref().map(|s| s.port).unwrap_or_default(),
-                cli.config
+        // The management page answers on any LAN IP without configuration, so
+        // the hint only prints the detected address; nothing is written into
+        // the generated `[server]` table.
+        let hint = match http_tunnel::detect_local_ipv4() {
+            Some(ip) => format!(
+                "管理页: http://{}:{} ，局域网内可直接访问；",
+                ip,
+                config
+                    .server
+                    .as_ref()
+                    .map(|s| s.port)
+                    .unwrap_or(http_tunnel::DEFAULT_LISTEN_PORT)
             ),
-            None => println!(
-                "未找到 {:?} 或其内容为空，已生成默认配置并以服务端模式启动。\
-                 需要管理页和下游 v4 入口时，请为 [server] 填写 domain 和 token；\
-                 `ht` 会自动热加载保存后的配置。",
-                cli.config
-            ),
-        }
+            None => "管理页在局域网内用 http://<本机IP>:<端口> 直接访问；".to_string(),
+        };
+        println!(
+            "未找到 {:?} 或其内容为空，已生成默认配置并以服务端模式启动。{}\
+             用户名 ht，密码为 [server].token（见 {:?}）；\
+             保存配置后 `ht` 会自动热加载。",
+            cli.config, hint, cli.config
+        );
     }
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);

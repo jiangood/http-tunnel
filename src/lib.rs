@@ -14,6 +14,7 @@ pub use config::{
     Config, MaskedString, ServerConfig, ServerLimits, ServerProxyEntry, UpstreamConfig,
     DEFAULT_LISTEN_PORT,
 };
+pub use helper::detect_local_ipv4;
 
 use anyhow::Result;
 use std::path::Path;

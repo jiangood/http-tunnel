@@ -550,6 +550,92 @@ async fn websocket_transport_routes_http() -> Result<()> {
     Ok(())
 }
 
+// ==== Stale session takeover ====
+
+const TAKEOVER_HTTP_PORT: u16 = 2661;
+const TAKEOVER_HTTP_ADDR: &str = "127.0.0.1:2661";
+const TAKEOVER_ECHO_ADDR: &str = "127.0.0.1:8097";
+const TAKEOVER_HOST: &str = "takeover.test";
+
+/// A node that restarts under a new name reclaims its route even while the
+/// next hop still holds the prefix for the previous session: the next hop
+/// rejects the first advertisement with `Conflict`, the advertiser retries it,
+/// and once the stale session is withdrawn the retry is accepted and the
+/// visitor is served again. Without the retry, the route would stay down
+/// until the next configuration change or reconnect.
+#[tokio::test]
+async fn renamed_node_reclaims_route_after_conflict() -> Result<()> {
+    init();
+
+    tokio::spawn(async move {
+        if let Err(e) = common::tcp::echo_server(TAKEOVER_ECHO_ADDR).await {
+            panic!("Failed to run the echo server: {:?}", e);
+        }
+    });
+
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let server = tokio::spawn(async move {
+        run_http_tunnel_server(
+            TAKEOVER_HTTP_PORT,
+            "127.0.0.1",
+            LEAF_TOKEN,
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_tcp(TAKEOVER_HTTP_ADDR, Duration::from_secs(10)).await?;
+
+    let old_config = write_leaf_config(
+        "takeover_client_old.toml",
+        "old-name",
+        "127.0.0.1",
+        TAKEOVER_HTTP_PORT,
+        LEAF_TOKEN,
+        0,
+        &[(TAKEOVER_HOST, TAKEOVER_ECHO_ADDR)],
+    )?;
+    let (old_shutdown_tx, old_shutdown_rx) = broadcast::channel(1);
+    let old_client = tokio::spawn(async move {
+        run_http_tunnel_from_config(&old_config, old_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_echo(TAKEOVER_HTTP_ADDR, TAKEOVER_HOST, Duration::from_secs(20)).await?;
+
+    // The same domain from a node with a new name: the next hop answers the
+    // first advertisement with `Conflict`, because the old session still owns
+    // the prefix.
+    let new_config = write_leaf_config(
+        "takeover_client_new.toml",
+        "new-name",
+        "127.0.0.1",
+        TAKEOVER_HTTP_PORT,
+        LEAF_TOKEN,
+        0,
+        &[(TAKEOVER_HOST, TAKEOVER_ECHO_ADDR)],
+    )?;
+    let (new_shutdown_tx, new_shutdown_rx) = broadcast::channel(1);
+    let new_client = tokio::spawn(async move {
+        run_http_tunnel_from_config(&new_config, new_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    // Give the new session time to advertise and to be rejected.
+    time::sleep(Duration::from_secs(2)).await;
+
+    // The old session withdraws the route; the new node's retry then claims
+    // the prefix within one retry interval.
+    old_shutdown_tx.send(true)?;
+    old_client.await?;
+    wait_for_echo(TAKEOVER_HTTP_ADDR, TAKEOVER_HOST, Duration::from_secs(30)).await?;
+
+    new_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(new_client, server);
+    Ok(())
+}
+
 // ==== WebSocket-only entrypoint ====
 
 const WS_ONLY_HTTP_PORT: u16 = 2555;

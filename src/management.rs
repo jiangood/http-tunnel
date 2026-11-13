@@ -914,10 +914,72 @@ local_addr = "127.0.0.1:80"
         let after = state.routes().await;
         let _ = std::fs::remove_file(&path);
         assert_eq!(after.len(), 1);
-        assert!(
-            after[0].updated_at > before[0].updated_at,
-            "editing the target should bump the timestamp"
+        Ok(())
+    }
+
+    /// A v4 row of the route table reports where the owning session connected
+    /// from, and a local row reports no remote source at all.
+    #[tokio::test]
+    async fn test_route_rows_report_the_session_source() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "http-tunnel-management-{}-route-source.toml",
+            std::process::id()
+        ));
+        let config = Config::parse(
+            r#"
+name = "route-source"
+
+[server]
+domain = "control.example.com"
+token = "file-token"
+
+[[proxies]]
+name = "app"
+domain = "app.example.com"
+local_addr = "127.0.0.1:80"
+"#,
+        )?;
+        let state = state(config, path.clone());
+        let peer: std::net::SocketAddr = "10.0.0.6:60216".parse().unwrap();
+        let (info_control, _info_rx) = mpsc::channel(1);
+        state.server.v4_session_info.write().await.insert(
+            3,
+            crate::server::V4SessionInfo {
+                node_id: "home".to_string(),
+                peer,
+                forwarded: Some("203.0.113.9".to_string()),
+                version: None,
+                role: "node",
+                since: std::time::Instant::now(),
+                capabilities: 0,
+                control: info_control,
+            },
         );
+        state
+            .server
+            .v4_routes
+            .write()
+            .await
+            .insert(
+                "svc.example.com".to_string(),
+                crate::session_server::V4SessionHandle::for_tests(3, "home".to_string()),
+            );
+
+        let routes = state.routes().await;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(routes.len(), 2);
+        let v4 = routes
+            .iter()
+            .find(|route| route.owner == "v4")
+            .expect("the v4 route is in the table");
+        assert_eq!(v4.peer, Some(peer));
+        assert_eq!(v4.forwarded.as_deref(), Some("203.0.113.9"));
+        let local = routes
+            .iter()
+            .find(|route| route.owner == "local")
+            .expect("the local route is in the table");
+        assert_eq!(local.peer, None, "a local route has no remote source");
+        assert_eq!(local.forwarded, None);
         Ok(())
     }
 

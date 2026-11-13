@@ -79,6 +79,18 @@ impl OpenFailure {
 }
 
 impl V4SessionHandle {
+    /// Build a handle from a test. The real one is created by the session task.
+    #[cfg(test)]
+    pub(crate) fn for_tests(session_id: u64, node_id: String) -> Self {
+        // The test never opens a stream, so the channel stays silent.
+        let (tx, _rx) = mpsc::channel(1);
+        Self {
+            session_id,
+            node_id,
+            tx,
+        }
+    }
+
     /// Open one visitor stream. The returned half is the server side of the
     /// pipe; the session task drives the other half to the downstream.
     pub(crate) async fn open(
@@ -111,13 +123,15 @@ impl V4SessionHandle {
 
 /// Accept a v4 session on an already-upgraded WebSocket. `peer` is the address
 /// the session connected from, `forwarded` the address a gateway in front of us
-/// reported and `peer_version` the software version the peer announced in the
-/// upgrade. The last three are kept for the management page and the logs.
+/// reported, `peer_version` the software version the peer announced in the
+/// upgrade and `host` the Host the session reached us on. The last three are
+/// kept for the management page and the logs.
 pub(crate) async fn accept(
     mut conn: Conn,
     peer: SocketAddr,
     forwarded: Option<String>,
     peer_version: Option<String>,
+    host: &str,
     state: Arc<ServerState>,
 ) -> Result<()> {
     let hello = time::timeout(HANDSHAKE_TIMEOUT, p4::read_frame(&mut conn))
@@ -151,9 +165,10 @@ pub(crate) async fn accept(
 
     let mut nonce = vec![0u8; 32];
     rand::thread_rng().fill_bytes(&mut nonce);
-    // The v4 endpoint is unreachable when no control host is configured, so a
-    // missing value here never reaches a real handshake.
-    let server_id = state.control_host.clone().unwrap_or_default();
+    // The peer proves the token against the Host it actually used, so a
+    // session works through the configured `[server].domain` and through an
+    // IP literal alike: both sides digest the same string.
+    let server_id = host.to_string();
     p4::write_frame(
         &mut conn,
         &SessionFrame::Challenge {
@@ -538,6 +553,15 @@ async fn apply_routes(
             });
             continue;
         };
+        if crate::helper::is_ip_host(&prefix) {
+            // An IP literal Host always reaches the control plane first, so a
+            // route keyed by it would never match a visitor.
+            rejected.push(RouteRejection {
+                prefix,
+                reason: RouteError::ReservedHost,
+            });
+            continue;
+        }
         if state
             .control_host
             .as_deref()
@@ -559,15 +583,28 @@ async fn apply_routes(
         let already_owned = owned.contains(&prefix);
         {
             let mut routes = state.v4_routes.write().await;
-            if routes
-                .get(&prefix)
-                .is_some_and(|owner| owner.session_id != handle.session_id)
-            {
-                rejected.push(RouteRejection {
-                    prefix,
-                    reason: RouteError::Conflict,
-                });
-                continue;
+            match routes.get(&prefix) {
+                Some(owner) if owner.session_id != handle.session_id => {
+                    if owner.node_id != handle.node_id {
+                        rejected.push(RouteRejection {
+                            prefix,
+                            reason: RouteError::Conflict,
+                        });
+                        continue;
+                    }
+                    // The same node reconnected before its previous session was
+                    // reaped (for example a restart behind a connection the next
+                    // hop has not timed out yet). The newer session takes the
+                    // route over; the stale session's withdrawal at close then
+                    // finds the route no longer its own and leaves it alone.
+                    info!(
+                        session_id = handle.session_id,
+                        stale_session = owner.session_id,
+                        domain = %prefix,
+                        "Taking the route over from a stale session of the same node"
+                    );
+                }
+                _ => {}
             }
             routes.insert(prefix.clone(), handle.clone());
         }

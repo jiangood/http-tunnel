@@ -76,8 +76,12 @@ keepalive_interval = 15
 - There is no switch: a process with `[upstream]` always mirrors its route set.
   The old `mirror`, `claim` and `max_mirrored_routes` keys are rejected with a
   migration hint, so an upgrade cannot silently change the advertised topology.
-- Duplicate domains are rejected as `Conflict`. A rejected route is logged and
-  does not stop the process.
+- Duplicate domains from different nodes are rejected as `Conflict`; the
+  advertiser retries the route until the holder is gone, so a stale session on
+  the next hop only delays the route instead of leaving it down. A session
+  that re-advertises a prefix still held by its own previous session (a
+  restart before the next hop reaped the old connection) takes the route over
+  immediately. A rejected route is logged and does not stop the process.
 - A relay also advertises `CAP_PROXY_ADMIN` for its own local services and
   announces `CAP_PROXY_WRITE` only when `[upstream].allow_modify` is on.
   Toggling the switch reconnects the upstream session so the new capability is

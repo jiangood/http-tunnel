@@ -95,7 +95,11 @@ visitor, and a mirroring session sees the new route immediately.
 A stream whose downstream cannot reach its `local_addr` is reset with
 `ConnectFailed`; the server answers the visitor with `502`. A stream whose
 session dies is closed and the visitor gets a `503`/`504` instead of hanging. A
-duplicate advertisement from another session is rejected with `Conflict`.
+duplicate advertisement from another session is rejected with `Conflict`,
+unless the advertising session announces the same node id as the holder, in
+which case it takes the route over (a restarted node reclaims its own routes).
+The advertiser retries a `Conflict` on a slow timer, so a stale holder only
+delays the route instead of leaving it down.
 
 Each WebSocket bridge sends a protocol ping every `[server].keepalive_interval`
 or `[upstream].keepalive_interval` seconds (15 by default) and gives up after

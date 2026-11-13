@@ -75,6 +75,12 @@ enum StreamInput {
     Reset(p4::StreamError),
 }
 
+/// How often a route rejected with `Conflict` is advertised again within the
+/// current session. The next hop frees a prefix when it reaps the session that
+/// holds it, which takes at most three keepalive intervals after a crash, so a
+/// retry on this cadence is enough.
+const ROUTE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Run the session until the shutdown signal or a fatal error, reconnecting
 /// with the same exponential backoff policy as the previous attempt.
 pub(crate) async fn run(
@@ -202,6 +208,12 @@ async fn run_once(
     }
     let mut sent: BTreeSet<String> = args.routes.borrow_and_update().keys().cloned().collect();
     let mut generation = 1u64;
+    // Routes the next hop rejected with `Conflict` that are still wanted. They
+    // are advertised again on `ROUTE_RETRY_INTERVAL` until the next hop
+    // accepts them; without the retry a restart would leave such a route down
+    // until the next configuration change or reconnect.
+    let mut retrying: BTreeSet<String> = BTreeSet::new();
+    let mut retry_timer = Box::pin(time::sleep(ROUTE_RETRY_INTERVAL));
 
     let mut conn = connect_websocket_v4(
         &args.server_addr,
@@ -299,6 +311,8 @@ async fn run_once(
                     .collect();
                 let remove: Vec<String> = sent.difference(&current).cloned().collect();
                 sent = current;
+                // A route that left the configuration is not retried either.
+                retrying.retain(|prefix| sent.contains(prefix));
                 if add.is_empty() && remove.is_empty() {
                     continue;
                 }
@@ -310,6 +324,33 @@ async fn run_once(
                 }
                 generation += 1;
                 if out_tx.send(SessionFrame::Update { generation, add, remove }).await.is_err() {
+                    break;
+                }
+            }
+            _ = retry_timer.as_mut(), if !retrying.is_empty() => {
+                // The next hop frees each prefix as soon as it reaps the session
+                // that holds it, so advertising the same routes again is all it
+                // takes to recover from a `Conflict`.
+                retry_timer.as_mut().reset(time::Instant::now() + ROUTE_RETRY_INTERVAL);
+                let add: Vec<RouteAdvert> = retrying
+                    .iter()
+                    .map(|prefix| RouteAdvert {
+                        prefix: prefix.clone(),
+                        origin: args.node_id.clone(),
+                        hops: 0,
+                    })
+                    .collect();
+                generation += 1;
+                info!(
+                    generation,
+                    routes = ?retrying,
+                    "Re-advertising the routes the next hop holds for another session"
+                );
+                if out_tx
+                    .send(SessionFrame::Update { generation, add, remove: Vec::new() })
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -381,12 +422,40 @@ async fn run_once(
                         }
                         SessionFrame::RouteAck { generation: ack_generation, accepted, rejected } => {
                             for rejection in rejected {
-                                warn!(
-                                    generation = ack_generation,
-                                    prefix = %rejection.prefix,
-                                    reason = ?rejection.reason,
-                                    "The next hop rejected a route"
-                                );
+                                // The next hop keeps a prefix for the session
+                                // that advertised it last, so a `Conflict`
+                                // usually means the previous session of this
+                                // node is not reaped yet. Keep the route if it
+                                // is still wanted and retry it on the timer.
+                                // Every other reason is a configuration
+                                // problem that only a route change fixes.
+                                let wanted =
+                                    args.routes.borrow().contains_key(&rejection.prefix);
+                                if rejection.reason == p4::RouteError::Conflict && wanted {
+                                    sent.remove(&rejection.prefix);
+                                    retry_timer
+                                        .as_mut()
+                                        .reset(time::Instant::now() + ROUTE_RETRY_INTERVAL);
+                                    retrying.insert(rejection.prefix.clone());
+                                    warn!(
+                                        generation = ack_generation,
+                                        prefix = %rejection.prefix,
+                                        reason = ?rejection.reason,
+                                        retry_interval = ?ROUTE_RETRY_INTERVAL,
+                                        "The next hop rejected a route; retrying"
+                                    );
+                                } else {
+                                    warn!(
+                                        generation = ack_generation,
+                                        prefix = %rejection.prefix,
+                                        reason = ?rejection.reason,
+                                        "The next hop rejected a route"
+                                    );
+                                }
+                            }
+                            for prefix in &accepted {
+                                sent.insert(prefix.clone());
+                                retrying.remove(prefix);
                             }
                             debug!(
                                 generation = ack_generation,

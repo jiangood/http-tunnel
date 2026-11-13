@@ -330,9 +330,102 @@ pub fn normalize_domain(raw: &str) -> Option<String> {
     Some(host.to_lowercase())
 }
 
+/// Whether a normalized `Host` is an IP literal (`192.168.1.5`, `[::1]`).
+pub(crate) fn is_ip_host(host: &str) -> bool {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok()
+}
+
+/// Whether the address is a LAN one: loopback, RFC1918 or IPv6 ULA/link-local.
+/// The control plane on an IP `Host` is only reachable from these peers, so a
+/// public scanner presenting a forged private `Host` still gets a `404`.
+pub(crate) fn is_lan_peer(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            v6.is_loopback()
+                || (seg[0] & 0xfe00) == 0xfc00
+                || (seg[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// A best-effort local IPv4 of the default outbound route, only used for the
+/// first-start hint. UDP `connect` only looks up the route and never sends a
+/// packet. `None` when no route exists at all.
+pub fn detect_local_ipv4() -> Option<String> {
+    use std::net::{SocketAddr, UdpSocket};
+
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()? {
+        SocketAddr::V4(addr) => Some(addr.ip().to_string()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
+
+    #[test]
+    fn test_is_ip_host() {
+        assert!(is_ip_host("192.168.1.5"));
+        assert!(is_ip_host("127.0.0.1"));
+        assert!(is_ip_host("[::1]"));
+        assert!(is_ip_host("[fe80::1]"));
+        assert!(!is_ip_host("edge.lan"));
+        assert!(!is_ip_host("*.example.com"));
+        assert!(!is_ip_host("999.1.1.1"));
+    }
+
+    #[test]
+    fn test_is_lan_peer() {
+        let lan = [
+            "127.0.0.1",
+            "10.0.0.3",
+            "172.16.0.9",
+            "192.168.1.200",
+            "169.254.3.4",
+            "::1",
+            "fd12:3456::1",
+            "fe80::1",
+        ];
+        for ip in lan {
+            assert!(
+                is_lan_peer(ip.parse::<IpAddr>().unwrap()),
+                "{} is a LAN address",
+                ip
+            );
+        }
+        let wan = [
+            "8.8.8.8",
+            "203.0.113.7",
+            "172.32.0.1",
+            "192.169.0.1",
+            "2606:4700::1",
+            "2001:db8::1",
+        ];
+        for ip in wan {
+            assert!(
+                !is_lan_peer(ip.parse::<IpAddr>().unwrap()),
+                "{} is a public address",
+                ip
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_local_ipv4_is_a_plain_address() {
+        // Whatever the environment offers, it must be a bare IPv4 literal.
+        if let Some(ip) = detect_local_ipv4() {
+            assert!(ip.parse::<std::net::Ipv4Addr>().is_ok(), "{}", ip);
+        }
+    }
 
     fn allowed(outcome: AuthOutcome) -> Vec<u8> {
         match outcome {

@@ -127,7 +127,11 @@ protocol-level loop detection are not part of 1.0.
   generation is monotonic.
 - The server applies each snapshot or update and answers with `RouteAck`.
 - A rejected prefix is logged once and is not retried until the advertised set
-  changes again.
+  changes again — except for `Conflict`. The next hop usually still holds the
+  prefix for the advertiser's own previous session (for example after a
+  restart), so the advertiser retries it every few seconds until it is
+  accepted, and the next hop hands a prefix over immediately when the new
+  session announces the same node id as the session that holds it.
 
 Current rejection reasons:
 

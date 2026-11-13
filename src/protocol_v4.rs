@@ -95,8 +95,10 @@ pub enum ProxyOp {
     },
 }
 
-/// Why a route was rejected. The advertiser logs it once and does not retry
-/// the same prefix until its advertisement changes.
+/// Why a route was rejected. The advertiser retries a `Conflict` on a slow
+/// timer, because the next hop usually frees the prefix when it reaps the
+/// session that holds it; every other reason is logged once and is not retried
+/// until the advertisement changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteRejection {
     pub prefix: String,

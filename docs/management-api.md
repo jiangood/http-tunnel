@@ -76,9 +76,15 @@ wins, but both entries are listed:
 ```json
 [
   {"domain":"app.example.com","owner":"local","name":"app","target":"127.0.0.1:3000","updated_at":1762749000},
-  {"domain":"svc.example.com","owner":"v4","session_id":3,"node":"home","updated_at":1762749180}
+  {"domain":"svc.example.com","owner":"v4","session_id":3,"node":"home","peer":"10.0.0.6:60216","forwarded":"203.0.113.9","updated_at":1762749180}
 ]
 ```
+
+`peer` and `forwarded` have the same meaning as in `GET /api/sessions`: the
+address the owning session connected from, and the one a gateway in front of
+the server reported for it. They are diagnostic; a changed address alone does
+not start a new `updated_at`. Both are omitted on local rows, which have no
+remote source, and `forwarded` is omitted when the node connected directly.
 
 `updated_at` is Unix seconds (the server's clock) and marks when that effective
 entry last appeared or changed. An unchanged row keeps its timestamp, so it
@@ -121,7 +127,7 @@ The same route table is logged at `info` whenever it changes:
 ```
 INFO http_tunnel::server: The route table changed routes=2
      table=["app.example.com -> local:app (127.0.0.1:3000)",
-            "svc.example.com -> v4:3 (home)"]
+            "svc.example.com -> v4:3 (home @10.0.0.6:60216)"]
 ```
 
 ```sh

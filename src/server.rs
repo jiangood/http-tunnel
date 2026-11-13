@@ -109,6 +109,15 @@ pub(crate) struct RouteSnapshot {
     pub(crate) session_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) node: Option<String>,
+    /// The TCP address the owning session connected from. Local routes have
+    /// no remote source, so they carry `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) peer: Option<SocketAddr>,
+    /// The address a gateway in front of the server reported for the owning
+    /// session (`X-Forwarded-For` and friends). `None` when it connected
+    /// directly or the gateway did not add the header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) forwarded: Option<String>,
     /// Unix seconds when this effective entry last appeared or changed. The
     /// management page shows it so an operator can confirm that an edit has
     /// taken effect. Unchanged entries keep their original timestamp.
@@ -145,12 +154,25 @@ impl RouteSnapshot {
                 self.name.as_deref().unwrap_or("?"),
                 self.target.as_deref().unwrap_or("?")
             ),
-            _ => format!(
-                "{} -> v4:{} ({})",
-                self.domain,
-                self.session_id.unwrap_or(0),
-                self.node.as_deref().unwrap_or("?")
-            ),
+            _ => {
+                // The source address is diagnostic: it shows where the route
+                // was claimed from, which matters when several nodes may
+                // announce the same node id.
+                let source = self
+                    .forwarded
+                    .as_deref()
+                    .map(|forwarded| forwarded.to_string())
+                    .or_else(|| self.peer.map(|peer| peer.to_string()))
+                    .map(|addr| format!(" @{}", addr))
+                    .unwrap_or_default();
+                format!(
+                    "{} -> v4:{} ({}{})",
+                    self.domain,
+                    self.session_id.unwrap_or(0),
+                    self.node.as_deref().unwrap_or("?"),
+                    source
+                )
+            }
         }
     }
 
@@ -375,6 +397,7 @@ impl ServerState {
     pub(crate) async fn routes_snapshot(&self) -> Vec<RouteSnapshot> {
         let proxies = self.proxies.read().await;
         let v4_routes = self.v4_routes.read().await;
+        let infos = self.v4_session_info.read().await;
         let mut table = Vec::with_capacity(proxies.len() + v4_routes.len());
         for proxy in proxies.iter() {
             let Some(domain) = crate::helper::normalize_domain(&proxy.domain) else {
@@ -401,6 +424,8 @@ impl ServerState {
                     target: Some(proxy.local_addr.clone()),
                     session_id: None,
                     node: None,
+                    peer: None,
+                    forwarded: None,
                     updated_at: 0,
                 },
                 identity,
@@ -414,6 +439,10 @@ impl ServerState {
             {
                 continue;
             }
+            // The route and the session registry are updated together, so the
+            // owning session is normally found; a missing entry only means the
+            // session is on its way out, and the address stays empty then.
+            let info = infos.get(&handle.session_id);
             table.push((
                 RouteSnapshot {
                     domain: domain.clone(),
@@ -422,6 +451,8 @@ impl ServerState {
                     target: None,
                     session_id: Some(handle.session_id),
                     node: Some(handle.node_id.clone()),
+                    peer: info.map(|info| info.peer),
+                    forwarded: info.and_then(|info| info.forwarded.clone()),
                     updated_at: 0,
                 },
                 RouteIdentity::V4 {

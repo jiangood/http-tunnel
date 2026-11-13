@@ -35,7 +35,7 @@
 
 从 [Releases](https://github.com/jiangood/http-tunnel/releases) 下载 `ht`，在服务器和内网机器上各放一份：
 
-直接运行 `./ht`，程序会写出带注释的默认配置并直接以服务端模式启动（默认监听 `0.0.0.0:7777`，`[server].token` 随机生成，`[server].domain` 自动填入探测到的本机 IP，`[upstream]` 默认注释掉），不会退出。因此首次启动后即可直接用 `http://本机IP:7777` 打开管理页（用户名 `ht`，密码是生成的 token）；没有探测到 IP 时 `[server].domain` 保持注释，需要手动填写。IP 部署的管理页是明文 HTTP，建议仅在内网这样使用。按下面的内容改好配置后保存，运行中的 `ht` 会自动热加载。
+直接运行 `./ht`，程序会写出带注释的默认配置并直接以服务端模式启动（默认监听 `0.0.0.0:7777`，`[server].token` 随机生成，`[upstream]` 默认注释掉），不会退出。局域网内用 `http://本机IP:7777` 即可直接打开管理页（用户名 `ht`，密码是生成的 token），无需配置 `[server].domain`；`domain` 主要用于公网域名入口或反代场景。局域网 IP 的管理页是明文 HTTP，建议仅在内网这样使用。按下面的内容改好配置后保存，运行中的 `ht` 会自动热加载。
 
 ### 2. 服务端
 
@@ -146,7 +146,7 @@ local_addr = "127.0.0.1:3000"
 
 要点：
 
-- `[server].domain` 是保留 Host，不能和任何 `[[proxies]].domain` 相同，也不支持泛域名。
+- `[server].domain` 是保留 Host，不能和任何 `[[proxies]].domain` 相同，也不支持泛域名。不配置它时，局域网内用 IP 字面量访问（如 `http://192.168.1.5:7777`）就是管理页，下游节点也能用 `ws://192.168.1.5:7777` 直接入网；公网来源访问 IP 字面量一律 404。
 - `[server].bind` 在生成的配置里是 `0.0.0.0`，默认监听所有网卡，方便 Docker 发布端口和公网直连；只允许本机 Nginx/Caddy 反代时改成 `127.0.0.1`。公网部署务必设置强 Token 并用防火墙限制来源。
 - 公网部署应在入口前加 TLS 终止层，把 443 反代到 `127.0.0.1:7777`，见[传输模式与 TLS](#传输模式与-tls)。
 
@@ -444,7 +444,7 @@ keepalive_interval = 15
 | GET | `/api/settings` | 查看本节点的全部配置项（含 Token 明文，`[[proxies]]` 除外） |
 | GET | `/api/settings/export` | 下载磁盘上的 `ht.toml`（含注释和 Token 明文），可作为备份 |
 | GET | `/api/proxies` | 列出本地 `[[proxies]]`（含 `x-auth` 明文和来源）；带 `?node=` 或 `?session=` 时列出该下游节点的服务 |
-| GET | `/api/routes` | 查看当前生效的路由表（本地服务在前，下游 v4 路由在后，均按域名排序；每行带 `updated_at` 更新时间） |
+| GET | `/api/routes` | 查看当前生效的路由表（本地服务在前，下游 v4 路由在后，均按域名排序；每行带 `updated_at` 更新时间，v4 行带来源地址） |
 | GET | `/api/sessions` | 列出已连接的下游节点：会话号、节点、网关转发的来源 IP、TCP 对端、角色、连接时长、所属域名、是否可管理/可写与服务来源 |
 | PUT | `/api/settings` | 替换本节点配置并写回 `ht.toml`；`?dry_run=true` 只检查是否需要重启，`?restart=true` 在需要时立即重建运行时。响应含 `restart_required`、`restart_triggered`、`saved` 和 `settings` |
 | POST | `/api/restart` | 按磁盘上的 `ht.toml` 立即重建监听器和上游会话；`ht` 进程本身不退出 |
