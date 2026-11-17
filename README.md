@@ -20,44 +20,44 @@
 
 ## 快速开始
 
-下面用一台服务器和一个客户端跑通完整链路：服务器在公网监听，客户端在内网主动拨出，把内网机器的 `http://127.0.0.1:3000` 暴露成 `app.example.com`。
+使用方式以 **Docker + Web 管理页** 为主：一台公网服务器跑服务端容器，一台内网机器跑客户端容器，客户端主动拨出，把内网机器的 `http://127.0.0.1:3000` 暴露成 `app.example.com`。
 
 ```text
-访客 ──> 服务器 ht（control.example.com:7777）
-                ^ 客户端主动建立的 ws / wss 长连接
+访客 ──> 服务器 ht 容器（0.0.0.0:7777）
+                ^ 客户端容器主动建立的 ws / wss 长连接
                 │
-         客户端 ht（app.example.com -> 127.0.0.1:3000）
+         客户端 ht 容器（app.example.com -> 127.0.0.1:3000）
 ```
 
-`control.example.com` 是服务器的保留域名，只用于管理页和下游会话，不承载业务流量。Token 可用 `openssl rand -hex 16` 生成，两端必须一致；示例里的中文占位符都要替换。
+### 1. 启动服务端（公网服务器）
 
-### 1. 准备
-
-从 [Releases](https://github.com/jiangood/http-tunnel/releases) 下载 `ht`，在服务器和内网机器上各放一份：
-
-直接运行 `./ht`，程序会写出带注释的默认配置并直接以服务端模式启动（默认监听 `0.0.0.0:7777`，`[server].token` 随机生成，`[upstream]` 默认注释掉），不会退出。局域网内用 `http://本机IP:7777` 即可直接打开管理页（用户名 `ht`，密码是生成的 token），无需配置 `[server].domain`；`domain` 主要用于公网域名入口或反代场景。局域网 IP 的管理页是明文 HTTP，建议仅在内网这样使用。按下面的内容改好配置后保存，运行中的 `ht` 会自动热加载。
-
-### 2. 服务端
-
-`server/ht.toml`：
-
-```toml
-name = "ingress"
-
-[server]
-port = 7777
-bind = "0.0.0.0"
-domain = "control.example.com"
-token = "把 openssl rand -hex 16 的输出填在这里（客户端用同一个）"
+```sh
+mkdir -p /data/ht
+docker run -d --name ht \
+  --restart unless-stopped \
+  --stop-timeout 40 \
+  -p 7777:7777 \
+  -v /data/ht:/app \
+  ghcr.io/jiangood/ht:latest
 ```
 
-它按 `Host` 把访客请求转给已连接客户端声明的域名。`bind = "0.0.0.0"` 是为了让客户端能从公网连上
+首次启动会在 `/data/ht` 生成一份默认配置 `ht.toml`：无注释、无示例服务，`[server]` 监听 `0.0.0.0:7777`，`token` 为默认值 `123456`。
 
-### 3. 客户端
+### 2. 首次登录
 
-`client/ht.toml`：
+浏览器打开 `http://服务器IP:7777/`，用户名 `ht`，密码 `123456`。
 
-```toml
+**首次登录成功后，Token 会立即自动重置为随机值，并在页面上显示一次。** 请立刻保存这个新 Token：`123456` 从此失效，浏览器会要求用它重新登录；下游节点连接本入口也要使用同一个新 Token。之后所有配置（域名、本地服务、上游等）都可以在管理页里修改，保存后立即生效并写回 `ht.toml`。
+
+在管理页"管理服务"里添加要暴露的服务（`domain` + `local_addr`），例如 `app.example.com` -> `127.0.0.1:3000`。
+
+### 3. 启动客户端（内网机器）
+
+客户端没有管理页，先写好配置再启动。`[upstream].url` 填服务器的 IP 或域名（主机名必须与服务器 `[server].domain` 一致；服务器没配 `domain` 时，直接填 IP 即可），`token` 填首次登录后服务端显示的新 Token：
+
+```sh
+mkdir -p /data/ht
+cat > /data/ht/ht.toml <<'EOF'
 name = "home"
 
 [[proxies]]
@@ -66,31 +66,24 @@ domain = "app.example.com"
 local_addr = "127.0.0.1:3000"
 
 [upstream]
-url = "ws://control.example.com:7777"
-token = "与服务端 token 相同"
+url = "ws://<服务器IP>:7777"
+token = "服务端首次登录后显示的新 Token"
+EOF
+
+docker run -d --name ht \
+  --restart unless-stopped \
+  --stop-timeout 40 \
+  --add-host host.docker.internal:host-gateway \
+  -v /data/ht:/app \
+  ghcr.io/jiangood/ht:latest
 ```
 
-- `local_addr` 指向内网机器上已经在监听的服务；示例假设 `127.0.0.1:3000` 可访问。
-- 不写 `[server]`，客户端就完全不监听端口，只向上游拨出，内网不需要开放任何入站端口。
-- `[upstream].url` 里的主机名必须与服务器的 `[server].domain` 完全一致，否则 v4 握手会被拒绝。
-- 还没有 DNS 时，把两边的 `control.example.com` 都换成服务器的 IP，两处主机名保持相同即可。
-- 这里先用 `ws://` 验证链路；公网正式部署时换成 `wss://control.example.com`（默认 443），并在服务器前加 TLS 终止层，见[传输模式与 TLS](#传输模式与-tls)。
+- 客户端不写 `[server]`，完全不监听端口，内网不需要开放任何入站端口，所以上面的命令不发布端口。
+- `local_addr` 在客户端容器内解析：`127.0.0.1` 指容器自己；宿主机服务用 `host.docker.internal:<端口>`（Linux 上需要 `--add-host`，见上面命令）。
+- 公网正式部署时换成 `wss://<域名>`（默认 443），并在服务器前加 TLS 终止层，见[传输模式与 TLS](#传输模式与-tls)。
+- 还没有 DNS 时，把 `domain` 换成服务器 IP 先跑通链路，两处主机名保持一致。
 
-### 4. 启动
-
-先启动服务端，再启动客户端：
-
-```sh
-# 公网服务器
-cd server && ./ht
-
-# 内网机器（另一个终端或另一台机器）
-cd client && ./ht
-```
-
-需要常驻时加 `-b`，输出写入当前目录的 `ht.log`；`-c` 可以指定别的配置文件。命令行只有 `ht [-c/--config ht.toml] [-b/--background]`。
-
-### 5. 验证
+### 4. 验证
 
 ```sh
 # 在服务器上，用 Host 头模拟 DNS 解析
@@ -100,13 +93,14 @@ curl -i -H "Host: app.example.com" http://127.0.0.1:7777/
 curl -i http://app.example.com:7777/
 ```
 
-返回客户端 `127.0.0.1:3000` 的内容，就说明整条链路已经打通。管理页在 `http://control.example.com:7777/`，用户名 `ht`，密码是服务端的 token；域名还没解析时用 `curl -H "Host: control.example.com" http://127.0.0.1:7777/`。
+返回客户端 `127.0.0.1:3000` 的内容，就说明整条链路已经打通。管理页在 `http://服务器IP:7777/`。
 
-### 6. 下一步
+### 5. 下一步
 
 - 只有一台机器（入口和本地服务同机）：[单节点：入口 + 本地代理](#单节点入口--本地代理)
 - 客户端不能直接访问公网入口：[三个节点：服务端 + 中继 + 客户端](#三个节点服务端--中继--客户端)
 - 公网部署：补上 [TLS](#传输模式与-tls)，并给敏感服务的 `[[proxies]]` 加 `x-auth`
+- 不用 Docker 而是直接跑二进制：从 [Releases](https://github.com/jiangood/http-tunnel/releases) 下载 `ht` 或参考 [构建指南](./docs/build-guide.md)，`./ht` 直接启动并生成同样的默认配置
 - 连不上或返回错误：[验证与常见问题](#验证与常见问题)、[错误响应与排查](#错误响应与排查)
 
 ## 拓扑与配置
@@ -307,7 +301,8 @@ curl -i -H "Host: app.example.com" http://127.0.0.1:7777/
 
 3.0 起不再读取 `HT_*` 环境变量。`ht.toml` 是唯一的配置来源，管理页和 `/api/settings` 可以直接修改本节点的全部配置项并写回该文件：
 
-- 首次启动时如果 `ht.toml` 不存在或内容为空（只有空白字符也视为空），`ht` 会生成带注释的默认配置并直接以服务端模式启动，不退出；`[server]` 默认启用并监听 `0.0.0.0:7777`，其中的 `token` 随机生成，`[upstream]` 默认注释掉。运行中把配置改成空文件则不会重新生成：热加载会保留当前生效的配置并提示错误，直到写入完整配置。
+- 首次启动时如果 `ht.toml` 不存在或内容为空（只有空白字符也视为空），`ht` 会生成一份无注释的默认配置并直接以服务端模式启动，不退出；`[server]` 默认启用并监听 `0.0.0.0:7777`，其中 `token` 为默认值 `123456`，没有 `[[proxies]]` 示例，也没有 `[upstream]`。运行中把配置改成空文件则不会重新生成：热加载会保留当前生效的配置并提示错误，直到写入完整配置。
+- 默认 `token = "123456"` 只用于第一次登录管理页：首次登录成功后，`ht` 自动把它重置为随机值并写回 `ht.toml`，页面上显示一次新 Token。此后 `123456` 不再有效，配置文件里也不会再出现它。
 - 容器部署也只需要挂载配置文件；不再支持“只有环境变量、没有配置文件”的启动方式。
 - 旧部署中的 `HT_*` 变量会被忽略，请把需要的值迁移到 `ht.toml`。
 - `[[proxies]]` 可以在管理页“管理服务”中增删改，其他配置项在“节点配置”中修改。
@@ -397,7 +392,16 @@ local_addr = "unix:///var/run/docker.sock"
 x-auth = "demo-visitor-token"
 ```
 
-完整可运行的 compose、Dockerfile、Docker CLI 接入方式和 Windows 说明见 [examples/docker/client-docker-sock](./examples/docker/client-docker-sock/) 与 [examples/docker/README.md](./examples/docker/README.md)。Docker API 等价于宿主机 root：公网部署必须加 TLS 和 `x-auth`，优先只通过 VPN 或内网暴露。Windows 原生 `ht.exe` 不支持 Unix Socket，请让 ht 以 Linux 容器运行。
+完整可运行的容器命令见 [Docker](#docker)。Docker API 等价于宿主机 root：公网部署必须加 TLS 和 `x-auth`，优先只通过 VPN 或内网暴露。Windows 原生 `ht.exe` 不支持 Unix Socket，请让 ht 以 Linux 容器运行，直接挂载 socket 即可（无需开启 2375 端口）：
+
+```sh
+docker run -d --name ht \
+  --restart unless-stopped \
+  --stop-timeout 40 \
+  -v /data/ht:/app \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  ghcr.io/jiangood/ht:latest
+```
 
 ## 多跳细节
 
@@ -432,7 +436,7 @@ keepalive_interval = 15
 
 ## Web 管理
 
-配置了 `[server].domain` 时管理页面与 API 开启，和访客、v4 会话共用 `[server].port`，只在保留的 `[server].domain` 上可达。浏览器打开 `http://<server.domain>:<server.port>/`，HTTP Basic 用户名填 `ht`，密码填 `[server].token`；页面是一个内联 CSS/JS 的单页控制台，本身不做服务端渲染，所有数据都通过 `/api/*`（Bearer token）获取，可查看状态、活跃访客与本次运行的累计连接、热加载错误、编辑本节点全部配置、管理本地服务、筛选带更新时间的路由表、查看下游节点（含来源 IP）、接口列表和 `ht.toml` 配置项参考。路由表的“更新时间”标出每行最近一次出现或变化的时间，修改配置后可直接确认是否生效。节点卡片中本节点和下游节点的每一行都有“管理服务”，点开后可在弹窗内查看，本节点服务还可以一键“测试”`local_addr` 是否可达，或在允许时增删改该节点自己的 `[[proxies]]`；下游节点行还可以“断开”当前会话。顶部“导出配置”会下载包含注释和 Token 明文的 `ht.toml`；保存配置时会保留文件里的注释和未修改服务的说明。
+配置了 `[server].domain` 时管理页面与 API 开启，和访客、v4 会话共用 `[server].port`，只在保留的 `[server].domain` 上可达。浏览器打开 `http://<server.domain>:<server.port>/`，HTTP Basic 用户名填 `ht`，密码填 `[server].token`；首次部署时 token 是默认值 `123456`，首次登录成功后自动重置为随机值并在页面上显示一次，之后以页面显示的值为准。页面是一个内联 CSS/JS 的单页控制台，本身不做服务端渲染，所有数据都通过 `/api/*`（Bearer token）获取，可查看状态、活跃访客与本次运行的累计连接、热加载错误、编辑本节点全部配置、管理本地服务、筛选带更新时间的路由表、查看下游节点（含来源 IP）、接口列表和 `ht.toml` 配置项参考。路由表的“更新时间”标出每行最近一次出现或变化的时间，修改配置后可直接确认是否生效。节点卡片中本节点和下游节点的每一行都有“管理服务”，点开后可在弹窗内查看，本节点服务还可以一键“测试”`local_addr` 是否可达，或在允许时增删改该节点自己的 `[[proxies]]`；下游节点行还可以“断开”当前会话。顶部“导出配置”会下载包含注释和 Token 明文的 `ht.toml`；保存配置时会保留文件里的注释和未修改服务的说明。
 
 **上级修改默认关闭。** 下游节点的 `[[proxies]]` 默认只能由本机管理页修改；上一跳仍可列出这些服务（包括 `x-auth` 明文），但写入会返回 `409`。下游节点可以在自己的管理页顶部“上级修改”中切换，切换会立即重连上游会话以重新上报能力位，期间该节点的路由会短暂撤销并重新通告。独立入口没有上游，页面显示“无上游”。
 
@@ -542,17 +546,58 @@ docker run ... -e RUST_LOG=debug ghcr.io/jiangood/ht:latest
 
 ## Docker
 
-仓库提供可直接使用的 compose 示例，镜像统一为 `ghcr.io/jiangood/ht:latest`，角色由挂载的 `ht.toml` 决定：
+镜像统一为 `ghcr.io/jiangood/ht:latest`，角色完全由挂载目录里的 `ht.toml` 决定：有 `[server]` 就监听端口（服务端/中继），只有 `[upstream]` 就是纯客户端，不需要发布任何端口。
 
-| 角色 | compose | 配置 | Dockerfile |
-| --- | --- | --- | --- |
-| 服务端 | [compose.yaml](./examples/docker/server/compose.yaml) | [ht.toml](./examples/docker/server/data/ht.toml) | [Dockerfile](./examples/docker/server/Dockerfile) |
-| 客户端 | [compose.yaml](./examples/docker/client/compose.yaml) | [ht.toml](./examples/docker/client/data/ht.toml) | [Dockerfile](./examples/docker/client/Dockerfile) |
-| Docker Socket | [compose.yaml](./examples/docker/client-docker-sock/compose.yaml) | [ht.toml](./examples/docker/client-docker-sock/data/ht.toml) | [Dockerfile](./examples/docker/client-docker-sock/Dockerfile) |
+### 服务端（需要发布端口）
 
-完整部署、验证和排查说明见 [examples/docker/README.md](./examples/docker/README.md)。
+```sh
+mkdir -p /data/ht
+docker run -d --name ht \
+  --restart unless-stopped \
+  --stop-timeout 40 \
+  -p 7777:7777 \
+  -v /data/ht:/app \
+  ghcr.io/jiangood/ht:latest
+```
 
-容器固定读取 `/app/ht.toml`，示例把配置放在各自的 `data/` 目录并挂载到 `/app`，修改后约 1 秒自动热加载。`local_addr` 在容器内解析：`127.0.0.1` 是容器自己，宿主机服务用 `host.docker.internal:<端口>`，同一 compose 的服务用服务名。停止时 `ht` 最多 drain 30 秒，compose 已设置 `stop_grace_period: 40s`（`docker run` 用 `--stop-timeout 40`）。
+首次启动在 `/data/ht` 生成默认 `ht.toml`（无注释，`token = "123456"`）并以服务端模式监听 `0.0.0.0:7777`。打开 `http://服务器IP:7777/` 登录（用户名 `ht`，密码 `123456`），首次登录成功后 Token 自动重置为随机值并在页面上显示一次。之后域名、本地服务、上游都可以在管理页里改，约 1 秒热加载。只允许本机 Nginx/Caddy 反代时，把端口映射改成 `-p 127.0.0.1:7777:7777`。
+
+### 客户端（不发布端口）
+
+先在挂载目录里放好 `ht.toml`（模板见[两个节点：服务端 + 客户端](#两个节点服务端--客户端)），再启动：
+
+```sh
+mkdir -p /data/ht   # 先写入 ht.toml
+docker run -d --name ht \
+  --restart unless-stopped \
+  --stop-timeout 40 \
+  --add-host host.docker.internal:host-gateway \
+  -v /data/ht:/app \
+  ghcr.io/jiangood/ht:latest
+```
+
+### 注意事项
+
+- 容器固定读取 `/app/ht.toml`，把目录挂载到 `/app`。管理页保存配置要求 `/app` 可写；只读运行可挂载为 `:ro`，只通过宿主机编辑配置。
+- `local_addr` 在容器内解析：`127.0.0.1` 是容器自己；宿主机服务用 `host.docker.internal:<端口>`（Linux 需要 `--add-host host.docker.internal:host-gateway`）；同一网络中的其他容器直接用服务名/容器名。
+- `ht` 收到 `SIGTERM` 后最多 drain 30 秒，`docker stop` 需要 `--stop-timeout 40`，否则在途连接会被默认 10 秒截断。
+- 镜像基于 `scratch`，没有 shell 和 `curl`。查日志用 `docker logs <容器名>`；验证请求从宿主机或另一个容器发出。
+- 默认以 root 运行，保证首启动能生成 `ht.toml`、管理页能写回。改用 `--user 65532:65532` 时，挂载目录要对该 UID 可写；挂载 `docker.sock` 时还要处理 socket 的组权限。
+- 镜像没有内置 `HEALTHCHECK`，对 `[server].port` 做 TCP 检查即可。
+- 端口映射必须与 `[server].port` 一致；管理页和 API 共用这个端口，不需要额外映射。
+
+### 排查
+
+| 现象 | 检查 |
+| --- | --- |
+| `404 No tunnel for this host` | 客户端是否已连上；域名是否在某个 `[[proxies]]` 中 |
+| v4 会话返回 `401` | 两端 Token 是否一致 |
+| WebSocket 握手失败 | `[server].domain` 与 `[upstream].url` 的主机名是否一致；TLS 终止层是否转发 `Upgrade` / `Connection` |
+| `502`，`cause` 是 `Connection refused` | `local_addr` 在容器内是否可达；是不是误用了 `127.0.0.1` |
+| `502`，`cause` 是 `no such host` | `host.docker.internal` 是否配置；Linux 需要 `--add-host` |
+| 容器停止时请求被截断 | `--stop-timeout` 是否设为 40 |
+
+> Windows / Docker Desktop 上想通过隧道访问 Docker API：Windows 原生 `ht.exe` 不支持 Unix Socket，让 ht 以 Linux 容器运行并挂载 `/var/run/docker.sock` 即可（见[用隧道访问 Docker API](#用隧道访问-docker-api)），不需要开启 2375 端口。
 
 ## 许可证
 

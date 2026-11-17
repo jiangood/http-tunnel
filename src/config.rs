@@ -1131,17 +1131,22 @@ impl ServerLimits {
     }
 }
 
-/// The example written when `ht.toml` is missing.
+/// The well-known bootstrap token of a freshly generated config.
 ///
-/// `examples/minimal/ht.toml` is the single source of truth: it is embedded at
-/// compile time, so the shipped binary needs no example directory at runtime.
-pub(crate) const DEFAULT_CONFIG: &str = include_str!("../examples/minimal/ht.toml");
+/// It exists only so a first-time user can open the management page without
+/// reading a file first. The first successful page login rotates it to a random
+/// value (see `crate::management_api`); a config that still carries it after
+/// that is either unused or was never logged into.
+pub(crate) const DEFAULT_TOKEN: &str = "123456";
 
-/// The length of the random token written into a freshly generated config.
-const GENERATED_TOKEN_LEN: usize = 32;
+/// The process name written into a freshly generated config.
+pub(crate) const GENERATED_NAME: &str = "edge";
+
+/// The length of a random token, the same shape as `openssl rand -hex 16`.
+pub(crate) const GENERATED_TOKEN_LEN: usize = 32;
 
 /// A random lowercase hexadecimal token, the same shape as `openssl rand -hex 16`.
-fn generated_token() -> String {
+pub(crate) fn generated_token() -> String {
     use rand::Rng;
 
     const HEX: &[u8] = b"0123456789abcdef";
@@ -1151,20 +1156,25 @@ fn generated_token() -> String {
         .collect()
 }
 
-/// The example with a fresh random `[server].token` enabled.
+/// The config written on a first start, built from the defaults.
 ///
-/// The shipped example keeps the token commented so it stays a readable
-/// template. The generated file activates it, so a first start never uses the
-/// documented placeholder as its secret.
+/// There is no example file to embed: the first-start config is generated in
+/// code, so it always matches the built-in defaults. It is a standalone
+/// ingress on all interfaces with the bootstrap token [`DEFAULT_TOKEN`] and no
+/// local services or upstream; the first successful page login replaces the
+/// bootstrap token with a random value and tells the user what it became.
 ///
-/// `[server].domain` stays commented: a LAN peer can already reach the
-/// management page and a v4 session through an IP literal Host, so nothing is
-/// written into the file (see `crate::http`).
+/// `bind` is written explicitly as `0.0.0.0` (instead of the safe
+/// [`crate::helper::DEFAULT_BIND_HOST`] fallback) so that a first start in a
+/// container or on a LAN is reachable without editing the file.
 pub(crate) fn generated_config() -> String {
-    DEFAULT_CONFIG.replacen(
-        "# token = \"replace-with-the-downstream-secret\"",
-        &format!("token = \"{}\"", generated_token()),
-        1,
+    format!(
+        "name = \"{}\"\n\n\
+         [server]\n\
+         port = {}\n\
+         bind = \"0.0.0.0\"\n\
+         token = \"{}\"\n",
+        GENERATED_NAME, DEFAULT_LISTEN_PORT, DEFAULT_TOKEN
     )
 }
 
@@ -1189,24 +1199,25 @@ mod tests {
         Ok(files)
     }
 
-    fn get_all_example_config() -> Result<Vec<PathBuf>> {
-        Ok(list_config_files("./examples")?
-            .into_iter()
-            .filter(|x| x.extension().map(|e| e == "toml").unwrap_or(false))
-            .collect())
-    }
-
     fn router(source: &str) -> Config {
         Config::parse(source).expect("the test source should be a valid config")
     }
 
     #[test]
-    fn test_generated_config_activates_the_token() -> Result<()> {
+    fn test_generated_config_boots_with_the_default_token() -> Result<()> {
         let config = generated_config();
-        assert!(!config.contains("# token = \"replace-with-the-downstream-secret\""));
-        // The generated file must parse as-is.
+        // The generated file is built in code and must parse as-is.
         let parsed = Config::parse(&config)?;
-        assert!(parsed.listener_token().is_some());
+        assert_eq!(parsed.name, GENERATED_NAME);
+        let server = parsed.server.expect("the generated config is a server");
+        assert_eq!(server.port, DEFAULT_LISTEN_PORT);
+        assert_eq!(server.bind, "0.0.0.0");
+        assert_eq!(
+            &*server.token.expect("the generated config has a token"),
+            DEFAULT_TOKEN
+        );
+        assert!(parsed.proxies.is_empty());
+        assert!(parsed.upstream.is_none());
         Ok(())
     }
 
@@ -1322,20 +1333,6 @@ mod tests {
             assert!(err.contains(old), "{}", err);
             assert!(err.contains(new), "{}", err);
         }
-    }
-
-    #[test]
-    fn test_example_config() -> Result<()> {
-        let paths = get_all_example_config()?;
-        assert!(!paths.is_empty());
-        for p in paths {
-            let s = fs::read_to_string(&p)?;
-            let mut config: Config = toml::from_str(&s)?;
-            // Every shipped example is a runnable config, so a first start can
-            // use it as-is instead of exiting for an edit.
-            Config::validate(&mut config)?;
-        }
-        Ok(())
     }
 
     #[test]
@@ -1816,26 +1813,20 @@ local_addr = "127.0.0.1:80"
             .expect_err("the control plane needs a token");
         assert!(format!("{:#}", err).contains("token"), "{:#}", err);
 
-        // The generated template runs as a listener without a control plane,
-        // so its placeholder domain/token comments are never validated.
-        std::fs::write(&path, DEFAULT_CONFIG)?;
+        // The generated config runs as a listener without a control plane,
+        // and its bootstrap token does not need replacing.
+        std::fs::write(&path, generated_config())?;
         let cfg = Config::from_file(&path).await?;
         assert_eq!(cfg.entry_domain(), None);
         assert_eq!(cfg.listen_port(), Some(DEFAULT_LISTEN_PORT));
 
-        // Enabling the commented domain without replacing the placeholder token
-        // is still rejected.
-        let enabled = DEFAULT_CONFIG
-            .replace("# domain = \"edge.lan\"", "domain = \"edge.lan\"")
-            .replace(
-                "# token = \"replace-with-the-downstream-secret\"",
-                "token = \"replace-with-the-downstream-secret\"",
-            );
-        std::fs::write(&path, enabled)?;
-        let err = Config::from_file(&path)
-            .await
-            .expect_err("the placeholder token must be rejected");
-        assert!(format!("{:#}", err).contains("token"), "{:#}", err);
+        // Adding a domain keeps the bootstrap token valid; the first page login
+        // rotates it (see the management API).
+        let with_domain =
+            generated_config().replacen("[server]", "[server]\ndomain = \"edge.lan\"", 1);
+        std::fs::write(&path, with_domain)?;
+        let cfg = Config::from_file(&path).await?;
+        assert_eq!(cfg.entry_domain(), Some("edge.lan"));
 
         let _ = std::fs::remove_file(&path);
         Ok(())
@@ -1853,20 +1844,14 @@ local_addr = "127.0.0.1:80"
         let config = Config::from_file(&path).await?;
         assert_eq!(config.listen_port(), Some(DEFAULT_LISTEN_PORT));
         assert!(config.upstream.is_none());
+        // The generated file is exactly what the code builds: no comments, no
+        // example services, and the bootstrap token for the first page login.
         let generated = std::fs::read_to_string(&path)?;
-        assert_ne!(generated, DEFAULT_CONFIG);
-        assert!(
-            !generated.contains("replace-with-the-downstream-secret"),
-            "the generated config must not keep the placeholder token"
-        );
+        assert_eq!(generated, generated_config());
         let token = config
             .listener_token()
             .expect("the generated config enables a listener token");
-        assert_eq!(token.len(), GENERATED_TOKEN_LEN);
-        assert!(
-            token.chars().all(|c| c.is_ascii_hexdigit()),
-            "the generated token must be hexadecimal"
-        );
+        assert_eq!(&**token, DEFAULT_TOKEN);
         assert_eq!(config.bind_host(), "0.0.0.0");
         assert_eq!(config.source.path.as_deref(), Some(path.as_path()));
 
@@ -2003,55 +1988,6 @@ local_addr = "127.0.0.1:81"
             ..ServerLimits::default()
         };
         assert!(limits.validate().is_err());
-    }
-
-    /// The number of lines that disable a setting with a single `#`.
-    fn disabled_settings(example: &str, prefix: &str) -> usize {
-        example
-            .lines()
-            .filter(|line| line.starts_with(prefix))
-            .count()
-    }
-
-    /// Check the comment convention of the generated file: `##` marks
-    /// documentation and a single `#` only ever disables a setting.
-    fn assert_comment_convention(example: &str) {
-        for line in example.lines() {
-            if line.trim().is_empty() || line.starts_with("##") {
-                continue;
-            }
-            let Some(rest) = line.strip_prefix("# ") else {
-                assert!(
-                    !line.starts_with('#'),
-                    "a comment must start with ##: {:?}",
-                    line
-                );
-                continue;
-            };
-            assert!(
-                rest.contains(" = ") || rest.starts_with('['),
-                "documentation must start with ##, not a single #: {:?}",
-                line
-            );
-        }
-    }
-
-    #[test]
-    fn test_config_example_is_a_runnable_server() -> Result<()> {
-        let example = DEFAULT_CONFIG;
-        let mut cfg: Config = toml::from_str(example)?;
-        Config::validate(&mut cfg)?;
-        assert_eq!(cfg.name, "edge");
-        // The template is a standalone ingress: `[server]` is active and
-        // `[upstream]` stays commented out.
-        assert!(cfg.server.is_some());
-        assert!(cfg.upstream.is_none());
-        assert_eq!(cfg.bind_host(), "0.0.0.0");
-        assert_eq!(cfg.proxies.len(), 1);
-        assert_eq!(disabled_settings(example, "# [server]"), 0);
-        assert_eq!(disabled_settings(example, "# [upstream]"), 1);
-        assert_comment_convention(example);
-        Ok(())
     }
 
     const LEAF_CONFIG: &str = r#"

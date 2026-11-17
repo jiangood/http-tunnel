@@ -9,6 +9,8 @@ perf.data.old
 
 # Background log of ht -b
 /ht.log
+# Default config a first start generates in the working directory
+/ht.toml
 # Local Docker release staging directory
 /build-out/
 

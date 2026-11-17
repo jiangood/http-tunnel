@@ -2,7 +2,7 @@
 
 use crate::config::{Config, MaskedString, ServerConfig, ServerProxyEntry, UpstreamConfig};
 use crate::management::{ManagementState, SessionAdminError};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpStream;
-use tracing::warn;
+use tracing::{info, warn};
 
 struct ApiState {
     management: Arc<ManagementState>,
@@ -84,7 +84,7 @@ fn build_router(token: String, management: Arc<ManagementState>) -> Router {
     // shows comes from `/api` with the Bearer token it was handed.
     let web = Router::new()
         .route("/", get(web_index))
-        .route_layer(middleware::from_fn_with_state(token, web_auth));
+        .route_layer(middleware::from_fn_with_state(state.clone(), web_auth));
 
     Router::new()
         .nest("/api", api)
@@ -178,7 +178,12 @@ async fn api_auth<B>(State(token): State<String>, req: Request<B>, next: Next<B>
     next.run(req).await
 }
 
-async fn web_auth<B>(State(token): State<String>, req: Request<B>, next: Next<B>) -> Response {
+async fn web_auth<B>(
+    State(state): State<Arc<ApiState>>,
+    req: Request<B>,
+    next: Next<B>,
+) -> Response {
+    let token = &state.token;
     let expected = format!(
         "Basic {}",
         base64_encode(format!("ht:{}", token).as_bytes())
@@ -187,7 +192,7 @@ async fn web_auth<B>(State(token): State<String>, req: Request<B>, next: Next<B>
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v == expected)
+        .map(|v| *v == expected)
         .unwrap_or(false);
     if !authorized {
         let request_id = crate::http::new_request_id();
@@ -206,8 +211,106 @@ async fn web_auth<B>(State(token): State<String>, req: Request<B>, next: Next<B>
         insert_request_id_header(&mut response, &request_id);
         return response;
     }
+    // The shipped bootstrap token exists only for the very first login. The
+    // first request that presents it rotates the token to a random value and
+    // answers with a page that shows the new token once, so the operator never
+    // keeps using a publicly documented secret.
+    if *token == crate::config::DEFAULT_TOKEN {
+        match rotate_bootstrap_token(&state).await {
+            Ok(new_token) => {
+                return Html(bootstrap_token_page(&new_token)).into_response();
+            }
+            Err(err) => {
+                warn!("Failed to rotate the bootstrap token: {:#}", err);
+            }
+        }
+    }
     next.run(req).await
 }
+
+/// Rotate the bootstrap `[server].token` to a fresh random value.
+///
+/// The change is persisted to `ht.toml` and applied by the configuration
+/// watcher, which rebuilds the runtime within a second. The running generation
+/// keeps the old token until then, so the current response is not interrupted.
+async fn rotate_bootstrap_token(state: &ApiState) -> Result<String> {
+    let new_token = crate::config::generated_token();
+    state
+        .management
+        .update_settings(
+            |config| {
+                let server = config
+                    .server
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("The node has no `[server]` table"))?;
+                match server.token.as_deref() {
+                    Some(token) if token == crate::config::DEFAULT_TOKEN => {}
+                    // Another request already rotated the token while this
+                    // connection was still authorized with the old value.
+                    _ => bail!("The bootstrap token has already been rotated"),
+                }
+                server.token = Some(MaskedString::from(new_token.clone()));
+                Ok(())
+            },
+            false,
+        )
+        .await?;
+    info!(
+        "The default token was used to log into the management page; `[server].token` \
+         was reset to a random value and saved to {:?}",
+        state.management.config_path()
+    );
+    Ok(new_token)
+}
+
+/// The one-time page shown after the first login rotated the bootstrap token.
+///
+/// The browser still holds the bootstrap credentials, so the operator must log
+/// in again with the new token; the page says so and displays the value once.
+fn bootstrap_token_page(token: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>Token 已重置</title><style>{}</style></head><body>\
+         <div class=\"wrap\"><section class=\"card\">\
+         <h1>登录成功，管理 Token 已自动重置</h1>\
+         <p class=\"reason\">检测到首次登录：为了安全，默认密码已停用，\
+         新 Token 已写入 ht.toml。</p>\
+         <p class=\"hint\">请立即保存下面这个只显示一次的新 Token，\
+         然后刷新页面，用用户名 <code>ht</code> 和它重新登录：</p>\
+         <p class=\"token\"><code>{}</code></p>\
+         <p class=\"hint\">下游节点连接本入口时也使用同一个 Token。</p>\
+         <div class=\"actions\"><a class=\"btn\" href=\"/\">用新 Token 重新登录</a></div>\
+         </section></div></body></html>",
+        BOOTSTRAP_CSS,
+        escape_html(token)
+    )
+}
+
+/// The stylesheet of [`bootstrap_token_page`], in the same visual language as
+/// the console.
+const BOOTSTRAP_CSS: &str = r#"*,*::before,*::after{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;background:#f4f6fb;color:#101828;font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{width:100%;max-width:560px}
+.card{background:#fff;border:1px solid #e4e7ec;border-radius:16px;padding:24px;box-shadow:0 1px 2px rgba(16,24,40,.05),0 12px 28px -18px rgba(16,24,40,.35)}
+h1{margin:0 0 12px;font-size:18px;line-height:1.4}
+.reason{margin:0;padding:12px 14px;border-radius:10px;background:#fffaeb;color:#b54708;font-size:14px;overflow-wrap:anywhere}
+.token{margin:14px 0 0}
+.token code{display:block;padding:12px 14px;border-radius:10px;font-size:18px;letter-spacing:.5px;overflow-wrap:anywhere}
+.hint{margin:14px 0 0;color:#667085;font-size:13px}
+.actions{margin-top:18px}
+.btn{display:inline-flex;align-items:center;padding:9px 18px;border:1px solid #e4e7ec;border-radius:10px;background:#fff;color:#101828;font-size:14px;font-weight:600;text-decoration:none}
+.btn:hover{border-color:#4f46e5;color:#4f46e5}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em;padding:1px 6px;border-radius:6px;background:#eef2ff;color:#4f46e5}
+@media (prefers-color-scheme:dark){
+body{background:#0b1020;color:#e6e9f0}
+.card{background:#121a2e;border-color:#232d47}
+.reason{background:#332712;color:#fdb022}
+.hint{color:#98a2b3}
+.btn{background:#121a2e;border-color:#232d47;color:#e6e9f0}
+.btn:hover{border-color:#a5b4fc;color:#a5b4fc}
+code{background:#1d2750;color:#a5b4fc}
+}"#;
 
 // Small local encoder avoids adding a dependency just for HTTP Basic auth.
 fn base64_encode(input: &[u8]) -> String {
@@ -966,4 +1069,95 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::management::ManagementState;
+    use crate::reload::ReloadMarker;
+    use crate::server::ServerState;
+    use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::watch;
+
+    fn state(config: Config, path: std::path::PathBuf) -> Arc<ApiState> {
+        let (routes, _) = watch::channel(BTreeSet::new());
+        let mut config = config;
+        config.source.path = Some(path);
+        let server = Arc::new(ServerState::new(
+            config
+                .listener_token()
+                .cloned()
+                .unwrap_or_default(),
+            config.name.clone(),
+            config.bind_host().parse().ok(),
+            config.entry_domain().map(str::to_string),
+            config.server_limits(),
+            routes,
+            config.proxies.clone(),
+        ));
+        let (live, _live_rx) = tokio::sync::mpsc::channel(8);
+        let (restart, _restart_rx) = tokio::sync::mpsc::channel(1);
+        let management = Arc::new(ManagementState::new(
+            config,
+            server,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(ReloadMarker::default()),
+            Arc::new(crate::reload::ReloadStatus::new()),
+            0,
+            live,
+            restart,
+        ));
+        Arc::new(ApiState {
+            management,
+            token: crate::config::DEFAULT_TOKEN.to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_first_login_rotates_the_bootstrap_token() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "http-tunnel-rotate-{}.toml",
+            std::process::id()
+        ));
+        let config = Config::parse(&crate::config::generated_config())?;
+        let state = state(config, path.clone());
+
+        let new_token = rotate_bootstrap_token(&state).await?;
+        assert_ne!(new_token, crate::config::DEFAULT_TOKEN);
+        assert_eq!(new_token.len(), crate::config::GENERATED_TOKEN_LEN);
+        assert!(new_token.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // The rotation is persisted, so a login in another tab or session does
+        // not rotate it again: the earlier of the two responses carries the
+        // valid token and the later one is refused until a re-login.
+        let again = rotate_bootstrap_token(&state).await;
+        assert!(again.is_err(), "the rotation must happen only once");
+
+        let saved = tokio::fs::read_to_string(&path).await?;
+        assert!(!saved.contains(crate::config::DEFAULT_TOKEN), "{}", saved);
+        assert!(saved.contains(&new_token), "{}", saved);
+
+        let _ = tokio::fs::remove_file(&path).await;
+        Ok(())
+    }
+
+    /// The management page keeps the connection's token in its state; the
+    /// rotation must not be visible in `web_auth`'s own check, only on disk.
+    #[tokio::test]
+    async fn test_rotation_needs_a_server_table() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "http-tunnel-rotate-leaf-{}.toml",
+            std::process::id()
+        ));
+        // A leaf: no `[server]`, so there is no `[server].token` to rotate and
+        // no management page in a real process either.
+        let config = Config::parse(
+            "[upstream]\nurl = \"ws://a.test:7777\"\ntoken = \"upstream-secret\"\n",
+        )?;
+        let state = state(config, path);
+        assert!(rotate_bootstrap_token(&state).await.is_err());
+        Ok(())
+    }
 }

@@ -131,9 +131,9 @@ async fn main() -> Result<()> {
         };
         println!(
             "未找到 {:?} 或其内容为空，已生成默认配置并以服务端模式启动。{}\
-             用户名 ht，密码为 [server].token（见 {:?}）；\
+             用户名 ht，默认密码 123456，首次登录后 Token 会自动重置为随机值并显示；\
              保存配置后 `ht` 会自动热加载。",
-            cli.config, hint, cli.config
+            cli.config, hint
         );
     }
 

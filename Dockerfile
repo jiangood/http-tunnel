@@ -10,7 +10,7 @@ WORKDIR /app
 COPY --chmod=0755 build-out/${TARGETARCH}/ht /usr/local/bin/ht
 # Runs as root so a first run can generate /app/ht.toml and the web API can
 # persist it. For a non-root deployment, make the mounted config writable and
-# pass `--user 65532:65532` (or the equivalent in compose/Kubernetes).
+# pass `--user 65532:65532` (or the equivalent in Kubernetes).
 # The listener and the management page/API share `[server].port`. These are
 # documentation-only defaults.
 EXPOSE 7777

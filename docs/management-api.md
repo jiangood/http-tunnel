@@ -22,7 +22,10 @@ Open `http://<server.domain>:<server.port>/`. Requests whose `Host` is not
 domain never reaches the management router.
 
 The page itself is protected by the browser-native HTTP Basic login: username
-`ht`, password = the listener `token`. It is the only Basic-authenticated
+`ht`, password = the listener `token`. On a fresh install the token is the
+bootstrap value `123456`; the first successful page login rotates it to a random
+value and answers with a page that displays the new token once, so the browser
+then has to log in again with it. The page is the only Basic-authenticated
 resource. It is a single HTML document with an inline stylesheet and script and
 no external dependency; it renders nothing on the server and reads all of its
 data from `/api` with the Bearer token it is handed after login. One node
@@ -407,7 +410,10 @@ presence of `x-http-tunnel-request-id`.
 
 `ht.toml` is the only configuration source. The management page and
 `PUT /api/settings` write that same file. On first start a missing file is
-replaced with a commented example that runs as a server (`[server]` enabled on
-`0.0.0.0:7777` with a random `token`, `[upstream]` commented out); the process
-keeps starting with it and hot-reloads later edits. There is no environment-only
-mode.
+replaced with a generated, comment-free config that runs as a server
+(`[server]` enabled on `0.0.0.0:7777` with the bootstrap `token = "123456"`, no
+`[[proxies]]` example, no `[upstream]`); the process keeps starting with it and
+hot-reloads later edits. The first successful page login rotates that bootstrap
+token to a random value, writes it back to `ht.toml`, and shows it once on a
+dedicated page; afterwards the bootstrap value no longer authenticates. There
+is no environment-only mode.
